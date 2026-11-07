@@ -444,7 +444,7 @@ pub(crate) struct Operation {
 
 /// Read failures are independent of normal work cadence and shared by callers
 /// of the same endpoint class, including answer/mine challenge observations.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReadScope {
     Challenge,
     Identity,
@@ -455,7 +455,7 @@ pub(crate) enum ReadScope {
 }
 
 impl ReadScope {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Challenge => "challenge",
             Self::Identity => "identity",
@@ -465,12 +465,45 @@ impl ReadScope {
             Self::Receipt => "receipt",
         }
     }
+
+    pub(crate) const ALL: [Self; 6] = [
+        Self::Challenge,
+        Self::Identity,
+        Self::Assignments,
+        Self::AssignmentEvidence,
+        Self::Job,
+        Self::Receipt,
+    ];
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ReadBackoff {
     pub failures: u32,
     pub next_at: i64,
+}
+
+fn read_delay(failures: u32, base: u64, cap: u64, jitter: u64) -> u64 {
+    base.saturating_mul(
+        1_u64
+            .checked_shl(failures.saturating_sub(1))
+            .unwrap_or(u64::MAX),
+    )
+    .min(cap.max(base))
+    .saturating_add(jitter)
+}
+
+fn safe_read_category(category: &str) -> &'static str {
+    match category {
+        "timeout" => "timeout",
+        "connect" => "connect",
+        "request" => "request",
+        "body_interrupted" => "body_interrupted",
+        "response_too_large" => "response_too_large",
+        "invalid_json" => "invalid_json",
+        "credential_echo_redacted" => "credential_echo_redacted",
+        "http_status" => "http_status",
+        _ => "unusable_response",
+    }
 }
 
 pub(crate) struct Store {
@@ -669,6 +702,15 @@ impl Store {
              CREATE TABLE IF NOT EXISTS schedule (kind TEXT PRIMARY KEY, next_at INTEGER NOT NULL, cursor TEXT);
              CREATE TABLE IF NOT EXISTS read_backoff (
                 scope TEXT PRIMARY KEY, failures INTEGER NOT NULL, next_at INTEGER NOT NULL);
+             CREATE TABLE IF NOT EXISTS read_observations (
+                scope TEXT PRIMARY KEY, in_flight INTEGER NOT NULL DEFAULT 0,
+                started_at INTEGER, finished_at INTEGER, last_http_success_at INTEGER,
+                last_success_at INTEGER, last_failure_at INTEGER, failure_category TEXT,
+                status INTEGER, local_next_at INTEGER NOT NULL DEFAULT 0,
+                server_not_before INTEGER NOT NULL DEFAULT 0,
+                retained_conservative_floor INTEGER NOT NULL DEFAULT 0);
+             INSERT OR IGNORE INTO read_observations(scope,retained_conservative_floor)
+                SELECT scope,next_at FROM read_backoff;
              CREATE TABLE IF NOT EXISTS observation (singleton INTEGER PRIMARY KEY CHECK(singleton=1),
                 epoch INTEGER NOT NULL, observed_at INTEGER NOT NULL);
              CREATE TABLE IF NOT EXISTS runtime_state (singleton INTEGER PRIMARY KEY CHECK(singleton=1),
@@ -788,6 +830,10 @@ impl Store {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE read_observations SET in_flight=0,finished_at=?1 WHERE in_flight!=0",
+            [now()],
+        )?;
         for (from, to) in [("generating", "model_unknown"), ("dispatching", "unknown")] {
             tx.execute(
                 "INSERT INTO events(at,code,kind,operation_id)
@@ -1259,7 +1305,7 @@ impl Store {
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        if effects.len() as u64 + 1 > u64::from(policy.max_unresolved_operations)
+        if effects.len() as u64 + 1 > u64::from(policy.unresolved_limit(op.kind))
             || effects.iter().any(|e| e.1 == "dispatching" || e.3 > now())
         {
             return Ok(None);
@@ -1381,7 +1427,7 @@ impl Store {
             "SELECT COUNT(*) FROM operations WHERE state IN ('dispatching','queued','unknown','included_pending')",
             [], |r| r.get(0),
         )?;
-        if unresolved + 1 > u64::from(config.participation.max_unresolved_operations) {
+        if unresolved + 1 > u64::from(config.participation.unresolved_limit(kind)) {
             bail!("manual authorization exceeds unresolved operation limit");
         }
         let (attempts,accepted,uncertain): (u32,bool,bool) = tx.query_row(
@@ -1500,7 +1546,7 @@ impl Store {
         }
         if policy.mode == ParticipationMode::Strict
             || !policy.allows(kind)
-            || effects.len() as u64 + 1 > u64::from(policy.max_unresolved_operations)
+            || effects.len() as u64 + 1 > u64::from(policy.unresolved_limit(kind))
             || effects.iter().any(|e| e.1 == "dispatching" || e.3 > now())
         {
             return Ok(false);
@@ -1742,6 +1788,162 @@ impl Store {
         Ok(())
     }
 
+    pub(crate) fn work_revision(&self) -> Result<i64> {
+        Ok(self.db.query_row(
+            "SELECT COALESCE(MAX(id),0) FROM events WHERE operation_id IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    pub(crate) fn wake_delay(&self, config: &Config, fallback: u64) -> Result<u64> {
+        let current = now();
+        let mut deadline = current.saturating_add(fallback.min(i64::MAX as u64) as i64);
+        for kind in [WorkKind::Answer, WorkKind::Judge, WorkKind::Mine] {
+            if config.mode(kind) == Mode::Off {
+                continue;
+            }
+            let scope = if kind == WorkKind::Judge {
+                ReadScope::Assignments
+            } else {
+                ReadScope::Challenge
+            };
+            let next = self.next_at(kind)?.max(self.read_backoff(scope)?.next_at);
+            if next > current {
+                deadline = deadline.min(next);
+            }
+        }
+        for scope in ReadScope::ALL {
+            let next = self.read_backoff(scope)?.next_at;
+            if next > current {
+                deadline = deadline.min(next);
+            }
+        }
+        let operation: Option<i64> = self.db.query_row("SELECT MIN(next_at) FROM operations
+            WHERE next_at>?1 AND state IN ('prepared','generated','retry','queued','unknown','included_pending')",
+            [current],|r| r.get(0))?;
+        if let Some(next) = operation {
+            deadline = deadline.min(next);
+        }
+        Ok(deadline.saturating_sub(current).max(1) as u64)
+    }
+
+    pub(crate) fn defer_until(&self, kind: WorkKind, deadline: i64) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO schedule(kind,next_at) VALUES (?1,?2)
+            ON CONFLICT(kind) DO UPDATE SET next_at=excluded.next_at",
+            params![kind.as_str(), deadline],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn read_started(&self, scope: ReadScope) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO read_observations(scope,in_flight,started_at) VALUES (?1,1,?2)
+            ON CONFLICT(scope) DO UPDATE SET in_flight=1,started_at=excluded.started_at",
+            params![scope.as_str(), now()],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn read_finished(
+        &self,
+        scope: ReadScope,
+        status: Option<u16>,
+        category: Option<&str>,
+    ) -> Result<()> {
+        self.db.execute("UPDATE read_observations SET in_flight=0,finished_at=?2,status=?3,
+            failure_category=?4,last_http_success_at=CASE WHEN ?3>=200 AND ?3<300 THEN ?2 ELSE last_http_success_at END
+            WHERE scope=?1", params![scope.as_str(),now(),status,category])?;
+        Ok(())
+    }
+
+    pub(crate) fn reschedule_read(
+        &self,
+        scope: ReadScope,
+        base: u64,
+        cap: u64,
+        jitter: u64,
+    ) -> Result<()> {
+        let old = self.read_backoff(scope)?;
+        if old.failures == 0 {
+            return Ok(());
+        }
+        let timing: Option<(Option<i64>, i64, i64)> = self
+            .db
+            .query_row(
+                "SELECT last_failure_at,server_not_before,retained_conservative_floor FROM read_observations WHERE scope=?1",
+                [scope.as_str()],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let Some((Some(failed_at), floor, legacy_floor)) = timing else {
+            return Ok(());
+        };
+        let local = failed_at
+            .saturating_add(read_delay(old.failures, base, cap, jitter).min(i64::MAX as u64) as i64)
+            .saturating_add(1);
+        let next = local.max(floor).max(legacy_floor);
+        let tx = self.db.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE read_observations SET local_next_at=?2 WHERE scope=?1",
+            params![scope.as_str(), local],
+        )?;
+        tx.execute(
+            "UPDATE read_backoff SET next_at=?2 WHERE scope=?1",
+            params![scope.as_str(), next],
+        )?;
+        if scope == ReadScope::Challenge {
+            tx.execute(
+                "UPDATE schedule SET next_at=?2 WHERE kind IN ('answer','mine') AND next_at=?1",
+                params![old.next_at, next],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn reads(&self) -> Result<Value> {
+        let mut rows = Vec::with_capacity(ReadScope::ALL.len());
+        let has_backoff = self.has_table("read_backoff")?;
+        let has_observations = self.has_table("read_observations")?;
+        for scope in ReadScope::ALL {
+            let backoff = if has_backoff {
+                self.read_backoff(scope)?
+            } else {
+                ReadBackoff::default()
+            };
+            let detail = if has_observations {
+                self.db.query_row("SELECT in_flight,started_at,finished_at,last_http_success_at,last_success_at,
+                    last_failure_at,failure_category,status,local_next_at,server_not_before,retained_conservative_floor
+                    FROM read_observations WHERE scope=?1",[scope.as_str()],|r| {
+                    let category: Option<String> = r.get(6)?;
+                    Ok(json!({"state":if r.get::<_,bool>(0)? {"in_flight"} else {"idle"},
+                        "started_at":r.get::<_,Option<i64>>(1)?,"finished_at":r.get::<_,Option<i64>>(2)?,
+                        "last_http_success_at":r.get::<_,Option<i64>>(3)?,"last_success_at":r.get::<_,Option<i64>>(4)?,
+                        "last_failure_at":r.get::<_,Option<i64>>(5)?,"failure_category":category.as_deref().map(safe_read_category),
+                        "status":r.get::<_,Option<u16>>(7)?,"local_next_at":r.get::<_,i64>(8)?,
+                        "server_not_before":r.get::<_,i64>(9)?,
+                        "retained_conservative_floor":r.get::<_,i64>(10)?}))
+                }).optional()?
+            } else {
+                None
+            };
+            let mut detail = detail.unwrap_or_else(|| {
+                json!({"state":"idle","started_at":null,"finished_at":null,
+                "last_http_success_at":null,"last_success_at":null,"last_failure_at":null,
+                "failure_category":null,"status":null,"local_next_at":0,"server_not_before":0,
+                "retained_conservative_floor":backoff.next_at})
+            });
+            detail["scope"] = json!(scope.as_str());
+            detail["failures"] = json!(backoff.failures);
+            detail["next_at"] = json!(backoff.next_at);
+            detail["due_in_seconds"] = json!(backoff.next_at.saturating_sub(now()).max(0));
+            rows.push(detail);
+        }
+        Ok(json!(rows))
+    }
+
     pub(crate) fn read_backoff(&self, scope: ReadScope) -> Result<ReadBackoff> {
         Ok(self
             .db
@@ -1768,27 +1970,51 @@ impl Store {
         server_minimum: Option<u64>,
     ) -> Result<ReadBackoff> {
         let failures = self.read_backoff(scope)?.failures.saturating_add(1);
-        let multiplier = 1_u64.checked_shl(failures - 1).unwrap_or(u64::MAX);
-        let seconds = retry_seconds
-            .saturating_mul(multiplier)
-            .min(cap_seconds.max(retry_seconds))
-            .max(server_minimum.unwrap_or(0))
-            .saturating_add(jitter_seconds);
+        let local = not_before(read_delay(
+            failures,
+            retry_seconds,
+            cap_seconds,
+            jitter_seconds,
+        ));
+        let (prior_floor, legacy_floor): (i64, i64) = self.db.query_row(
+            "SELECT server_not_before,retained_conservative_floor FROM read_observations WHERE scope=?1",
+            [scope.as_str()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).optional()?.unwrap_or_default();
+        // The old API included jitter after the server minimum. Keep that conservative rule.
+        let floor = prior_floor.max(server_minimum.map_or(0, |seconds| {
+            not_before(seconds.saturating_add(jitter_seconds))
+        }));
         let state = ReadBackoff {
             failures,
-            next_at: not_before(seconds),
+            next_at: local.max(floor).max(legacy_floor),
         };
-        self.db.execute(
+        let tx = self.db.unchecked_transaction()?;
+        tx.execute(
             "INSERT INTO read_backoff(scope,failures,next_at) VALUES (?1,?2,?3)
-             ON CONFLICT(scope) DO UPDATE SET failures=excluded.failures,next_at=excluded.next_at",
+            ON CONFLICT(scope) DO UPDATE SET failures=excluded.failures,next_at=excluded.next_at",
             params![scope.as_str(), state.failures, state.next_at],
         )?;
+        tx.execute("INSERT INTO read_observations(scope,last_failure_at,failure_category,local_next_at,server_not_before)
+            VALUES (?1,?2,'unusable_response',?3,?4) ON CONFLICT(scope) DO UPDATE SET
+            last_failure_at=excluded.last_failure_at,local_next_at=excluded.local_next_at,
+            server_not_before=excluded.server_not_before,
+            failure_category=COALESCE(read_observations.failure_category,'unusable_response')",
+            params![scope.as_str(),now(),local,floor])?;
+        tx.commit()?;
         Ok(state)
     }
 
     pub(crate) fn reset_read(&self, scope: ReadScope) -> Result<()> {
-        self.db
-            .execute("DELETE FROM read_backoff WHERE scope=?1", [scope.as_str()])?;
+        let tx = self.db.unchecked_transaction()?;
+        tx.execute("DELETE FROM read_backoff WHERE scope=?1", [scope.as_str()])?;
+        tx.execute(
+            "INSERT INTO read_observations(scope,last_success_at) VALUES (?1,?2)
+            ON CONFLICT(scope) DO UPDATE SET last_success_at=excluded.last_success_at,
+            local_next_at=0,server_not_before=0,retained_conservative_floor=0,failure_category=NULL",
+            params![scope.as_str(), now()],
+        )?;
+        tx.commit()?;
         Ok(())
     }
     pub(crate) fn observe(&self, epoch: u64, answered: bool) -> Result<()> {
@@ -1906,6 +2132,306 @@ impl Store {
             params![id, now()],
         )?;
         Ok(())
+    }
+
+    fn work_projection(
+        &self,
+        config: &Config,
+        reads: &Value,
+        epoch: Option<u64>,
+        answered: Option<bool>,
+        stopped: bool,
+        reload_blocked: bool,
+    ) -> Result<Value> {
+        let control = self.control()?;
+        let current = now();
+        let mut work = json!({});
+        for kind in [WorkKind::Answer, WorkKind::Judge, WorkKind::Mine] {
+            let prepared = self.preparation(kind)?;
+            let operation = if prepared.is_some() {
+                prepared
+            } else if kind != WorkKind::Judge {
+                let id: Option<i64> = self.db.query_row(
+                    "SELECT id FROM operations WHERE kind=?1 AND work_key LIKE ?2
+                    AND state IN ('dispatching','queued','unknown','included_pending','confirmed','final','completed','model_unknown')
+                    ORDER BY id DESC LIMIT 1",
+                    params![kind.as_str(),format!("{}:%",epoch.unwrap_or(u64::MAX))],|r| r.get(0)).optional()?;
+                id.map(|id| self.operation(id)).transpose()?.flatten()
+            } else {
+                None
+            };
+            let op = operation.as_ref();
+            let scope = if kind == WorkKind::Judge {
+                ReadScope::Assignments
+            } else {
+                ReadScope::Challenge
+            };
+            let read = reads
+                .as_array()
+                .and_then(|rows| rows.iter().find(|row| row["scope"] == scope.as_str()));
+            let read_at = read.and_then(|row| row["next_at"].as_i64()).unwrap_or(0);
+            let mut next_at = Some(self.next_at(kind)?.max(read_at).max(current));
+            let mut phase = "observing";
+            let mut reason = "observation_due";
+            let mut action = if kind == WorkKind::Judge {
+                "observe_assignments"
+            } else {
+                "observe_challenge"
+            };
+            let unresolved: u64 = self.db.query_row(
+                "SELECT COUNT(*) FROM operations WHERE id!=?1 AND state IN ('dispatching','queued','unknown','included_pending')",
+                [op.map_or(-1,|op| op.id)],|r| r.get(0))?;
+            let capacity = unresolved.saturating_add(1)
+                > u64::from(config.participation.unresolved_limit(kind));
+            if read.is_some_and(|row| row["state"] == "in_flight") {
+                phase = "observing";
+                reason = "read_in_flight";
+                action = if kind == WorkKind::Judge {
+                    "await_assignments"
+                } else {
+                    "await_challenge"
+                };
+                next_at = None;
+            } else if read_at > current {
+                reason = "read_backoff";
+            } else if next_at.is_some_and(|at| at > current) {
+                reason = "cadence";
+            }
+            if kind == WorkKind::Answer && answered == Some(true) {
+                phase = "answered";
+                reason = "hosted_answer_observed";
+            }
+            if capacity {
+                phase = "blocked";
+                reason = if kind != WorkKind::Answer
+                    && config.participation.answer_reserved_slots > 0
+                    && unresolved < u64::from(config.participation.max_unresolved_operations)
+                {
+                    "answer_capacity_reserved"
+                } else {
+                    "unresolved_capacity"
+                };
+                action = "await_reconciliation";
+                next_at = None;
+            }
+            if let Some(op) = op {
+                match op.state.as_str() {
+                    "generating" => {
+                        phase = "preparing";
+                        reason = if op.request["solver"]["epoch"].as_u64() != epoch
+                            && kind == WorkKind::Answer
+                        {
+                            "model_capacity"
+                        } else {
+                            "model_running"
+                        };
+                        action = "await_model";
+                        next_at = if self.has_table("operation_evidence")? {
+                            self.db.query_row("SELECT model_deadline FROM operation_evidence WHERE operation_id=?1",
+                                [op.id],|r| r.get::<_,Option<i64>>(0)).optional()?.flatten()
+                        } else {
+                            None
+                        };
+                    }
+                    "prepared" | "generated" | "retry" => {
+                        if !capacity {
+                            phase = "prepared";
+                            reason = "fresh_evidence_required";
+                            action = if kind == WorkKind::Judge {
+                                "revalidate_assignment"
+                            } else {
+                                "revalidate_challenge"
+                            };
+                            next_at = Some(op.next_at.max(read_at).max(current));
+                            if op.next_at > current {
+                                reason = "operation_backoff";
+                            } else if read_at > current {
+                                reason = "read_backoff";
+                            } else if self.has_table("operation_timing")?
+                                && !self.admission_allowed(config, op)?
+                            {
+                                phase = "blocked";
+                                action = "await_reconciliation";
+                                next_at = None;
+                                let (writing, floor, grace): (bool,i64,i64) = self.db.query_row(
+                                    "SELECT COALESCE(MAX(o.state='dispatching'),0),
+                                    COALESCE(MAX(COALESCE(t.retry_not_before,o.next_at)),0),
+                                    COALESCE(MAX(COALESCE(e.blocked_since,o.created_at)),0)
+                                    FROM operations o LEFT JOIN operation_timing t ON t.operation_id=o.id
+                                    LEFT JOIN operation_evidence e ON e.operation_id=o.id
+                                    WHERE o.id!=?1 AND o.state IN ('dispatching','queued','unknown','included_pending')",
+                                    [op.id],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+                                if writing {
+                                    reason = "effect_in_flight";
+                                    action = "await_effect";
+                                } else if floor > current {
+                                    reason = "retained_retry_minimum";
+                                    next_at = Some(floor);
+                                } else if unresolved == 0 {
+                                    reason = "request_eligibility";
+                                    action = "revalidate_request";
+                                    next_at = Some(current);
+                                } else if config.participation.mode == ParticipationMode::Strict {
+                                    reason = "strict_uncertainty";
+                                } else if !config.participation.allows(kind) {
+                                    reason = "participation_disabled";
+                                } else if config.participation.mode == ParticipationMode::Manual {
+                                    reason = "manual_authorization_required";
+                                    action = "authorize";
+                                } else {
+                                    let until = grace.saturating_add(
+                                        config
+                                            .participation
+                                            .uncertainty_grace_seconds
+                                            .min(i64::MAX as u64)
+                                            as i64,
+                                    );
+                                    if until > current {
+                                        reason = "uncertainty_grace";
+                                        next_at = Some(until);
+                                    } else {
+                                        reason = "request_eligibility";
+                                        action = "revalidate_request";
+                                    }
+                                }
+                            }
+                            if phase == "prepared" {
+                                let identity = reads.as_array().and_then(|rows| {
+                                    rows.iter().find(|row| row["scope"] == "identity")
+                                });
+                                let identity_at = identity
+                                    .and_then(|row| row["next_at"].as_i64())
+                                    .unwrap_or(0);
+                                if identity_at > current {
+                                    reason = "identity_backoff";
+                                    next_at = Some(next_at.unwrap_or(current).max(identity_at));
+                                }
+                                if read.is_some_and(|row| row["state"] == "in_flight") {
+                                    reason = "freshness_in_flight";
+                                    action = if kind == WorkKind::Judge {
+                                        "await_assignments"
+                                    } else {
+                                        "await_challenge"
+                                    };
+                                    next_at = None;
+                                } else if identity.is_some_and(|row| row["state"] == "in_flight") {
+                                    reason = "identity_in_flight";
+                                    action = "await_identity";
+                                    next_at = None;
+                                }
+                            }
+                        }
+                    }
+                    "dispatching" => {
+                        phase = "dispatching";
+                        reason = "effect_in_flight";
+                        action = "await_effect";
+                        next_at = None;
+                    }
+                    "queued" | "unknown" | "included_pending" => {
+                        phase = match op.state.as_str() {
+                            "queued" => "queued",
+                            "included_pending" => "included_pending",
+                            _ => "unknown",
+                        };
+                        reason = "authoritative_evidence_required";
+                        let bound_scope = if op.txid.is_some() {
+                            Some(ReadScope::Receipt)
+                        } else if op.job_id.is_some() {
+                            Some(ReadScope::Job)
+                        } else {
+                            None
+                        };
+                        action = match bound_scope {
+                            Some(ReadScope::Receipt) => "read_receipt",
+                            Some(_) => "read_job",
+                            None => "authoritative_recovery",
+                        };
+                        next_at = bound_scope.map(|scope| {
+                            reads
+                                .as_array()
+                                .and_then(|rows| {
+                                    rows.iter().find(|row| row["scope"] == scope.as_str())
+                                })
+                                .and_then(|row| row["next_at"].as_i64())
+                                .unwrap_or(0)
+                                .max(op.next_at)
+                                .max(current)
+                        });
+                    }
+                    "model_unknown" => {
+                        phase = "blocked";
+                        reason = "model_uncertain";
+                        action = if config.preparation.retry_uncertain {
+                            "retry_model"
+                        } else {
+                            "recover_model"
+                        };
+                        next_at = None;
+                    }
+                    "confirmed" | "final" => {
+                        phase = "included";
+                        reason = if op.state == "final" {
+                            "checkpoint_reported"
+                        } else {
+                            "receipt_included"
+                        };
+                        action = "observe_challenge";
+                    }
+                    "completed" => {
+                        phase = "completed";
+                        reason = "mine_completed";
+                    }
+                    _ => {}
+                }
+                if op.generation != control.generation
+                    && matches!(op.state.as_str(), "prepared" | "generated" | "retry")
+                {
+                    phase = "blocked";
+                    reason = "generation_changed";
+                    action = "discard_unsent";
+                    next_at = Some(current);
+                }
+            }
+            if config.mode(kind) == Mode::ReadOnly {
+                phase = "read_only";
+                reason = "capability_read_only";
+                action = if kind == WorkKind::Judge {
+                    "observe_assignments"
+                } else {
+                    "observe_challenge"
+                };
+                next_at = Some(self.next_at(kind)?.max(read_at).max(current));
+            }
+            if stopped {
+                phase = "stopped";
+                reason = "controller_stopped";
+                action = "start_controller";
+                next_at = None;
+            }
+            if reload_blocked {
+                phase = "blocked";
+                reason = "config_reload_rejected";
+                action = "repair_config";
+                next_at = None;
+            }
+            if control.paused {
+                phase = "paused";
+                reason = "admission_paused";
+                action = "resume";
+                next_at = None;
+            }
+            if config.mode(kind) == Mode::Off {
+                phase = "off";
+                reason = "capability_off";
+                action = "enable_capability";
+                next_at = None;
+            }
+            work[kind.as_str()] = json!({"phase":phase,"reason":reason,"next_action":action,
+                "next_at":next_at,"epoch":epoch,"operation_id":op.map(|op| op.id),
+                "operation_epoch":op.and_then(|op| op.request["solver"]["epoch"].as_u64())});
+        }
+        Ok(work)
     }
 
     pub(crate) fn status(&self, config: &Config) -> Result<Value> {
@@ -2057,6 +2583,14 @@ impl Store {
         {
             policy_config.capabilities = capabilities;
         }
+        if let Some(policy) = effective.as_ref().map(|e| &e["policy"]) {
+            if let Ok(schedule) = serde_json::from_value(policy["schedule"].clone()) {
+                policy_config.schedule = schedule;
+            }
+            if let Ok(preparation) = serde_json::from_value(policy["preparation"].clone()) {
+                policy_config.preparation = preparation;
+            }
+        }
         let risk_admissions: u64 = if self.has_table("risk_admissions")? {
             self.db
                 .query_row("SELECT COUNT(*) FROM risk_admissions", [], |r| r.get(0))?
@@ -2140,6 +2674,17 @@ impl Store {
         } else {
             None
         };
+        let reads = self.reads()?;
+        let work = self.work_projection(
+            &policy_config,
+            &reads,
+            epoch,
+            answered,
+            controller_stopped,
+            effective
+                .as_ref()
+                .is_some_and(|e| e["reload_blocked"] == true),
+        )?;
         let status = json!({"initialized":true,"paused":control.paused,"generation":control.generation,
             "identity_fingerprint":digest(format!("{}\n{}",stored["chain"].as_str().unwrap_or_default(),stored["address"].as_str().unwrap_or_default())),
             "chain":stored["chain"],"capabilities":config.capabilities,"observation":observed,
@@ -2147,6 +2692,7 @@ impl Store {
             "controller_stopped":controller_stopped,"epoch_evidence":epoch_evidence,
             "identity_matches_config":stored_identity==identity(config)?,"last_event":last_event,
             "hosted_identity_verified":hosted_identity_verified,
+            "reads":reads,"work":work,
             "pending":pending,"operations":counts,"evidence":"authenticated_hosted_response",
             "admission_blocked":blocked,"blocking_operation":blocking_operation,"blocked_since":blocked_since,
             "affected_capabilities":affected,"participation":participation,
@@ -2489,6 +3035,128 @@ mod tests {
         op.state = "unknown".into();
         store.save(&op, "dispatch_outcome_unknown").unwrap();
         op
+    }
+
+    #[test]
+    fn answer_reservation_survives_answered_epoch_and_manual_admission() {
+        let (_temp, mut config, mut store) = participation_fixture();
+        config.participation.max_unresolved_operations = 8;
+        config.participation.answer_reserved_slots = 2;
+        config.participation.allow_judge = true;
+        for epoch in 1..=6 {
+            dispatched_unknown(&mut store, &config, WorkKind::Judge, epoch);
+        }
+        store.observe(40, true).unwrap();
+        store.runtime_state(&config, false).unwrap();
+        let mut grade = prepared_epoch(&mut store, WorkKind::Judge, 40, "seventh");
+        let mut mine = prepared_epoch(&mut store, WorkKind::Mine, 40, "mine");
+        assert!(!store.dispatch_intent(&mut grade, &config).unwrap());
+        assert!(!store.dispatch_intent(&mut mine, &config).unwrap());
+        let status = store.status(&config).unwrap();
+        assert_eq!(
+            status["work"]["judge"]["reason"],
+            "answer_capacity_reserved"
+        );
+        assert_eq!(status["work"]["mine"]["reason"], "answer_capacity_reserved");
+        config.participation.mode = ParticipationMode::Manual;
+        assert!(store.authorize(&config, 40, WorkKind::Judge).is_err());
+        assert!(store.authorize(&config, 40, WorkKind::Mine).is_err());
+        store.authorize(&config, 41, WorkKind::Answer).unwrap();
+        let first = dispatched_unknown(&mut store, &config, WorkKind::Answer, 41);
+        store.authorize(&config, 42, WorkKind::Answer).unwrap();
+        let second = dispatched_unknown(&mut store, &config, WorkKind::Answer, 42);
+        assert_ne!(first.id, second.id);
+        assert!(store.authorize(&config, 43, WorkKind::Answer).is_err());
+        let mut third = prepared_epoch(&mut store, WorkKind::Answer, 43, "third");
+        assert!(!store.dispatch_intent(&mut third, &config).unwrap());
+        assert_eq!(third.state, "prepared");
+    }
+
+    #[test]
+    fn read_policy_retimes_local_failure_but_preserves_server_and_legacy_minima() {
+        let (_temp, config) = fixture();
+        let store = Store::open(&config).unwrap();
+        store.read_started(ReadScope::Challenge).unwrap();
+        store
+            .read_finished(ReadScope::Challenge, Some(503), Some("http_status"))
+            .unwrap();
+        let old = store
+            .fail_read(ReadScope::Challenge, 180, 900, 0, None)
+            .unwrap();
+        assert_eq!(store.reads().unwrap()[0]["server_not_before"], 0);
+        store.defer_until(WorkKind::Answer, old.next_at).unwrap();
+        store
+            .reschedule_read(ReadScope::Challenge, 1, 2, 0)
+            .unwrap();
+        assert!(store.read_backoff(ReadScope::Challenge).unwrap().next_at < old.next_at);
+        assert_eq!(
+            store.next_at(WorkKind::Answer).unwrap(),
+            store.read_backoff(ReadScope::Challenge).unwrap().next_at
+        );
+        let floored = store
+            .fail_read(ReadScope::Challenge, 1, 2, 0, Some(90))
+            .unwrap();
+        store
+            .reschedule_read(ReadScope::Challenge, 1, 1, 0)
+            .unwrap();
+        assert_eq!(
+            store.read_backoff(ReadScope::Challenge).unwrap().next_at,
+            floored.next_at
+        );
+        store
+            .db
+            .execute("DROP TABLE read_observations", [])
+            .unwrap();
+        drop(store);
+        let store = Store::open(&config).unwrap();
+        store
+            .reschedule_read(ReadScope::Challenge, 1, 1, 0)
+            .unwrap();
+        assert_eq!(store.read_backoff(ReadScope::Challenge).unwrap(), floored);
+        let diagnostics = store.reads().unwrap();
+        assert_eq!(diagnostics[0]["server_not_before"], 0);
+        assert_eq!(
+            diagnostics[0]["retained_conservative_floor"],
+            floored.next_at
+        );
+        assert_eq!(store.reads().unwrap()[0]["last_failure_at"], Value::Null);
+    }
+
+    #[test]
+    fn read_diagnostics_distinguish_http_success_from_usable_evidence_and_bound_codes() {
+        let (_temp, config) = fixture();
+        let store = Store::open(&config).unwrap();
+        store.read_started(ReadScope::Challenge).unwrap();
+        assert_eq!(store.reads().unwrap()[0]["state"], "in_flight");
+        store
+            .read_finished(ReadScope::Challenge, Some(200), Some("invalid_json"))
+            .unwrap();
+        store
+            .fail_read(ReadScope::Challenge, 10, 30, 0, None)
+            .unwrap();
+        let failed = store.reads().unwrap();
+        assert!(failed[0]["last_http_success_at"].is_i64());
+        assert!(failed[0]["last_success_at"].is_null());
+        assert_eq!(failed[0]["failure_category"], "invalid_json");
+        store
+            .db
+            .execute(
+                "UPDATE read_observations SET failure_category='https://private.invalid/secret'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            store.reads().unwrap()[0]["failure_category"],
+            "unusable_response"
+        );
+        store.reset_read(ReadScope::Challenge).unwrap();
+        let recovered = store.reads().unwrap();
+        assert!(recovered[0]["last_success_at"].is_i64());
+        assert_eq!(
+            recovered[0]["last_failure_at"],
+            failed[0]["last_failure_at"]
+        );
+        assert_eq!(recovered[0]["failures"], 0);
     }
 
     #[test]

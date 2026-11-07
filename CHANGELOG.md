@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Keep bounded background HTTP requests progressing while urgent epoch/answer work runs; wake on model completion and drain useful transitions without a full post-cycle sleep. Preserve serialized writes and one journal owner.
+- Retain completed model artifacts during clean shutdown and ordinary upgrade without changing pause generation. Explicit pause/off fencing and genuine execution uncertainty remain intact.
+- Add hot-reloaded challenge-only retry settings, durable local/server deadline provenance, sanitized `reads` diagnostics and actionable per-capability `status.work`. Distinguish current-epoch evidence freshness from heartbeat.
+- Reserve configurable unresolved capacity for answers across normal/manual admission, including after the current answer completes. Default zero preserves existing policy.
+- Permit mining in freshly observed unanswered epochs while retaining per-epoch limits, identity/freshness checks and reward uncertainty.
+- Exercise retained slow job/receipt/inventory reads, restart and pause fencing, answer reservation, unanswered mining, retry minima across reload/restart/stalled bodies, and sanitized transport failures through actual CLI processes.
+- Preserve assignment-page failure/minimum evidence when earlier partial candidates remain usable. Fence urgent scheduling and active admission out of stopped-writer recovery, even with active participation configured.
+- Expose unattributed legacy read deadlines separately from known server floors; retain conservative operation retry deadlines without mislabeling their provenance.
 - Add CLI-first configuration schema/show/apply, private guidance show/set, sanitized paginated operation/grant lists and grant revocation. Revision-checked stdin updates validate complete candidates, atomically replace private files and distinguish saved from controller-effective revisions. Serialize cooperating administration with startup identity binding.
 - Add strict-by-default, hot-reloaded bounded participation policy and explicit manual grants. Preserve uncertain outcomes while recording each authorized overlapping dispatch; independently bound and fence optional same-epoch uncertain-answer retries. Retain server delays, account/pause/mode fences and distinct operation linkage across restart.
 - Rotate bounded reconciliation fairly past old identifier-less unknowns. Add opt-in per-answered-epoch mining and separate read HTTP deadlines without misclassifying mining GET effects as reads.

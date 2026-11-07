@@ -342,6 +342,8 @@ fn defaults() -> Value {
     let mut value =
         serde_json::to_value(Config::default()).expect("Config serialization is infallible");
     value["timeouts"]["read_http_seconds"] = Value::Null;
+    value["schedule"]["challenge_retry_seconds"] = Value::Null;
+    value["schedule"]["challenge_backoff_max_seconds"] = Value::Null;
     value["solver"]["answer"]["guidance_file"] = Value::Null;
     value["solver"]["judge"]["guidance_file"] = Value::Null;
     value["excluded_judging_assignments"] = json!([]);
@@ -363,7 +365,16 @@ fn describe(path: &str, value: &Value, settings: &mut Vec<Value>) {
         Value::Bool(_) => "boolean",
         Value::Number(_) => "integer",
         Value::Array(_) => "array<string>",
-        Value::Null if path == "timeouts.read_http_seconds" => "integer|null",
+        Value::Null
+            if matches!(
+                path,
+                "timeouts.read_http_seconds"
+                    | "schedule.challenge_retry_seconds"
+                    | "schedule.challenge_backoff_max_seconds"
+            ) =>
+        {
+            "integer|null"
+        }
         Value::Null => "string|null",
         _ => "string",
     };

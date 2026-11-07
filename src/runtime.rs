@@ -1,8 +1,9 @@
 use crate::config::{Config, Mode, Participation, ParticipationMode, WorkKind};
 use crate::protocol::{
-    Assignment, Challenge, Outcome, Protocol, Response, ResponseSource, assignment_ids,
-    assignment_needs_hydration, classify_source, has_required_words, parse_challenge,
-    parse_selected_assignment, response_evidence, valid_grade_reasoning,
+    Assignment, Challenge, Outcome, Protocol, ReadFailure, Response, ResponseSource,
+    assignment_ids, assignment_needs_hydration, classify_source, has_required_words,
+    parse_challenge, parse_selected_assignment, response_evidence, transport_failure,
+    valid_grade_reasoning,
 };
 use crate::solver::{
     SolverRequest, SolverResult, completed_artifact_invalid, execution_may_have_started,
@@ -18,7 +19,7 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::watch;
+use tokio::sync::{Notify, oneshot, watch};
 
 pub fn build_info() -> Value {
     json!({"commit":env!("AGMI_BUILD_COMMIT"),"source_dirty":env!("AGMI_BUILD_DIRTY"),
@@ -89,6 +90,8 @@ pub async fn recovery_resolve(
         reload_blocked: false,
         preparations: Vec::new(),
         controller: false,
+        model_wake: Arc::new(Notify::new()),
+        urgent_context: false,
     };
     if !runtime.identity_matches(op.kind).await? {
         bail!("recovery identity unverified");
@@ -113,9 +116,18 @@ pub fn status(config: &Config) -> Result<Value> {
         None => Ok(json!({"initialized":false,"paused":true,"generation":0,
             "configured_revision":config.optional_revision()?,"effective_runtime":null,
             "hosted_identity_verified":null,"pending":null,"operations":[],
+            "reads":[],"work":{},
             "participation":{"policy":Participation::default(),"policy_source":"unavailable",
                 "unresolved_count":0,"risk_admissions":0,
                 "uncertainty_blocks":{"answer":false,"judge":false,"mine":false}}})),
+    }
+}
+
+/// Local metadata only: never initializes a journal or contacts the network.
+pub fn reads(config: &Config) -> Result<Value> {
+    match Store::read_only(config)? {
+        Some(store) => store.reads(),
+        None => Ok(json!([])),
     }
 }
 
@@ -218,6 +230,29 @@ enum ModelAttempt {
     Unknown(&'static str),
 }
 
+/// A bounded HTTP task owns only its request/result, never journal state.
+/// Dropping a controller read also cancels its still-running transport.
+struct ReadTaskGuard(tokio::task::AbortHandle);
+impl Drop for ReadTaskGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+struct Preparation {
+    operation: Operation,
+    input: Arc<Input>,
+    control: Control,
+    task: tokio::task::JoinHandle<()>,
+    completion: oneshot::Receiver<ModelAttempt>,
+}
+
+struct Inventory {
+    response: Response,
+    // Earlier usable pages cannot supersede a later page's failure or delay.
+    pages_usable: bool,
+}
+
 struct Runtime {
     config_path: PathBuf,
     config: Config,
@@ -226,12 +261,9 @@ struct Runtime {
     stop: watch::Receiver<bool>,
     reload_blocked: bool,
     controller: bool,
-    preparations: Vec<(
-        Operation,
-        Arc<Input>,
-        Control,
-        tokio::task::JoinHandle<ModelAttempt>,
-    )>,
+    model_wake: Arc<Notify>,
+    urgent_context: bool,
+    preparations: Vec<Preparation>,
 }
 
 /// A single runtime owns the account lock even when paused or read-only. The
@@ -274,6 +306,8 @@ pub async fn run(config_path: &Path, once: bool) -> Result<()> {
         reload_blocked: false,
         preparations: Vec::new(),
         controller: true,
+        model_wake: Arc::new(Notify::new()),
+        urgent_context: false,
     };
     let result = runtime.run_loop(once).await;
     signal.abort();
@@ -338,6 +372,13 @@ impl Runtime {
         if changed || was_blocked != self.reload_blocked {
             self.store
                 .runtime_state(&self.config, self.reload_blocked)?;
+            let (base, cap) = self.read_policy(ReadScope::Challenge);
+            self.store.reschedule_read(
+                ReadScope::Challenge,
+                base,
+                cap,
+                stagger(&self.config, "retry"),
+            )?;
         }
         Ok(())
     }
@@ -357,6 +398,34 @@ impl Runtime {
             .saturating_add(stagger(&self.config, "retry"))
     }
 
+    fn read_policy(&self, scope: ReadScope) -> (u64, u64) {
+        let schedule = &self.config.schedule;
+        if scope == ReadScope::Challenge {
+            (
+                schedule
+                    .challenge_retry_seconds
+                    .unwrap_or(schedule.retry_seconds),
+                schedule
+                    .challenge_backoff_max_seconds
+                    .unwrap_or(schedule.backoff_max_seconds),
+            )
+        } else {
+            (schedule.retry_seconds, schedule.backoff_max_seconds)
+        }
+    }
+
+    fn urgent_delay(&self) -> Result<Duration> {
+        if self.config.mode(WorkKind::Answer) == Mode::Off {
+            return Ok(Duration::from_secs(self.poll_delay()));
+        }
+        let deadline = self
+            .store
+            .next_at(WorkKind::Answer)?
+            .max(self.store.read_backoff(ReadScope::Challenge)?.next_at);
+        Ok(Duration::from_secs(
+            deadline.saturating_sub(now()).max(0) as u64
+        ))
+    }
     async fn wait_delay(&mut self, seconds: u64) {
         if seconds == 0 || self.stopping() {
             return;
@@ -365,10 +434,18 @@ impl Runtime {
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(seconds)) => {},
             _ = self.stop.changed() => {},
+            _ = self.model_wake.notified() => {},
         }
     }
 
     async fn run_loop(&mut self, once: bool) -> Result<()> {
+        let (base, cap) = self.read_policy(ReadScope::Challenge);
+        self.store.reschedule_read(
+            ReadScope::Challenge,
+            base,
+            cap,
+            stagger(&self.config, "retry"),
+        )?;
         if !once {
             self.wait_delay(stagger(&self.config, "startup")).await;
         }
@@ -380,10 +457,11 @@ impl Runtime {
             if self.stopping() {
                 break;
             }
+            let before = self.store.work_revision()?;
             self.cycle().await?;
             if once {
                 while !self.preparations.is_empty() && !self.stopping() {
-                    self.wait_delay(1).await;
+                    self.wait_delay(self.poll_delay()).await;
                     self.reload()?;
                     self.collect_models().await?;
                     self.store
@@ -401,13 +479,35 @@ impl Runtime {
             if once || self.stopping() {
                 break;
             }
-            self.wait_delay(self.poll_delay()).await;
+            if self.store.work_revision()? == before {
+                let delay = self.store.wake_delay(&self.config, self.poll_delay())?;
+                self.wait_delay(delay).await;
+            }
         }
-        for (mut op, _, _, task) in self.preparations.drain(..) {
-            task.abort();
-            op.state = "model_unknown".into();
-            self.store.save(&op, "model_launch_unknown")?;
+        // Give already-ready solver results priority over cancellation, then
+        // retain their artifacts without granting permission to dispatch.
+        let shutdown =
+            tokio::time::sleep(Duration::from_secs(self.config.timeouts.shutdown_seconds));
+        tokio::pin!(shutdown);
+        loop {
+            self.collect_models().await?;
+            if self.preparations.is_empty() {
+                break;
+            }
+            tokio::select! {
+                _ = self.model_wake.notified() => {},
+                _ = &mut shutdown => break,
+            }
         }
+        for preparation in &self.preparations {
+            preparation.task.abort();
+        }
+        for preparation in &mut self.preparations {
+            let _ = (&mut preparation.task).await;
+        }
+        // A result sent just as the shutdown deadline fired still belongs in
+        // the journal. Joining closes only genuinely unfinished result channels.
+        self.collect_models().await?;
         self.store.event("runtime_stopped", None)?;
         Ok(())
     }
@@ -443,18 +543,58 @@ impl Runtime {
             return Ok(None);
         }
         self.heartbeat()?;
+        self.store.read_started(scope)?;
         let protocol = Arc::clone(&self.protocol);
-        let timeout = Duration::from_secs(self.config.timeouts.effective_read_http_seconds());
-        let result = tokio::select! {
-            biased;
-            _ = self.stop.changed() => return Ok(None),
-            result = tokio::time::timeout(timeout, async {
-                if let Some(offset) = offset { protocol.assignment_page(offset, 100).await }
-                else { protocol.get(path).await }
-            }) => result,
+        // Reqwest bounds the complete read, including its body. An equal outer
+        // timeout would race that result and lose already-received Retry-After.
+        let path = path.to_owned();
+        let mut request = tokio::spawn(async move {
+            if let Some(offset) = offset {
+                protocol.assignment_page(offset, 100).await
+            } else {
+                protocol.get(&path).await
+            }
+        });
+        let _request_guard = ReadTaskGuard(request.abort_handle());
+        // Exactly one retained background request. Nested urgent reads use
+        // their own lane, never a generic slot occupied by this request.
+        let background = self.controller
+            && !self.urgent_context
+            && !matches!(scope, ReadScope::Challenge | ReadScope::Identity);
+        let result = loop {
+            if self.stopping() {
+                self.store.read_finished(scope, None, None)?;
+                return Ok(None);
+            }
+            let urgent_delay = if background {
+                self.urgent_delay()?
+            } else {
+                Duration::from_secs(self.poll_delay())
+            };
+            let wake = Arc::clone(&self.model_wake);
+            tokio::select! {
+                biased;
+                result = &mut request => break result,
+                _ = self.stop.changed() => {
+                    self.store.read_finished(scope, None, None)?;
+                    return Ok(None);
+                },
+                _ = wake.notified() => {
+                    self.collect_models().await?;
+                    if background { Box::pin(self.service_urgent(true)).await?; }
+                },
+                _ = tokio::time::sleep(urgent_delay), if background => {
+                    Box::pin(self.service_urgent(true)).await?;
+                },
+            }
         };
         match result {
             Ok(Ok(response)) => {
+                self.store.read_finished(
+                    scope,
+                    Some(response.status),
+                    response.read_failure.map(ReadFailure::as_str),
+                )?;
                 // The documented 408 job-expired result is authoritative, not
                 // a transport timeout. Preserve its existing bound-job retry rule.
                 let expired_job = response.status == 408
@@ -468,6 +608,16 @@ impl Runtime {
                     || (500..600).contains(&response.status)
                     || response.body.is_null()
                 {
+                    self.store.read_finished(
+                        scope,
+                        Some(response.status),
+                        Some(
+                            response
+                                .read_failure
+                                .map(ReadFailure::as_str)
+                                .unwrap_or("http_status"),
+                        ),
+                    )?;
                     self.read_failed(scope, response.retry_after_seconds)?;
                     if let Some(minimum) = response.retry_after_seconds {
                         self.store.record_scope_retry_minimum(scope, minimum)?;
@@ -477,7 +627,14 @@ impl Runtime {
                 }
                 Ok(Some(response))
             }
-            _ => {
+            failure => {
+                let category = match failure {
+                    Ok(Err(error)) => transport_failure(&error),
+                    Err(_) => ReadFailure::Request,
+                    Ok(Ok(_)) => unreachable!(),
+                };
+                self.store
+                    .read_finished(scope, None, Some(category.as_str()))?;
                 self.read_failed(scope, None)?;
                 self.store.event("upstream_read_failed", Some(kind))?;
                 Ok(None)
@@ -486,13 +643,18 @@ impl Runtime {
     }
 
     fn read_failed(&self, scope: ReadScope, server_minimum: Option<u64>) -> Result<()> {
+        let (base, cap) = self.read_policy(scope);
         self.store.fail_read(
             scope,
-            self.config.schedule.retry_seconds,
-            self.config.schedule.backoff_max_seconds,
+            base,
+            cap,
             stagger(&self.config, "retry"),
             server_minimum,
         )?;
+        if scope == ReadScope::Challenge {
+            let deadline = self.store.read_backoff(scope)?.next_at;
+            self.store.defer_until(WorkKind::Answer, deadline)?;
+        }
         Ok(())
     }
 
@@ -520,14 +682,12 @@ impl Runtime {
             Err(_) => {
                 self.read_failed(ReadScope::Challenge, response.retry_after_seconds)?;
                 self.store.event("challenge_unavailable", Some(kind))?;
-                self.store
-                    .defer(kind, self.retry_delay(response.retry_after_seconds))?;
                 Ok(None)
             }
         }
     }
 
-    async fn assignment_inventory(&mut self) -> Result<Option<Response>> {
+    async fn assignment_inventory(&mut self) -> Result<Option<Inventory>> {
         let Some(mut response) = self
             .get(
                 WorkKind::Judge,
@@ -540,7 +700,7 @@ impl Runtime {
         };
         let ids = assignment_ids(&response);
         if ids.is_err() {
-            self.read_failed(ReadScope::Assignments, response.retry_after_seconds)?;
+            self.read_evaluated(ReadScope::Assignments, false, response.retry_after_seconds)?;
             self.store
                 .event("assignments_unavailable", Some(WorkKind::Judge))?;
             self.store.defer(
@@ -557,6 +717,7 @@ impl Runtime {
             .cloned()
             .unwrap_or_default();
         let mut complete = response.body["has_more"].as_bool() == Some(false);
+        let mut pages_usable = true;
         // Offset inventories can move between pages: bounded deduplication is
         // useful selection evidence, never proof that an absent sent request failed.
         for _ in 1..4 {
@@ -572,9 +733,12 @@ impl Runtime {
                 )
                 .await?
             else {
+                pages_usable = false;
                 break;
             };
             let Ok(page_ids) = assignment_ids(&page) else {
+                pages_usable = false;
+                self.read_evaluated(ReadScope::Assignments, false, page.retry_after_seconds)?;
                 break;
             };
             let page_rows = page.body["assignments"]
@@ -596,8 +760,9 @@ impl Runtime {
         response.body["assignments"] = json!(rows);
         response.body["has_more"] = json!(!complete);
         // Active selection validates the selected payload before clearing this scope.
-        if ids.as_ref().is_ok_and(|ids| ids.is_empty())
-            || self.config.mode(WorkKind::Judge) == Mode::ReadOnly
+        if pages_usable
+            && (ids.as_ref().is_ok_and(|ids| ids.is_empty())
+                || self.config.mode(WorkKind::Judge) == Mode::ReadOnly)
         {
             self.read_evaluated(ReadScope::Assignments, true, None)?;
         }
@@ -605,7 +770,10 @@ impl Runtime {
             self.store
                 .event("assignment_inventory_partial", Some(WorkKind::Judge))?;
         }
-        Ok(Some(response))
+        Ok(Some(Inventory {
+            response,
+            pages_usable,
+        }))
     }
 
     fn next_judging_assignment(&self, inventory: &Response) -> Result<Option<String>> {
@@ -639,7 +807,8 @@ impl Runtime {
         Ok(None)
     }
 
-    async fn assignment(&mut self, inventory: &Response, id: &str) -> Result<Option<Assignment>> {
+    async fn assignment(&mut self, snapshot: &Inventory, id: &str) -> Result<Option<Assignment>> {
+        let inventory = &snapshot.response;
         self.reload()?;
         if self.stopping() || self.config.mode(WorkKind::Judge) == Mode::Off {
             return Ok(None);
@@ -660,7 +829,13 @@ impl Runtime {
             }
             Ok(false) => None,
             Err(_) => {
-                self.read_failed(ReadScope::Assignments, inventory.retry_after_seconds)?;
+                if snapshot.pages_usable {
+                    self.read_evaluated(
+                        ReadScope::Assignments,
+                        false,
+                        inventory.retry_after_seconds,
+                    )?;
+                }
                 self.store
                     .event("assignment_evidence_unavailable", Some(WorkKind::Judge))?;
                 self.store.defer(
@@ -681,14 +856,18 @@ impl Runtime {
         };
         match parse_selected_assignment(inventory, id, hydrated.as_ref()) {
             Ok(assignment) => {
-                self.read_evaluated(scope, true, None)?;
                 if hydrated.is_some() {
+                    self.read_evaluated(ReadScope::AssignmentEvidence, true, None)?;
+                }
+                if snapshot.pages_usable {
                     self.read_evaluated(ReadScope::Assignments, true, None)?;
                 }
                 Ok(Some(assignment))
             }
             Err(_) => {
-                self.read_failed(scope, minimum)?;
+                if scope != ReadScope::Assignments || snapshot.pages_usable {
+                    self.read_evaluated(scope, false, minimum)?;
+                }
                 self.store
                     .event("assignment_evidence_unavailable", Some(WorkKind::Judge))?;
                 self.store
@@ -748,45 +927,135 @@ impl Runtime {
     }
 
     fn active(&self, kind: WorkKind) -> Result<bool> {
-        Ok(!self.stopping()
+        Ok(self.controller
+            && !self.stopping()
             && !self.reload_blocked
             && self.config.mode(kind) == Mode::Active
             && !self.store.control()?.paused)
     }
 
+    async fn advance_preparation(&mut self, kind: WorkKind) -> Result<()> {
+        let Some(mut op) = self.store.preparation(kind)? else {
+            return Ok(());
+        };
+        if op.state == "generating" || self.discard_excluded_judgment(&mut op)? {
+            return Ok(());
+        }
+        if self.config.mode(kind) == Mode::Off || op.generation != self.store.control()?.generation
+        {
+            op.state = "discarded".into();
+            self.store.save(&op, "unsent_admission_closed")?;
+        } else if !self.store.admission_allowed(&self.config, &op)? {
+            if matches!(kind, WorkKind::Answer | WorkKind::Mine)
+                && self.store.next_at(kind)? <= now()
+            {
+                let input: Input = serde_json::from_value(op.request.clone())?;
+                if self.fresh(&op, &input).await? == Some(false) {
+                    op.state = "discarded".into();
+                    self.store.save(&op, "request_no_longer_current")?;
+                }
+            }
+        } else if self.active(kind)? {
+            self.dispatch(&mut op).await?;
+        }
+        Ok(())
+    }
+
+    async fn service_urgent(&mut self, admission_available: bool) -> Result<()> {
+        let previous = self.urgent_context;
+        self.urgent_context = true;
+        let result = self.answer_work(admission_available).await;
+        self.urgent_context = previous;
+        result
+    }
+
+    async fn answer_work(&mut self, admission_available: bool) -> Result<()> {
+        self.reload()?;
+        self.collect_models().await?;
+        let kind = WorkKind::Answer;
+        if self.stopping() {
+            return Ok(());
+        }
+        // An effect holds the admission guard. Never reacquire it, even
+        // synchronously for an otherwise eligible local model launch.
+        if admission_available {
+            self.advance_preparation(kind).await?;
+        }
+        if self.config.mode(kind) == Mode::Off || self.store.next_at(kind)? > now() {
+            return Ok(());
+        }
+        self.store.defer(kind, self.poll_delay())?;
+        let Some(challenge) = self.challenge(kind).await? else {
+            return Ok(());
+        };
+        if !admission_available
+            || self.store.preparation(kind)?.is_some()
+            || challenge.answered
+            || !self.active(kind)?
+        {
+            return Ok(());
+        }
+        let key = format!("{}:{}", challenge.epoch, challenge.fingerprint);
+        let retry = if self.store.answer_epoch_attempted(challenge.epoch)? {
+            let Some(original) = self.store.uncertain_answer(challenge.epoch)? else {
+                return Ok(());
+            };
+            if !self.store.answer_retry_allowed(&self.config, &original)? {
+                return Ok(());
+            }
+            Some(original)
+        } else {
+            None
+        };
+        if !self.identity_matches(kind).await? {
+            return Ok(());
+        }
+        let input = Input {
+            solver: self.request(kind, &challenge, None)?,
+            challenge_fingerprint: Some(challenge.fingerprint),
+        };
+        if let Some(original) = retry {
+            if original.key == key {
+                let gate = AdmissionGuard::acquire(&self.config)?;
+                self.reload()?;
+                if !self.active(kind)?
+                    || !self.store.answer_retry_allowed(&self.config, &original)?
+                {
+                    return Ok(());
+                }
+                let mut op = self.store.begin_linked(
+                    kind,
+                    &key,
+                    ("prepared", &original.request),
+                    self.store.control()?,
+                    &self.config.revision()?,
+                    Some((&original, true)),
+                )?;
+                drop(gate);
+                self.dispatch(&mut op).await?;
+            } else {
+                self.generate_linked(kind, &key, input, Some(&original))
+                    .await?;
+            }
+        } else {
+            self.generate(kind, &key, input).await?;
+        }
+        Ok(())
+    }
+
     async fn cycle(&mut self) -> Result<()> {
         self.collect_models().await?;
         self.store.retry_models(&self.config)?;
+        let before_answer = self.store.work_revision()?;
+        self.service_urgent(true).await?;
+        if self.store.work_revision()? != before_answer {
+            return Ok(());
+        }
         for mut op in self.store.reconciliation_batch()? {
             self.reconcile(&mut op).await?;
         }
-        // Prepared work owns capacity, not the wallet effect slot. Disable or
-        // generation changes discard only proven-unsent work.
-        for kind in [WorkKind::Answer, WorkKind::Judge, WorkKind::Mine] {
-            if let Some(mut op) = self.store.preparation(kind)? {
-                if op.state == "generating" {
-                    continue;
-                }
-                if self.discard_excluded_judgment(&mut op)? {
-                    continue;
-                }
-                if self.config.mode(kind) == Mode::Off
-                    || op.generation != self.store.control()?.generation
-                {
-                    op.state = "discarded".into();
-                    self.store.save(&op, "unsent_admission_closed")?;
-                } else if !self.store.admission_allowed(&self.config, &op)?
-                    && matches!(kind, WorkKind::Answer | WorkKind::Mine)
-                {
-                    let input: Input = serde_json::from_value(op.request.clone())?;
-                    if self.fresh(&op, &input).await? == Some(false) {
-                        op.state = "discarded".into();
-                        self.store.save(&op, "request_no_longer_current")?;
-                    }
-                } else if op.next_at <= now() && self.active(kind)? {
-                    self.dispatch(&mut op).await?;
-                }
-            }
+        for kind in [WorkKind::Judge, WorkKind::Mine] {
+            self.advance_preparation(kind).await?;
         }
         self.follow_finality().await?;
         // Answer always goes first. Older eligible lower-priority work wins;
@@ -798,7 +1067,7 @@ impl Runtime {
         } else {
             [WorkKind::Judge, WorkKind::Mine]
         };
-        for kind in [WorkKind::Answer, lower[0], lower[1]] {
+        for kind in lower {
             if self.stopping() {
                 break;
             }
@@ -810,10 +1079,6 @@ impl Runtime {
             }
             self.store.defer(kind, self.poll_delay())?;
             if self.store.preparation(kind)?.is_some() {
-                // Observation never waits for model tasks, even for the same kind.
-                if kind == WorkKind::Answer {
-                    let _ = self.challenge(kind).await?;
-                }
                 continue;
             }
             if self.store.effect()?.is_some()
@@ -827,60 +1092,7 @@ impl Runtime {
                 continue;
             }
             match kind {
-                WorkKind::Answer => {
-                    let Some(challenge) = self.challenge(kind).await? else {
-                        continue;
-                    };
-                    let key = format!("{}:{}", challenge.epoch, challenge.fingerprint);
-                    if challenge.answered || !self.active(kind)? {
-                        continue;
-                    }
-                    let retry = if self.store.answer_epoch_attempted(challenge.epoch)? {
-                        let Some(original) = self.store.uncertain_answer(challenge.epoch)? else {
-                            continue;
-                        };
-                        if !self.store.answer_retry_allowed(&self.config, &original)? {
-                            continue;
-                        }
-                        Some(original)
-                    } else {
-                        None
-                    };
-                    if !self.identity_matches(kind).await? {
-                        continue;
-                    }
-                    let input = Input {
-                        solver: self.request(kind, &challenge, None)?,
-                        challenge_fingerprint: Some(challenge.fingerprint),
-                    };
-                    if let Some(original) = retry {
-                        if original.key == key {
-                            let gate = AdmissionGuard::acquire(&self.config)?;
-                            self.reload()?;
-                            if !self.active(kind)?
-                                || !self.store.answer_retry_allowed(&self.config, &original)?
-                            {
-                                continue;
-                            }
-                            let mut op = self.store.begin_linked(
-                                kind,
-                                &key,
-                                ("prepared", &original.request),
-                                self.store.control()?,
-                                &self.config.revision()?,
-                                Some((&original, true)),
-                            )?;
-                            drop(gate);
-                            self.dispatch(&mut op).await?;
-                        } else {
-                            self.generate_linked(kind, &key, input, Some(&original))
-                                .await?;
-                        }
-                    } else {
-                        self.generate(kind, &key, input).await?;
-                    }
-                    return Ok(());
-                }
+                WorkKind::Answer => unreachable!("answer uses the urgent lane"),
                 WorkKind::Judge => {
                     let Some(inventory) = self.assignment_inventory().await? else {
                         continue;
@@ -888,7 +1100,7 @@ impl Runtime {
                     if !self.active(kind)? {
                         continue;
                     }
-                    let Some(key) = self.next_judging_assignment(&inventory)? else {
+                    let Some(key) = self.next_judging_assignment(&inventory.response)? else {
                         continue;
                     };
                     let Some(assignment) = self.assignment(&inventory, &key).await? else {
@@ -926,8 +1138,7 @@ impl Runtime {
                     let Some(challenge) = self.challenge(kind).await? else {
                         continue;
                     };
-                    if !challenge.answered
-                        || !self.active(kind)?
+                    if !self.active(kind)?
                         || (self.config.schedule.mine_each_epoch
                             && self.store.mine_epoch_attempted(challenge.epoch)?)
                         || !self.identity_matches(kind).await?
@@ -1100,6 +1311,8 @@ impl Runtime {
         let input = Arc::new(input);
         let task_input = Arc::clone(&input);
         let mut stop = self.stop.clone();
+        let wake = Arc::clone(&self.model_wake);
+        let (completed, completion) = oneshot::channel();
         let task = tokio::spawn(async move {
             let future = solve(&model, &task_input.solver, timeout, move || {
                 let gate = AdmissionGuard::try_acquire(&expected)?;
@@ -1117,9 +1330,8 @@ impl Runtime {
                 }
                 Ok(gate)
             });
-            tokio::select! {
+            let attempt = tokio::select! {
                 biased;
-                _ = stop.changed() => ModelAttempt::Unknown("model_launch_unknown"),
                 result = tokio::time::timeout(Duration::from_secs(timeout), future) => match result {
                     Ok(Ok(result)) => ModelAttempt::Captured(result),
                     Ok(Err(error)) if completed_artifact_invalid(&error) => ModelAttempt::Invalid(failure_code(&error)),
@@ -1127,23 +1339,40 @@ impl Runtime {
                     Ok(Err(error)) => ModelAttempt::Unknown(failure_code(&error)),
                     Err(_) => ModelAttempt::Unknown("model_launch_unknown"),
                 },
-            }
+                _ = stop.changed() => ModelAttempt::Unknown("model_launch_unknown"),
+            };
+            let _ = completed.send(attempt);
+            wake.notify_one();
         });
-        self.preparations.push((op, input, control, task));
+        self.preparations.push(Preparation {
+            operation: op,
+            input,
+            control,
+            task,
+            completion,
+        });
         Ok(())
     }
 
     async fn collect_models(&mut self) -> Result<()> {
         let mut index = 0;
         while index < self.preparations.len() {
-            if !self.preparations[index].3.is_finished() {
-                index += 1;
-                continue;
-            }
-            let (mut op, input, control, task) = self.preparations.swap_remove(index);
-            let result = task
-                .await
-                .unwrap_or(ModelAttempt::Unknown("model_launch_unknown"));
+            let result = match self.preparations[index].completion.try_recv() {
+                Ok(result) => result,
+                Err(oneshot::error::TryRecvError::Empty) => {
+                    index += 1;
+                    continue;
+                }
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    ModelAttempt::Unknown("model_launch_unknown")
+                }
+            };
+            let Preparation {
+                operation: mut op,
+                input,
+                control,
+                ..
+            } = self.preparations.swap_remove(index);
             // A captured attempt can never overwrite a superseding durable state.
             if self
                 .store
@@ -1155,7 +1384,11 @@ impl Runtime {
             match result {
                 ModelAttempt::Captured(result) => {
                     op.result = Some(serde_json::to_value(&result)?);
-                    if self.store.control()? != control || !self.active(op.kind)? {
+                    if self.store.control()? != control
+                        || self.config.mode(op.kind) == Mode::Off
+                        || (op.kind == WorkKind::Judge
+                            && self.config.judging_assignment_excluded(&op.key))
+                    {
                         // The completed artifact is retained privately, but never
                         // promoted after pause/resume changes its generation.
                         op.state = "discarded".into();
@@ -1209,20 +1442,22 @@ impl Runtime {
                         && challenge.words == input.solver.words
                         && challenge.min_chars == input.solver.min_chars
                         && challenge.max_chars == input.solver.max_chars
-                        && if op.kind == WorkKind::Mine {
-                            challenge.answered
-                        } else {
-                            !challenge.answered
-                        },
+                        && (op.kind == WorkKind::Mine || !challenge.answered),
                 ))
             }
             WorkKind::Judge => {
                 let Some(inventory) = self.assignment_inventory().await? else {
                     return Ok(None);
                 };
-                let ids = assignment_ids(&inventory)?;
+                let ids = assignment_ids(&inventory.response)?;
                 if !ids.contains(&op.key) {
-                    if inventory.body.get("has_more").and_then(Value::as_bool) == Some(false) {
+                    if inventory
+                        .response
+                        .body
+                        .get("has_more")
+                        .and_then(Value::as_bool)
+                        == Some(false)
+                    {
                         return Ok(Some(false));
                     }
                     self.store
@@ -1256,7 +1491,10 @@ impl Runtime {
         if self.discard_excluded_judgment(op)? {
             return Ok(());
         }
-        if !self.active(op.kind)? || !self.store.admission_allowed(&self.config, op)? {
+        if !self.active(op.kind)?
+            || !self.store.admission_allowed(&self.config, op)?
+            || self.store.read_backoff(ReadScope::Identity)?.next_at > now()
+        {
             return Ok(());
         }
         let expected_control = self.store.control()?;
@@ -1305,19 +1543,53 @@ impl Runtime {
             prepared,
         );
         tokio::pin!(request);
-        let result = tokio::select! {
-            biased;
-            _ = self.stop.changed() => {
-                match tokio::time::timeout(Duration::from_secs(self.config.timeouts.shutdown_seconds), &mut request).await {
-                    Ok(result) => result,
+        let result = loop {
+            if self.stopping() {
+                match tokio::time::timeout(
+                    Duration::from_secs(self.config.timeouts.shutdown_seconds),
+                    &mut request,
+                )
+                .await
+                {
+                    Ok(result) => break result,
                     Err(_) => {
-                        self.store.record_evidence(op.id, &serde_json::to_value(response_evidence(op.kind, ResponseSource::Submit, None))?)?;
+                        self.store.record_evidence(
+                            op.id,
+                            &serde_json::to_value(response_evidence(
+                                op.kind,
+                                ResponseSource::Submit,
+                                None,
+                            ))?,
+                        )?;
                         op.next_at = not_before(self.retry_delay(None));
-                        op.state="unknown".into(); self.store.save(op,"dispatch_outcome_unknown")?; drop(gate); return Ok(());
+                        op.state = "unknown".into();
+                        self.store.save(op, "dispatch_outcome_unknown")?;
+                        drop(gate);
+                        return Ok(());
                     }
                 }
             }
-            result = &mut request => result,
+            let wake = Arc::clone(&self.model_wake);
+            let delay = self.urgent_delay()?;
+            tokio::select! {
+                biased;
+                result = &mut request => break result,
+                _ = self.stop.changed() => continue,
+                _ = wake.notified() => self.collect_models().await?,
+                _ = tokio::time::sleep(delay) => {
+                    // Poll the effect while observing too: receiving an urgent
+                    // read must not hide an already-completed write response.
+                    let mut observation = Box::pin(self.service_urgent(false));
+                    tokio::select! {
+                        biased;
+                        result = &mut request => {
+                            observation.await?;
+                            break result;
+                        },
+                        observed = &mut observation => observed?,
+                    }
+                },
+            }
         };
         match result {
             Ok(Ok(response)) => {
@@ -1644,6 +1916,7 @@ mod tests {
             status: 200,
             body,
             retry_after_seconds: None,
+            read_failure: None,
         }
     }
 
@@ -1719,8 +1992,84 @@ mod tests {
             reload_blocked: false,
             preparations: Vec::new(),
             controller: true,
+            model_wake: Arc::new(Notify::new()),
+            urgent_context: false,
         };
         (temp, runtime, sender)
+    }
+
+    #[tokio::test]
+    async fn completed_model_is_retained_on_stop_but_pause_and_off_still_fence_it() {
+        for fence in ["stop", "pause", "off"] {
+            let (_temp, mut runtime, sender) = fixture();
+            let input = Arc::new(Input {
+                solver: request(WorkKind::Answer),
+                challenge_fingerprint: Some("current".into()),
+            });
+            let control = runtime.store.control().unwrap();
+            let op = runtime
+                .store
+                .begin(
+                    WorkKind::Answer,
+                    "8:current",
+                    "generating",
+                    &serde_json::to_value(&*input).unwrap(),
+                    control,
+                    "revision",
+                )
+                .unwrap();
+            let id = op.id;
+            let (completed, completion) = oneshot::channel();
+            assert!(completed.send(ModelAttempt::Captured(result())).is_ok());
+            runtime.preparations.push(Preparation {
+                operation: op,
+                input,
+                control,
+                task: tokio::spawn(async {}),
+                completion,
+            });
+            match fence {
+                "pause" => runtime.store.set_paused(true).unwrap(),
+                "off" => runtime.config.capabilities.answer = Mode::Off,
+                _ => {
+                    sender.send(true).unwrap();
+                }
+            }
+            runtime.collect_models().await.unwrap();
+            let captured = runtime.store.operation(id).unwrap().unwrap();
+            assert!(captured.result.is_some());
+            assert_eq!(
+                captured.state,
+                if fence == "stop" {
+                    "generated"
+                } else {
+                    "discarded"
+                }
+            );
+            assert_eq!(captured.payload.is_some(), fence == "stop");
+            assert!(!runtime.active(WorkKind::Answer).unwrap());
+        }
+    }
+
+    #[test]
+    fn challenge_policy_reload_shortens_local_delay_and_kind_defer_not_server_floor() {
+        let (_temp, mut runtime, _sender) = fixture();
+        runtime.read_failed(ReadScope::Challenge, Some(30)).unwrap();
+        let before = runtime.store.reads().unwrap();
+        let floor = before[0]["server_not_before"].as_i64().unwrap();
+        let mut changed = runtime.config.clone();
+        changed.schedule.challenge_retry_seconds = Some(1);
+        changed.schedule.challenge_backoff_max_seconds = Some(2);
+        std::fs::write(&runtime.config_path, toml::to_string(&changed).unwrap()).unwrap();
+        runtime.reload().unwrap();
+        let after = runtime.store.reads().unwrap();
+        assert!(
+            after[0]["local_next_at"].as_i64().unwrap()
+                < before[0]["local_next_at"].as_i64().unwrap()
+        );
+        assert_eq!(after[0]["server_not_before"], floor);
+        assert_eq!(after[0]["next_at"], floor);
+        assert_eq!(runtime.store.next_at(WorkKind::Answer).unwrap(), floor);
     }
 
     fn judging_inventory(ids: &[String]) -> Response {
@@ -1996,6 +2345,95 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn retained_inventory_read_allows_urgent_observation_and_still_completes() {
+        use tokio::io::AsyncWriteExt;
+        let credentials = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = active_judge_config(credentials.path());
+        config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
+        config.capabilities.answer = Mode::ReadOnly;
+        config.timeouts.read_http_seconds = Some(5);
+        let (_temp, mut runtime, _sender) = fixture_with(config);
+        runtime
+            .store
+            .defer_until(WorkKind::Answer, now() + 1)
+            .unwrap();
+        let prefix = format!("GET /chain/{}", runtime.config.network.chain);
+        let server = tokio::spawn(async move {
+            let mut retained =
+                accept_api_request(&listener, &format!("{prefix}/api/hosted/assignments")).await;
+            // A serial await would deadlock here until its read deadline.
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                api_reply(
+                    &listener,
+                    &format!("{prefix}/api/hosted/challenge"),
+                    200,
+                    None,
+                    json!({"epoch":77,"answered":false,"words":["burn"]}),
+                ),
+            )
+            .await
+            .unwrap();
+            let body = json!({"assignments":[],"has_more":false}).to_string();
+            retained
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let inventory = runtime.assignment_inventory().await.unwrap().unwrap();
+        server.await.unwrap();
+        assert_eq!(inventory.response.body["has_more"], false);
+        let status = runtime.store.status(&runtime.config).unwrap();
+        assert_eq!(status["observation"]["epoch"], 77);
+        assert_eq!(status["reads"][2]["state"], "idle");
+        assert!(status["reads"][2]["last_success_at"].is_i64());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stalled_read_body_keeps_status_and_authoritative_retry_floor() {
+        use tokio::io::AsyncWriteExt;
+        let credentials = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = active_judge_config(credentials.path());
+        config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
+        config.capabilities.answer = Mode::ReadOnly;
+        config.timeouts.read_http_seconds = Some(1);
+        config.schedule.challenge_retry_seconds = Some(1);
+        let (_temp, mut runtime, _sender) = fixture_with(config);
+        let path = format!(
+            "GET /chain/{}/api/hosted/challenge",
+            runtime.config.network.chain
+        );
+        let server = tokio::spawn(async move {
+            let mut stream = accept_api_request(&listener, &path).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 503 Unavailable\r\nRetry-After: 90\r\nContent-Length: 100\r\n\r\n{",
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+        let before = now();
+        assert!(runtime.challenge(WorkKind::Answer).await.unwrap().is_none());
+        let reads = runtime.store.reads().unwrap();
+        assert_eq!(reads[0]["failure_category"], "timeout");
+        assert_eq!(reads[0]["status"], 503);
+        assert!(reads[0]["server_not_before"].as_i64().unwrap() >= before + 90);
+        assert_eq!(reads[0]["failures"], 1);
+        server.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn effectful_get_mining_retains_write_timeout() {
         use tokio::io::AsyncWriteExt;
         let credentials = tempfile::tempdir().unwrap();
@@ -2043,6 +2481,11 @@ mod tests {
         let db =
             rusqlite::Connection::open(runtime.config.state_dir.join("state.sqlite3")).unwrap();
         db.execute("UPDATE read_backoff SET next_at=0", []).unwrap();
+        db.execute(
+            "UPDATE read_observations SET local_next_at=0,server_not_before=0",
+            [],
+        )
+        .unwrap();
     }
 
     #[cfg(unix)]
@@ -2248,6 +2691,10 @@ mod tests {
         let inventory = response(json!({"assignments":[
             {"answer_txid":id,"answer_epoch":8,"answer":"candidate","words":["burn"]}
         ]}));
+        let inventory = Inventory {
+            response: inventory,
+            pages_usable: true,
+        };
         let selected = runtime.assignment(&inventory, &id).await.unwrap().unwrap();
         assert_eq!(selected.epoch, 8);
         assert_eq!(
@@ -2296,24 +2743,27 @@ mod tests {
             {"answer_txid":id,"answer":"candidate-test"},
             {"answer_txid":"c".repeat(64),"answer":"unselected"}
         ]}));
-        let prefix = format!("GET /chain/{}", runtime.config.network.chain);
-        let server_id = id.clone();
+        let inventory = Inventory {
+            response: inventory,
+            pages_usable: true,
+        };
         let server = tokio::spawn(async move {
-            for endpoint in [
-                format!("/api/receipt/{txid}"),
-                "/api/job/private-job".into(),
-                "/api/hosted/challenge".into(),
-                "/api/hosted/assignments".into(),
-                format!("/api/explorer/tx/{server_id}"),
-            ] {
-                api_reply(
-                    &listener,
-                    &format!("{prefix}{endpoint}"),
-                    429,
-                    Some(120),
-                    json!({}),
-                )
-                .await;
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            // Backoff is per scope, independent of request completion order.
+            for _ in 0..5 {
+                let (mut stream, _) =
+                    tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                let mut bytes = [0_u8; 8192];
+                let mut received = 0;
+                while !bytes[..received].windows(4).any(|part| part == b"\r\n\r\n") {
+                    let count = stream.read(&mut bytes[received..]).await.unwrap();
+                    assert!(count > 0);
+                    received += count;
+                }
+                stream.write_all(b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 120\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").await.unwrap();
             }
             listener
         });
@@ -3302,6 +3752,7 @@ export async function callGatewayFromCli(_method, _options, params) {{
             status: 404,
             body: json!({"status":"rejected"}),
             retry_after_seconds: None,
+            read_failure: None,
         };
         assert_eq!(receipt(&missing, "known", "Account"), Receipt::Unresolved);
         for field in ["txid", "address", "sender"] {
@@ -3432,6 +3883,7 @@ export async function callGatewayFromCli(_method, _options, params) {{
         assert_eq!(status["initialized"], false);
         assert_eq!(status.get("hosted_identity_verified"), Some(&Value::Null));
         assert_eq!(events(&config, 10).unwrap(), json!([]));
+        assert_eq!(reads(&config).unwrap(), json!([]));
         assert!(!config.state_dir.exists());
     }
 

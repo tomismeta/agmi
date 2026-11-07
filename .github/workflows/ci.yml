@@ -47,6 +47,8 @@ jobs:
         run: python3 tests/recovery_smoke.py target/debug/agmi --unanchored
       - name: Bounded participation and CLI policy reload
         run: python3 tests/participation_smoke.py target/debug/agmi
+      - name: Urgent work and retained background progress
+        run: python3 tests/work_first_smoke.py target/debug/agmi
       - name: Agent administration and startup identity fencing
         run: python3 tests/admin_smoke.py target/debug/agmi
       - name: Build identity

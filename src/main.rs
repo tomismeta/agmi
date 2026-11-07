@@ -52,6 +52,8 @@ enum Command {
     },
     /// Inspect local durable state without contacting MinePOA or a model.
     Status,
+    /// Inspect sanitized read progress, failures and retry deadlines without network access.
+    Reads,
     /// Inspect sanitized durable operations without exposing bearer IDs or payloads.
     Operations {
         #[command(subcommand)]
@@ -252,6 +254,7 @@ fn discovery() -> Value {
     json!({"commands":[
         {"name":"run","network_reads":true,"model_calls":"active capabilities only","network_writes":"active capabilities and resumed state only","local_writes":true},
         {"name":"status","network_reads":false,"network_writes":false,"purpose":"local state and blockers"},
+        {"name":"reads","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":false,"purpose":"sanitized read progress, failure categories and retry deadlines"},
         {"name":"health","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":false,"purpose":"sanitized local health; unhealthy exits nonzero"},
         {"name":"config init","network_writes":false,"local_writes":true},
         {"name":"config show","network_writes":false,"local_writes":false},
@@ -433,6 +436,7 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
             )),
         },
         Command::Status => Ok(("status", runtime::status(&config)?)),
+        Command::Reads => Ok(("reads", runtime::reads(&config)?)),
         Command::Health {
             stale_seconds,
             work_seconds,

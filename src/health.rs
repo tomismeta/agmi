@@ -306,6 +306,11 @@ fn evaluate(config: &Config, options: Options, status: &Value, at: i64) -> Value
         "hosted_identity_verified":status["hosted_identity_verified"].as_bool(),
         "heartbeat_age_seconds":heartbeat_age,"observation_age_seconds":observation_age,
         "heartbeat_recent":heartbeat_age.is_some_and(|age|age<=stale),
+        "current_epoch":{"epoch":status["observation"]["epoch"].as_u64(),
+            "answered":status["epoch_evidence"]["answered"].as_bool(),
+            "evidence_fresh":observation_age.is_some_and(|age|age<=stale)
+                && status["observation"]["observed_at"].as_i64().is_some_and(|time| time<=at),
+            "evidence":"last_local_observation_not_a_live_remote_check"},
         "observing":observation_age.is_some_and(|age|age<=stale),"preparing":preparing,
         "last_safety_observation_at":status["last_safety_observation_at"],
         "captured_work":status["captured_work"],
@@ -643,5 +648,24 @@ mod tests {
                 .iter()
                 .all(|warning| warning != "participation_risk_admitted")
         );
+    }
+
+    #[test]
+    fn live_heartbeat_does_not_make_old_answer_evidence_current() {
+        let (config, options, mut status) = fixture();
+        status["observation"]["epoch"] = json!(56);
+        let fresh = evaluate(&config, options, &status, 10000);
+        assert_eq!(fresh["current_epoch"]["evidence_fresh"], true);
+        let stale_at = 10001 + fresh["thresholds"]["stale_seconds"].as_i64().unwrap();
+        status["effective_runtime"]["observed_at"] = json!(stale_at);
+        let stale = evaluate(&config, options, &status, stale_at);
+        assert_eq!(stale["heartbeat_recent"], true);
+        assert_eq!(stale["current_epoch"]["answered"], true);
+        assert_eq!(stale["current_epoch"]["evidence_fresh"], false);
+        assert!(has(&stale, "challenge_observation_stale"));
+        status["observation"]["observed_at"] = json!(stale_at + 1);
+        let future = evaluate(&config, options, &status, stale_at);
+        assert_eq!(future["current_epoch"]["evidence_fresh"], false);
+        assert!(has(&future, "clock_regressed"));
     }
 }

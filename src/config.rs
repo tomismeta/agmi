@@ -107,6 +107,10 @@ pub struct Schedule {
     pub retry_seconds: u64,
     #[serde(default = "default_backoff_max_seconds")]
     pub backoff_max_seconds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub challenge_retry_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub challenge_backoff_max_seconds: Option<u64>,
     #[serde(default = "default_jitter_seconds")]
     pub jitter_seconds: u64,
 }
@@ -149,6 +153,7 @@ pub struct Participation {
     pub mode: ParticipationMode,
     pub uncertainty_grace_seconds: u64,
     pub max_unresolved_operations: u32,
+    pub answer_reserved_slots: u32,
     pub allow_answer: bool,
     pub allow_mine: bool,
     pub allow_judge: bool,
@@ -162,6 +167,7 @@ impl Default for Participation {
             mode: ParticipationMode::Strict,
             uncertainty_grace_seconds: 300,
             max_unresolved_operations: 4,
+            answer_reserved_slots: 0,
             allow_answer: true,
             allow_mine: true,
             allow_judge: false,
@@ -172,6 +178,15 @@ impl Default for Participation {
     }
 }
 impl Participation {
+    pub(crate) fn unresolved_limit(&self, kind: WorkKind) -> u32 {
+        if kind == WorkKind::Answer {
+            self.max_unresolved_operations
+        } else {
+            self.max_unresolved_operations
+                .saturating_sub(self.answer_reserved_slots)
+        }
+    }
+
     pub(crate) fn allows(&self, kind: WorkKind) -> bool {
         match kind {
             WorkKind::Answer => self.allow_answer,
@@ -242,6 +257,8 @@ impl Default for Config {
                 mine_each_epoch: false,
                 retry_seconds: 180,
                 backoff_max_seconds: default_backoff_max_seconds(),
+                challenge_retry_seconds: None,
+                challenge_backoff_max_seconds: None,
                 jitter_seconds: default_jitter_seconds(),
             },
         }
@@ -325,6 +342,10 @@ impl Config {
             "participation operation and answer attempt limits must be positive"
         );
         ensure!(
+            self.participation.answer_reserved_slots < self.participation.max_unresolved_operations,
+            "participation.answer_reserved_slots must be below max_unresolved_operations"
+        );
+        ensure!(
             (1..=8).contains(&self.preparation.max_attempts_per_work),
             "preparation.max_attempts_per_work must be between 1 and 8"
         );
@@ -403,6 +424,18 @@ impl Config {
             (self.schedule.mine_seconds, false),
             (self.schedule.retry_seconds, false),
             (self.schedule.backoff_max_seconds, false),
+            (
+                self.schedule
+                    .challenge_retry_seconds
+                    .unwrap_or(self.schedule.retry_seconds),
+                false,
+            ),
+            (
+                self.schedule
+                    .challenge_backoff_max_seconds
+                    .unwrap_or(self.schedule.backoff_max_seconds),
+                false,
+            ),
             (self.schedule.jitter_seconds, true),
             (
                 self.schedule
@@ -414,6 +447,18 @@ impl Config {
                 self.schedule
                     .backoff_max_seconds
                     .max(self.schedule.retry_seconds)
+                    .saturating_add(self.schedule.jitter_seconds),
+                false,
+            ),
+            (
+                self.schedule
+                    .challenge_backoff_max_seconds
+                    .unwrap_or(self.schedule.backoff_max_seconds)
+                    .max(
+                        self.schedule
+                            .challenge_retry_seconds
+                            .unwrap_or(self.schedule.retry_seconds),
+                    )
                     .saturating_add(self.schedule.jitter_seconds),
                 false,
             ),
@@ -606,6 +651,27 @@ pub(crate) fn validate_origin(value: &str) -> Result<reqwest::Url> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn challenge_policy_and_answer_reserve_are_opt_in_and_validated() {
+        let mut config = Config::default();
+        assert_eq!(config.participation.answer_reserved_slots, 0);
+        assert_eq!(config.schedule.challenge_retry_seconds, None);
+        assert_eq!(config.schedule.challenge_backoff_max_seconds, None);
+        config.participation.max_unresolved_operations = 8;
+        config.participation.answer_reserved_slots = 2;
+        config.schedule.challenge_retry_seconds = Some(2);
+        config.schedule.challenge_backoff_max_seconds = Some(8);
+        config.validate().unwrap();
+        let decoded: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(decoded.participation, config.participation);
+        assert_eq!(decoded.schedule, config.schedule);
+        config.participation.answer_reserved_slots = 8;
+        assert!(config.validate().is_err());
+        config.participation.answer_reserved_slots = 2;
+        config.schedule.challenge_retry_seconds = Some(0);
+        assert!(config.validate().is_err());
+    }
 
     #[test]
     fn participation_and_read_timeout_defaults_and_bounds() {

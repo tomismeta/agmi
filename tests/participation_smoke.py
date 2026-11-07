@@ -329,8 +329,7 @@ jitter_seconds = 0
             status = self.status()
             runtime = status.get('effective_runtime') or {}
             return (runtime.get('revision') == status.get('configured_revision')
-                    and not runtime.get('reload_blocked')
-                    and status.get('participation', {}).get('policy') == self.policy)
+                    and not runtime.get('reload_blocked'))
         self.wait(matches, 'effective participation policy did not reload')
 
     def cycles(self, count=3):

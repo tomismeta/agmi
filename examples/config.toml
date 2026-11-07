@@ -28,6 +28,9 @@ max_attempts_per_work = 1
 mode = "strict" # strict | participation_first | manual
 uncertainty_grace_seconds = 300
 max_unresolved_operations = 4
+# Reserve unresolved capacity for answers even after this epoch's answer completes.
+# Must be smaller than max_unresolved_operations; zero preserves existing policy.
+answer_reserved_slots = 0
 allow_answer = true
 allow_mine = true
 allow_judge = false
@@ -62,10 +65,14 @@ shutdown_seconds = 30
 [schedule]
 poll_seconds = 120
 mine_seconds = 86400
-# Replaces the interval with one dispatched mine per observed answered epoch.
+# Replaces the interval with one dispatched mine per freshly observed epoch.
 mine_each_epoch = false
 retry_seconds = 180
 # Caps exponential read backoff; base/server minimum wins, then jitter is added.
 backoff_max_seconds = 900
+# Optional challenge-only overrides; omitted fields inherit the generic values.
+# Hot changes never shorten retained server minima.
+# challenge_retry_seconds = 30
+# challenge_backoff_max_seconds = 120
 # Deterministic per-identity startup/poll/retry staggering; 0 disables staggering.
 jitter_seconds = 30

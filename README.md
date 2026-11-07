@@ -50,6 +50,7 @@ printf '%s\n' '{"participation":{"mode":"participation_first","uncertainty_grace
   agmi --json config apply --expected-revision "$FILE_REVISION" --dry-run
 # Remove --dry-run to save the validated patch.
 agmi --json status
+agmi --json reads
 agmi --json operations list --state unknown --limit 20
 agmi --json recover grants --limit 20
 ```
@@ -69,6 +70,8 @@ agmi --json guidance set --kind answer \
 ```
 
 Guidance commands read/write private UTF-8 content, not model instructions in argv. An unconfigured route can create its conventional guidance file; `missing` is a create-only revision token. Guidance updates reload without restarting. Do not forward private guidance or `recover inspect` output. Operation and grant lists expose sanitized, bounded pages; use `next_before` as the next `--before` cursor. No administration command above calls a model or submits MinePOA work.
+
+`reads` reports bounded per-scope request state, last usable success, safe failure category/status, local retry deadline and retained server minimum. It never makes a network request. `status.data.work` explains each capability's phase, blocker, next action and deadline; no deadline means progress needs evidence or administration, not an immediate retry. Heartbeat, useful progress and current-epoch answer evidence remain separate.
 
 
 ## Modes and effects
@@ -92,11 +95,16 @@ Operator settings control capability modes, model/harness/reasoning, deadlines, 
 The `[schedule]` defaults are `poll_seconds = 120`, `retry_seconds = 180`, `backoff_max_seconds = 900`, `jitter_seconds = 30` and `mine_seconds = 86400`. Existing explicit values remain effective; omitted new fields use defaults. Failed upstream reads use durable, endpoint-scoped exponential backoff, so restarting does not reset a failing endpoint's delay and success on another endpoint does not clear it. The effective backoff cap cannot shorten the retry base or a server retry minimum.
 The bounded identity offset is added after the exponential cap and server minimum, so retries remain staggered during prolonged outages. The final wait can exceed `backoff_max_seconds` by up to `jitter_seconds`, or longer when the server requires it.
 
-`timeouts.http_seconds` controls writes, including the effectful GET mine endpoint. Optional `read_http_seconds` overrides read deadlines; omitted means the existing HTTP deadline. `schedule.mine_each_epoch = true` replaces daily cadence with one explicit mining attempt per observed answered epoch. Proven nonacceptance may retry captured work; an uncertain mine is not repeatedly issued within that epoch. Neither mode guarantees upstream acceptance.
+Optional `schedule.challenge_retry_seconds` and `challenge_backoff_max_seconds` override only challenge-read backoff; omitted values inherit the generic settings. Hot changes recompute local delay from the original failure time, never from each reload and never below a retained server minimum. Legacy deadlines without separate provenance remain conservative. Inspect effective deadlines with `agmi --json reads`.
+`reads` labels unattributed legacy deadlines as `retained_conservative_floor`, not server evidence. `server_not_before` retains observed server delays plus retry staggering. Operation blockers use `retained_retry_minimum` because older operation timing may also have unknown provenance.
+
+`timeouts.http_seconds` controls writes, including the effectful GET mine endpoint. Optional `read_http_seconds` overrides read deadlines; omitted means the existing HTTP deadline. `schedule.mine_each_epoch = true` replaces daily cadence with one explicit mining attempt per freshly observed epoch, whether answered or not. [MinePOA permits mining anytime](https://minepoa.com/go.md), but rewards require an answered epoch; local permission is not an earnings claim. Proven nonacceptance may retry captured work; an uncertain mine is not repeatedly issued within that epoch. Neither mode guarantees upstream acceptance.
 
 Startup, polling and retries include deterministic identity-based staggering, bounded by `jitter_seconds` (`0` disables it). This spreads independent identities without peer discovery, shared state or coordination; it is not a guarantee of distinct request times. Answers retain priority; when no answer is selected, judge and mine are considered oldest-due first rather than allowing a busy judging queue to continually outrank due mining. Existing eligibility, pause and unresolved-operation boundaries still apply.
 
 Preparation and wallet effects have separate lifecycles. One runtime owns transitions and serializes local network writes, with at most one local answer task and one local judging task. Epoch observation does not wait for a judge model call. Strict policy retains one outstanding effect; participation-first/manual policy can admit bounded new work while old effects remain unresolved. Pending mining recovery uses its own deadline, not the next mining cadence.
+
+Slow background job, receipt, inventory or hydration reads retain their request while urgent answer work proceeds; they are not repeatedly cancelled at polling boundaries. Observation uses an absolute poll deadline including configured staggering, and model completion wakes the controller. Useful transitions trigger another work turn without a full poll sleep. Fresh identity/challenge availability, server minima, existing answer-model capacity and an already-started write can still delay preparation or submission. A retained background request never owns the wallet-effect slot.
 
 `[preparation]` defaults to `answer_while_blocked = true`, `retry_uncertain = false`, and `max_attempts_per_work = 1` (1–8). A current answer may be prepared behind an uncertain effect; submission is governed separately by participation policy. Raising the budget permits regeneration of an invalid draft; uncertain inference additionally requires opt-in and can duplicate model charges. Discarded generations still consume their model budget; a manual network grant does not increase it. Each launch has a distinct identity and late-result fencing. Local task bounds do not prove a disconnected remote model stopped.
 
@@ -115,6 +123,8 @@ Configuration inspection shows references and model names, not credential values
 | `manual` | Require a stopped-writer, one-dispatch grant for the requested epoch/kind; overrides general grace, not server delays or answer retry grace |
 
 `uncertainty_grace_seconds` defaults to 300. `max_unresolved_operations` defaults to 4 and includes the prospective dispatch. `allow_answer` and `allow_mine` default true; `allow_judge` defaults false. Live dispatches cannot be bypassed. All old unknowns remain recorded, reconciliation rotates among bound operations, and each risk admission captures its policy, revision and blocking operation IDs atomically with dispatch intent.
+
+`answer_reserved_slots` defaults to zero and must be smaller than `max_unresolved_operations`. With cap 8/reserve 2, a judge or mine dispatch may occupy at most six unresolved slots; answers may use all eight. Reservation persists after the current answer completes and applies to manual grants too. It does not evict existing unknowns or prevent unresolved answers exhausting capacity. `allow_judge = true` enables bounded judging overlap under the selected participation policy; it does not clear old judgments.
 
 Local reconciliation cadence and jitter do not extend the risk-admission grace or override a manual grant. Only reported server minima add that fence. Older journals whose deadlines lack this distinction retain their inherited deadline conservatively until it expires.
 
@@ -197,17 +207,17 @@ The Linux user-systemd installer stages versioned matching binary/unit sets unde
 ```sh
 sh deploy/install-user.sh stage "$PWD/target/release/agmi"
 # Set RELEASE_ID to the r-<sha256> printed by stage.
-sh deploy/install-user.sh activate "$RELEASE_ID" --stopped
-# Existing initialized journals only; skip adoption on a fresh installation.
-~/.local/bin/agmi --config ~/.config/agmi/config.toml recover adopt
-~/.local/bin/agmi --config ~/.config/agmi/config.toml config check
-# Review modes and original pause intent. Resume only when participation is intended.
+"$PWD/target/release/agmi" --config ~/.config/agmi/config.toml config check
 sh deploy/install-user.sh activate "$RELEASE_ID"
 systemctl --user enable agmi.service agmi-health.timer
 sh deploy/install-user.sh status
 ```
 
 Stage never activates anything. Activate stops the units, changes one release pointer, reloads systemd and explicitly restarts; `--stopped` leaves the new release stopped for journal adoption. Neither resumes participation. Installed, loaded and running identities are reported separately. Unsupported unit overrides block activation instead of silently changing operator policy. Configure user lingering if supervision must survive logout.
+
+Ordinary upgrades preserve pause intent and generation: use normal activation, not `pause`/`resume`. Completed unsent drafts survive stop/start and are revalidated before dispatch; explicitly paused/off or obsolete work is not silently revived. Clean shutdown captures completed model results; genuine unfinished execution remains uncertain.
+
+For a journal that requires explicit adoption, first use `activate "$RELEASE_ID" --stopped`, then `agmi recover adopt`, before normal activation. Adoption is not part of an ordinary already-anchored upgrade.
 
 Adoption refuses missing, uninitialized or authority-less legacy journals; it never creates replacement history. An already-adopted intact journal is accepted idempotently. A fresh installation initializes paused state through normal `run`/control initialization instead.
 

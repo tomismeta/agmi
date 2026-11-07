@@ -19,6 +19,58 @@ use std::{
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_TEXT_CHARS: usize = 16384;
 
+/// Bounded diagnostics only; these categories never establish a write outcome.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadFailure {
+    Timeout,
+    Connect,
+    Request,
+    BodyInterrupted,
+    ResponseTooLarge,
+    InvalidJson,
+    CredentialEchoRedacted,
+}
+
+impl ReadFailure {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Connect => "connect",
+            Self::Request => "request",
+            Self::BodyInterrupted => "body_interrupted",
+            Self::ResponseTooLarge => "response_too_large",
+            Self::InvalidJson => "invalid_json",
+            Self::CredentialEchoRedacted => "credential_echo_redacted",
+        }
+    }
+}
+
+impl std::fmt::Display for ReadFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl std::error::Error for ReadFailure {}
+
+pub fn transport_failure(error: &anyhow::Error) -> ReadFailure {
+    error
+        .downcast_ref::<ReadFailure>()
+        .copied()
+        .unwrap_or(ReadFailure::Request)
+}
+
+fn request_failure(error: &reqwest::Error) -> ReadFailure {
+    if error.is_timeout() {
+        ReadFailure::Timeout
+    } else if error.is_connect() {
+        ReadFailure::Connect
+    } else {
+        ReadFailure::Request
+    }
+}
+
 // Deliberately no Debug: authentication and queued-job identifiers must not enter logs.
 pub struct Protocol {
     client: Client,
@@ -34,6 +86,8 @@ pub struct Response {
     pub status: u16,
     pub body: Value,
     pub retry_after_seconds: Option<u64>,
+    #[serde(default)]
+    pub read_failure: Option<ReadFailure>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
@@ -303,7 +357,7 @@ impl Protocol {
         let mut response = request
             .send()
             .await
-            .map_err(|_| anyhow::anyhow!("HTTP request failed; write outcome may be unknown"))?;
+            .map_err(|error| anyhow::Error::new(request_failure(&error)))?;
         let status = response.status().as_u16();
         let header_delay = response
             .headers()
@@ -312,16 +366,17 @@ impl Protocol {
             .and_then(parse_retry_after);
         // Retain status/backoff even when an upstream error page is empty, broken,
         // oversized or interrupted. A null body cannot establish a write outcome.
-        let unavailable = || Response {
+        let unavailable = |failure| Response {
             status,
             body: Value::Null,
             retry_after_seconds: header_delay,
+            read_failure: Some(failure),
         };
         if response
             .content_length()
             .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
         {
-            return Ok(unavailable());
+            return Ok(unavailable(ReadFailure::ResponseTooLarge));
         }
         let mut bytes = Vec::new();
         loop {
@@ -330,18 +385,25 @@ impl Protocol {
                     bytes.extend_from_slice(&chunk);
                 }
                 Ok(None) => break,
-                _ => return Ok(unavailable()),
+                Ok(Some(_)) => return Ok(unavailable(ReadFailure::ResponseTooLarge)),
+                Err(error) => {
+                    return Ok(unavailable(if error.is_timeout() {
+                        ReadFailure::Timeout
+                    } else {
+                        ReadFailure::BodyInterrupted
+                    }));
+                }
             }
         }
         let Ok(body) = serde_json::from_slice::<Value>(&bytes) else {
-            return Ok(unavailable());
+            return Ok(unavailable(ReadFailure::InvalidJson));
         };
         if let Some(key) = &self.key {
             let secret = key
                 .to_str()
                 .map_err(|_| anyhow::anyhow!("invalid internal credential encoding"))?;
             if contains_credential(&body, secret) {
-                return Ok(unavailable());
+                return Ok(unavailable(ReadFailure::CredentialEchoRedacted));
             }
         }
         let body_delay = body.get("retry_after_seconds").and_then(Value::as_u64);
@@ -349,6 +411,7 @@ impl Protocol {
             status,
             body,
             retry_after_seconds: max_delay(header_delay, body_delay),
+            read_failure: None,
         })
     }
 }
@@ -1187,6 +1250,7 @@ mod tests {
             status,
             body,
             retry_after_seconds: None,
+            read_failure: None,
         }
     }
     fn txid() -> String {
@@ -1583,9 +1647,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_backoff_bodies_retain_status_and_retry_after() {
+    async fn unavailable_bodies_retain_safe_categories_status_and_retry_after() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        for (status, body) in [(429, ""), (503, "<html>unavailable</html>")] {
+        for (status, body, length, failure) in [
+            (429, "", 0, ReadFailure::InvalidJson),
+            (
+                503,
+                "<html>unavailable</html>",
+                24,
+                ReadFailure::InvalidJson,
+            ),
+            (503, "{", 100, ReadFailure::BodyInterrupted),
+            (
+                503,
+                "",
+                MAX_RESPONSE_BYTES + 1,
+                ReadFailure::ResponseTooLarge,
+            ),
+            (
+                200,
+                "\"private-test-credential\"",
+                25,
+                ReadFailure::CredentialEchoRedacted,
+            ),
+        ] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let mut config = Config::default();
             config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
@@ -1603,23 +1688,49 @@ mod tests {
                 }
                 let reply = format!(
                     "HTTP/1.1 {status} Unavailable\r\nRetry-After: 300\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len(),
+                    length,
                 );
                 stream.write_all(reply.as_bytes()).await.unwrap();
             });
-            let response = Protocol::new(&config)
-                .unwrap()
-                .get("/api/status")
-                .await
-                .unwrap();
+            let mut protocol = Protocol::new(&config).unwrap();
+            protocol.key = Some(HeaderValue::from_static("private-test-credential"));
+            let response = protocol.get("/api/status").await.unwrap();
             assert_eq!(response.status, status);
             assert_eq!(response.retry_after_seconds, Some(300));
+            assert_eq!(response.read_failure, Some(failure));
+            assert!(response.body.is_null());
+            let public = serde_json::to_string(&response).unwrap();
+            assert!(!public.contains("private-test-credential"));
+            assert!(!public.contains("127.0.0.1"));
             assert!(matches!(
                 classify_source(WorkKind::Answer, &response, ResponseSource::Submit),
                 Outcome::Unknown { .. }
             ));
             server.await.unwrap();
         }
+    }
+
+    #[test]
+    fn read_failure_vocabulary_and_transport_errors_are_sanitized() {
+        for failure in [
+            ReadFailure::Timeout,
+            ReadFailure::Connect,
+            ReadFailure::Request,
+            ReadFailure::BodyInterrupted,
+            ReadFailure::ResponseTooLarge,
+            ReadFailure::InvalidJson,
+            ReadFailure::CredentialEchoRedacted,
+        ] {
+            let error = anyhow::Error::new(failure).context("safe context");
+            assert_eq!(transport_failure(&error), failure);
+        }
+        let unknown = anyhow::anyhow!("https://private.example/bearer-secret");
+        assert_eq!(transport_failure(&unknown), ReadFailure::Request);
+        let legacy: Response = serde_json::from_value(json!({
+            "status": 200, "body": {}, "retry_after_seconds": null
+        }))
+        .unwrap();
+        assert_eq!(legacy.read_failure, None);
     }
     #[cfg(unix)]
     #[test]
