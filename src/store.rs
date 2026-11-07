@@ -266,6 +266,9 @@ impl AccountLock {
             bail!("adoption requires an existing initialized journal");
         }
         if legacy || binding.is_some() || database.exists() {
+            if !migration_allowed && !legacy && binding.is_none() {
+                bail!("unanchored journal requires explicit stopped-writer adoption");
+            }
             // Never create or initialize a missing/replaced bound database.
             if !database.exists() {
                 bail!("bound journal is missing; authoritative recovery required");
@@ -280,6 +283,16 @@ impl AccountLock {
                 }
                 if !migration_allowed {
                     bail!("journal adoption requires a stopped writer; run recover adopt first");
+                }
+            } else {
+                let (database_id, sequence) = existing
+                    .database_identity()
+                    .context("existing journal authority is missing or malformed")?;
+                if database_id.len() != 32
+                    || !database_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    || sequence < 0
+                {
+                    bail!("existing journal authority is invalid");
                 }
             }
         }
@@ -2409,6 +2422,49 @@ mod tests {
         remove_anchors(&config);
         assert!(!adopted);
         assert!(!initialized);
+    }
+
+    #[test]
+    fn unanchored_schema2_requires_explicit_adoption() {
+        let (_dir, config) = bound_fixture();
+        let store = Store::open(&config).unwrap();
+        let identity = store.database_identity().unwrap();
+        drop(store);
+        let acquired = AccountLock::acquire(&config).is_ok();
+        let controlled = AccountLock::control_store(&config).is_ok();
+        remove_anchors(&config);
+        assert!(!acquired && !controlled);
+        let (lock, adopted) = AccountLock::adopt(&config).unwrap();
+        assert_eq!(adopted.database_identity().unwrap(), identity);
+        drop(adopted);
+        drop(lock);
+        remove_anchors(&config);
+    }
+
+    #[test]
+    fn missing_schema2_authority_is_not_recreated() {
+        for explicit in [false, true] {
+            let (_dir, config) = bound_fixture();
+            let store = Store::open(&config).unwrap();
+            store.db.execute("DROP TABLE authority", []).unwrap();
+            let accepted = if explicit {
+                AccountLock::adopt(&config).is_ok()
+            } else {
+                AccountLock::acquire(&config).is_ok()
+            };
+            let recreated: bool = store
+                .db
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='authority')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            drop(store);
+            remove_anchors(&config);
+            assert!(!accepted);
+            assert!(!recreated);
+        }
     }
 
     #[test]

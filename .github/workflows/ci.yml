@@ -43,6 +43,8 @@ jobs:
         run: python3 tests/recovery_smoke.py target/debug/agmi --slow-inventory
       - name: Malformed identity fences effects
         run: python3 tests/recovery_smoke.py target/debug/agmi --bad-identity
+      - name: Unanchored journal and authority integrity
+        run: python3 tests/recovery_smoke.py target/debug/agmi --unanchored
       - name: Build identity
         run: ./target/debug/agmi build-info --manifest
       - name: Inspect distributable contents

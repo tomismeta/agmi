@@ -28,12 +28,13 @@ def main():
     parser.add_argument('--stalled-judge', action='store_true')
     parser.add_argument('--slow-inventory', action='store_true')
     parser.add_argument('--bad-identity', action='store_true')
+    parser.add_argument('--unanchored', action='store_true')
     parser.add_argument('--old-binary', type=pathlib.Path)
     parser.add_argument('--harness', choices=('openclaw', 'hermes'), default='openclaw')
     args = parser.parse_args()
     if args.harness == 'openclaw' and shutil.which('node') is None:
         parser.error('OpenClaw fixture requires Node.js; use --harness hermes for the Python fixture')
-    if args.old_binary and (args.baseline or args.bound_job or args.stalled_judge or args.slow_inventory or args.bad_identity):
+    if args.old_binary and (args.baseline or args.bound_job or args.stalled_judge or args.slow_inventory or args.bad_identity or args.unanchored):
         parser.error('--old-binary is a separate adoption scenario')
     binary = str(args.binary.resolve())
     address = 'poa1' + '1' * 32
@@ -286,6 +287,15 @@ jitter_seconds = 0
             child.kill()
             child.wait(timeout=5)
             child = None
+            if args.unanchored:
+                lock_key = hashlib.sha256(f'{chain}\n{address}'.encode()).hexdigest()
+                lock_root = pathlib.Path(pwd.getpwuid(os.geteuid()).pw_dir) / '.agmi-account-locks'
+                for entry in lock_root.glob(lock_key + '.*'):
+                    entry.unlink()
+                denied = subprocess.run(command + ['run', '--once'], capture_output=True,
+                                        text=True, timeout=10)
+                assert denied.returncode != 0, 'unanchored journal silently rebound'
+                invoke('recover', 'adopt')
             if args.old_binary:
                 command[0] = binary
                 denied = subprocess.run(command + ['run', '--once'], capture_output=True, text=True, timeout=10)
@@ -354,14 +364,24 @@ jitter_seconds = 0
                 assert prepared == 1, f'expected one bounded answer preparation, observed {prepared}'
                 assert any(row['kind'] == 'answer' and row['state'] == 'generated'
                            for row in after['operations']), 'answer draft was not durably captured'
-            mode = 'baseline' if args.baseline else ('adoption' if args.old_binary else 'acceptance')
+            child.kill()
+            child.wait(timeout=5)
+            child = None
+            if args.unanchored:
+                for entry in lock_root.glob(lock_key + '.*'):
+                    entry.unlink()
+                with sqlite3.connect(shared['database']) as connection:
+                    connection.execute('DROP TABLE authority')
+                denied = subprocess.run(command + ['recover', 'adopt'], capture_output=True,
+                                        text=True, timeout=10)
+                assert denied.returncode != 0, 'missing authority recreated by adoption'
+                with sqlite3.connect(shared['database'].as_uri() + '?mode=ro', uri=True) as connection:
+                    assert connection.execute("SELECT COUNT(*) FROM sqlite_schema WHERE name='authority'").fetchone()[0] == 0
+            mode = 'baseline' if args.baseline else ('adoption' if args.old_binary else ('unanchored' if args.unanchored else 'acceptance'))
             print(json.dumps({'mode': mode,
                 'cold_restart': True, 'epoch_observed': 11, 'wallet_mutations': 1,
                 'unknown_preserved': True, 'answer_preparations': prepared,
                 'health_blocked': True}))
-            child.kill()
-            child.wait(timeout=5)
-            child = None
     finally:
         release_page.set()
         stop_child()

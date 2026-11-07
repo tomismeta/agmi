@@ -2178,6 +2178,7 @@ mod tests {
         let credentials = tempfile::tempdir().unwrap();
         let (_temp, mut runtime, sender) = fixture_with(active_judge_config(credentials.path()));
         let config = runtime.config.clone();
+        drop(AccountLock::adopt(&config).unwrap());
         let pause_and_stop = async move {
             tokio::time::sleep(Duration::from_millis(10)).await;
             pause(&config).unwrap();
@@ -3400,6 +3401,7 @@ export async function callGatewayFromCli(_method, _options, params) {
         let mut op = judging_operation(&mut runtime, &"a".repeat(64), "unknown");
         let path = runtime.config_path.clone();
         let config = runtime.config.clone();
+        drop(AccountLock::adopt(&config).unwrap());
         let prefix = format!("GET /chain/{}", config.network.chain);
         assert!(
             recovery_resolve(&path, op.id, Some("guessed-job"), None)
