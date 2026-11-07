@@ -1,0 +1,14 @@
+[Unit]
+Description=agmi local participation health
+After=agmi.service
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/agmi --config %h/.config/agmi/config.toml --json health --stale-seconds 180 --work-seconds 1800 --answer-grace-seconds 900 --min-free-mib 128
+Environment="PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
+TimeoutStartSec=30
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+StandardOutput=journal
+StandardError=journal

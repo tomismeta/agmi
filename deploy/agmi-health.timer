@@ -1,0 +1,12 @@
+[Unit]
+Description=Check agmi local participation health every two minutes
+
+[Timer]
+OnCalendar=*:0/2
+RandomizedDelaySec=10
+AccuracySec=10
+Persistent=true
+Unit=agmi-health.service
+
+[Install]
+WantedBy=timers.target

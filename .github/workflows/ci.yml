@@ -1,0 +1,33 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install 1.96.0 --profile minimal --component rustfmt --component clippy
+      - name: Formatting
+        run: cargo +1.96.0 fmt --all -- --check
+      - name: Native bridge syntax
+        run: node --check adapters/openclaw.mjs
+      - name: Behavior tests
+        run: cargo +1.96.0 test --locked
+      - name: Lints
+        run: cargo +1.96.0 clippy --locked --all-targets -- -D warnings
+      - name: Build binary
+        run: cargo +1.96.0 build --locked
+      - name: CLI discovery
+        run: ./target/debug/agmi commands --json
+      - name: Inspect distributable contents
+        run: cargo +1.96.0 package --locked --list --allow-dirty

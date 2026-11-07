@@ -1,0 +1,37 @@
+# Changelog
+
+## Unreleased
+
+- Add typed, allowlisted model failure diagnostics without exposing native stderr/provider text or permitting uncertain inference replay.
+- Add durable endpoint-scoped exponential read backoff, deterministic identity-based startup/poll/retry staggering without peer coordination, and answer-first oldest-due judge/mine fairness. Default polling/retry/backoff cap/stagger are 120/180/900/30 seconds; mining remains 86400 seconds. Preserve explicit older settings and never shorten retry/server minimums through the cap.
+- Persist prepared mining intents with their empty payload atomically, avoiding an incomplete unsent operation after a crash. Retain retry staggering after the exponential cap and server minimum.
+- Apply durable backoff to unavailable or malformed endpoint evidence even when HTTP status is successful; clear each endpoint's failure history only after usable evidence.
+- Separate health warnings from unhealthy issues; warning-only operation preserves successful health status without relaxing uncertainty boundaries.
+- Keep health local and read-only, with structured health/events/warnings available for agents to forward through existing native channels. External forwarding remains agent-owned; agmi does not add delivery transports, credentials or notification state.
+- Add shared, harness-agnostic user-systemd installation, process supervision and a two-minute local health timer. Installation preserves private configuration/state and never activates participation.
+- Add read-only structured health checks for execution, work age, identity evidence, epoch-answer evidence and disk space, with configurable thresholds and deadline-aware timing floors. Persist current health evidence independently of bounded diagnostic history.
+- Add hot-reloaded judging assignment exclusions at selection and admission boundaries. Release only proven-unsent excluded work before backoff/activity gates; preserve queued and uncertain reconciliation.
+- Read assignment target epochs from the protocol's `answer_epoch` field and grading transaction identifiers from `id`. Preserve selected-only hydration when target metadata is absent and keep inclusion separate from checkpoint finality.
+- Exercise bounded live answer, judge and mine workflows through both native harnesses on independent accounts. Recover queued grading results read-only without regenerating or resubmitting work; retain regression coverage for malformed target epochs, duplicate inventories and route-specific result identifiers.
+- Replace isolated OpenClaw exec with the existing Gateway's authenticated native CLI transport, preserving per-call model/reasoning/guidance and checking run binding, no-tool/no-bootstrap/no-fallback evidence. Gateway configuration/hooks are explicitly trusted; shared Gateway lifetime is not controlled by killing the local adapter.
+- Distinguish unsupported native SDK setup from uncertain Gateway execution without exposing diagnostics or copying credentials. Exercise actual Rust answer/judge inference against the existing Gateway.
+- Fix SQLite descriptor ownership under concurrent control commands: never open an existing database through an auxiliary raw descriptor, serialize initial opens within a process, and retain no-follow database opens with canonical parent paths.
+- Match the native Hermes session database API's `Path` argument and verify authenticated answer/judge inference on Linux.
+- Preserve allowlisted OpenClaw failure categories in durable events without exposing native diagnostics or automatically retrying uncertain inference.
+- Exercise two independent Linux identities in read-only mode: guidance reload/repair, concurrent pause, single-writer exclusion, forced termination, restart and graceful shutdown.
+
+- Add optional per-answer/judge guidance files, content-aware hot reload, private request snapshots and redacted configuration diagnostics.
+- Keep local safety controls and diagnostics available when guidance files are broken; redact request debug output and preserve separate task-context and escaped-guidance size budgets.
+- Remove `fs2` and `hex` in favor of standard file locks and SHA digest formatting; trim unused Tokio features and clap color support without replacing HTTP/TLS or SQLite.
+
+- Introduce `agmi`, a single Rust CLI/runtime for MinePOA answer, judge and hosted mine capabilities.
+- Add independent active/read-only/off modes, strict TOML configuration, model/harness/reasoning selection per model task, configurable deadlines/cadence, and atomic hot reload with immutable identity boundaries.
+- Add native authenticated Hermes and OpenClaw adapters for the inspected execution contracts, with tool/context restrictions, request/output binding and bounded process-group cleanup.
+- Persist private SQLite operation intents, queued jobs, receipts, unknown outcomes, sanitized events and durable pause state. Do not replay ambiguous submissions on restart.
+- Add account-wide cooperative locking with persistent state-directory binding, identity verification, original-answer-epoch grading hydration, fair selection within returned assignments, and separate included/final observations.
+- Add versioned CLI JSON envelopes, command discovery, local status/logs, a secret-free configuration example, opt-in systemd unit and CI.
+- Synchronize actual inference launch with durable pause after native preflight. Keep model-only uncertainty separate from network-write uncertainty; add stopped-writer `recover-model` without permitting unknown request replay.
+- Validate submissions before journaling possible dispatch, share protocol grade/word constraints with model validation, retain backoff on malformed responses, and retry only authoritatively expired bound jobs. Report partial assignment inventories without inventing an undocumented continuation API.
+- Exercise actual binary behavior using local HTTP/native-process fixtures: queued answer recovery, grading, mining, durable pause, read-only enforcement, no resend after a lost response, hot model reload, capability disablement, Hermes embedding, preflight pause races, alternate-state rejection, model-only recovery, authoritative job expiry, malformed-response backoff, failed-initialization correction and conservative assignment absence.
+
+Authenticated Hermes and existing-Gateway OpenClaw participation have passed bounded Linux live acceptance, including explicit mining and node-reported checkpoint coverage. A continuous pilot is now active on three independent identities using the shared service and health timer; real stop/crash/restart and initial answer/judge participation were exercised. Long-running stability and earnings remain unverified. Upstream timeouts and an uncertain model attempt were retained without blind replay. No public release or destructive legacy cleanup has occurred. Package publication remains disabled pending name/license clearance and release review. Server auto-mining and cryptographic finality are not controlled or independently verified by the local runtime.

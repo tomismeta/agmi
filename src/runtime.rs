@@ -1,0 +1,2828 @@
+use crate::config::{Config, Mode, WorkKind};
+use crate::protocol::{
+    Assignment, Challenge, Outcome, Protocol, Response, assignment_ids, assignment_needs_hydration,
+    classify, has_required_words, parse_challenge, parse_selected_assignment,
+    valid_grade_reasoning,
+};
+use crate::solver::{SolverRequest, SolverResult, execution_may_have_started, failure_code, solve};
+use crate::store::{
+    AccountLock, AdmissionGuard, Control, Operation, ReadScope, Store, digest, not_before, now,
+};
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::future::Future;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::watch;
+
+pub fn status(config: &Config) -> Result<Value> {
+    match Store::read_only(config)? {
+        Some(store) => store.status(config),
+        None => Ok(json!({"initialized":false,"paused":true,"generation":0,
+            "configured_revision":config.optional_revision()?,"effective_runtime":null,
+            "hosted_identity_verified":null,"pending":null,"operations":[]})),
+    }
+}
+pub fn events(config: &Config, limit: usize) -> Result<Value> {
+    match Store::read_only(config)? {
+        Some(store) => store.events(limit),
+        None => Ok(json!([])),
+    }
+}
+pub fn pause(config: &Config) -> Result<()> {
+    let _gate = AdmissionGuard::acquire(config)?;
+    AccountLock::control_store(config)?.set_paused(true)
+}
+pub fn resume(config: &Config) -> Result<()> {
+    config.validate()?;
+    if config.network.address.is_empty() || config.network.credential_file.as_os_str().is_empty() {
+        bail!("resume requires a configured account and credential file");
+    }
+    let _gate = AdmissionGuard::acquire(config)?;
+    AccountLock::control_store(config)?.set_paused(false)
+}
+
+/// Explicitly release model-only uncertainty while the writer is stopped.
+/// A possibly-sent protocol request is never eligible.
+pub fn recover_model(config: &Config) -> Result<usize> {
+    let (_account, mut store) = AccountLock::acquire(config)?;
+    store.recover()?;
+    store.abandon_models()
+}
+
+fn same_identity(a: &Config, b: &Config) -> bool {
+    a.network.base_url == b.network.base_url
+        && a.network.chain == b.network.chain
+        && a.network.address == b.network.address
+        && a.network.credential_file == b.network.credential_file
+        && a.state_dir == b.state_dir
+}
+
+fn stagger(config: &Config, phase: &str) -> u64 {
+    let bound = config.schedule.jitter_seconds;
+    if bound == 0 {
+        return 0;
+    }
+    let mut hash = Sha256::new();
+    for part in [
+        config.network.chain.as_bytes(),
+        config.network.address.as_bytes(),
+        phase.as_bytes(),
+    ] {
+        hash.update(part);
+        hash.update(b"\0");
+    }
+    let bytes = hash.finalize();
+    let value = u64::from_be_bytes(bytes[..8].try_into().expect("SHA-256 prefix"));
+    if bound == u64::MAX {
+        value
+    } else {
+        value % (bound + 1)
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct Input {
+    solver: SolverRequest,
+    challenge_fingerprint: Option<String>,
+}
+
+enum ModelAttempt {
+    Captured(SolverResult),
+    NotStarted(&'static str),
+    Unknown(&'static str),
+}
+
+struct Runtime {
+    config_path: PathBuf,
+    config: Config,
+    protocol: Arc<Protocol>,
+    store: Store,
+    stop: watch::Receiver<bool>,
+    reload_blocked: bool,
+}
+
+/// A single runtime owns the account lock even when paused or read-only. The
+/// admission lock is separate so local control commands can close admission.
+pub async fn run(config_path: &Path, once: bool) -> Result<()> {
+    let config = Config::load(config_path)?;
+    config.validate()?;
+    let protocol = Arc::new(Protocol::new(&config).map_err(|_| {
+        anyhow::anyhow!(
+            "cannot initialize protocol client; check local identity and credential permissions"
+        )
+    })?);
+    let (_account, mut store) = AccountLock::acquire(&config)?;
+    store.recover()?;
+    store.runtime_state(&config, false)?;
+    let (stop_tx, stop) = watch::channel(false);
+    let signal = tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            if let Ok(mut terminate) =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            {
+                tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = terminate.recv() => {} }
+            } else {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = tokio::signal::ctrl_c().await;
+        let _ = stop_tx.send(true);
+    });
+    let mut runtime = Runtime {
+        config_path: config_path.to_path_buf(),
+        config,
+        protocol,
+        store,
+        stop,
+        reload_blocked: false,
+    };
+    let result = runtime.run_loop(once).await;
+    signal.abort();
+    result
+}
+
+impl Runtime {
+    fn stopping(&self) -> bool {
+        *self.stop.borrow()
+    }
+
+    fn reload(&mut self) -> Result<()> {
+        let was_blocked = self.reload_blocked;
+        let mut changed = false;
+        let candidate = Config::load(&self.config_path).and_then(|config| {
+            config.validate()?;
+            Ok(config)
+        });
+        let update = match candidate {
+            Ok(config) if same_identity(&self.config, &config) => {
+                if config.revision()? == self.config.revision()? {
+                    Some((config, None))
+                } else {
+                    Protocol::new(&config)
+                        .ok()
+                        .map(|protocol| (config, Some(Arc::new(protocol))))
+                }
+            }
+            _ => None,
+        };
+        match update {
+            Some((config, protocol)) => {
+                if let Some(protocol) = protocol {
+                    self.config = config;
+                    self.protocol = protocol;
+                    changed = true;
+                    self.store.event("config_reloaded", None)?;
+                }
+                if self.reload_blocked {
+                    self.store.event("config_reload_recovered", None)?;
+                }
+                self.reload_blocked = false;
+            }
+            None => {
+                if !self.reload_blocked {
+                    self.store.event("config_reload_rejected", None)?;
+                }
+                self.reload_blocked = true;
+            }
+        }
+        if changed || was_blocked != self.reload_blocked {
+            self.store
+                .runtime_state(&self.config, self.reload_blocked)?;
+        }
+        Ok(())
+    }
+
+    fn poll_delay(&self) -> u64 {
+        self.config
+            .schedule
+            .poll_seconds
+            .saturating_add(stagger(&self.config, "poll"))
+    }
+
+    fn retry_delay(&self, server_minimum: Option<u64>) -> u64 {
+        self.config
+            .schedule
+            .retry_seconds
+            .max(server_minimum.unwrap_or(0))
+            .saturating_add(stagger(&self.config, "retry"))
+    }
+
+    async fn wait_delay(&mut self, seconds: u64) {
+        if seconds == 0 || self.stopping() {
+            return;
+        }
+        // No admission gate is held: pause remains immediately available.
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(seconds)) => {},
+            _ = self.stop.changed() => {},
+        }
+    }
+
+    async fn run_loop(&mut self, once: bool) -> Result<()> {
+        if !once {
+            self.wait_delay(stagger(&self.config, "startup")).await;
+        }
+        loop {
+            self.reload()?;
+            self.store
+                .runtime_state(&self.config, self.reload_blocked)?;
+            if self.stopping() {
+                break;
+            }
+            self.cycle().await?;
+            if once || self.stopping() {
+                break;
+            }
+            self.wait_delay(self.poll_delay()).await;
+        }
+        self.store.event("runtime_stopped", None)?;
+        Ok(())
+    }
+
+    async fn get(
+        &mut self,
+        kind: WorkKind,
+        scope: ReadScope,
+        path: &str,
+    ) -> Result<Option<Response>> {
+        self.reload()?;
+        if self.stopping() || self.config.mode(kind) == Mode::Off {
+            return Ok(None);
+        }
+        let backoff = self.store.read_backoff(scope)?;
+        if backoff.next_at > now() {
+            return Ok(None);
+        }
+        let protocol = Arc::clone(&self.protocol);
+        let timeout = Duration::from_secs(self.config.timeouts.http_seconds);
+        let result = tokio::select! {
+            biased;
+            _ = self.stop.changed() => return Ok(None),
+            result = tokio::time::timeout(timeout, protocol.get(path)) => result,
+        };
+        match result {
+            Ok(Ok(response)) => {
+                // The documented 408 job-expired result is authoritative, not
+                // a transport timeout. Preserve its existing bound-job retry rule.
+                let expired_job = response.status == 408
+                    && matches!(scope, ReadScope::Job)
+                    && matches!(classify(kind, &response), Outcome::Expired);
+                if (response.status == 408 && !expired_job)
+                    || response.status == 429
+                    || (500..600).contains(&response.status)
+                    || response.body.is_null()
+                {
+                    self.read_failed(scope, response.retry_after_seconds)?;
+                    self.store.event("read_backoff", Some(kind))?;
+                    return Ok(None);
+                }
+                Ok(Some(response))
+            }
+            _ => {
+                self.read_failed(scope, None)?;
+                self.store.event("upstream_read_failed", Some(kind))?;
+                Ok(None)
+            }
+        }
+    }
+
+    fn read_failed(&self, scope: ReadScope, server_minimum: Option<u64>) -> Result<()> {
+        self.store.fail_read(
+            scope,
+            self.config.schedule.retry_seconds,
+            self.config.schedule.backoff_max_seconds,
+            stagger(&self.config, "retry"),
+            server_minimum,
+        )?;
+        Ok(())
+    }
+
+    fn read_evaluated(&self, scope: ReadScope, valid: bool, minimum: Option<u64>) -> Result<()> {
+        if valid {
+            self.store.reset_read(scope)
+        } else {
+            self.read_failed(scope, minimum)
+        }
+    }
+
+    async fn challenge(&mut self, kind: WorkKind) -> Result<Option<Challenge>> {
+        let Some(response) = self
+            .get(kind, ReadScope::Challenge, "/api/hosted/challenge")
+            .await?
+        else {
+            return Ok(None);
+        };
+        match parse_challenge(&response) {
+            Ok(challenge) => {
+                self.read_evaluated(ReadScope::Challenge, true, None)?;
+                self.store.observe(challenge.epoch, challenge.answered)?;
+                Ok(Some(challenge))
+            }
+            Err(_) => {
+                self.read_failed(ReadScope::Challenge, response.retry_after_seconds)?;
+                self.store.event("challenge_unavailable", Some(kind))?;
+                self.store
+                    .defer(kind, self.retry_delay(response.retry_after_seconds))?;
+                Ok(None)
+            }
+        }
+    }
+
+    async fn assignment_inventory(&mut self) -> Result<Option<Response>> {
+        let Some(response) = self
+            .get(
+                WorkKind::Judge,
+                ReadScope::Assignments,
+                "/api/hosted/assignments",
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let ids = assignment_ids(&response);
+        if ids.is_err() {
+            self.read_failed(ReadScope::Assignments, response.retry_after_seconds)?;
+            self.store
+                .event("assignments_unavailable", Some(WorkKind::Judge))?;
+            self.store.defer(
+                WorkKind::Judge,
+                self.retry_delay(response.retry_after_seconds),
+            )?;
+            return Ok(None);
+        }
+        // Active selection validates the selected payload before clearing this scope.
+        if ids.as_ref().is_ok_and(|ids| ids.is_empty())
+            || self.config.mode(WorkKind::Judge) == Mode::ReadOnly
+        {
+            self.read_evaluated(ReadScope::Assignments, true, None)?;
+        }
+        if response.body.get("has_more") == Some(&Value::Bool(true)) {
+            self.store
+                .event("assignment_inventory_partial", Some(WorkKind::Judge))?;
+        }
+        Ok(Some(response))
+    }
+
+    fn next_judging_assignment(&self, inventory: &Response) -> Result<Option<String>> {
+        let mut ids = assignment_ids(inventory)?;
+        ids.retain(|id| !self.config.judging_assignment_excluded(id));
+        self.store.next_assignment(&ids)
+    }
+
+    async fn assignment(&mut self, inventory: &Response, id: &str) -> Result<Option<Assignment>> {
+        self.reload()?;
+        if self.stopping() || self.config.mode(WorkKind::Judge) == Mode::Off {
+            return Ok(None);
+        }
+        let hydrated = match assignment_needs_hydration(inventory, id) {
+            Ok(true) => {
+                let Some(response) = self
+                    .get(
+                        WorkKind::Judge,
+                        ReadScope::AssignmentEvidence,
+                        &format!("/api/explorer/tx/{id}"),
+                    )
+                    .await?
+                else {
+                    return Ok(None);
+                };
+                Some(response)
+            }
+            Ok(false) => None,
+            Err(_) => {
+                self.read_failed(ReadScope::Assignments, inventory.retry_after_seconds)?;
+                self.store
+                    .event("assignment_evidence_unavailable", Some(WorkKind::Judge))?;
+                self.store.defer(
+                    WorkKind::Judge,
+                    self.retry_delay(inventory.retry_after_seconds),
+                )?;
+                return Ok(None);
+            }
+        };
+        let minimum = hydrated
+            .as_ref()
+            .and_then(|r| r.retry_after_seconds)
+            .max(inventory.retry_after_seconds);
+        let scope = if hydrated.is_some() {
+            ReadScope::AssignmentEvidence
+        } else {
+            ReadScope::Assignments
+        };
+        match parse_selected_assignment(inventory, id, hydrated.as_ref()) {
+            Ok(assignment) => {
+                self.read_evaluated(scope, true, None)?;
+                if hydrated.is_some() {
+                    self.read_evaluated(ReadScope::Assignments, true, None)?;
+                }
+                Ok(Some(assignment))
+            }
+            Err(_) => {
+                self.read_failed(scope, minimum)?;
+                self.store
+                    .event("assignment_evidence_unavailable", Some(WorkKind::Judge))?;
+                self.store
+                    .defer(WorkKind::Judge, self.retry_delay(minimum))?;
+                Ok(None)
+            }
+        }
+    }
+
+    async fn identity_matches(&mut self, kind: WorkKind) -> Result<bool> {
+        let Some(response) = self
+            .get(kind, ReadScope::Identity, "/api/hosted/me")
+            .await?
+        else {
+            self.store.record_hosted_identity(false)?;
+            return Ok(false);
+        };
+        let matched = (200..300).contains(&response.status)
+            && response
+                .body
+                .get("address")
+                .and_then(Value::as_str)
+                .is_some_and(|address| address == self.config.network.address)
+            && response
+                .body
+                .get("chain_id")
+                .and_then(Value::as_str)
+                .is_none_or(|chain| chain == self.config.network.chain);
+        self.store.record_hosted_identity(matched)?;
+        self.read_evaluated(ReadScope::Identity, matched, response.retry_after_seconds)?;
+        if !matched {
+            self.store.event("identity_unverified", Some(kind))?;
+            self.store
+                .defer(kind, self.retry_delay(response.retry_after_seconds))?;
+        }
+        Ok(matched)
+    }
+
+    fn active(&self, kind: WorkKind) -> Result<bool> {
+        Ok(!self.stopping()
+            && !self.reload_blocked
+            && self.config.mode(kind) == Mode::Active
+            && !self.store.control()?.paused)
+    }
+
+    async fn cycle(&mut self) -> Result<()> {
+        if let Some(mut op) = self.store.pending()? {
+            if !self.discard_excluded_judgment(&mut op)?
+                && self.config.mode(op.kind) != Mode::Off
+                && op.next_at <= now()
+                && self.store.next_at(op.kind)? <= now()
+            {
+                match op.state.as_str() {
+                    "queued" | "included_pending" | "unknown" => self.reconcile(&mut op).await?,
+                    "generated" | "prepared" | "retry" if self.active(op.kind)? => {
+                        self.dispatch(&mut op).await?
+                    }
+                    _ => {}
+                }
+            }
+            self.follow_finality().await?;
+            self.observe_enabled().await?;
+            return Ok(());
+        }
+        self.follow_finality().await?;
+        // Answer always goes first. Older eligible lower-priority work wins;
+        // judge wins stable ties, but its poll deferral gives overdue mining a turn.
+        let judge_at = self.store.next_at(WorkKind::Judge)?;
+        let mine_at = self.store.next_at(WorkKind::Mine)?;
+        let lower = if mine_at < judge_at {
+            [WorkKind::Mine, WorkKind::Judge]
+        } else {
+            [WorkKind::Judge, WorkKind::Mine]
+        };
+        for kind in [WorkKind::Answer, lower[0], lower[1]] {
+            if self.stopping() {
+                break;
+            }
+            if self.config.mode(kind) == Mode::Off || self.store.next_at(kind)? > now() {
+                continue;
+            }
+            self.store.defer(kind, self.poll_delay())?;
+            match kind {
+                WorkKind::Answer => {
+                    let Some(challenge) = self.challenge(kind).await? else {
+                        continue;
+                    };
+                    let key = format!("{}:{}", challenge.epoch, challenge.fingerprint);
+                    if challenge.answered
+                        || !self.active(kind)?
+                        || self.store.answer_epoch_attempted(challenge.epoch)?
+                    {
+                        continue;
+                    }
+                    if !self.identity_matches(kind).await? {
+                        continue;
+                    }
+                    let input = Input {
+                        solver: self.request(kind, &challenge, None)?,
+                        challenge_fingerprint: Some(challenge.fingerprint),
+                    };
+                    self.generate(kind, &key, input).await?;
+                    return Ok(());
+                }
+                WorkKind::Judge => {
+                    let Some(inventory) = self.assignment_inventory().await? else {
+                        continue;
+                    };
+                    if !self.active(kind)? {
+                        continue;
+                    }
+                    let Some(key) = self.next_judging_assignment(&inventory)? else {
+                        continue;
+                    };
+                    let Some(assignment) = self.assignment(&inventory, &key).await? else {
+                        continue;
+                    };
+                    if !self.identity_matches(kind).await? {
+                        continue;
+                    }
+                    let request = SolverRequest {
+                        id: self.request_id(kind, &key)?,
+                        kind,
+                        epoch: assignment.epoch,
+                        words: assignment.words,
+                        min_chars: 0,
+                        max_chars: 0,
+                        assignment: Some(assignment.id),
+                        candidate: Some(assignment.answer),
+                        history: Vec::new(),
+                        guidance: String::new(),
+                    };
+                    self.generate(
+                        kind,
+                        &key,
+                        Input {
+                            solver: request,
+                            challenge_fingerprint: None,
+                        },
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                WorkKind::Mine => {
+                    let Some(challenge) = self.challenge(kind).await? else {
+                        continue;
+                    };
+                    if !challenge.answered
+                        || !self.active(kind)?
+                        || !self.identity_matches(kind).await?
+                    {
+                        continue;
+                    }
+                    let key = format!("{}:{}", challenge.epoch, now());
+                    let input = Input {
+                        solver: self.request(kind, &challenge, None)?,
+                        challenge_fingerprint: Some(challenge.fingerprint),
+                    };
+                    self.reload()?;
+                    if !self.active(kind)? {
+                        continue;
+                    }
+                    let gate = AdmissionGuard::acquire(&self.config)?;
+                    let control = self.store.control()?;
+                    if control.paused {
+                        continue;
+                    }
+                    let mut op = self.store.begin(
+                        kind,
+                        &key,
+                        "prepared",
+                        &serde_json::to_value(input)?,
+                        control,
+                        &self.config.revision()?,
+                    )?;
+                    self.store.defer(kind, self.config.schedule.mine_seconds)?;
+                    drop(gate);
+                    self.dispatch(&mut op).await?;
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn observe_enabled(&mut self) -> Result<()> {
+        for kind in [WorkKind::Answer, WorkKind::Judge, WorkKind::Mine] {
+            if self.stopping()
+                || self.config.mode(kind) == Mode::Off
+                || self.store.next_at(kind)? > now()
+            {
+                continue;
+            }
+            self.store.defer(kind, self.poll_delay())?;
+            match kind {
+                WorkKind::Judge => {
+                    let _ = self.assignment_inventory().await?;
+                }
+                _ => {
+                    let _ = self.challenge(kind).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn follow_finality(&mut self) -> Result<()> {
+        for kind in [WorkKind::Answer, WorkKind::Judge] {
+            if self.stopping()
+                || self.config.mode(kind) == Mode::Off
+                || self.store.next_at(kind)? > now()
+            {
+                continue;
+            }
+            if let Some(mut op) = self.store.awaiting_finality(kind)? {
+                self.reconcile(&mut op).await?;
+            }
+        }
+        Ok(())
+    }
+
+    fn request_id(&self, kind: WorkKind, key: &str) -> Result<String> {
+        Ok(digest(format!(
+            "{}\n{}\n{}\n{}\n{}",
+            self.config.network.chain,
+            self.config.network.address,
+            kind.as_str(),
+            key,
+            self.store.control()?.generation
+        )))
+    }
+    fn request(
+        &self,
+        kind: WorkKind,
+        challenge: &Challenge,
+        candidate: Option<String>,
+    ) -> Result<SolverRequest> {
+        Ok(SolverRequest {
+            id: self.request_id(kind, &challenge.fingerprint)?,
+            kind,
+            epoch: challenge.epoch,
+            words: challenge.words.clone(),
+            min_chars: challenge.min_chars,
+            max_chars: challenge.max_chars,
+            assignment: None,
+            candidate,
+            history: self.store.history()?,
+            guidance: String::new(),
+        })
+    }
+
+    async fn generate(&mut self, kind: WorkKind, key: &str, mut input: Input) -> Result<()> {
+        self.reload()?;
+        if !self.active(kind)?
+            || (kind == WorkKind::Judge && self.config.judging_assignment_excluded(key))
+        {
+            return Ok(());
+        }
+        let gate = AdmissionGuard::acquire(&self.config)?;
+        let control = self.store.control()?;
+        if control.paused {
+            return Ok(());
+        }
+        let model = match kind {
+            WorkKind::Answer => self.config.solver.answer.clone(),
+            WorkKind::Judge => self.config.solver.judge.clone(),
+            WorkKind::Mine => bail!("mine does not use a model"),
+        };
+        input.solver.guidance = model.guidance.to_string();
+        let mut op = self.store.begin(
+            kind,
+            key,
+            "generating",
+            &serde_json::to_value(&input)?,
+            control,
+            &self.config.revision()?,
+        )?;
+        let timeout = self.config.timeouts.model_seconds;
+        drop(gate);
+        let expected = self.config.clone();
+        let config_path = self.config_path.clone();
+        let future = solve(&model, &input.solver, timeout, move || {
+            let gate = AdmissionGuard::acquire(&expected)?;
+            let current = Config::load(&config_path)?;
+            if !same_identity(&expected, &current)
+                || current.mode(kind) != Mode::Active
+                || (kind == WorkKind::Judge && current.judging_assignment_excluded(key))
+            {
+                bail!("model admission changed");
+            }
+            let store = Store::read_only(&expected)?.context("model admission state missing")?;
+            if store.control()? != control || control.paused {
+                bail!("model admission closed");
+            }
+            Ok(gate)
+        });
+        let result = self.model_result(future, control, timeout).await?;
+        match result {
+            ModelAttempt::Captured(result) => {
+                op.result = Some(serde_json::to_value(&result)?);
+                if self.store.control()?.generation != control.generation || self.stopping() {
+                    op.state = "discarded".into();
+                    self.store.save(&op, "late_model_result_discarded")?;
+                    return Ok(());
+                }
+                match payload(&input.solver, &result) {
+                    Ok(payload) => {
+                        op.payload = Some(payload);
+                        op.state = "generated".into();
+                        self.store.save(&op, "model_result_captured")?;
+                    }
+                    Err(_) => {
+                        op.state = "rejected".into();
+                        self.store.save(&op, "model_result_invalid")?;
+                        return Ok(());
+                    }
+                }
+                // Model selection may have changed: the result still belongs to
+                // its captured request/model. Only current admission and evidence
+                // determine whether that captured result can be submitted.
+                self.dispatch(&mut op).await?;
+            }
+            ModelAttempt::NotStarted(code) => {
+                op.state = "prelaunch_failed".into();
+                self.store.save(&op, code)?;
+                self.store.defer(kind, self.retry_delay(None))?;
+            }
+            ModelAttempt::Unknown(code) => {
+                op.state = "model_unknown".into();
+                self.store.save(&op, code)?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn model_result<F>(
+        &mut self,
+        future: F,
+        control: Control,
+        timeout: u64,
+    ) -> Result<ModelAttempt>
+    where
+        F: Future<Output = Result<SolverResult>>,
+    {
+        tokio::pin!(future);
+        let deadline = tokio::time::sleep(Duration::from_secs(timeout));
+        tokio::pin!(deadline);
+        let mut tick = tokio::time::interval(Duration::from_millis(250));
+        loop {
+            tokio::select! {
+                biased;
+                _ = self.stop.changed() => return Ok(ModelAttempt::Unknown("model_launch_unknown")),
+                _ = &mut deadline => return Ok(ModelAttempt::Unknown("model_launch_unknown")),
+                _ = tick.tick() => {
+                    self.reload()?;
+                    let current = self.store.control()?;
+                    if current.paused || current.generation != control.generation { return Ok(ModelAttempt::Unknown("model_launch_unknown")); }
+                }
+                result = &mut future => return Ok(match result {
+                    Ok(result)=>ModelAttempt::Captured(result),
+                    Err(error) if !execution_may_have_started(&error)=>ModelAttempt::NotStarted(failure_code(&error)),
+                    Err(error)=>ModelAttempt::Unknown(failure_code(&error)),
+                }),
+            }
+        }
+    }
+
+    async fn fresh(&mut self, op: &Operation, input: &Input) -> Result<Option<bool>> {
+        match op.kind {
+            WorkKind::Answer | WorkKind::Mine => {
+                let Some(challenge) = self.challenge(op.kind).await? else {
+                    return Ok(None);
+                };
+                Ok(Some(
+                    challenge.epoch == input.solver.epoch
+                        && input.challenge_fingerprint.as_deref()
+                            == Some(challenge.fingerprint.as_str())
+                        && challenge.words == input.solver.words
+                        && challenge.min_chars == input.solver.min_chars
+                        && challenge.max_chars == input.solver.max_chars
+                        && if op.kind == WorkKind::Mine {
+                            challenge.answered
+                        } else {
+                            !challenge.answered
+                        },
+                ))
+            }
+            WorkKind::Judge => {
+                let Some(inventory) = self.assignment_inventory().await? else {
+                    return Ok(None);
+                };
+                let ids = assignment_ids(&inventory)?;
+                if !ids.contains(&op.key) {
+                    if inventory.body.get("has_more").and_then(Value::as_bool) == Some(false) {
+                        return Ok(Some(false));
+                    }
+                    self.store
+                        .event("assignment_eligibility_unresolved", Some(WorkKind::Judge))?;
+                    return Ok(None);
+                }
+                let Some(assignment) = self.assignment(&inventory, &op.key).await? else {
+                    return Ok(None);
+                };
+                Ok(Some(assignment_matches(&assignment, &input.solver)))
+            }
+        }
+    }
+
+    fn discard_excluded_judgment(&mut self, op: &mut Operation) -> Result<bool> {
+        // Only unsent or authoritatively retryable work can be discarded.
+        // Possibly-sent operations must retain their receipt/job reconciliation.
+        if op.kind == WorkKind::Judge
+            && matches!(op.state.as_str(), "generated" | "prepared" | "retry")
+            && self.config.judging_assignment_excluded(&op.key)
+        {
+            op.state = "discarded".into();
+            self.store.save(op, "judging_assignment_excluded")?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    async fn dispatch(&mut self, op: &mut Operation) -> Result<()> {
+        self.reload()?;
+        if self.discard_excluded_judgment(op)? {
+            return Ok(());
+        }
+        if !self.active(op.kind)? || op.next_at > now() {
+            return Ok(());
+        }
+        let expected_control = self.store.control()?;
+        let input: Input =
+            serde_json::from_value(op.request.clone()).context("invalid durable request")?;
+        match self.fresh(op, &input).await? {
+            Some(true) => {}
+            Some(false) => {
+                op.state = "discarded".into();
+                self.store.save(op, "request_no_longer_current")?;
+                return Ok(());
+            }
+            None => return Ok(()),
+        }
+        if !self.identity_matches(op.kind).await? {
+            return Ok(());
+        }
+        let gate = AdmissionGuard::acquire(&self.config)?;
+        self.reload()?;
+        if self.discard_excluded_judgment(op)? || !self.active(op.kind)? {
+            return Ok(());
+        }
+        let control = self.store.control()?;
+        if control.paused || control != expected_control || self.stopping() {
+            return Ok(());
+        }
+        let payload = op
+            .payload
+            .clone()
+            .context("prepared operation has no payload")?;
+        let protocol = Arc::clone(&self.protocol);
+        let prepared = match protocol.prepare_submission(op.kind, &payload) {
+            Ok(prepared) => prepared,
+            Err(_) => {
+                op.state = "locally_rejected".into();
+                self.store.save(op, "submission_preflight_rejected")?;
+                return Ok(());
+            }
+        };
+        op.state = "dispatching".into();
+        self.store.save(op, "dispatch_intent")?;
+        let request = tokio::time::timeout(
+            Duration::from_secs(self.config.timeouts.http_seconds),
+            prepared,
+        );
+        tokio::pin!(request);
+        let result = tokio::select! {
+            biased;
+            _ = self.stop.changed() => {
+                match tokio::time::timeout(Duration::from_secs(self.config.timeouts.shutdown_seconds), &mut request).await {
+                    Ok(result) => result,
+                    Err(_) => { op.state="unknown".into(); self.store.save(op,"dispatch_outcome_unknown")?; drop(gate); return Ok(()); }
+                }
+            }
+            result = &mut request => result,
+        };
+        match result {
+            Ok(Ok(response)) => self.outcome(
+                op,
+                classify(op.kind, &response),
+                true,
+                response.retry_after_seconds,
+            )?,
+            _ => {
+                op.state = "unknown".into();
+                self.store.save(op, "dispatch_outcome_unknown")?;
+            }
+        }
+        drop(gate);
+        Ok(())
+    }
+
+    fn outcome(
+        &mut self,
+        op: &mut Operation,
+        outcome: Outcome,
+        submitted: bool,
+        retry_after: Option<u64>,
+    ) -> Result<()> {
+        let event = match outcome {
+            Outcome::Queued { job_id } => {
+                op.next_at = not_before(self.retry_delay(retry_after));
+                if !submitted && op.job_id.as_ref().is_some_and(|known| known != &job_id) {
+                    op.state = "unknown".into();
+                    "job_binding_mismatch"
+                } else {
+                    op.job_id = Some(job_id);
+                    op.state = "queued".into();
+                    "submission_queued"
+                }
+            }
+            Outcome::Included { txid } => {
+                op.txid = Some(txid);
+                op.state = "included_pending".into();
+                op.next_at = 0;
+                "transaction_included_unconfirmed"
+            }
+            Outcome::Rejected { code } => {
+                op.state = if matches!(
+                    code.as_str(),
+                    "stale_challenge" | "epoch_mismatch" | "wrong_epoch" | "words_mismatch"
+                ) {
+                    "stale"
+                } else {
+                    "rejected"
+                }
+                .into();
+                "submission_rejected"
+            }
+            Outcome::Retry { after_seconds } => {
+                if submitted {
+                    op.state = "retry".into();
+                }
+                op.next_at = not_before(self.retry_delay(Some(after_seconds)));
+                "submission_backoff"
+            }
+            Outcome::Expired => {
+                if !submitted && op.job_id.is_some() && op.txid.is_none() {
+                    op.job_id = None;
+                    op.state = "retry".into();
+                    op.next_at = not_before(self.retry_delay(retry_after));
+                    "queued_job_expired"
+                } else {
+                    op.state = "unknown".into();
+                    op.next_at = not_before(self.retry_delay(retry_after));
+                    "unbound_job_expiry"
+                }
+            }
+            Outcome::Unknown { .. } => {
+                op.state = "unknown".into();
+                op.next_at = not_before(self.retry_delay(retry_after));
+                "dispatch_outcome_unknown"
+            }
+            Outcome::Completed => {
+                op.state = "completed".into();
+                self.store
+                    .defer(op.kind, self.config.schedule.mine_seconds)?;
+                "mine_completed"
+            }
+        };
+        if op.kind == WorkKind::Mine && op.state == "retry" {
+            op.next_at = op
+                .next_at
+                .max(not_before(self.config.schedule.mine_seconds));
+        }
+        self.store.save(op, event)
+    }
+
+    async fn reconcile(&mut self, op: &mut Operation) -> Result<()> {
+        if self.config.mode(op.kind) == Mode::Off {
+            return Ok(());
+        }
+        if let Some(txid) = op.txid.clone() {
+            let Some(response) = self
+                .get(op.kind, ReadScope::Receipt, &format!("/api/receipt/{txid}"))
+                .await?
+            else {
+                return Ok(());
+            };
+            op.next_at = not_before(self.retry_delay(response.retry_after_seconds));
+            let evidence = receipt(&response, &txid, &self.config.network.address);
+            self.read_evaluated(
+                ReadScope::Receipt,
+                evidence != Receipt::Unresolved,
+                response.retry_after_seconds,
+            )?;
+            match evidence {
+                Receipt::Final => {
+                    op.state = "final".into();
+                    self.store.save(op, "checkpoint_coverage_reported")?;
+                }
+                Receipt::Included => {
+                    op.state = "confirmed".into();
+                    self.store.save(op, "receipt_included")?;
+                }
+                Receipt::Rejected => {
+                    op.state = "rejected".into();
+                    self.store.save(op, "receipt_rejected")?;
+                }
+                Receipt::Unresolved => {
+                    self.store.save(op, "receipt_unresolved")?;
+                }
+            }
+        } else if let Some(job) = op.job_id.clone() {
+            let Some(response) = self
+                .get(op.kind, ReadScope::Job, &format!("/api/job/{job}"))
+                .await?
+            else {
+                return Ok(());
+            };
+            if response.status == 202
+                && response.body.get("state").and_then(Value::as_str) == Some("queued")
+            {
+                self.read_evaluated(ReadScope::Job, true, None)?;
+                op.state = "queued".into();
+                op.next_at = not_before(self.retry_delay(response.retry_after_seconds));
+                self.store.save(op, "job_pending")?;
+            } else {
+                let outcome = classify(op.kind, &response);
+                self.read_evaluated(
+                    ReadScope::Job,
+                    !matches!(outcome, Outcome::Unknown { .. }),
+                    response.retry_after_seconds,
+                )?;
+                self.outcome(op, outcome, false, response.retry_after_seconds)?;
+            }
+        }
+        // Unknown operations with no authoritative identifier intentionally remain
+        // blocked. Account flags and assignment disappearance cannot resolve them.
+        Ok(())
+    }
+}
+
+fn assignment_matches(assignment: &Assignment, request: &SolverRequest) -> bool {
+    request.assignment.as_deref() == Some(assignment.id.as_str())
+        && request.epoch == assignment.epoch
+        && request.candidate.as_deref() == Some(assignment.answer.as_str())
+        && request.words == assignment.words
+}
+
+fn payload(request: &SolverRequest, result: &SolverResult) -> Result<Value> {
+    match request.kind {
+        WorkKind::Answer => {
+            let answer = result.answer.as_deref().context("missing model answer")?;
+            let length = answer.encode_utf16().count();
+            if length < request.min_chars || length > request.max_chars || answer.trim().is_empty()
+            {
+                bail!("answer outside challenge bounds");
+            }
+            if !has_required_words(answer, &request.words) {
+                bail!("missing challenge word");
+            }
+            Ok(json!({"answer":answer}))
+        }
+        WorkKind::Judge => {
+            let score = result.score.context("missing judgment score")?;
+            let reasoning = result
+                .reasoning
+                .as_deref()
+                .context("missing judgment reasoning")?;
+            if score > 3 || !valid_grade_reasoning(reasoning) {
+                bail!("invalid judgment");
+            }
+            Ok(
+                json!({"assignment":request.assignment.as_deref().context("missing assignment")?,"score":score,"reasoning":reasoning}),
+            )
+        }
+        WorkKind::Mine => Ok(json!({})),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Receipt {
+    Final,
+    Included,
+    Rejected,
+    Unresolved,
+}
+fn receipt(response: &Response, txid: &str, address: &str) -> Receipt {
+    if response.status != 200 {
+        return Receipt::Unresolved;
+    }
+    let body = &response.body;
+    if body
+        .get("txid")
+        .and_then(Value::as_str)
+        .is_some_and(|id| !id.eq_ignore_ascii_case(txid))
+        || body
+            .get("address")
+            .and_then(Value::as_str)
+            .is_some_and(|id| id != address)
+        || body
+            .get("sender")
+            .and_then(Value::as_str)
+            .is_some_and(|id| id != address)
+    {
+        return Receipt::Unresolved;
+    }
+    match body.get("status").and_then(Value::as_str) {
+        Some("rejected") => Receipt::Rejected,
+        Some("included") if body.get("next_nonce").and_then(Value::as_u64).is_some() => {
+            if body.get("checkpoint_covered").and_then(Value::as_bool) == Some(true) {
+                Receipt::Final
+            } else if body.get("valid_in_open_window").and_then(Value::as_bool) == Some(true) {
+                Receipt::Included
+            } else {
+                Receipt::Unresolved
+            }
+        }
+        _ => Receipt::Unresolved,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn response(body: Value) -> Response {
+        Response {
+            status: 200,
+            body,
+            retry_after_seconds: None,
+        }
+    }
+
+    fn request(kind: WorkKind) -> SolverRequest {
+        SolverRequest {
+            id: "request-test".into(),
+            kind,
+            epoch: 8,
+            words: vec!["burn".into()],
+            min_chars: 4,
+            max_chars: 100,
+            assignment: Some("assignment-test".into()),
+            candidate: Some("candidate-test".into()),
+            history: Vec::new(),
+            guidance: String::new(),
+        }
+    }
+
+    fn result() -> SolverResult {
+        SolverResult {
+            answer: Some("burning".into()),
+            score: Some(2),
+            reasoning: Some("Grounded judgment.".into()),
+            provider: "test".into(),
+            model: "test".into(),
+            run_id: "test".into(),
+        }
+    }
+
+    fn fixture() -> (tempfile::TempDir, Runtime, watch::Sender<bool>) {
+        fixture_with(Config::default())
+    }
+
+    fn fixture_with(mut config: Config) -> (tempfile::TempDir, Runtime, watch::Sender<bool>) {
+        config.schedule.jitter_seconds = 0;
+        let temp = tempfile::tempdir().unwrap();
+        config.state_dir = temp.path().join("state");
+        let path = temp.path().join("config.toml");
+        std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+        let config = Config::load(&path).unwrap();
+        let protocol = Arc::new(Protocol::new(&config).unwrap());
+        let mut store = Store::open(&config).unwrap();
+        store.set_paused(false).unwrap();
+        store.runtime_state(&config, false).unwrap();
+        let (sender, stop) = watch::channel(false);
+        let runtime = Runtime {
+            config_path: path,
+            config,
+            protocol,
+            store,
+            stop,
+            reload_blocked: false,
+        };
+        (temp, runtime, sender)
+    }
+
+    fn judging_inventory(ids: &[String]) -> Response {
+        response(
+            json!({"has_more":false,"assignments":ids.iter().map(|id| json!({
+            "answer_txid":id, "answer_epoch":8, "answer":"candidate-test", "words":["burn"]
+        })).collect::<Vec<_>>()}),
+        )
+    }
+
+    fn judging_input(id: &str) -> Input {
+        let mut solver = request(WorkKind::Judge);
+        solver.assignment = Some(id.into());
+        Input {
+            solver,
+            challenge_fingerprint: None,
+        }
+    }
+
+    fn judging_operation(runtime: &mut Runtime, id: &str, state: &str) -> Operation {
+        let input = judging_input(id);
+        let control = runtime.store.control().unwrap();
+        let mut op = runtime
+            .store
+            .begin(
+                WorkKind::Judge,
+                id,
+                state,
+                &serde_json::to_value(&input).unwrap(),
+                control,
+                &runtime.config.revision().unwrap(),
+            )
+            .unwrap();
+        op.payload = Some(payload(&input.solver, &result()).unwrap());
+        runtime.store.save(&op, "test_judgment_prepared").unwrap();
+        op
+    }
+
+    #[cfg(unix)]
+    fn active_judge_config(dir: &Path) -> Config {
+        use std::os::unix::fs::PermissionsExt;
+        let mut config = Config::default();
+        config.network.chain = format!(
+            "test-{}",
+            dir.file_name().unwrap().to_str().unwrap().replace('.', "")
+        );
+        config.network.address = format!("poa1{}", "1".repeat(32));
+        config.network.credential_file = dir.join("key");
+        std::fs::write(&config.network.credential_file, "pk_test_fixture").unwrap();
+        std::fs::set_permissions(
+            &config.network.credential_file,
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        config.capabilities.answer = Mode::Off;
+        config.capabilities.mine = Mode::Off;
+        config.capabilities.judge = Mode::Active;
+        config.timeouts.http_seconds = 2;
+        config
+    }
+
+    async fn judging_reply(
+        listener: &tokio::net::TcpListener,
+        expected_path: &str,
+        body: Value,
+        update: Option<(&Path, &Config)>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let count = stream.read(&mut buffer).await.unwrap();
+            assert!(count > 0 && request.len() + count <= 4096);
+            request.extend_from_slice(&buffer[..count]);
+        }
+        assert!(
+            std::str::from_utf8(&request)
+                .unwrap()
+                .starts_with(&format!("GET {expected_path} HTTP/1.1"))
+        );
+        if let Some((path, config)) = update {
+            std::fs::write(path, toml::to_string(config).unwrap()).unwrap();
+        }
+        let body = body.to_string();
+        let reply = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(reply.as_bytes()).await.unwrap();
+    }
+
+    async fn accept_api_request(
+        listener: &tokio::net::TcpListener,
+        expected: &str,
+    ) -> tokio::net::TcpStream {
+        use tokio::io::AsyncReadExt;
+        let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut bytes = Vec::new();
+        let mut buffer = [0; 1024];
+        let header_end = loop {
+            let count = stream.read(&mut buffer).await.unwrap();
+            assert!(count > 0 && bytes.len() + count <= 8192);
+            bytes.extend_from_slice(&buffer[..count]);
+            if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                break end + 4;
+            }
+        };
+        let headers = std::str::from_utf8(&bytes[..header_end]).unwrap();
+        assert!(
+            headers.starts_with(&format!("{expected} HTTP/1.1")),
+            "{headers}"
+        );
+        let length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap_or(0);
+        while bytes.len() < header_end + length {
+            let count = stream.read(&mut buffer).await.unwrap();
+            assert!(count > 0);
+            bytes.extend_from_slice(&buffer[..count]);
+        }
+        stream
+    }
+
+    async fn api_reply(
+        listener: &tokio::net::TcpListener,
+        expected: &str,
+        status: u16,
+        retry_after: Option<u64>,
+        body: Value,
+    ) {
+        use tokio::io::AsyncWriteExt;
+        let mut stream = accept_api_request(listener, expected).await;
+        let retry = retry_after
+            .map(|seconds| format!("Retry-After: {seconds}\r\n"))
+            .unwrap_or_default();
+        let body = body.to_string();
+        let reply = format!(
+            "HTTP/1.1 {status} Fixture\r\n{retry}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(reply.as_bytes()).await.unwrap();
+    }
+
+    fn expire_read_deadlines(runtime: &Runtime) {
+        let db =
+            rusqlite::Connection::open(runtime.config.state_dir.join("state.sqlite3")).unwrap();
+        db.execute("UPDATE read_backoff SET next_at=0", []).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn http_read_backoff_grows_caps_reopens_and_resets_per_endpoint() {
+        let credentials = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = active_judge_config(credentials.path());
+        config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
+        config.capabilities.answer = Mode::ReadOnly;
+        config.schedule.retry_seconds = 2;
+        config.schedule.backoff_max_seconds = 5;
+        let (_temp, mut runtime, _sender) = fixture_with(config);
+        let prefix = format!("GET /chain/{}", runtime.config.network.chain);
+        let address = runtime.config.network.address.clone();
+        let server = tokio::spawn(async move {
+            for (status, retry) in [
+                (500, None),
+                (502, None),
+                (429, Some(75)),
+                (503, None),
+                (200, None),
+                (200, Some(90)),
+            ] {
+                api_reply(
+                    &listener,
+                    &format!("{prefix}/api/hosted/challenge"),
+                    status,
+                    retry,
+                    json!({}),
+                )
+                .await;
+                api_reply(
+                    &listener,
+                    &format!("{prefix}/api/hosted/me"),
+                    200,
+                    None,
+                    json!({"address":address}),
+                )
+                .await;
+            }
+            api_reply(
+                &listener,
+                &format!("{prefix}/api/hosted/challenge"),
+                200,
+                None,
+                json!({"epoch":8,"words":["burn"],"answered":true}),
+            )
+            .await;
+            api_reply(
+                &listener,
+                &format!("{prefix}/api/hosted/challenge"),
+                503,
+                Some(1),
+                json!({}),
+            )
+            .await;
+            listener
+        });
+        for (failures, delay) in [(1, 2), (2, 4), (3, 75), (4, 5), (5, 5), (6, 90)] {
+            let before = now();
+            assert!(runtime.challenge(WorkKind::Answer).await.unwrap().is_none());
+            let state = runtime.store.read_backoff(ReadScope::Challenge).unwrap();
+            assert_eq!(state.failures, failures);
+            assert!(state.next_at > before + delay);
+            assert!(state.next_at <= now() + delay + 1);
+            runtime.store = Store::open(&runtime.config).unwrap();
+            assert_eq!(
+                runtime.store.read_backoff(ReadScope::Challenge).unwrap(),
+                state
+            );
+            assert!(runtime.challenge(WorkKind::Answer).await.unwrap().is_none());
+            assert!(runtime.identity_matches(WorkKind::Answer).await.unwrap());
+            assert_eq!(
+                runtime.store.read_backoff(ReadScope::Challenge).unwrap(),
+                state
+            );
+            expire_read_deadlines(&runtime);
+        }
+        // Normal pre-deferral must not suppress the read; only read failure state gates it.
+        runtime.store.defer(WorkKind::Answer, 300).unwrap();
+        assert!(runtime.challenge(WorkKind::Answer).await.unwrap().is_some());
+        assert_eq!(
+            runtime
+                .store
+                .read_backoff(ReadScope::Challenge)
+                .unwrap()
+                .failures,
+            0
+        );
+        let before = now();
+        assert!(runtime.challenge(WorkKind::Answer).await.unwrap().is_none());
+        let state = runtime.store.read_backoff(ReadScope::Challenge).unwrap();
+        assert_eq!(state.failures, 1);
+        assert!(state.next_at >= before + 3);
+        assert!(state.next_at <= now() + 3);
+        let listener = server.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn transport_disconnect_and_timeout_persist_read_failure_without_replay() {
+        for timeout in [false, true] {
+            let credentials = tempfile::tempdir().unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut config = active_judge_config(credentials.path());
+            config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
+            config.timeouts.http_seconds = 1;
+            let (_temp, mut runtime, _sender) = fixture_with(config);
+            let path = format!(
+                "GET /chain/{}/api/hosted/assignments",
+                runtime.config.network.chain
+            );
+            let (release, released) = tokio::sync::oneshot::channel::<()>();
+            let server = tokio::spawn(async move {
+                let stream = accept_api_request(&listener, &path).await;
+                if timeout {
+                    let _ = released.await;
+                }
+                drop(stream);
+                listener
+            });
+            assert!(runtime.assignment_inventory().await.unwrap().is_none());
+            let state = runtime.store.read_backoff(ReadScope::Assignments).unwrap();
+            assert_eq!(state.failures, 1);
+            runtime.store = Store::open(&runtime.config).unwrap();
+            assert!(runtime.assignment_inventory().await.unwrap().is_none());
+            assert_eq!(
+                runtime.store.read_backoff(ReadScope::Assignments).unwrap(),
+                state
+            );
+            let _ = release.send(());
+            let listener = server.await.unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn http_authoritative_job_expiry_preserves_captured_retry_without_resubmission() {
+        let credentials = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = active_judge_config(credentials.path());
+        config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
+        let (_temp, mut runtime, _sender) = fixture_with(config);
+        let mut queued = judging_operation(&mut runtime, &"a".repeat(64), "queued");
+        queued.job_id = Some("private-job".into());
+        let captured_payload = queued.payload.clone();
+        runtime.store.save(&queued, "test_job_bound").unwrap();
+        let path = format!(
+            "GET /chain/{}/api/job/private-job",
+            runtime.config.network.chain
+        );
+        let server = tokio::spawn(async move {
+            api_reply(
+                &listener,
+                &path,
+                408,
+                Some(600),
+                json!({"state":"expired","error":"job_expired"}),
+            )
+            .await;
+            listener
+        });
+        let before = now();
+        runtime.reconcile(&mut queued).await.unwrap();
+        assert_eq!(queued.state, "retry");
+        assert!(queued.job_id.is_none());
+        assert_eq!(queued.payload, captured_payload);
+        assert!(queued.next_at >= before + 601);
+        assert_eq!(
+            runtime.store.read_backoff(ReadScope::Job).unwrap().failures,
+            0
+        );
+        runtime.store.defer(WorkKind::Judge, 600).unwrap();
+        runtime.cycle().await.unwrap();
+        let listener = server.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_inventory_does_not_depend_on_or_reset_explorer_backoff() {
+        let credentials = tempfile::tempdir().unwrap();
+        let (_temp, mut runtime, _sender) = fixture_with(active_judge_config(credentials.path()));
+        let failed = runtime
+            .store
+            .fail_read(ReadScope::AssignmentEvidence, 120, 900, 0, None)
+            .unwrap();
+        let id = "a".repeat(64);
+        let inventory = response(json!({"assignments":[
+            {"answer_txid":id,"answer_epoch":8,"answer":"candidate","words":["burn"]}
+        ]}));
+        let selected = runtime.assignment(&inventory, &id).await.unwrap().unwrap();
+        assert_eq!(selected.epoch, 8);
+        assert_eq!(
+            runtime
+                .store
+                .read_backoff(ReadScope::AssignmentEvidence)
+                .unwrap(),
+            failed
+        );
+    }
+
+    #[test]
+    fn server_minimum_keeps_work_retry_stagger() {
+        let (_temp, mut runtime, _sender) = fixture();
+        runtime.config.schedule.jitter_seconds = 30;
+        runtime.config.network.chain = "retry-stagger-test".into();
+        runtime.config.network.address = format!("poa1{}", "1".repeat(32));
+        assert!(stagger(&runtime.config, "retry") > 0);
+        assert!(runtime.retry_delay(Some(900)) > 900);
+        assert!(runtime.retry_delay(Some(900)) <= 930);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn finality_pending_observation_and_hydration_cannot_bypass_read_backoff() {
+        let credentials = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = active_judge_config(credentials.path());
+        config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
+        config.capabilities.answer = Mode::ReadOnly;
+        config.capabilities.mine = Mode::ReadOnly;
+        let (_temp, mut runtime, _sender) = fixture_with(config);
+        let id = "a".repeat(64);
+        let txid = "b".repeat(64);
+        let mut confirmed = judging_operation(&mut runtime, &id, "confirmed");
+        confirmed.txid = Some(txid.clone());
+        runtime
+            .store
+            .save(&confirmed, "test_receipt_bound")
+            .unwrap();
+        let mut queued = operation(&mut runtime);
+        queued.state = "queued".into();
+        queued.job_id = Some("private-job".into());
+        runtime.store.save(&queued, "test_job_bound").unwrap();
+        let inventory = response(json!({"has_more":true,"assignments":[
+            {"answer_txid":id,"answer":"candidate-test"},
+            {"answer_txid":"c".repeat(64),"answer":"unselected"}
+        ]}));
+        let prefix = format!("GET /chain/{}", runtime.config.network.chain);
+        let server_id = id.clone();
+        let server = tokio::spawn(async move {
+            for endpoint in [
+                format!("/api/receipt/{txid}"),
+                "/api/job/private-job".into(),
+                "/api/hosted/challenge".into(),
+                "/api/hosted/assignments".into(),
+                format!("/api/explorer/tx/{server_id}"),
+            ] {
+                api_reply(
+                    &listener,
+                    &format!("{prefix}{endpoint}"),
+                    429,
+                    Some(120),
+                    json!({}),
+                )
+                .await;
+            }
+            listener
+        });
+        runtime.follow_finality().await.unwrap();
+        runtime.reconcile(&mut queued).await.unwrap();
+        runtime.observe_enabled().await.unwrap();
+        assert!(runtime.assignment(&inventory, &id).await.unwrap().is_none());
+        let listener = server.await.unwrap();
+        runtime.store = Store::open(&runtime.config).unwrap();
+        let db =
+            rusqlite::Connection::open(runtime.config.state_dir.join("state.sqlite3")).unwrap();
+        db.execute("UPDATE schedule SET next_at=0", []).unwrap();
+        drop(db);
+        runtime.follow_finality().await.unwrap();
+        runtime.cycle().await.unwrap();
+        runtime.observe_enabled().await.unwrap();
+        assert!(runtime.assignment(&inventory, &id).await.unwrap().is_none());
+        assert_eq!(runtime.store.pending().unwrap().unwrap().state, "queued");
+        for scope in [
+            ReadScope::Receipt,
+            ReadScope::Job,
+            ReadScope::Challenge,
+            ReadScope::Assignments,
+            ReadScope::AssignmentEvidence,
+        ] {
+            assert_eq!(runtime.store.read_backoff(scope).unwrap().failures, 1);
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+        expire_read_deadlines(&runtime);
+        let path = format!(
+            "GET /chain/{}/api/explorer/tx/{id}",
+            runtime.config.network.chain
+        );
+        let selected = id.clone();
+        let server = tokio::spawn(async move {
+            api_reply(&listener, &path, 200, None, json!({
+                "id":selected,"body":{"type":"challenge","epoch":7,"answer":"candidate-test","words":["burn"]}
+            })).await;
+            listener
+        });
+        let hydrated = runtime.assignment(&inventory, &id).await.unwrap().unwrap();
+        assert_eq!(hydrated.id, id);
+        assert_eq!(hydrated.epoch, 7);
+        assert_eq!(hydrated.words, vec!["burn"]);
+        assert_eq!(
+            runtime
+                .store
+                .read_backoff(ReadScope::AssignmentEvidence)
+                .unwrap()
+                .failures,
+            0
+        );
+        // Successful hydration resets only its own failure streak.
+        assert_eq!(
+            runtime.store.read_backoff(ReadScope::Job).unwrap().failures,
+            1
+        );
+        let listener = server.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn identity_stagger_is_deterministic_bounded_and_disabled_by_zero() {
+        let mut config = Config::default();
+        config.schedule.jitter_seconds = 30;
+        for phase in ["startup", "poll", "retry"] {
+            let mut offsets = std::collections::HashSet::new();
+            for index in 0..32 {
+                config.network.address = format!("poa1{index:032}");
+                let delay = stagger(&config, phase);
+                assert_eq!(delay, stagger(&config.clone(), phase));
+                assert!(delay <= 30);
+                offsets.insert(delay);
+            }
+            assert!(offsets.len() > 1);
+        }
+        config.schedule.jitter_seconds = 0;
+        for phase in ["startup", "poll", "retry"] {
+            assert_eq!(stagger(&config, phase), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn once_skips_startup_stagger_and_waits_are_shutdown_interruptible() {
+        let (_temp, mut runtime, sender) = fixture();
+        runtime.config.capabilities.answer = Mode::Off;
+        runtime.config.capabilities.judge = Mode::Off;
+        runtime.config.capabilities.mine = Mode::Off;
+        runtime.config.schedule.jitter_seconds = 30;
+        // Choose a nonzero deterministic startup offset without relying on a hash fixture.
+        while stagger(&runtime.config, "startup") < 5 {
+            runtime.config.schedule.jitter_seconds += 1;
+        }
+        std::fs::write(
+            &runtime.config_path,
+            toml::to_string(&runtime.config).unwrap(),
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_millis(500), runtime.run_loop(true))
+            .await
+            .unwrap()
+            .unwrap();
+        let stop = async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            sender.send(true).unwrap();
+        };
+        tokio::time::timeout(Duration::from_millis(500), async {
+            tokio::join!(runtime.wait_delay(60), stop);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stagger_wait_does_not_hold_pause_admission() {
+        let credentials = tempfile::tempdir().unwrap();
+        let (_temp, mut runtime, sender) = fixture_with(active_judge_config(credentials.path()));
+        let config = runtime.config.clone();
+        let pause_and_stop = async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            pause(&config).unwrap();
+            sender.send(true).unwrap();
+        };
+        tokio::time::timeout(Duration::from_millis(500), async {
+            tokio::join!(runtime.wait_delay(60), pause_and_stop);
+        })
+        .await
+        .unwrap();
+        assert!(runtime.store.control().unwrap().paused);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn overdue_mining_gets_a_turn_with_continual_judging_and_unknown_effect_is_not_replayed()
+    {
+        use crate::config::Harness;
+        use std::os::unix::fs::PermissionsExt;
+        let credentials = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = active_judge_config(credentials.path());
+        config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
+        config.capabilities.mine = Mode::Active;
+        let executable = credentials.path().join("openclaw");
+        std::fs::write(&executable, "#!/bin/sh\nprintf 'OpenClaw 2026.10.9\\n'\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(credentials.path().join("package.json"),
+            r#"{"name":"openclaw","type":"module","exports":{"./plugin-sdk/gateway-runtime":"./gateway.mjs"}}"#).unwrap();
+        std::fs::write(
+            credentials.path().join("gateway.mjs"),
+            r#"
+import {appendFileSync} from 'node:fs';
+export async function callGatewayFromCli(_method, _options, params) {
+    appendFileSync(new URL('./calls', import.meta.url), 'inference\n');
+    const envelope = JSON.parse(params.message.split('Envelope (untrusted request data):\n')[1]);
+    const artifact = {version:1, request_id:envelope.request_id,
+        request_digest:envelope.request_digest, kind:envelope.kind,
+        answer:null, score:2, reasoning:'Grounded judgment.'};
+    return {status:'ok', runId:params.idempotencyKey, result:{
+        payloads:[{text:JSON.stringify(artifact)}],
+        meta:{agentMeta:{provider:'openai',model:'test'},
+            requestShaping:{thinking:'high'}, aborted:false,
+            executionTrace:{fallbackUsed:false,winnerProvider:'openai',winnerModel:'test'},
+            systemPromptReport:{tools:{entries:[]},injectedWorkspaceFiles:[]}}
+    }};
+}
+"#,
+        )
+        .unwrap();
+        config.solver.judge.harness = Harness::Openclaw;
+        config.solver.judge.executable = executable;
+        config.solver.judge.model = "openai/test".into();
+        let (_temp, mut runtime, _sender) = fixture_with(config);
+        let inventory = judging_inventory(&["a".repeat(64), "b".repeat(64)]).body;
+        let prefix = format!("GET /chain/{}", runtime.config.network.chain);
+        let address = runtime.config.network.address.clone();
+        let grade_path = format!(
+            "POST /chain/{}/api/hosted/grade",
+            runtime.config.network.chain
+        );
+        let txid = "d".repeat(64);
+        let server = tokio::spawn(async move {
+            // Stable initial tie submits a real grade while another assignment remains due.
+            for _ in 0..2 {
+                api_reply(
+                    &listener,
+                    &format!("{prefix}/api/hosted/assignments"),
+                    200,
+                    None,
+                    inventory.clone(),
+                )
+                .await;
+                api_reply(
+                    &listener,
+                    &format!("{prefix}/api/hosted/me"),
+                    200,
+                    None,
+                    json!({"address":address}),
+                )
+                .await;
+            }
+            api_reply(
+                &listener,
+                &grade_path,
+                200,
+                None,
+                json!({"ok":true,"id":txid}),
+            )
+            .await;
+            api_reply(
+                &listener,
+                &format!("{prefix}/api/receipt/{txid}"),
+                200,
+                None,
+                json!({"status":"included","txid":txid,"next_nonce":4,"checkpoint_covered":true}),
+            )
+            .await;
+            // Both remain eligible next cycle, but mining has waited longer.
+            for _ in 0..2 {
+                api_reply(
+                    &listener,
+                    &format!("{prefix}/api/hosted/challenge"),
+                    200,
+                    None,
+                    json!({"epoch":8,"words":["burn"],"answered":true}),
+                )
+                .await;
+                api_reply(
+                    &listener,
+                    &format!("{prefix}/api/hosted/me"),
+                    200,
+                    None,
+                    json!({"address":address}),
+                )
+                .await;
+            }
+            let stream = accept_api_request(&listener, &format!("{prefix}/api/hosted/mine")).await;
+            // An actual accepted mutation loses its response: never infer completion or retry.
+            drop(stream);
+            api_reply(
+                &listener,
+                &format!("{prefix}/api/hosted/assignments"),
+                200,
+                None,
+                inventory,
+            )
+            .await;
+            listener
+        });
+        runtime.cycle().await.unwrap();
+        let mut grade = runtime.store.pending().unwrap().unwrap();
+        assert_eq!(grade.kind, WorkKind::Judge);
+        assert_eq!(grade.state, "included_pending");
+        runtime.reconcile(&mut grade).await.unwrap();
+        assert_eq!(grade.state, "final");
+        assert!(runtime.store.pending().unwrap().is_none());
+        assert_eq!(
+            std::fs::read_to_string(credentials.path().join("calls")).unwrap(),
+            "inference\n"
+        );
+        let db =
+            rusqlite::Connection::open(runtime.config.state_dir.join("state.sqlite3")).unwrap();
+        db.execute(
+            "UPDATE schedule SET next_at=?1 WHERE kind='judge'",
+            [now() - 1],
+        )
+        .unwrap();
+        drop(db);
+        let before_mine = now();
+        runtime.cycle().await.unwrap();
+        let pending = runtime.store.pending().unwrap().unwrap();
+        assert_eq!(pending.kind, WorkKind::Mine);
+        assert_eq!(pending.state, "unknown");
+        assert!(
+            runtime.store.next_at(WorkKind::Mine).unwrap()
+                >= before_mine + runtime.config.schedule.mine_seconds as i64
+        );
+        runtime.store = Store::open(&runtime.config).unwrap();
+        runtime.store.recover().unwrap();
+        for _ in 0..3 {
+            runtime.cycle().await.unwrap();
+        }
+        assert_eq!(runtime.store.pending().unwrap().unwrap().id, pending.id);
+        let listener = server.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            runtime.store.status(&runtime.config).unwrap()["operations"],
+            json!([{"kind":"judge","state":"final","count":1},
+                {"kind":"mine","state":"unknown","count":1}])
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn answer_keeps_priority_over_older_judging_and_mining() {
+        let credentials = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = active_judge_config(credentials.path());
+        config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
+        config.capabilities.answer = Mode::Active;
+        config.capabilities.mine = Mode::Active;
+        config.solver.answer.executable = credentials.path().join("absent-model");
+        let (_temp, mut runtime, _sender) = fixture_with(config);
+        let db =
+            rusqlite::Connection::open(runtime.config.state_dir.join("state.sqlite3")).unwrap();
+        db.execute(
+            "INSERT INTO schedule(kind,next_at) VALUES ('answer',?1)",
+            [now() - 1],
+        )
+        .unwrap();
+        drop(db);
+        let prefix = format!("GET /chain/{}", runtime.config.network.chain);
+        let address = runtime.config.network.address.clone();
+        let server = tokio::spawn(async move {
+            api_reply(
+                &listener,
+                &format!("{prefix}/api/hosted/challenge"),
+                200,
+                None,
+                json!({"epoch":8,"words":["burn"],"answered":false}),
+            )
+            .await;
+            api_reply(
+                &listener,
+                &format!("{prefix}/api/hosted/me"),
+                200,
+                None,
+                json!({"address":address}),
+            )
+            .await;
+            listener
+        });
+        runtime.cycle().await.unwrap();
+        let listener = server.await.unwrap();
+        assert_eq!(
+            runtime.store.status(&runtime.config).unwrap()["operations"],
+            json!([{"kind":"answer","state":"prelaunch_failed","count":1}])
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn identity_matches_persists_latest_success_mismatch_and_unavailable_result() {
+        let credentials = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = active_judge_config(credentials.path());
+        config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
+        let (_temp, mut runtime, _sender) = fixture_with(config);
+        assert_eq!(
+            runtime
+                .store
+                .status(&runtime.config)
+                .unwrap()
+                .get("hosted_identity_verified"),
+            Some(&Value::Null)
+        );
+        let path = format!("/chain/{}/api/hosted/me", runtime.config.network.chain);
+        let address = runtime.config.network.address.clone();
+        let server = tokio::spawn(async move {
+            for body in [
+                json!({"address":address}),
+                json!({"address":"different-account"}),
+                json!({"address":address}),
+            ] {
+                judging_reply(&listener, &path, body, None).await;
+            }
+            let (stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            drop(stream);
+        });
+        for matched in [true, false, true] {
+            let scheduled = runtime.store.next_at(WorkKind::Judge).unwrap();
+            let before = now();
+            assert_eq!(
+                runtime.identity_matches(WorkKind::Judge).await.unwrap(),
+                matched
+            );
+            assert_eq!(
+                runtime.store.status(&runtime.config).unwrap()["hosted_identity_verified"],
+                matched
+            );
+            let after = runtime.store.next_at(WorkKind::Judge).unwrap();
+            if matched {
+                assert_eq!(after, scheduled);
+            } else {
+                assert!(after >= before + runtime.config.schedule.retry_seconds as i64);
+                assert!(!runtime.identity_matches(WorkKind::Judge).await.unwrap());
+                expire_read_deadlines(&runtime);
+            }
+        }
+        let before = now();
+        assert!(!runtime.identity_matches(WorkKind::Judge).await.unwrap());
+        server.await.unwrap();
+        assert_eq!(
+            runtime.store.status(&runtime.config).unwrap()["hosted_identity_verified"],
+            false
+        );
+        assert!(
+            runtime
+                .store
+                .read_backoff(ReadScope::Identity)
+                .unwrap()
+                .next_at
+                >= before + runtime.config.schedule.retry_seconds as i64
+        );
+        let events = runtime.store.events(100).unwrap();
+        let events = events.as_array().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["event"] == "identity_unverified")
+                .count(),
+            1
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event["event"] == "upstream_read_failed")
+        );
+    }
+
+    #[test]
+    fn judging_selection_skips_exclusions_without_synthesizing_attempts() {
+        let (_temp, mut runtime, _sender) = fixture();
+        let ids = vec!["a".repeat(64), "b".repeat(64), "c".repeat(64)];
+        let inventory = judging_inventory(&ids);
+        runtime.config.excluded_judging_assignments = vec![ids[0].to_uppercase()];
+        for expected in [&ids[1], &ids[2], &ids[1]] {
+            assert_eq!(
+                runtime
+                    .next_judging_assignment(&inventory)
+                    .unwrap()
+                    .as_ref(),
+                Some(expected)
+            );
+        }
+        assert!(!runtime.store.attempted(WorkKind::Judge, &ids[0]).unwrap());
+        assert_eq!(
+            runtime.store.status(&runtime.config).unwrap()["operations"],
+            json!([])
+        );
+        runtime.config.excluded_judging_assignments = ids;
+        assert!(
+            runtime
+                .next_judging_assignment(&inventory)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn excluded_judgments_do_not_launch_or_block_unexcluded_model_admission() {
+        let native = tempfile::tempdir().unwrap();
+        let mut config = active_judge_config(native.path());
+        config.solver.judge.executable = native.path().join("absent-model");
+        let excluded = "a".repeat(64);
+        let allowed = "b".repeat(64);
+        config.excluded_judging_assignments = vec![excluded.clone()];
+        let (_temp, mut runtime, _sender) = fixture_with(config);
+        runtime
+            .generate(WorkKind::Judge, &excluded, judging_input(&excluded))
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime.store.status(&runtime.config).unwrap()["operations"],
+            json!([])
+        );
+        runtime
+            .generate(WorkKind::Judge, &allowed, judging_input(&allowed))
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime.store.status(&runtime.config).unwrap()["operations"],
+            json!([{"kind":"judge","state":"prelaunch_failed","count":1}])
+        );
+        assert!(!runtime.store.attempted(WorkKind::Judge, &excluded).unwrap());
+    }
+
+    #[tokio::test]
+    async fn excluded_captured_and_retryable_judgments_release_unsent_boundary() {
+        for state in ["generated", "prepared", "retry"] {
+            let id = "a".repeat(64);
+            let config = Config {
+                excluded_judging_assignments: vec![id.clone()],
+                ..Config::default()
+            };
+            let (_temp, mut runtime, _sender) = fixture_with(config);
+            let mut op = judging_operation(&mut runtime, &id, state);
+            runtime.dispatch(&mut op).await.unwrap();
+            assert_eq!(op.state, "discarded");
+            assert!(runtime.store.pending().unwrap().is_none());
+            assert!(
+                runtime
+                    .next_judging_assignment(&judging_inventory(&[id]))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cycle_discards_excluded_unsent_judgments_before_backoff_and_activity_gates() {
+        let credentials = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        for (state, mode, paused) in [
+            ("generated", Mode::Active, false),
+            ("prepared", Mode::Active, false),
+            ("retry", Mode::Active, false),
+            ("retry", Mode::Active, true),
+            ("retry", Mode::ReadOnly, false),
+            ("retry", Mode::ReadOnly, true),
+            ("retry", Mode::Off, false),
+        ] {
+            let id = "a".repeat(64);
+            let allowed = "b".repeat(64);
+            let mut config = active_judge_config(credentials.path());
+            config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
+            config.capabilities.judge = mode;
+            config.excluded_judging_assignments = vec![id.clone()];
+            let (_temp, mut runtime, _sender) = fixture_with(config);
+            let mut op = judging_operation(&mut runtime, &id, state);
+            op.next_at = not_before(86_400);
+            runtime.store.save(&op, "test_submission_backoff").unwrap();
+            runtime.store.defer(WorkKind::Judge, 86_400).unwrap();
+            let scheduled = runtime.store.next_at(WorkKind::Judge).unwrap();
+            runtime.store.set_paused(paused).unwrap();
+
+            runtime.cycle().await.unwrap();
+
+            assert!(runtime.store.pending().unwrap().is_none());
+            assert_eq!(
+                runtime.store.status(&runtime.config).unwrap()["operations"],
+                json!([{"kind":"judge","state":"discarded","count":1}])
+            );
+            assert_eq!(runtime.store.next_at(WorkKind::Judge).unwrap(), scheduled);
+            let events = runtime.store.events(100).unwrap();
+            assert_eq!(
+                events
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|event| event["event"] == "judging_assignment_excluded")
+                    .count(),
+                1
+            );
+            assert!(
+                !events
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|event| event["event"] == "dispatch_intent")
+            );
+            runtime.store.set_paused(false).unwrap();
+            judging_operation(&mut runtime, &allowed, "prepared");
+            assert_eq!(runtime.store.pending().unwrap().unwrap().key, allowed);
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cycle_preserves_excluded_ambiguous_judgments_and_reconciliation_bindings() {
+        let credentials = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        for state in [
+            "generating",
+            "dispatching",
+            "unknown",
+            "queued",
+            "included_pending",
+        ] {
+            let id = "a".repeat(64);
+            let mut config = active_judge_config(credentials.path());
+            config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
+            config.excluded_judging_assignments = vec![id.clone()];
+            let (_temp, mut runtime, _sender) = fixture_with(config);
+            let mut op = judging_operation(&mut runtime, &id, state);
+            if state == "queued" {
+                op.job_id = Some("test-job".into());
+            } else if state == "included_pending" {
+                op.txid = Some("b".repeat(64));
+            }
+            op.next_at = not_before(86_400);
+            runtime.store.save(&op, "test_submission_backoff").unwrap();
+            runtime.store.defer(WorkKind::Judge, 86_400).unwrap();
+
+            runtime.cycle().await.unwrap();
+
+            let pending = runtime.store.pending().unwrap().unwrap();
+            assert_eq!(pending.id, op.id);
+            assert_eq!(pending.state, state);
+            assert_eq!(pending.next_at, op.next_at);
+            assert_eq!(pending.request, op.request);
+            assert_eq!(pending.payload, op.payload);
+            assert_eq!(pending.job_id, op.job_id);
+            assert_eq!(pending.txid, op.txid);
+            assert!(
+                !runtime
+                    .store
+                    .events(100)
+                    .unwrap()
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|event| event["event"] == "judging_assignment_excluded")
+            );
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exclusion_hotreload_during_native_discovery_or_inference_closes_admission() {
+        use crate::config::Harness;
+        use std::os::unix::fs::PermissionsExt;
+        for during_inference in [false, true] {
+            let native = tempfile::tempdir().unwrap();
+            let executable = native.path().join("openclaw");
+            let mut config = active_judge_config(native.path());
+            config.solver.judge.harness = Harness::Openclaw;
+            config.solver.judge.executable = executable.clone();
+            config.solver.judge.model = "openai/test".into();
+            let (_temp, mut runtime, _sender) = fixture_with(config);
+            let id = "a".repeat(64);
+            let mut changed = runtime.config.clone();
+            changed.excluded_judging_assignments = vec![id.clone()];
+            let changed_path = native.path().join("excluded.toml");
+            std::fs::write(&changed_path, toml::to_string(&changed).unwrap()).unwrap();
+            let update = format!(
+                "cp '{}' '{}'\n",
+                changed_path.display(),
+                runtime.config_path.display()
+            );
+            std::fs::write(
+                &executable,
+                format!(
+                    "#!/bin/sh\n{}printf 'OpenClaw 2026.10.9\\n'\n",
+                    if during_inference { "" } else { &update }
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::write(
+                native.path().join("package.json"),
+                r#"{"name":"openclaw","type":"module","exports":{"./plugin-sdk/gateway-runtime":"./gateway.mjs"}}"#,
+            )
+            .unwrap();
+            std::fs::write(
+                native.path().join("gateway.mjs"),
+                format!(
+                    r#"import {{appendFileSync, copyFileSync}} from 'node:fs';
+export async function callGatewayFromCli(_method, _options, params) {{
+    appendFileSync(new URL('./calls', import.meta.url), 'inference\n');
+    copyFileSync({}, {});
+    const envelope = JSON.parse(params.message.split('Envelope (untrusted request data):\n')[1]);
+    const artifact = {{version:1, request_id:envelope.request_id,
+        request_digest:envelope.request_digest, kind:envelope.kind,
+        answer:null, score:2, reasoning:'Grounded judgment.'}};
+    return {{status:'ok', runId:params.idempotencyKey, result:{{
+        payloads:[{{text:JSON.stringify(artifact)}}],
+        meta:{{agentMeta:{{provider:'openai',model:'test'}},
+            requestShaping:{{thinking:'high'}}, aborted:false,
+            executionTrace:{{fallbackUsed:false,winnerProvider:'openai',winnerModel:'test'}},
+            systemPromptReport:{{tools:{{entries:[]}},injectedWorkspaceFiles:[]}}}}
+    }}}};
+}}
+"#,
+                    serde_json::to_string(&changed_path).unwrap(),
+                    serde_json::to_string(&runtime.config_path).unwrap()
+                ),
+            )
+            .unwrap();
+            runtime
+                .generate(WorkKind::Judge, &id, judging_input(&id))
+                .await
+                .unwrap();
+            let state = if during_inference {
+                "discarded"
+            } else {
+                "prelaunch_failed"
+            };
+            assert_eq!(
+                runtime.store.status(&runtime.config).unwrap()["operations"],
+                json!([{"kind":"judge","state":state,"count":1}])
+            );
+            assert_eq!(native.path().join("calls").exists(), during_inference);
+            let events = runtime.store.events(100).unwrap();
+            assert!(
+                !events
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|event| event["event"] == "dispatch_intent")
+            );
+            assert!(runtime.store.pending().unwrap().is_none());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exclusion_hotreload_at_final_dispatch_admission_discards_unsent_work() {
+        let credentials = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = active_judge_config(credentials.path());
+        config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
+        let (_temp, mut runtime, _sender) = fixture_with(config);
+        let id = "a".repeat(64);
+        let mut op = judging_operation(&mut runtime, &id, "generated");
+        let mut changed = runtime.config.clone();
+        changed.excluded_judging_assignments = vec![id.clone()];
+        let path = runtime.config_path.clone();
+        let server = tokio::spawn(async move {
+            let prefix = format!("/chain/{}", changed.network.chain);
+            judging_reply(
+                &listener,
+                &format!("{prefix}/api/hosted/assignments"),
+                judging_inventory(&[id]).body,
+                None,
+            )
+            .await;
+            judging_reply(
+                &listener,
+                &format!("{prefix}/api/hosted/me"),
+                json!({"address":changed.network.address}),
+                Some((&path, &changed)),
+            )
+            .await;
+        });
+        runtime.dispatch(&mut op).await.unwrap();
+        server.await.unwrap();
+        assert_eq!(op.state, "discarded");
+        assert!(runtime.store.pending().unwrap().is_none());
+        assert!(
+            !runtime
+                .store
+                .events(100)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|event| event["event"] == "dispatch_intent")
+        );
+    }
+
+    #[tokio::test]
+    async fn excluded_sent_judgment_keeps_job_receipt_and_unknown_reconciliation() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let id = "a".repeat(64);
+        let txid = "b".repeat(64);
+        let mut config = Config::default();
+        config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
+        config.excluded_judging_assignments = vec![id.clone()];
+        let (_temp, mut runtime, _sender) = fixture_with(config);
+        let mut op = judging_operation(&mut runtime, &id, "queued");
+        op.job_id = Some("test-job".into());
+        runtime.store.save(&op, "test_job_bound").unwrap();
+        let server = tokio::spawn(async move {
+            judging_reply(
+                &listener,
+                "/chain/poa-mainnet-1/api/job/test-job",
+                json!({"ok":true, "state":"done", "id":txid}),
+                None,
+            )
+            .await;
+            judging_reply(
+                &listener,
+                &format!("/chain/poa-mainnet-1/api/receipt/{txid}"),
+                json!({
+                    "status":"included", "txid":txid, "next_nonce":4, "checkpoint_covered":true
+                }),
+                None,
+            )
+            .await;
+        });
+        runtime.reconcile(&mut op).await.unwrap();
+        assert_eq!(op.state, "included_pending");
+        runtime.reconcile(&mut op).await.unwrap();
+        server.await.unwrap();
+        assert_eq!(op.state, "final");
+        let mut unknown = judging_operation(&mut runtime, &id, "unknown");
+        runtime.reconcile(&mut unknown).await.unwrap();
+        assert_eq!(runtime.store.pending().unwrap().unwrap().state, "unknown");
+        assert_eq!(unknown.state, "unknown");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_failure_stays_unknown_without_retry_or_private_diagnostics() {
+        use crate::config::{Harness, Mode};
+        use std::os::unix::fs::PermissionsExt;
+
+        let native = tempfile::tempdir().unwrap();
+        let executable = native.path().join("openclaw");
+        let calls = native.path().join("calls");
+        std::fs::write(&executable, "#!/bin/sh\nprintf 'OpenClaw 2026.10.9\\n'\n").unwrap();
+        std::fs::write(
+            native.path().join("package.json"),
+            r#"{"name":"openclaw","type":"module","exports":{"./plugin-sdk/gateway-runtime":"./gateway.mjs"}}"#,
+        ).unwrap();
+        std::fs::write(
+            native.path().join("gateway.mjs"),
+            "import {appendFileSync} from 'node:fs';\nexport async function callGatewayFromCli() {\nappendFileSync(new URL('./calls', import.meta.url), 'attempt\\n');\nconsole.log('private-native-stdout-canary');\nconsole.error('private-native-stderr-canary');\nthrow new Error('private-native-canary');\n}\n",
+        ).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut config = Config::default();
+        config.network.chain = format!(
+            "test-{}",
+            native
+                .path()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .replace('.', "")
+        );
+        config.network.address = format!("poa1{}", "1".repeat(32));
+        config.network.credential_file = native.path().join("key");
+        std::fs::write(&config.network.credential_file, "pk_test_fixture").unwrap();
+        std::fs::set_permissions(
+            &config.network.credential_file,
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        config.capabilities.answer = Mode::Active;
+        config.solver.answer.harness = Harness::Openclaw;
+        config.solver.answer.executable = executable;
+        config.solver.answer.model = "openai/test".into();
+        let (_temp, mut runtime, _signal) = fixture_with(config);
+        let mut input = request(WorkKind::Answer);
+        input.assignment = None;
+        input.candidate = None;
+        runtime
+            .generate(
+                WorkKind::Answer,
+                "8:fixture",
+                Input {
+                    solver: input,
+                    challenge_fingerprint: Some("fixture".into()),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(runtime.store.answer_epoch_attempted(8).unwrap());
+        assert_eq!(std::fs::read_to_string(calls).unwrap(), "attempt\n");
+        assert_eq!(
+            runtime.store.status(&runtime.config).unwrap()["operations"],
+            json!([{"kind":"answer", "state":"model_unknown", "count":1}])
+        );
+        let events = runtime.store.events(100).unwrap();
+        assert!(
+            events
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|event| event["event"] == "openclaw_exception")
+        );
+        assert!(!events.to_string().contains("private-native"));
+    }
+
+    fn operation(runtime: &mut Runtime) -> Operation {
+        let control = runtime.store.control().unwrap();
+        runtime
+            .store
+            .begin(
+                WorkKind::Answer,
+                "8:words",
+                "dispatching",
+                &json!({}),
+                control,
+                "captured-revision",
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn receipt_needs_positive_inclusion_and_nonce_evidence() {
+        assert_eq!(
+            receipt(&response(json!({"status":"included"})), "tx", "account"),
+            Receipt::Unresolved
+        );
+        assert_eq!(
+            receipt(
+                &response(json!({"status":"included","valid_in_open_window":true})),
+                "tx",
+                "account"
+            ),
+            Receipt::Unresolved
+        );
+        assert_eq!(
+            receipt(
+                &response(json!({"status":"included","valid_in_open_window":true,"next_nonce":4})),
+                "tx",
+                "account"
+            ),
+            Receipt::Included
+        );
+        assert_eq!(
+            receipt(
+                &response(json!({"status":"included","checkpoint_covered":true,"next_nonce":4})),
+                "tx",
+                "account"
+            ),
+            Receipt::Final
+        );
+    }
+
+    #[test]
+    fn receipt_cannot_cross_known_transaction_or_case_sensitive_account() {
+        let body =
+            json!({"status":"included","valid_in_open_window":true,"next_nonce":4,"txid":"other"});
+        assert_eq!(
+            receipt(&response(body), "known", "Account"),
+            Receipt::Unresolved
+        );
+        let body = json!({"status":"included","valid_in_open_window":true,"next_nonce":4,"address":"account"});
+        assert_eq!(
+            receipt(&response(body), "known", "Account"),
+            Receipt::Unresolved
+        );
+        let missing = Response {
+            status: 404,
+            body: json!({"status":"rejected"}),
+            retry_after_seconds: None,
+        };
+        assert_eq!(receipt(&missing, "known", "Account"), Receipt::Unresolved);
+    }
+
+    #[test]
+    fn generic_success_and_answered_flags_do_not_resolve_a_receipt() {
+        assert_eq!(
+            receipt(
+                &response(json!({"ok":true,"answered":true})),
+                "known",
+                "account"
+            ),
+            Receipt::Unresolved
+        );
+        assert_eq!(
+            receipt(&response(json!({"status":"rejected"})), "known", "account"),
+            Receipt::Rejected
+        );
+    }
+
+    #[test]
+    fn answer_constraints_use_protocol_utf16_and_substrings() {
+        let mut request = request(WorkKind::Answer);
+        assert!(payload(&request, &result()).is_ok());
+        request.words.clear();
+        request.min_chars = 2;
+        request.max_chars = 2;
+        let mut output = result();
+        output.answer = Some("\u{1f600}".into());
+        assert!(payload(&request, &output).is_ok());
+        request.max_chars = 1;
+        assert!(payload(&request, &output).is_err());
+    }
+
+    #[test]
+    fn judgment_never_fabricates_score_or_reasoning() {
+        let request = request(WorkKind::Judge);
+        let mut output = result();
+        assert_eq!(
+            payload(&request, &output).unwrap()["assignment"],
+            "assignment-test"
+        );
+        output.score = None;
+        assert!(payload(&request, &output).is_err());
+        output.score = Some(4);
+        assert!(payload(&request, &output).is_err());
+        output.score = Some(2);
+        output.reasoning = Some(" ".into());
+        assert!(payload(&request, &output).is_err());
+    }
+
+    #[test]
+    fn grading_refresh_binds_exact_candidate_assignment_and_answer_epoch() {
+        let request = request(WorkKind::Judge);
+        let mut assignment = Assignment {
+            id: "assignment-test".into(),
+            epoch: 8,
+            answer: "candidate-test".into(),
+            words: vec!["burn".into()],
+        };
+        assert!(assignment_matches(&assignment, &request));
+        assignment.epoch = 9;
+        assert!(!assignment_matches(&assignment, &request));
+        assignment.epoch = 8;
+        assignment.answer.push('x');
+        assert!(!assignment_matches(&assignment, &request));
+    }
+
+    #[test]
+    fn mutable_model_settings_do_not_change_identity_but_address_case_does() {
+        let mut original = Config::default();
+        original.network.address = "AccountCase".into();
+        let mut changed = original.clone();
+        changed.solver.answer.model = "different-model".into();
+        changed.capabilities.answer = Mode::Off;
+        assert!(same_identity(&original, &changed));
+        changed.network.address = "accountcase".into();
+        assert!(!same_identity(&original, &changed));
+    }
+
+    #[test]
+    fn local_status_and_events_do_not_initialize_missing_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = Config {
+            state_dir: temp.path().join("absent"),
+            ..Config::default()
+        };
+        let status = status(&config).unwrap();
+        assert_eq!(status["initialized"], false);
+        assert_eq!(status.get("hosted_identity_verified"), Some(&Value::Null));
+        assert_eq!(events(&config, 10).unwrap(), json!([]));
+        assert!(!config.state_dir.exists());
+    }
+
+    #[test]
+    fn queued_response_honors_retry_after_and_preserves_private_job() {
+        let (_temp, mut runtime, _sender) = fixture();
+        let mut op = operation(&mut runtime);
+        let before = now();
+        runtime
+            .outcome(
+                &mut op,
+                Outcome::Queued {
+                    job_id: "private-job".into(),
+                },
+                true,
+                Some(90),
+            )
+            .unwrap();
+        assert_eq!(op.state, "queued");
+        assert!(op.next_at >= before + 90);
+        assert_eq!(
+            runtime.store.pending().unwrap().unwrap().job_id.as_deref(),
+            Some("private-job")
+        );
+        runtime
+            .outcome(
+                &mut op,
+                Outcome::Queued {
+                    job_id: "other-job".into(),
+                },
+                false,
+                None,
+            )
+            .unwrap();
+        assert_eq!(op.state, "unknown");
+        assert_eq!(op.job_id.as_deref(), Some("private-job"));
+    }
+
+    #[test]
+    fn queued_retry_does_not_become_a_resubmission_intent() {
+        let (_temp, mut runtime, _sender) = fixture();
+        let mut op = operation(&mut runtime);
+        runtime
+            .outcome(
+                &mut op,
+                Outcome::Queued {
+                    job_id: "private-job".into(),
+                },
+                true,
+                None,
+            )
+            .unwrap();
+        runtime
+            .outcome(&mut op, Outcome::Retry { after_seconds: 120 }, false, None)
+            .unwrap();
+        assert_eq!(op.state, "queued");
+        assert!(op.next_at >= now() + 119);
+        runtime
+            .outcome(
+                &mut op,
+                Outcome::Unknown {
+                    reason: "private-upstream-message".into(),
+                },
+                false,
+                None,
+            )
+            .unwrap();
+        assert_eq!(op.state, "unknown");
+        assert!(
+            !runtime
+                .store
+                .events(100)
+                .unwrap()
+                .to_string()
+                .contains("private-upstream-message")
+        );
+    }
+
+    #[test]
+    fn authoritative_bound_job_expiry_permits_a_fresh_submission_only() {
+        let (_temp, mut runtime, _sender) = fixture();
+        let mut op = operation(&mut runtime);
+        op.job_id = Some("original-job".into());
+        op.payload = Some(json!({"answer":"captured answer"}));
+        op.state = "queued".into();
+        runtime
+            .outcome(&mut op, Outcome::Expired, false, Some(120))
+            .unwrap();
+        assert_eq!(op.state, "retry");
+        assert!(op.job_id.is_none());
+        assert_eq!(op.payload.as_ref().unwrap()["answer"], "captured answer");
+        assert!(op.next_at >= now() + 120);
+        runtime
+            .outcome(&mut op, Outcome::Expired, true, None)
+            .unwrap();
+        assert_eq!(op.state, "unknown");
+    }
+
+    #[test]
+    fn immutable_or_invalid_reload_keeps_effective_snapshot_and_blocks_admission() {
+        let (_temp, mut runtime, _sender) = fixture();
+        let original = runtime.config.revision().unwrap();
+        let mut changed = runtime.config.clone();
+        changed.network.chain = "different-chain".into();
+        std::fs::write(&runtime.config_path, toml::to_string(&changed).unwrap()).unwrap();
+        runtime.reload().unwrap();
+        assert!(runtime.reload_blocked);
+        assert_eq!(runtime.config.revision().unwrap(), original);
+        std::fs::write(&runtime.config_path, "private-config-canary = [").unwrap();
+        runtime.reload().unwrap();
+        assert!(
+            !runtime
+                .store
+                .events(100)
+                .unwrap()
+                .to_string()
+                .contains("private-config-canary")
+        );
+        std::fs::write(
+            &runtime.config_path,
+            toml::to_string(&runtime.config).unwrap(),
+        )
+        .unwrap();
+        runtime.reload().unwrap();
+        assert!(!runtime.reload_blocked);
+    }
+
+    #[test]
+    fn mode_reload_updates_effective_status_atomically() {
+        let (_temp, mut runtime, _sender) = fixture();
+        let mut changed = runtime.config.clone();
+        changed.capabilities.answer = Mode::Off;
+        std::fs::write(&runtime.config_path, toml::to_string(&changed).unwrap()).unwrap();
+        runtime.reload().unwrap();
+        assert!(runtime.config.mode(WorkKind::Answer) == Mode::Off);
+        let status = runtime.store.status(&changed).unwrap();
+        assert_eq!(
+            status["effective_runtime"]["revision"],
+            changed.revision().unwrap()
+        );
+        assert_eq!(status["effective_runtime"]["capabilities"]["answer"], "off");
+    }
+}

@@ -1,0 +1,45 @@
+# Copy outside the repository. Keep account credentials in a separate private file.
+# Paths are relative to this configuration file, except bare executables use PATH.
+state_dir = "./agmi-state"
+# Known assignment IDs to exclude from new judging work; root-level, before tables.
+excluded_judging_assignments = []
+
+[network]
+base_url = "https://minepoa.com"
+chain = "poa-mainnet-1"
+address = ""
+credential_file = ""
+
+[capabilities]
+answer = "read_only"
+judge = "read_only"
+mine = "read_only"
+
+[solver.answer]
+harness = "hermes"
+executable = "hermes"
+model = "gpt-6.1-sol"
+reasoning = "high"
+# Optional plain UTF-8 context; edits reload without restart.
+# guidance_file = "answer-guidance.md"
+
+[solver.judge]
+harness = "hermes"
+executable = "hermes"
+model = "gpt-6.1-sol"
+reasoning = "high"
+# guidance_file = "judge-guidance.md"
+
+[timeouts]
+http_seconds = 30
+model_seconds = 300
+shutdown_seconds = 30
+
+[schedule]
+poll_seconds = 120
+mine_seconds = 86400
+retry_seconds = 180
+# Caps exponential read backoff; base/server minimum wins, then jitter is added.
+backoff_max_seconds = 900
+# Deterministic per-identity startup/poll/retry staggering; 0 disables staggering.
+jitter_seconds = 30
