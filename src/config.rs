@@ -109,6 +109,23 @@ fn default_jitter_seconds() -> u64 {
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+pub struct Preparation {
+    /// One answer and one judge task may run locally; remote cancellation is not guaranteed.
+    pub answer_while_blocked: bool,
+    pub retry_uncertain: bool,
+    pub max_attempts_per_work: u32,
+}
+impl Default for Preparation {
+    fn default() -> Self {
+        Self {
+            answer_while_blocked: true,
+            retry_uncertain: false,
+            max_attempts_per_work: 1,
+        }
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub network: NetworkConfig,
     pub state_dir: PathBuf,
@@ -116,6 +133,7 @@ pub struct Config {
     pub solver: SolverConfig,
     pub timeouts: Timeouts,
     pub schedule: Schedule,
+    pub preparation: Preparation,
     /// Assignment transaction IDs that must never start new judging work.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub excluded_judging_assignments: Vec<String>,
@@ -134,6 +152,7 @@ impl Default for Config {
         };
         Self {
             guidance_loaded: true,
+            preparation: Preparation::default(),
             excluded_judging_assignments: Vec::new(),
             network: NetworkConfig {
                 base_url: "https://minepoa.com".into(),
@@ -200,6 +219,11 @@ impl Config {
             anyhow::anyhow!("invalid configuration: check field names, types and enum values")
         })?;
         config.validate_fields(check_guidance_paths)?;
+        for id in &mut config.excluded_judging_assignments {
+            id.make_ascii_lowercase();
+        }
+        config.excluded_judging_assignments.sort();
+        config.excluded_judging_assignments.dedup();
         let absolute = if path.is_absolute() {
             path.to_path_buf()
         } else {
@@ -230,6 +254,10 @@ impl Config {
     }
 
     fn validate_fields(&self, check_guidance_paths: bool) -> Result<()> {
+        ensure!(
+            (1..=8).contains(&self.preparation.max_attempts_per_work),
+            "preparation.max_attempts_per_work must be between 1 and 8"
+        );
         ensure!(
             self.excluded_judging_assignments
                 .iter()
@@ -487,8 +515,13 @@ pub(crate) fn validate_origin(value: &str) -> Result<reqwest::Url> {
                 .parse::<std::net::IpAddr>()
                 .is_ok_and(|ip| ip.is_loopback())
     });
-    if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
-        bail!("HTTPS required except for loopback HTTP");
+    let production = url.scheme() == "https"
+        && url.host_str() == Some("minepoa.com")
+        && url.port_or_known_default() == Some(443);
+    if !(production || (url.scheme() == "http" && loopback)) {
+        bail!(
+            "trusted origin must be https://minepoa.com or explicit loopback HTTP development origin"
+        );
     }
     Ok(url)
 }
@@ -506,7 +539,10 @@ mod tests {
         let id = "aB".repeat(32);
         std::fs::write(&path, format!("excluded_judging_assignments = ['{id}']\n")).unwrap();
         let changed = Config::load(&path).unwrap();
-        assert_eq!(changed.excluded_judging_assignments, vec![id.clone()]);
+        assert_eq!(
+            changed.excluded_judging_assignments,
+            vec![id.to_ascii_lowercase()]
+        );
         assert!(changed.judging_assignment_excluded(&id.to_lowercase()));
         assert!(!changed.judging_assignment_excluded(&"c".repeat(64)));
         assert_ne!(original.revision().unwrap(), changed.revision().unwrap());
@@ -565,6 +601,9 @@ mod tests {
     fn unsafe_origins_and_paths_are_rejected() {
         for origin in [
             "http://example.com",
+            "https://example.com",
+            "https://minepoa.com:8443",
+            "https://sub.minepoa.com",
             "https://user:secret@example.com",
             "https://example.com/api",
             "https://example.com?key=secret",
@@ -575,6 +614,7 @@ mod tests {
         }
         for origin in [
             "https://minepoa.com",
+            "https://minepoa.com:443",
             "http://127.0.0.1:8123",
             "http://[::1]:8123",
         ] {

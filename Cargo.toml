@@ -6,7 +6,7 @@ rust-version = "1.96"
 description = "Reliable, configurable MinePOA participation for autonomous agents"
 publish = false
 readme = "README.md"
-include = ["/Cargo.toml", "/Cargo.lock", "/src/**", "/adapters/**", "/README.md", "/ARCHITECTURE.md", "/CHANGELOG.md", "/SECURITY.md", "/examples/config.toml", "/examples/answer-guidance.md", "/deploy/**"]
+include = ["/Cargo.toml", "/Cargo.lock", "/build.rs", "/src/**", "/adapters/**", "/README.md", "/ARCHITECTURE.md", "/CHANGELOG.md", "/SECURITY.md", "/examples/config.toml", "/examples/answer-guidance.md", "/deploy/**"]
 
 [dependencies]
 anyhow = "1"
@@ -21,6 +21,9 @@ serde_json = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 toml = "0.9"
+
+[build-dependencies]
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"

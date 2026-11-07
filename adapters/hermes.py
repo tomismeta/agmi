@@ -53,6 +53,8 @@ def main():
                     "session_db", "side_agent", "cwd", "requested_provider"}
         if not required <= set(inspect.signature(AIAgent).parameters):
             raise RuntimeError("unsupported Hermes embedding isolation API")
+        if "system_message" not in inspect.signature(AIAgent.run_conversation).parameters:
+            raise RuntimeError("unsupported Hermes privileged policy API")
         PRELAUNCH_CODE = 79
         runtime = resolve_runtime_provider(requested="openai-codex", target_model=payload["model"])
         PRELAUNCH_CODE = 80
@@ -88,6 +90,9 @@ def main():
             if agent.reasoning_config != {"enabled": True, "effort": payload["reasoning"]}:
                 raise RuntimeError("reasoning setting changed")
             STARTED = True
+            # Policy uses the inspected native privileged channel. The user
+            # message contains only the envelope; this is not semantic validation
+            # or a claim that model prompt injection is solved.
             result = agent.run_conversation(payload["prompt"], system_message=payload["policy"])
             if (result.get("completed") is not True or result.get("partial")
                     or result.get("interrupted") or result.get("failed")):

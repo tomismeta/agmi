@@ -30,6 +30,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Inspect the compiled release identity without loading configuration.
+    BuildInfo {
+        #[arg(long)]
+        manifest: bool,
+    },
+    /// Inspect private recovery evidence or reconcile an already-bound request.
+    Recover {
+        #[command(subcommand)]
+        command: RecoveryCommand,
+    },
     /// Run the supervised participation loop using the configured modes.
     Run {
         /// Perform one bounded cycle and exit.
@@ -79,7 +89,29 @@ enum Command {
 }
 
 #[derive(Subcommand)]
+enum RecoveryCommand {
+    /// Private output includes captured payload/model text and opaque identifiers.
+    Inspect {
+        #[arg(long)]
+        operation: i64,
+    },
+    /// Adopt an intact journal while its writer is stopped.
+    Adopt,
+    /// Verify terminal evidence for an identifier already bound in the journal.
+    Resolve {
+        #[arg(long)]
+        operation: i64,
+        #[arg(long, conflicts_with = "txid")]
+        job_id: Option<String>,
+        #[arg(long)]
+        txid: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum ConfigCommand {
+    /// Print the absolute configured state location only; never open its journal.
+    StatePath,
     /// Create a read-only example configuration; refuses to overwrite a file.
     Init,
     /// Show nonsecret configuration without reading guidance files.
@@ -127,9 +159,14 @@ fn discovery() -> Value {
         {"name":"config init","network_writes":false,"local_writes":true},
         {"name":"config show","network_writes":false,"local_writes":false},
         {"name":"config check","network_writes":false,"local_writes":false},
+        {"name":"config state-path","network_writes":false,"local_writes":false,"purpose":"plain absolute state path without opening journal"},
+        {"name":"build-info","network_writes":false,"local_writes":false,"purpose":"compiled release identity; --manifest emits installer manifest verbatim"},
         {"name":"pause","network_writes":false,"local_writes":true},
         {"name":"resume","network_writes":false,"local_writes":true,"purpose":"authorize configured capabilities"},
         {"name":"recover-model","network_writes":false,"local_writes":true,"purpose":"allow regeneration of model-only work; requires stopped writer"},
+        {"name":"recover inspect","network_reads":false,"network_writes":false,"local_writes":false,"purpose":"private captured operation and evidence; may contain payload/model text"},
+        {"name":"recover adopt","network_reads":false,"network_writes":false,"local_writes":true,"purpose":"stopped-writer intact journal migration"},
+        {"name":"recover resolve","network_reads":true,"network_writes":false,"local_writes":true,"purpose":"verify authoritative terminal evidence for an already-bound request; never force-clear"},
         {"name":"logs","network_writes":false,"purpose":"sanitized local events"},
         {"name":"agents","network_writes":false,"model_calls":false},
         {"name":"commands","network_writes":false,"local_writes":false}
@@ -137,6 +174,9 @@ fn discovery() -> Value {
 }
 
 async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
+    if matches!(cli.command, Command::BuildInfo { .. }) {
+        return Ok(("build_info", runtime::build_info()));
+    }
     if matches!(cli.command, Command::Commands) {
         return Ok(("commands", discovery()));
     }
@@ -162,6 +202,28 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
         Config::load_metadata(&path)?
     };
     match &cli.command {
+        Command::Recover { command } => match command {
+            RecoveryCommand::Inspect { operation } => Ok((
+                "recovery_inspect",
+                runtime::recovery_inspect(&config, *operation)?,
+            )),
+            RecoveryCommand::Adopt => {
+                runtime::recovery_adopt(&config)?;
+                Ok((
+                    "recovery_adopt",
+                    json!({"schema":2,"uncertainty_preserved":true}),
+                ))
+            }
+            RecoveryCommand::Resolve {
+                operation,
+                job_id,
+                txid,
+            } => Ok((
+                "recovery_resolve",
+                runtime::recovery_resolve(&path, *operation, job_id.as_deref(), txid.as_deref())
+                    .await?,
+            )),
+        },
         Command::Run { once } => {
             runtime::run(&path, *once).await?;
             Ok(("run", json!({"stopped":true})))
@@ -225,7 +287,11 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
                 json!({"valid":true,"revision":config.revision()?,"network_verified":false,"auth_verified":false}),
             ))
         }
-        Command::Commands
+        Command::BuildInfo { .. }
+        | Command::Config {
+            command: ConfigCommand::StatePath,
+        }
+        | Command::Commands
         | Command::Config {
             command: ConfigCommand::Init,
         } => unreachable!(),
@@ -235,6 +301,25 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+    if matches!(cli.command, Command::BuildInfo { manifest: true }) {
+        print!("{}", include_str!(env!("AGMI_BUILD_MANIFEST_PATH")));
+        return;
+    }
+    if matches!(
+        cli.command,
+        Command::Config {
+            command: ConfigCommand::StatePath
+        }
+    ) {
+        match config_path(&cli).and_then(|path| Config::load_metadata(&path)) {
+            Ok(config) => println!("{}", config.state_dir.display()),
+            Err(_) => {
+                eprintln!("agmi: cannot read configuration metadata");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     match execute(&cli).await {
         Ok((kind, data)) => {
             let ok = kind != "health" || data["healthy"].as_bool() == Some(true);

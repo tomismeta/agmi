@@ -43,6 +43,12 @@ pub fn check(config: &Config, options: Options) -> Result<Value> {
             _ => None,
         };
         result["state_free_mib"] = json!(available);
+        if available.is_some_and(|mib| mib < options.min_free_mib.saturating_mul(4).max(512)) {
+            result["warnings"]
+                .as_array_mut()
+                .expect("health warnings array")
+                .push(json!("state_disk_headroom_low"));
+        }
         if let Some(code) = issue {
             result["issues"]
                 .as_array_mut()
@@ -52,6 +58,11 @@ pub fn check(config: &Config, options: Options) -> Result<Value> {
         }
     }
     result["thresholds"]["min_free_mib"] = json!(options.min_free_mib);
+    result["thresholds"]["warn_free_mib"] = json!(if options.min_free_mib == 0 {
+        0
+    } else {
+        options.min_free_mib.saturating_mul(4).max(512)
+    });
     result["attention_required"] = json!(
         result["healthy"].as_bool() != Some(true)
             || result["warnings"]
@@ -94,37 +105,68 @@ fn age(value: &Value, at: i64) -> Option<u64> {
         .map(|time| at.saturating_sub(time).max(0) as u64)
 }
 
+fn model_overdue(work: &Value, at: i64, poll: u64, fallback: Option<u64>) -> Option<bool> {
+    if let Some(deadline) = work["model_deadline"].as_i64() {
+        return Some(at > deadline.saturating_add(poll as i64));
+    }
+    Some(age(&work["created_at"], at)? > fallback?)
+}
+
 fn evaluate(config: &Config, options: Options, status: &Value, at: i64) -> Value {
-    // The controller heartbeat is written at cycle boundaries, not while waiting
-    // for a model. A cycle admits at most one model, plus bounded sequential HTTP
-    // reads/submission (including finality). Keep room for polling and shutdown.
-    let cycle_floor = config
-        .timeouts
-        .model_seconds
-        .saturating_add(config.timeouts.http_seconds.saturating_mul(12))
-        .saturating_add(config.schedule.poll_seconds)
-        .saturating_add(config.schedule.jitter_seconds)
-        .saturating_add(config.timeouts.shutdown_seconds)
+    // Use the running controller's policy, not a newly edited desired config.
+    // Native inference is independent and no longer expands heartbeat grace.
+    let policy = &status["effective_runtime"]["policy"];
+    let http = policy["timeouts"]["http_seconds"]
+        .as_u64()
+        .unwrap_or(config.timeouts.http_seconds);
+    let poll = policy["schedule"]["poll_seconds"]
+        .as_u64()
+        .unwrap_or(config.schedule.poll_seconds);
+    let jitter = policy["schedule"]["jitter_seconds"]
+        .as_u64()
+        .unwrap_or(config.schedule.jitter_seconds);
+    let shutdown = policy["timeouts"]["shutdown_seconds"]
+        .as_u64()
+        .unwrap_or(config.timeouts.shutdown_seconds);
+    let cycle_floor = http
+        .saturating_add(poll)
+        .saturating_add(jitter)
+        .saturating_add(shutdown)
         .saturating_add(1);
     let stale = options.stale_seconds.max(cycle_floor);
     let work_limit = options.work_seconds.max(cycle_floor);
     let grace = options.answer_grace_seconds.max(cycle_floor);
-    let model_limit = config
-        .timeouts
-        .model_seconds
-        .saturating_add(config.timeouts.shutdown_seconds)
-        .saturating_add(config.schedule.poll_seconds)
-        .saturating_add(config.schedule.jitter_seconds)
-        .saturating_add(1);
+    let model_limit = match (
+        policy["timeouts"]["model_seconds"].as_u64(),
+        policy["timeouts"]["shutdown_seconds"].as_u64(),
+        policy["schedule"]["poll_seconds"].as_u64(),
+        policy["schedule"]["jitter_seconds"].as_u64(),
+    ) {
+        (Some(model), Some(shutdown), Some(poll), Some(jitter)) => Some(
+            model
+                .saturating_add(shutdown)
+                .saturating_add(poll)
+                .saturating_add(jitter)
+                .saturating_add(1),
+        ),
+        _ => None,
+    };
     let initialized = status["initialized"].as_bool() == Some(true);
     let paused = status["paused"].as_bool() != Some(false);
     let effective = &status["effective_runtime"];
+    let effective_mode = |kind: WorkKind| {
+        effective["capabilities"][kind.as_str()]
+            .as_str()
+            .map(|mode| mode == "active")
+            .unwrap_or(config.mode(kind) == Mode::Active)
+    };
     let heartbeat_age = age(&effective["observed_at"], at);
     let observation_age = age(&status["observation"]["observed_at"], at);
     let epoch_age = age(&status["epoch_evidence"]["first_observed_at"], at);
     let pending = &status["pending"];
     let pending_age = age(&pending["created_at"], at);
     let mut issues = Vec::<&str>::new();
+    let mut warnings = Vec::<&str>::new();
     if !initialized {
         issues.push("not_initialized");
     }
@@ -160,25 +202,25 @@ fn evaluate(config: &Config, options: Options, status: &Value, at: i64) -> Value
         }
         if ![WorkKind::Answer, WorkKind::Judge, WorkKind::Mine]
             .iter()
-            .any(|kind| config.mode(*kind) == Mode::Active)
+            .any(|kind| effective_mode(*kind))
         {
             issues.push("no_active_capabilities");
         }
     }
     match pending["state"].as_str() {
         Some("unknown") => issues.push("pending_outcome_uncertain"),
-        Some("generating") if pending_age.is_some_and(|seconds| seconds > model_limit) => {
-            issues.push("model_work_overdue");
-        }
+        Some("generating") => match model_overdue(pending, at, poll, model_limit) {
+            Some(true) => issues.push("model_work_overdue"),
+            None => warnings.push("model_deadline_unavailable"),
+            _ => {}
+        },
         Some("dispatching")
-            if age(&pending["updated_at"], at).is_some_and(|seconds| {
-                seconds
-                    > config
-                        .timeouts
-                        .http_seconds
-                        .saturating_add(config.timeouts.shutdown_seconds)
-                        .saturating_add(1)
-            }) =>
+            if pending["http_deadline"].as_i64().map_or(
+                age(&pending["updated_at"], at).is_some_and(|seconds| {
+                    seconds > http.saturating_add(shutdown).saturating_add(1)
+                }),
+                |deadline| at > deadline.saturating_add(shutdown as i64),
+            ) =>
         {
             issues.push("dispatch_outcome_uncertain");
         }
@@ -188,8 +230,7 @@ fn evaluate(config: &Config, options: Options, status: &Value, at: i64) -> Value
         }
         _ => {}
     }
-    let answer_expected =
-        options.expect_participation && config.mode(WorkKind::Answer) == Mode::Active;
+    let answer_expected = options.expect_participation && effective_mode(WorkKind::Answer);
     if answer_expected {
         match observation_age {
             None => issues.push("challenge_unobserved"),
@@ -210,15 +251,37 @@ fn evaluate(config: &Config, options: Options, status: &Value, at: i64) -> Value
         .as_array()
         .into_iter()
         .flatten()
-        .filter(|row| row["state"].as_str() == Some("model_unknown"))
+        .filter(|row| {
+            matches!(
+                row["state"].as_str(),
+                Some("model_unknown" | "superseded_model_unknown")
+            )
+        })
         .fold(0_u64, |total, row| {
             total.saturating_add(row["count"].as_u64().unwrap_or(0))
         });
-    let warnings = if unresolved_models > 0 {
-        vec!["model_execution_unresolved"]
-    } else {
-        Vec::new()
-    };
+    if unresolved_models > 0 {
+        warnings.push("model_execution_unresolved");
+    }
+    let preparing = status["operations"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|row| row["state"] == "generating" && row["count"].as_u64().unwrap_or(0) > 0);
+    for work in status["captured_work"].as_array().into_iter().flatten() {
+        if work["state"] != "generating" {
+            continue;
+        }
+        match model_overdue(work, at, poll, model_limit) {
+            Some(true) if !issues.contains(&"model_work_overdue") => {
+                issues.push("model_work_overdue")
+            }
+            None if !warnings.contains(&"model_deadline_unavailable") => {
+                warnings.push("model_deadline_unavailable")
+            }
+            _ => {}
+        }
+    }
     let attention_required = !issues.is_empty() || !warnings.is_empty();
     json!({"healthy":issues.is_empty(),"checked_at":at,"issues":issues,
         "warnings":warnings,"attention_required":attention_required,
@@ -227,7 +290,18 @@ fn evaluate(config: &Config, options: Options, status: &Value, at: i64) -> Value
         "controller_stopped":status["controller_stopped"].as_bool().unwrap_or(false),
         "hosted_identity_verified":status["hosted_identity_verified"].as_bool(),
         "heartbeat_age_seconds":heartbeat_age,"observation_age_seconds":observation_age,
+        "heartbeat_recent":heartbeat_age.is_some_and(|age|age<=stale),
+        "observing":observation_age.is_some_and(|age|age<=stale),"preparing":preparing,
+        "last_safety_observation_at":status["last_safety_observation_at"],
+        "captured_work":status["captured_work"],
         "epoch_observed_age_seconds":epoch_age,"pending_age_seconds":pending_age,
+        "admission_blocked":status["admission_blocked"].as_bool().unwrap_or(false),
+        "blocking_operation":status["blocking_operation"],"blocked_since":status["blocked_since"],
+        "blocked_age_seconds":age(&status["blocked_since"],at),
+        "affected_capabilities":status["affected_capabilities"],
+        "progress_age_seconds":age(&status["last_progress_at"],at),
+        "desired_capabilities":config.capabilities,"effective_capabilities":effective["capabilities"],
+        "last_reported_build":status["last_reported_build"],"process_identity":"unverified",
         "thresholds":{"stale_seconds":stale,"work_seconds":work_limit,
             "answer_grace_seconds":grace,"model_seconds":model_limit,"cycle_floor_seconds":cycle_floor},
         "evidence":"local_only","notifications":"local_exit_status_and_journal"})
@@ -292,7 +366,6 @@ mod tests {
         let floor = evaluate(&config, options, &status, 10000)["thresholds"]["stale_seconds"]
             .as_u64()
             .unwrap();
-        assert!(floor > config.timeouts.model_seconds);
         assert!(!has(
             &evaluate(&config, options, &status, 10000 + floor as i64),
             "controller_stale"
@@ -385,6 +458,8 @@ mod tests {
             &evaluate(&config, options, &status, 10000),
             "pending_work_overdue"
         ));
+        status["effective_runtime"]["policy"] =
+            json!({"timeouts":config.timeouts,"schedule":config.schedule});
         status["pending"] = json!({"state":"generating","created_at":10000});
         let limit = evaluate(&config, options, &status, 10000)["thresholds"]["model_seconds"]
             .as_i64()
@@ -451,5 +526,62 @@ mod tests {
         let health = check(&config, Options::default()).unwrap();
         assert!(has(&health, "not_initialized"));
         assert!(!config.state_dir.exists());
+    }
+
+    #[test]
+    fn effective_modes_and_captured_deadline_override_desired_policy() {
+        let (mut config, options, mut status) = fixture();
+        config.capabilities.answer = Mode::Off;
+        config.timeouts.model_seconds = 1;
+        status["effective_runtime"]["capabilities"] =
+            json!({"answer":"active","judge":"off","mine":"off"});
+        status["pending"] =
+            json!({"kind":"answer","state":"generating","created_at":1,"model_deadline":20000});
+        let health = evaluate(&config, options, &status, 10000);
+        assert!(!has(&health, "no_active_capabilities"));
+        assert!(!has(&health, "model_work_overdue"));
+        status["admission_blocked"] = json!(true);
+        status["blocking_operation"] = json!(17);
+        status["blocked_since"] = json!(9000);
+        status["pending"] = json!({"kind":"judge","state":"unknown","created_at":9000});
+        status["operations"] = json!([{"kind":"answer","state":"generating","count":1}]);
+        let health = evaluate(&config, options, &status, 10000);
+        assert_eq!(health["healthy"], false);
+        assert_eq!(health["preparing"], true);
+        assert_eq!(health["admission_blocked"], true);
+        assert_eq!(health["blocked_age_seconds"], 1000);
+    }
+
+    #[test]
+    fn uncaptured_model_deadline_never_uses_desired_policy_as_execution_evidence() {
+        let (mut config, options, mut status) = fixture();
+        config.timeouts.model_seconds = 1;
+        config.timeouts.shutdown_seconds = 1;
+        config.schedule.poll_seconds = 1;
+        config.schedule.jitter_seconds = 0;
+        status["pending"] = json!({"state":"generating","created_at":9000});
+        let unavailable = evaluate(&config, options, &status, 10000);
+        assert!(!has(&unavailable, "model_work_overdue"));
+        assert_eq!(unavailable["thresholds"]["model_seconds"], Value::Null);
+        assert!(
+            unavailable["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v == "model_deadline_unavailable")
+        );
+        status["effective_runtime"]["policy"] = json!({
+            "timeouts":{"model_seconds":2000,"http_seconds":30,"shutdown_seconds":30},
+            "schedule":{"poll_seconds":120,"jitter_seconds":30}
+        });
+        assert!(!has(
+            &evaluate(&config, options, &status, 10000),
+            "model_work_overdue"
+        ));
+        status["pending"]["created_at"] = json!(7000);
+        assert!(has(
+            &evaluate(&config, options, &status, 10000),
+            "model_work_overdue"
+        ));
     }
 }

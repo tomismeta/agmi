@@ -36,13 +36,84 @@ pub struct Response {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
-    Queued { job_id: String },
-    Included { txid: String },
-    Rejected { code: String },
-    Retry { after_seconds: u64 },
+    Queued {
+        job_id: String,
+    },
+    Included {
+        txid: String,
+    },
+    Rejected {
+        code: String,
+    },
+    /// Terminal processed rejection is not proof of unchanged nonce.
+    ProcessedRejected {
+        code: String,
+        next_nonce: Option<u64>,
+    },
+    Retry {
+        after_seconds: u64,
+    },
     Expired,
-    Unknown { reason: String },
+    Unknown {
+        reason: String,
+    },
     Completed,
+}
+
+/// BoundJob is valid only when the identifier was durably learned from this
+/// operation's submit response. An operator-supplied capability is not binding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseSource {
+    Submit,
+    BoundJob,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DiagnosticEvidence {
+    pub stage: ResponseSource,
+    pub route: WorkKind,
+    pub status: Option<u16>,
+    pub reason: String,
+    pub retry_after_seconds: Option<u64>,
+    pub shape: String,
+    /// Diagnostic vocabulary only; it never grants retry or recovery authority.
+    #[serde(default)]
+    pub error_category: Option<String>,
+}
+
+/// Private, untrusted leads only. Deliberately no Debug: job IDs are bearer
+/// capabilities. This type must not enter public events/health or authorize
+/// reconciliation. Keep it separate from the dispatch's proven identifiers.
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct ResponseCandidates {
+    pub job_id: Option<String>,
+    pub transaction_ids: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceCoverage {
+    #[default]
+    Missing,
+    /// Supplied by the selected row; not a claim of exhaustive author history.
+    Supplied,
+    Truncated,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthorPrior {
+    pub epoch: u64,
+    pub answer_txid: String,
+    pub answer_text: String,
+    pub seed_words: Vec<String>,
+    pub text_truncated: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthorHistory {
+    pub entries: Vec<AuthorPrior>,
+    pub coverage: EvidenceCoverage,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Challenge {
@@ -60,6 +131,12 @@ pub struct Assignment {
     pub answer: String,
     /// Empty means the provider did not expose the answer's original words.
     pub words: Vec<String>,
+    #[serde(default)]
+    pub expires_at_epoch: Option<u64>,
+    #[serde(default)]
+    pub author: Option<String>,
+    #[serde(default)]
+    pub author_prior: AuthorHistory,
 }
 impl Protocol {
     pub fn new(config: &Config) -> Result<Self> {
@@ -95,6 +172,21 @@ impl Protocol {
     pub async fn get(&self, path: &str) -> Result<Response> {
         ensure!(self.allowed_read(path), "read endpoint is not allowlisted");
         self.request(Method::GET, path, None).await
+    }
+    /// Query values never enter the path allowlist. Offset inventories are
+    /// moving views, not snapshots; aggregation and coverage belong to the owner.
+    pub async fn assignment_page(&self, offset: u64, limit: u64) -> Result<Response> {
+        ensure!(
+            offset <= 10_000 && (1..=100).contains(&limit),
+            "invalid inventory page bounds"
+        );
+        self.request_query(
+            Method::GET,
+            "/api/hosted/assignments",
+            None,
+            Some((offset, limit)),
+        )
+        .await
     }
     /// Validate synchronously before the caller journals a possible network effect.
     pub fn prepare_submission<'a>(
@@ -171,8 +263,22 @@ impl Protocol {
         path: &str,
         payload: Option<&Value>,
     ) -> Result<Response> {
+        self.request_query(method, path, payload, None).await
+    }
+    async fn request_query(
+        &self,
+        method: Method,
+        path: &str,
+        payload: Option<&Value>,
+        page: Option<(u64, u64)>,
+    ) -> Result<Response> {
         let mut url = self.origin.clone();
         url.set_path(&format!("/chain/{}{}", self.chain, path));
+        if let Some((offset, limit)) = page {
+            url.query_pairs_mut()
+                .append_pair("offset", &offset.to_string())
+                .append_pair("limit", &limit.to_string());
+        }
         let mut request = self.client.request(method, url);
         if path.starts_with("/api/hosted/") {
             let key = self
@@ -241,9 +347,11 @@ impl Protocol {
 fn selected_assignment_row<'a>(response: &'a Response, id: &str) -> Result<&'a Value> {
     ensure!(valid_txid(id), "invalid selected assignment identifier");
     let rows = assignment_rows(response)?;
-    let mut selected = rows
-        .iter()
-        .filter(|row| row.get("answer_txid").and_then(Value::as_str) == Some(id));
+    let mut selected = rows.iter().filter(|row| {
+        row.get("answer_txid")
+            .and_then(Value::as_str)
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(id))
+    });
     let row = selected
         .next()
         .ok_or_else(|| anyhow::anyhow!("selected assignment is not on this page"))?;
@@ -280,7 +388,10 @@ pub fn parse_selected_assignment(
         "assignment transaction lookup unavailable"
     );
     ensure!(
-        tx.body.get("id").and_then(Value::as_str) == Some(id),
+        tx.body
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(id)),
         "assignment transaction ID mismatch"
     );
     let body = tx
@@ -299,12 +410,24 @@ pub fn parse_selected_assignment(
         body.get("answer").and_then(Value::as_str) == Some(answer),
         "assignment answer does not match transaction"
     );
+    if let Some(author) = row.get("from") {
+        ensure!(
+            body.get("from") == Some(author),
+            "assignment author does not match transaction"
+        );
+    }
     let mut bound = row.clone();
     bound["answer_epoch"] = body
         .get("epoch")
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("assignment transaction epoch missing"))?;
     if let Some(words) = body.get("words") {
+        if let Some(supplied) = row.get("words") {
+            ensure!(
+                supplied == words,
+                "assignment words do not match transaction"
+            );
+        }
         bound["words"] = words.clone();
     }
     parse_assignment(&bound)
@@ -465,8 +588,47 @@ fn max_delay(a: Option<u64>, b: Option<u64>) -> Option<u64> {
         (a, b) => a.or(b),
     }
 }
-fn valid_txid(id: &str) -> bool {
+pub(crate) fn valid_txid(id: &str) -> bool {
     id.len() == 64 && id.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+/// Only typed transaction identifiers are canonicalized. Addresses and job
+/// capabilities remain case-sensitive.
+pub fn canonical_txid(id: &str) -> Result<String> {
+    ensure!(valid_txid(id), "invalid transaction identifier");
+    Ok(id.to_ascii_lowercase())
+}
+
+#[derive(Clone, Copy)]
+pub enum RecoveryIdentifier {
+    Job,
+    Transaction,
+}
+
+/// A matching payload on an unrelated transaction is not request attribution.
+/// Only a capability/txid already durably bound to the dispatch can be used here.
+pub fn verify_recovery_identifier(
+    recorded: Option<&str>,
+    candidate: &str,
+    source: RecoveryIdentifier,
+) -> Result<String> {
+    let recorded = recorded.ok_or_else(|| anyhow::anyhow!("request attribution unavailable"))?;
+    match source {
+        RecoveryIdentifier::Job => {
+            ensure!(
+                safe_segment(candidate, 128) && recorded == candidate,
+                "job request binding mismatch"
+            );
+            Ok(candidate.to_owned())
+        }
+        RecoveryIdentifier::Transaction => {
+            let id = canonical_txid(candidate)?;
+            ensure!(
+                canonical_txid(recorded)? == id,
+                "transaction request binding mismatch"
+            );
+            Ok(id)
+        }
+    }
 }
 fn failed(body: &Value) -> bool {
     body.get("ok") == Some(&Value::Bool(false))
@@ -491,25 +653,67 @@ fn unknown(reason: &str) -> Outcome {
     }
 }
 
-pub fn classify(kind: WorkKind, response: &Response) -> Outcome {
+pub fn classify_source(kind: WorkKind, response: &Response, source: ResponseSource) -> Outcome {
     let body = &response.body;
     if !body.is_object() {
-        return unknown("unrecognized response shape");
+        return unknown("response_shape_unknown");
     }
     let code = error_code(body);
-    // Queue acknowledgement is not inclusion. Missing/malformed IDs remain unknown.
-    if response.status == 202 || (response.status == 409 && code == Some("duplicate_in_flight")) {
+    if let (Some(code), Some(error)) = (
+        body.get("code").and_then(Value::as_str),
+        body.get("error").and_then(Value::as_str),
+    ) && code != error
+    {
+        return unknown("conflicting_error_codes");
+    }
+    if body.get("state").is_some_and(|state| !state.is_string()) {
+        return unknown("job_state_unknown");
+    }
+    let state = body.get("state").and_then(Value::as_str);
+    let has_tx = ["id", "challenge_txid", "txid"]
+        .iter()
+        .any(|field| body.get(field).is_some());
+    let has_job = body.get("job_id").is_some();
+    let accepting = ["queued", "accepted"]
+        .iter()
+        .any(|field| body.get(field).is_some_and(|value| value != false))
+        || matches!(state, Some("queued" | "running" | "processing"));
+    // Acceptance evidence wins over refusal hints. Contradictory evidence must
+    // never authorize a new write, even for an otherwise known refusal code.
+    if response.status == 202 || code == Some("duplicate_in_flight") {
+        if has_tx || (failed(body) && code != Some("duplicate_in_flight")) {
+            return unknown("contradictory_acceptance");
+        }
         return body
             .get("job_id")
             .and_then(Value::as_str)
             .filter(|id| safe_segment(id, 128))
             .map(|id| Outcome::Queued { job_id: id.into() })
-            .unwrap_or_else(|| unknown("queued response has no usable job identifier"));
+            .unwrap_or_else(|| {
+                unknown(if source == ResponseSource::BoundJob {
+                    "bound_job_pending"
+                } else {
+                    "queued_identifier_missing"
+                })
+            });
     }
-    // These nonacceptance cases are documented for answer/grade, not explicit mine.
-    if kind != WorkKind::Mine {
-        if (response.status == 429 && code == Some("accept queue full"))
-            || (response.status == 503 && code == Some("epoch_closing"))
+    if source == ResponseSource::BoundJob && state != Some("done") && state != Some("expired") {
+        return unknown("bound_job_state_unknown");
+    }
+    if has_job || accepting {
+        return unknown("contradictory_acceptance");
+    }
+    if code.is_some()
+        && (body.get("ok") == Some(&Value::Bool(true))
+            || body.get("success") == Some(&Value::Bool(true)))
+    {
+        return unknown("contradictory_acceptance");
+    }
+    if kind != WorkKind::Mine && !has_tx {
+        if source == ResponseSource::Submit
+            && ((response.status == 429 && code == Some("accept queue full"))
+                || (response.status == 503 && code == Some("epoch_closing")))
+            && state.is_none()
         {
             return Outcome::Retry {
                 after_seconds: response
@@ -518,50 +722,75 @@ pub fn classify(kind: WorkKind, response: &Response) -> Outcome {
                     .max(1),
             };
         }
-        if response.status == 408
+        if source == ResponseSource::BoundJob
+            && response.status == 408
             && code == Some("job_expired")
-            && body.get("state").and_then(Value::as_str) == Some("expired")
+            && state == Some("expired")
         {
             return Outcome::Expired;
         }
         let rejected = match kind {
             WorkKind::Answer => {
                 response.status == 409
-                    && matches!(code, Some("already_answered") | Some("duplicate_answer"))
+                    && matches!(code, Some("already_answered" | "duplicate_answer"))
             }
             WorkKind::Judge => {
                 matches!(response.status, 400 | 403 | 409)
-                    && matches!(code, Some("off_panel") | Some("duplicate_grade"))
+                    && matches!(code, Some("off_panel" | "duplicate_grade"))
             }
             WorkKind::Mine => false,
         };
-        if rejected {
+        if rejected
+            && (state.is_none() || (source == ResponseSource::BoundJob && state == Some("done")))
+        {
             return Outcome::Rejected {
                 code: code.unwrap().into(),
             };
         }
+        // go.md binds a done job to the actual endpoint rejection. These exact
+        // engine reasons establish terminal processing, NOT unchanged nonce.
+        // Direct-submit vocabulary alone does not establish these semantics.
+        if source == ResponseSource::BoundJob
+            && state == Some("done")
+            && matches!(response.status, 200 | 400)
+        {
+            let terminal = match (kind, code) {
+                (WorkKind::Answer, Some("stale_seed")) => Some("stale_seed"),
+                (WorkKind::Answer, Some("challenge answer length out of bounds")) => {
+                    Some("answer_length")
+                }
+                (WorkKind::Judge, Some("duplicate sealed grade")) => Some("duplicate_sealed_grade"),
+                _ => None,
+            };
+            if let Some(code) = terminal {
+                return Outcome::ProcessedRejected {
+                    code: code.into(),
+                    next_nonce: body
+                        .get("next_nonce")
+                        .and_then(Value::as_u64)
+                        .filter(|nonce| *nonce > 0),
+                };
+            }
+        }
     }
     if response.status != 200 || failed(body) {
-        return unknown("unrecognized or unsuccessful route result");
+        return unknown("route_result_unknown");
     }
-    if body
-        .get("state")
-        .and_then(Value::as_str)
-        .is_some_and(|state| state != "done")
-    {
-        return unknown("nonterminal or unrecognized job state");
+    if state.is_some_and(|state| state != "done") {
+        return unknown("job_state_unknown");
     }
     if body.get("ok") != Some(&Value::Bool(true)) && body.get("success") != Some(&Value::Bool(true))
     {
-        return unknown("missing explicit route success");
+        return unknown("route_success_missing");
     }
     if kind == WorkKind::Mine {
-        return if body.get("ok") == Some(&Value::Bool(true))
+        return if !has_tx
+            && body.get("ok") == Some(&Value::Bool(true))
             && body.get("attested").and_then(Value::as_u64).is_some()
         {
             Outcome::Completed
         } else {
-            unknown("mine result lacks verified attestation count")
+            unknown("mine_attestation_count_missing")
         };
     }
     let field = if kind == WorkKind::Answer {
@@ -569,11 +798,107 @@ pub fn classify(kind: WorkKind, response: &Response) -> Outcome {
     } else {
         "id"
     };
+    if ["id", "challenge_txid", "txid"]
+        .iter()
+        .any(|other| *other != field && body.get(other).is_some())
+    {
+        return unknown("conflicting_transaction_identifiers");
+    }
     body.get(field)
         .and_then(Value::as_str)
-        .filter(|id| valid_txid(id))
-        .map(|id| Outcome::Included { txid: id.into() })
-        .unwrap_or_else(|| unknown("route success lacks transaction identifier"))
+        .and_then(|id| canonical_txid(id).ok())
+        .map(|txid| Outcome::Included { txid })
+        .unwrap_or_else(|| unknown("route_transaction_missing"))
+}
+
+fn response_error_category(kind: WorkKind, response: &Response) -> Option<&'static str> {
+    let code = error_code(&response.body)?;
+    match (kind, code) {
+        (WorkKind::Answer, "stale_seed") => Some("stale_seed"),
+        (WorkKind::Answer, "challenge answer length out of bounds") => Some("answer_length"),
+        (WorkKind::Judge, "duplicate sealed grade") => Some("duplicate_sealed_grade"),
+        (WorkKind::Judge, "grade queue is full") => Some("grade_queue_full"),
+        (_, "accept queue full") => Some("accept_queue_full"),
+        (_, "epoch_closing") => Some("epoch_closing"),
+        (_, "job_expired") => Some("job_expired"),
+        (_, "endpoint temporarily halted — API hardening in progress") => Some("endpoint_halted"),
+        (WorkKind::Answer, value) => {
+            let limit = value.strip_prefix("answer surface is at its global ceiling (")?;
+            let limit = limit.strip_suffix(" — retry shortly").unwrap_or(limit);
+            let number = limit.strip_suffix("/min)")?;
+            (!number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit()))
+                .then_some("answer_global_ceiling")
+        }
+        _ => None,
+    }
+}
+
+/// Static bounded labels only: never copy arbitrary errors, text or identifiers.
+pub fn response_evidence(
+    kind: WorkKind,
+    source: ResponseSource,
+    response: Option<&Response>,
+) -> DiagnosticEvidence {
+    let (reason, shape) = match response {
+        None => ("transport_unknown".to_owned(), "unavailable"),
+        Some(response) => {
+            let reason = match classify_source(kind, response, source) {
+                Outcome::Queued { .. } => "queued".into(),
+                Outcome::Included { .. } => "included".into(),
+                Outcome::Rejected { code } | Outcome::ProcessedRejected { code, .. } => code,
+                Outcome::Retry { .. } => "proven_not_accepted".into(),
+                Outcome::Expired => "bound_job_expired".into(),
+                Outcome::Unknown { reason } => reason,
+                Outcome::Completed => "completed".into(),
+            };
+            (
+                reason,
+                if response.body.is_object() {
+                    "object"
+                } else {
+                    "unavailable"
+                },
+            )
+        }
+    };
+    DiagnosticEvidence {
+        stage: source,
+        route: kind,
+        status: response.map(|r| r.status),
+        reason,
+        retry_after_seconds: response.and_then(|r| r.retry_after_seconds),
+        shape: shape.into(),
+        error_category: response
+            .and_then(|value| response_error_category(kind, value))
+            .map(str::to_owned),
+    }
+}
+
+/// Retain bounded syntactically usable leads even when the response is
+/// contradictory. This performs no attribution or outcome classification.
+pub fn response_candidates(response: &Response) -> ResponseCandidates {
+    let job_id = response
+        .body
+        .get("job_id")
+        .and_then(Value::as_str)
+        .filter(|id| safe_segment(id, 128))
+        .map(str::to_owned);
+    let mut transaction_ids = Vec::new();
+    for field in ["id", "challenge_txid", "txid"] {
+        if let Some(id) = response
+            .body
+            .get(field)
+            .and_then(Value::as_str)
+            .and_then(|id| canonical_txid(id).ok())
+            && !transaction_ids.contains(&id)
+        {
+            transaction_ids.push(id);
+        }
+    }
+    ResponseCandidates {
+        job_id,
+        transaction_ids,
+    }
 }
 
 pub fn parse_challenge(response: &Response) -> Result<Challenge> {
@@ -686,6 +1011,90 @@ fn assignment_id(row: &Value) -> Result<&str> {
         .filter(|id| valid_txid(id))
         .ok_or_else(|| anyhow::anyhow!("assignment answer_txid missing or invalid"))
 }
+/// Bounded row-local evidence only. `Supplied` means this provided list, never
+/// exhaustive lifetime history; an explicit [] differs from a missing field.
+fn parse_author_history(row: &Value) -> Result<AuthorHistory> {
+    let Some(value) = row.get("author_prior") else {
+        return Ok(AuthorHistory::default());
+    };
+    let Some(values) = value.as_array().filter(|_| {
+        row.get("from")
+            .and_then(Value::as_str)
+            .is_some_and(|author| safe_segment(author, 128))
+    }) else {
+        return Ok(AuthorHistory {
+            entries: vec![],
+            coverage: EvidenceCoverage::Truncated,
+        });
+    };
+    let candidate = assignment_id(row)?;
+    let target_epoch = row
+        .get("answer_epoch")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow::anyhow!("author history has no target epoch"))?;
+    let mut history = AuthorHistory {
+        entries: Vec::with_capacity(values.len().min(16)),
+        coverage: if values.len() > 16 {
+            EvidenceCoverage::Truncated
+        } else {
+            EvidenceCoverage::Supplied
+        },
+    };
+    let mut seen = std::collections::HashSet::new();
+    for value in values.iter().take(16) {
+        let parsed = (|| -> Result<AuthorPrior> {
+            let epoch = value
+                .get("epoch")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| anyhow::anyhow!("invalid prior epoch"))?;
+            ensure!(epoch < target_epoch, "prior epoch is not prior");
+            let answer_txid = canonical_txid(assignment_id(value)?)?;
+            ensure!(
+                !answer_txid.eq_ignore_ascii_case(candidate),
+                "candidate in prior history"
+            );
+            if let Some(author) = value.get("from") {
+                ensure!(Some(author) == row.get("from"), "prior author mismatch");
+            }
+            let text = value
+                .get("answer_text")
+                .and_then(Value::as_str)
+                .filter(|text| !text.trim().is_empty())
+                .ok_or_else(|| anyhow::anyhow!("invalid prior answer"))?;
+            // Observed provider excerpts stop at 400 UTF-16 units without a
+            // marker. Treat that boundary conservatively, not as full text.
+            let text_truncated = text.encode_utf16().count() >= 400
+                || text.ends_with('…')
+                || text.ends_with("...")
+                || value.get("truncated") == Some(&Value::Bool(true));
+            let answer_text: String = text.chars().take(2048).collect();
+            let seed_words = value
+                .get("seed_words")
+                .map(parse_words)
+                .transpose()?
+                .unwrap_or_default();
+            Ok(AuthorPrior {
+                epoch,
+                answer_txid,
+                answer_text,
+                seed_words,
+                text_truncated,
+            })
+        })();
+        match parsed {
+            Ok(entry) if seen.insert(entry.answer_txid.clone()) => {
+                if entry.text_truncated {
+                    history.coverage = EvidenceCoverage::Truncated;
+                }
+                history.entries.push(entry);
+            }
+            // Optional malformed history must not fabricate evidence or stop
+            // all judging. Explicit coverage records the discarded evidence.
+            _ => history.coverage = EvidenceCoverage::Truncated,
+        }
+    }
+    Ok(history)
+}
 fn parse_assignment(row: &Value) -> Result<Assignment> {
     let id = assignment_id(row)?;
     let epoch = row
@@ -708,10 +1117,27 @@ fn parse_assignment(row: &Value) -> Result<Assignment> {
         .transpose()?
         .unwrap_or_default();
     Ok(Assignment {
-        id: id.into(),
+        id: canonical_txid(id)?,
         epoch,
         answer: answer.into(),
         words,
+        expires_at_epoch: row
+            .pointer("/pending_meta/expires_at_epoch")
+            .map(|v| {
+                v.as_u64()
+                    .ok_or_else(|| anyhow::anyhow!("invalid assignment expiry"))
+            })
+            .transpose()?,
+        author: row
+            .get("from")
+            .map(|v| {
+                v.as_str()
+                    .filter(|author| safe_segment(author, 128))
+                    .map(str::to_owned)
+                    .ok_or_else(|| anyhow::anyhow!("invalid candidate author"))
+            })
+            .transpose()?,
+        author_prior: parse_author_history(row)?,
     })
 }
 fn ensure_unique_assignments(rows: &[Assignment]) -> Result<()> {
@@ -728,9 +1154,9 @@ pub fn assignment_ids(response: &Response) -> Result<Vec<String>> {
     let mut seen = std::collections::HashSet::with_capacity(rows.len());
     let mut ids = Vec::with_capacity(rows.len());
     for row in rows {
-        let id = assignment_id(row)?;
-        ensure!(seen.insert(id), "duplicate assignment identifier");
-        ids.push(id.to_owned());
+        let id = canonical_txid(assignment_id(row)?)?;
+        ensure!(seen.insert(id.clone()), "duplicate assignment identifier");
+        ids.push(id);
     }
     Ok(ids)
 }
@@ -761,33 +1187,34 @@ mod tests {
     fn success_is_route_specific_not_just_http_status() {
         let answer = response(200, json!({"ok":true,"challenge_txid":txid()}));
         assert!(matches!(
-            classify(WorkKind::Answer, &answer),
+            classify_source(WorkKind::Answer, &answer, ResponseSource::Submit),
             Outcome::Included { .. }
         ));
         assert!(matches!(
-            classify(WorkKind::Judge, &answer),
+            classify_source(WorkKind::Judge, &answer, ResponseSource::Submit),
             Outcome::Unknown { .. }
         ));
         assert!(matches!(
-            classify(WorkKind::Mine, &answer),
+            classify_source(WorkKind::Mine, &answer, ResponseSource::Submit),
             Outcome::Unknown { .. }
         ));
         let grade = response(200, json!({"ok":true,"id":txid()}));
         assert!(matches!(
-            classify(WorkKind::Judge, &grade),
+            classify_source(WorkKind::Judge, &grade, ResponseSource::Submit),
             Outcome::Included { .. }
         ));
         assert!(matches!(
-            classify(WorkKind::Answer, &grade),
+            classify_source(WorkKind::Answer, &grade, ResponseSource::Submit),
             Outcome::Unknown { .. }
         ));
         assert!(matches!(
-            classify(
+            classify_source(
                 WorkKind::Judge,
                 &response(
                     200,
                     json!({"ok":true,"id":"0123456789abcdef0123456789abcdef"})
-                )
+                ),
+                ResponseSource::Submit
             ),
             Outcome::Unknown { .. }
         ));
@@ -799,7 +1226,11 @@ mod tests {
             json!({"ok":true,"challenge_txid":txid(),"error":"bad_nonce"}),
         ] {
             assert!(matches!(
-                classify(WorkKind::Answer, &response(200, body)),
+                classify_source(
+                    WorkKind::Answer,
+                    &response(200, body),
+                    ResponseSource::Submit
+                ),
                 Outcome::Unknown { .. }
             ));
         }
@@ -807,18 +1238,20 @@ mod tests {
     #[test]
     fn queued_terminal_results_use_original_route() {
         assert_eq!(
-            classify(
+            classify_source(
                 WorkKind::Answer,
-                &response(202, json!({"job_id":"safe-id_1"}))
+                &response(202, json!({"job_id":"safe-id_1"})),
+                ResponseSource::Submit
             ),
             Outcome::Queued {
                 job_id: "safe-id_1".into()
             }
         );
         assert_eq!(
-            classify(
+            classify_source(
                 WorkKind::Answer,
-                &response(409, json!({"error":"duplicate_in_flight","job_id":"safe"}))
+                &response(409, json!({"error":"duplicate_in_flight","job_id":"safe"})),
+                ResponseSource::Submit
             ),
             Outcome::Queued {
                 job_id: "safe".into()
@@ -826,45 +1259,54 @@ mod tests {
         );
         for body in [json!({}), json!({"job_id":"../unsafe"})] {
             assert!(matches!(
-                classify(WorkKind::Answer, &response(202, body)),
+                classify_source(
+                    WorkKind::Answer,
+                    &response(202, body),
+                    ResponseSource::Submit
+                ),
                 Outcome::Unknown { .. }
             ));
         }
         assert!(matches!(
-            classify(
+            classify_source(
                 WorkKind::Answer,
                 &response(
                     200,
                     json!({"state":"done","ok":true,"challenge_txid":txid()})
-                )
+                ),
+                ResponseSource::BoundJob
             ),
             Outcome::Included { .. }
         ));
         assert_eq!(
-            classify(
+            classify_source(
                 WorkKind::Judge,
-                &response(200, json!({"state":"done","ok":true,"id":txid()}))
+                &response(200, json!({"state":"done","ok":true,"id":txid()})),
+                ResponseSource::BoundJob
             ),
             Outcome::Included { txid: txid() }
         );
         assert!(matches!(
-            classify(
+            classify_source(
                 WorkKind::Judge,
-                &response(409, json!({"state":"done","error":"off_panel"}))
+                &response(409, json!({"state":"done","error":"off_panel"})),
+                ResponseSource::BoundJob
             ),
             Outcome::Rejected { .. }
         ));
         assert!(matches!(
-            classify(
+            classify_source(
                 WorkKind::Answer,
-                &response(404, json!({"error":"unknown or expired job id"}))
+                &response(404, json!({"error":"unknown or expired job id"})),
+                ResponseSource::BoundJob
             ),
             Outcome::Unknown { .. }
         ));
         assert!(matches!(
-            classify(
+            classify_source(
                 WorkKind::Answer,
-                &response(408, json!({"state":"expired","error":"job_expired"}))
+                &response(408, json!({"state":"expired","error":"job_expired"})),
+                ResponseSource::BoundJob
             ),
             Outcome::Expired
         ));
@@ -875,11 +1317,11 @@ mod tests {
             let mut result = response(status, json!({"error":code}));
             result.retry_after_seconds = Some(123);
             assert_eq!(
-                classify(WorkKind::Answer, &result),
+                classify_source(WorkKind::Answer, &result, ResponseSource::Submit),
                 Outcome::Retry { after_seconds: 123 }
             );
             assert!(matches!(
-                classify(WorkKind::Mine, &result),
+                classify_source(WorkKind::Mine, &result, ResponseSource::Submit),
                 Outcome::Unknown { .. }
             ));
         }
@@ -889,7 +1331,11 @@ mod tests {
             (429, "rate_limited"),
         ] {
             assert!(matches!(
-                classify(WorkKind::Answer, &response(status, json!({"error":code}))),
+                classify_source(
+                    WorkKind::Answer,
+                    &response(status, json!({"error":code})),
+                    ResponseSource::Submit
+                ),
                 Outcome::Unknown { .. }
             ));
         }
@@ -898,9 +1344,10 @@ mod tests {
     fn mine_completion_requires_explicit_nonnegative_attestation_count() {
         for count in [0, 7] {
             assert_eq!(
-                classify(
+                classify_source(
                     WorkKind::Mine,
-                    &response(200, json!({"ok":true,"attested":count}))
+                    &response(200, json!({"ok":true,"attested":count})),
+                    ResponseSource::Submit
                 ),
                 Outcome::Completed
             );
@@ -913,7 +1360,7 @@ mod tests {
             json!({"ok":true,"attested":1,"error":"failed"}),
         ] {
             assert!(matches!(
-                classify(WorkKind::Mine, &response(200, body)),
+                classify_source(WorkKind::Mine, &response(200, body), ResponseSource::Submit),
                 Outcome::Unknown { .. }
             ));
         }
@@ -1159,7 +1606,7 @@ mod tests {
             assert_eq!(response.status, status);
             assert_eq!(response.retry_after_seconds, Some(300));
             assert!(matches!(
-                classify(WorkKind::Answer, &response),
+                classify_source(WorkKind::Answer, &response, ResponseSource::Submit),
                 Outcome::Unknown { .. }
             ));
             server.await.unwrap();
@@ -1218,5 +1665,370 @@ mod tests {
             &json!({"ordinary":"value"}),
             "pk_fixture"
         ));
+    }
+    #[test]
+    fn acceptance_evidence_prevents_refusal_retries() {
+        for body in [
+            json!({"error":"accept queue full","job_id":"capability"}),
+            json!({"error":"accept queue full","id":txid()}),
+            json!({"error":"accept queue full","accepted":true}),
+            json!({"error":"accept queue full","ok":true}),
+        ] {
+            assert!(matches!(
+                classify_source(
+                    WorkKind::Answer,
+                    &response(429, body),
+                    ResponseSource::Submit
+                ),
+                Outcome::Unknown { .. }
+            ));
+        }
+        for (status, body) in [
+            (429, json!({"error":"answer ceiling"})),
+            (429, json!({"error":"grade queue full"})),
+            (503, json!({"halted":true})),
+            (200, json!({"state":"done","error":"unspecified failure"})),
+        ] {
+            for source in [ResponseSource::Submit, ResponseSource::BoundJob] {
+                assert!(matches!(
+                    classify_source(WorkKind::Judge, &response(status, body.clone()), source),
+                    Outcome::Unknown { .. }
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn known_engine_rejections_require_bound_terminal_source() {
+        for (kind, error, code) in [
+            (WorkKind::Answer, "stale_seed", "stale_seed"),
+            (
+                WorkKind::Answer,
+                "challenge answer length out of bounds",
+                "answer_length",
+            ),
+            (
+                WorkKind::Judge,
+                "duplicate sealed grade",
+                "duplicate_sealed_grade",
+            ),
+        ] {
+            let mut result = response(400, json!({"state":"done","error":error}));
+            assert!(matches!(
+                classify_source(kind, &result, ResponseSource::Submit),
+                Outcome::Unknown { .. }
+            ));
+            assert_eq!(
+                classify_source(kind, &result, ResponseSource::BoundJob),
+                Outcome::ProcessedRejected {
+                    code: code.into(),
+                    next_nonce: None
+                }
+            );
+            result.body["next_nonce"] = json!(7);
+            assert_eq!(
+                classify_source(kind, &result, ResponseSource::BoundJob),
+                Outcome::ProcessedRejected {
+                    code: code.into(),
+                    next_nonce: Some(7)
+                }
+            );
+            result.body["id"] = json!(txid());
+            assert!(matches!(
+                classify_source(kind, &result, ResponseSource::BoundJob),
+                Outcome::Unknown { .. }
+            ));
+        }
+        let expired = response(408, json!({"state":"expired","error":"job_expired"}));
+        assert!(matches!(
+            classify_source(WorkKind::Answer, &expired, ResponseSource::Submit),
+            Outcome::Unknown { .. }
+        ));
+        assert_eq!(
+            classify_source(WorkKind::Answer, &expired, ResponseSource::BoundJob),
+            Outcome::Expired
+        );
+    }
+
+    #[test]
+    fn diagnostics_never_echo_untrusted_values() {
+        let result = response(
+            500,
+            json!({"error":"secret-canary","job_id":"secret-capability",
+            "answer":"private answer","reasoning":"private reasoning"}),
+        );
+        let evidence = serde_json::to_string(&response_evidence(
+            WorkKind::Judge,
+            ResponseSource::Submit,
+            Some(&result),
+        ))
+        .unwrap();
+        for secret in [
+            "secret-canary",
+            "secret-capability",
+            "private answer",
+            "private reasoning",
+        ] {
+            assert!(!evidence.contains(secret));
+        }
+        assert!(evidence.contains("contradictory_acceptance"));
+        assert_eq!(
+            response_evidence(WorkKind::Answer, ResponseSource::Submit, None).reason,
+            "transport_unknown"
+        );
+    }
+
+    #[test]
+    fn recognized_rate_limit_diagnostic_never_authorizes_unknown_replay() {
+        let limited = response(
+            429,
+            json!({
+                "error":"answer surface is at its global ceiling (20/min) — retry shortly",
+                "retry_after_seconds":60
+            }),
+        );
+        let diagnostic =
+            response_evidence(WorkKind::Answer, ResponseSource::Submit, Some(&limited));
+        assert_eq!(
+            diagnostic.error_category.as_deref(),
+            Some("answer_global_ceiling")
+        );
+        assert!(matches!(
+            classify_source(WorkKind::Answer, &limited, ResponseSource::Submit),
+            Outcome::Unknown { .. }
+        ));
+        let injected = response(
+            429,
+            json!({
+                "error":"answer surface is at its global ceiling (private-canary/min)"
+            }),
+        );
+        let diagnostic =
+            response_evidence(WorkKind::Answer, ResponseSource::Submit, Some(&injected));
+        assert!(diagnostic.error_category.is_none());
+        assert!(
+            !serde_json::to_string(&diagnostic)
+                .unwrap()
+                .contains("private-canary")
+        );
+    }
+
+    #[test]
+    fn recovery_requires_prior_request_attribution() {
+        assert!(
+            verify_recovery_identifier(None, "plausible-job", RecoveryIdentifier::Job).is_err()
+        );
+        assert!(verify_recovery_identifier(Some("Job"), "job", RecoveryIdentifier::Job).is_err());
+        assert!(verify_recovery_identifier(Some("Job"), "Job", RecoveryIdentifier::Job).is_ok());
+        assert_eq!(
+            verify_recovery_identifier(
+                Some(&txid()),
+                &txid().to_uppercase(),
+                RecoveryIdentifier::Transaction
+            )
+            .unwrap(),
+            txid()
+        );
+        assert!(
+            verify_recovery_identifier(
+                Some(&txid()),
+                &"b".repeat(64),
+                RecoveryIdentifier::Transaction
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn assignment_ids_and_history_are_candidate_bound() {
+        let prior = json!({"epoch":41,"answer_txid":"B".repeat(64),
+            "answer_text":"Earlier mechanism","seed_words":["clock"]});
+        let mut page = response(
+            200,
+            json!({"assignments":[
+                {"answer_txid":txid().to_uppercase(),"answer_epoch":42,"answer":"Candidate",
+                 "words":["clock"],"from":"CaseSensitiveAuthor",
+                 "pending_meta":{"expires_at_epoch":58},"author_prior":[prior]},
+                {"answer_txid":"c".repeat(64),"answer_epoch":43,"answer":"Other candidate",
+                 "words":["clock"],"from":"OtherAuthor","author_prior":[]}
+            ]}),
+        );
+        let first = parse_selected_assignment(&page, &txid(), None).unwrap();
+        assert_eq!(first.id, txid());
+        assert_eq!(first.author.as_deref(), Some("CaseSensitiveAuthor"));
+        assert_eq!(first.expires_at_epoch, Some(58));
+        assert_eq!(first.author_prior.coverage, EvidenceCoverage::Supplied);
+        assert_eq!(first.author_prior.entries[0].answer_txid, "b".repeat(64));
+        let other = parse_selected_assignment(&page, &"C".repeat(64), None).unwrap();
+        assert!(other.author_prior.entries.is_empty());
+        assert_eq!(other.author_prior.coverage, EvidenceCoverage::Supplied);
+        page.body["assignments"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("author_prior");
+        assert_eq!(
+            parse_selected_assignment(&page, &txid(), None)
+                .unwrap()
+                .author_prior
+                .coverage,
+            EvidenceCoverage::Missing
+        );
+        page.body["assignments"][0]["author_prior"] = json!([
+            {"epoch":41,"answer_txid":"b".repeat(64),"answer_text":"x".repeat(400)},
+            {"epoch":42,"answer_txid":txid(),"answer_text":"not prior"},
+            {"epoch":40,"answer_txid":"d".repeat(64),"answer_text":"wrong author","from":"OtherAuthor"}
+        ]);
+        let history = parse_selected_assignment(&page, &txid(), None)
+            .unwrap()
+            .author_prior;
+        assert_eq!(history.coverage, EvidenceCoverage::Truncated);
+        assert_eq!(history.entries.len(), 1);
+        assert!(history.entries[0].text_truncated);
+        page.body["assignments"][1]["answer_txid"] = json!(txid());
+        assert!(assignment_ids(&page).is_err());
+    }
+
+    #[tokio::test]
+    async fn hosted_page_query_is_structured_and_bounded() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = Config::default();
+        config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
+        config.timeouts.http_seconds = 2;
+        let mut protocol = Protocol::new(&config).unwrap();
+        protocol.key = Some(HeaderValue::from_static("pk_fixture"));
+        assert!(protocol.assignment_page(10_001, 1).await.is_err());
+        assert!(protocol.assignment_page(0, 101).await.is_err());
+        assert!(protocol.assignment_page(0, 0).await.is_err());
+        assert!(
+            protocol
+                .get("/api/hosted/assignments?offset=10&limit=10")
+                .await
+                .is_err()
+        );
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = [0; 4096];
+            let mut used = 0;
+            while !bytes[..used].windows(4).any(|w| w == b"\r\n\r\n") {
+                let count = stream.read(&mut bytes[used..]).await.unwrap();
+                assert!(count > 0);
+                used += count;
+            }
+            let request = std::str::from_utf8(&bytes[..used]).unwrap();
+            assert!(request.starts_with(
+                "GET /chain/poa-mainnet-1/api/hosted/assignments?offset=10&limit=10 HTTP/1.1\r\n"
+            ));
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("x-api-key: pk_fixture\r\n")
+            );
+            let body = r#"{"assignments":[],"offset":10,"limit":10,"has_more":false}"#;
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(reply.as_bytes()).await.unwrap();
+        });
+        let page = protocol.assignment_page(10, 10).await.unwrap();
+        assert_eq!(page.body["offset"], 10);
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn optional_history_stays_bounded_and_discloses_discarded_evidence() {
+        let prior: Vec<Value> = (0..17)
+            .map(|index| {
+                json!({
+                    "epoch":index,"answer_txid":format!("{index:064x}"),
+                    "answer_text":"A prior mechanism","seed_words":[]
+                })
+            })
+            .collect();
+        let mut page = response(
+            200,
+            json!({"assignments":[{
+                "answer_txid":txid(),"answer_epoch":100,"answer":"Candidate",
+                "words":["clock"],"from":"Author","author_prior":prior
+            }]}),
+        );
+        let history = parse_selected_assignment(&page, &txid(), None)
+            .unwrap()
+            .author_prior;
+        assert_eq!(history.entries.len(), 16);
+        assert_eq!(history.coverage, EvidenceCoverage::Truncated);
+        page.body["assignments"][0]["author_prior"] = json!({"unrecognized":"shape"});
+        let assignment = parse_selected_assignment(&page, &txid(), None).unwrap();
+        assert_eq!(
+            assignment.author_prior.coverage,
+            EvidenceCoverage::Truncated
+        );
+        assert!(assignment.author_prior.entries.is_empty());
+        assert_eq!(assignment.words, vec!["clock"]);
+    }
+
+    #[test]
+    fn hydration_rejects_conflicting_author_and_word_evidence() {
+        let page = response(
+            200,
+            json!({"assignments":[{
+                "answer_txid":txid(),"answer":"Candidate","from":"Author","words":["clock"]
+            }]}),
+        );
+        let mut transaction = response(
+            200,
+            json!({
+                "id":txid().to_uppercase(),
+                "body":{"type":"challenge","epoch":42,"answer":"Candidate",
+                    "from":"OtherAuthor","words":["clock"]}
+            }),
+        );
+        assert!(parse_selected_assignment(&page, &txid(), Some(&transaction)).is_err());
+        transaction.body["body"]["from"] = json!("Author");
+        transaction.body["body"]["words"] = json!(["other"]);
+        assert!(parse_selected_assignment(&page, &txid(), Some(&transaction)).is_err());
+        transaction.body["body"]["words"] = json!(["clock"]);
+        assert!(parse_selected_assignment(&page, &txid(), Some(&transaction)).is_ok());
+    }
+
+    #[test]
+    fn contradictory_identifiers_remain_private_untrusted_leads() {
+        let result = response(
+            429,
+            json!({
+                "error":"accept queue full","job_id":"private-bearer",
+                "id":txid().to_uppercase(),"challenge_txid":txid(),"txid":"b".repeat(64)
+            }),
+        );
+        let candidates = response_candidates(&result);
+        assert_eq!(candidates.job_id.as_deref(), Some("private-bearer"));
+        assert_eq!(candidates.transaction_ids, vec![txid(), "b".repeat(64)]);
+        assert!(matches!(
+            classify_source(WorkKind::Answer, &result, ResponseSource::Submit),
+            Outcome::Unknown { .. }
+        ));
+        assert!(
+            verify_recovery_identifier(
+                None,
+                candidates.job_id.as_deref().unwrap(),
+                RecoveryIdentifier::Job
+            )
+            .is_err()
+        );
+        let public = serde_json::to_string(&response_evidence(
+            WorkKind::Answer,
+            ResponseSource::Submit,
+            Some(&result),
+        ))
+        .unwrap();
+        assert!(!public.contains("private-bearer") && !public.contains(&txid()));
+        let malformed = response_candidates(&response(
+            500,
+            json!({
+                "job_id":"../unsafe","id":"bad","txid":"c".repeat(65)
+            }),
+        ));
+        assert!(malformed.job_id.is_none() && malformed.transaction_ids.is_empty());
     }
 }

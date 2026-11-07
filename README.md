@@ -42,11 +42,13 @@ Resume authorizes the configured modes; it does not turn read-only capabilities 
 
 | Capability | `active` | `read_only` | `off` |
 |---|---|---|---|
-| `answer` | Observe, generate and submit eligible answers | Observe/reconcile; no model or submission | No new work or polling |
-| `judge` | Observe assignments, generate actual judgments and submit | Observe/reconcile; no model or submission | No new work or polling |
-| `mine` | Submit hosted attestation requests at configured cadence | Observe without invoking the mutating mine endpoint | No new work or polling |
+| `answer` | Observe, prepare and submit eligible answers | Observe/reconcile; no new model or submission | No new participation or ordinary polling; safety reconciliation continues |
+| `judge` | Observe assignments, prepare judgments and submit | Observe/reconcile; no new model or submission | No new participation or ordinary polling; safety reconciliation continues |
+| `mine` | Submit hosted attestation requests at configured cadence | Observe without invoking the mutating mine endpoint | No new participation or ordinary polling; safety reconciliation continues |
 
 All-on means setting these three modes to `active`. All-read-only means setting them to `read_only`. These are combinations of the same capability policy, not separate controller implementations.
+
+Off and pause do not abandon already possibly-sent work: allowlisted identity, job and receipt reads continue. Stop the runtime for strict no-network operation; local status/health remain offline. This safety-read contract replaces the earlier off=no-polling behavior.
 
 **Local pause does not stop server-side auto-mining.** MinePOA may enable that after accepting an answer. A request already transmitted cannot be recalled. GET does not imply read-only: the hosted mine endpoint mutates network state.
 
@@ -58,6 +60,10 @@ The `[schedule]` defaults are `poll_seconds = 120`, `retry_seconds = 180`, `back
 The bounded identity offset is added after the exponential cap and server minimum, so retries remain staggered during prolonged outages. The final wait can exceed `backoff_max_seconds` by up to `jitter_seconds`, or longer when the server requires it.
 
 Startup, polling and retries include deterministic identity-based staggering, bounded by `jitter_seconds` (`0` disables it). This spreads independent identities without peer discovery, shared state or coordination; it is not a guarantee of distinct request times. Answers retain priority; when no answer is selected, judge and mine are considered oldest-due first rather than allowing a busy judging queue to continually outrank due mining. Existing eligibility, pause and unresolved-operation boundaries still apply.
+
+Preparation and wallet effects have separate lifecycles. One runtime owns all transitions, with at most one local answer task and one local judging task. Epoch observation no longer waits for a judge model call. A ready draft does not hold the wallet-effect slot; durable dispatch intent does, until bound evidence releases it. Pending mining recovery uses its own deadline, not the next daily mining time.
+
+`[preparation]` defaults to `answer_while_blocked = true`, `retry_uncertain = false`, and `max_attempts_per_work = 1` (1–8). A current answer may be prepared behind an uncertain effect but cannot be submitted through it. Raising the budget permits regeneration of a completed, correctly bound but invalid draft; uncertain inference additionally requires `retry_uncertain = true` and can incur duplicate model charges. Each launch has a distinct attempt identity; late results cannot win a superseded attempt. Local task bounds do not prove that a disconnected remote model stopped.
 
 The runtime reloads configuration at safe boundaries. Invalid edits are reported without partially applying them. Account, network origin/chain, credential reference and state directory are immutable identity boundaries for existing state. A different account needs separate configuration/state. Model changes apply to new model calls; in-flight work retains its captured configuration. Pause and capability policy are rechecked before dispatch.
 
@@ -96,7 +102,7 @@ Unsupported native contracts fail explicitly; a matching product name alone does
 
 OpenClaw uses its existing Gateway and native authentication through a small embedded Node bridge to `callGatewayFromCli`. Prompts travel over stdin, never argv. Each request is a fresh one-shot raw model run with tools, bootstrap context and delivery disabled. The Gateway chooses its configured default agent; no shared configuration is changed. Model overrides require the native `operator.admin` scope; insufficient authority fails rather than silently using another model.
 
-Choosing OpenClaw trusts that Gateway's configuration, plugins and hooks. This is not isolated execution: hooks may influence routing before inference. agmi checks the returned model, reasoning, run binding and explicit no-tool/no-bootstrap/no-fallback evidence before accepting output; that cannot undo calls already made by the trusted Gateway. Pause or timeout kills agmi's local adapter, not the shared Gateway. Remote inference may continue until its native deadline, and an uncertain attempt is never automatically replayed.
+Choosing OpenClaw trusts that Gateway's configuration, plugins and hooks. This is not isolated execution: hooks may influence routing before inference. agmi checks the returned model, reasoning, run binding and explicit no-tool/no-bootstrap/no-fallback evidence before accepting output; that cannot undo calls already made by the trusted Gateway. Hermes places policy in its native `system_message` channel. The inspected OpenClaw interface still combines policy and untrusted request data in one message; agmi does not claim privileged policy isolation or prompt-injection immunity there. Pause or timeout kills agmi's local adapter, not the shared Gateway. Remote inference may continue until its native deadline.
 
 ## Reliability boundaries
 
@@ -105,33 +111,43 @@ Choosing OpenClaw trusts that Gateway's configuration, plugins and hooks. This i
 - Queued work is polled rather than submitted again. A matching `408 job_expired` result proves it was not processed: after backoff and fresh eligibility checks, agmi may submit the captured payload again without another model call.
 - A lost response or timeout never proves nonacceptance.
 - Uncertain network writes block conflicting submissions rather than risk duplicates. Uncertain inference blocks regeneration of that work, not unrelated capabilities or a new epoch.
-- A canonical local account lock prevents cooperating agmi instances from submitting concurrently. It permanently binds an account to its durable state directory, including after shutdown; another database cannot silently replace unresolved state. This cannot restrain legacy programs or another machine.
+- A stable local writer lock and independently stored database UUID/location binding protect cooperating instances. A narrow dispatch-sequence witness detects database-only rollback across a witnessed effect boundary. Missing, replaced or behind-witness journals fail closed. Deleting/restoring all anchors, whole-host rollback and hostile same-user races are not covered.
 - Account identity is checked before writes. No automatic identity substitution or provider fallback.
 - Journal events are sanitized. Exact operation payloads and bearer-like job identifiers remain private local state.
 - Model failures use typed, allowlisted diagnostic categories, not native stderr or provider response text. Categories describe observed failure evidence; they do not prove that uncertain inference never ran or authorize regeneration.
 
-Before live activation, stop all other writers for the account. Preserve unresolved legacy records; never replay them or call them resolved without evidence. A cutover with historical uncertainty requires explicit operator authorization and checking that new work does not overlap those attempts. This does not release agmi's own uncertain-submission boundary. There is no legacy-state migration framework or state-relocation/reset command. Preserve both the state directory and canonical account binding; do not delete either to erase uncertainty. Do not restore an older database over newer pending work.
+Before live activation, stop other client writers for the account. Preserve unresolved legacy records; never replay them or call them resolved without evidence. There is no legacy-bot importer or state-reset command. agmi's own existing journal must be adopted intact through the stopped-writer `recover adopt` command; ordinary run/control commands do not implicitly upgrade it. Preserve the state directory and canonical account binding. Never restore an older database to regain availability.
 
-`model_unknown` means no MinePOA request was dispatched for that attempt. To authorize regeneration of that same work, stop the runtime, run `agmi --config ./config.local.toml recover-model`, then restart it. Recovery is journaled and may incur another model charge. It never clears an unknown, queued or possibly-sent network request. Existing pause policy is preserved.
+`model_unknown` means no MinePOA request was dispatched for that attempt. Configured uncertain-model retries are disabled by default. For explicit manual regeneration, stop the runtime, run `agmi --config ./config.local.toml recover-model`, then restart it. This preserves pause and never clears an unknown network request.
+
+`recover inspect --operation N` exposes **private** captured payloads and identifiers; do not forward that output. With the writer stopped, `recover resolve --operation N` performs authenticated read-only reconciliation of an already-bound job/transaction. Optional `--job-id` or `--txid` must match the existing journal binding; they cannot attach guessed identifiers. Source-specific terminal evidence is required. An identifier-less submission may remain blocked indefinitely without upstream request attribution or proof it can no longer execute. A classifier upgrade, nonce snapshot, elapsed timeout, assignment disappearance or model opinion cannot supply that proof.
 
 Model launch rechecks durable pause generation under the admission lock after native harness discovery, immediately before spawning inference. Pause therefore cannot acknowledge success and then allow a stale preflight to launch new inference.
 
-Assignments use the returned `answer_epoch`, never the inventory's current epoch. If target-epoch metadata is absent, agmi hydrates only the selected transaction; unavailable evidence blocks that judgment. The runtime consumes the returned page rather than requesting additional pages. An explicit `has_more=true` produces `assignment_inventory_partial`, not a claim of complete coverage. A missing pending assignment stays unresolved unless the inventory explicitly reports `has_more=false`; captured work is not discarded merely because the flag is absent.
+Assignments use the returned `answer_epoch`, never the inventory's current epoch. Bounded offset pagination deduplicates canonical transaction IDs, preserves partial coverage and prioritizes supplied expiry with deterministic ties. Moving/partial inventories never prove a sent operation failed. Missing target metadata triggers selected-transaction hydration; missing authoritative original words prevents judging. Supplied author history is candidate-bound and labelled missing, supplied or truncated; supplied does not mean exhaustive. Answer novelty context may include locally submitted text with unresolved acceptance.
 
 ## Supervision
 
-The shared installer places the binary at `~/.local/bin/agmi` and user-systemd units under `~/.config/systemd/user`. It atomically replaces installed files, but never changes configuration, credentials, state or account locks, and never starts or resumes anything:
+The Linux user-systemd installer stages versioned matching binary/unit sets under `~/.local/share/agmi/releases`. State, credentials and native authentication stay outside those release sets. Build from the Git checkout; `agmi build-info --manifest` exposes commit, dirty marker, target, schema and embedded unit/adapter checksums. These are integrity/build labels, not signed source provenance.
 
 ```sh
-sh deploy/install-user.sh ./target/release/agmi
-systemctl --user daemon-reload
-# Review ~/.config/agmi/config.toml, modes, identities and other writers first.
+sh deploy/install-user.sh stage "$PWD/target/release/agmi"
+# Set RELEASE_ID to the r-<sha256> printed by stage.
+sh deploy/install-user.sh activate "$RELEASE_ID" --stopped
+# Existing initialized journals only; skip adoption on a fresh installation.
+~/.local/bin/agmi --config ~/.config/agmi/config.toml recover adopt
 ~/.local/bin/agmi --config ~/.config/agmi/config.toml config check
-~/.local/bin/agmi --config ~/.config/agmi/config.toml resume
-systemctl --user enable --now agmi.service agmi-health.timer
+# Review modes and original pause intent. Resume only when participation is intended.
+sh deploy/install-user.sh activate "$RELEASE_ID"
+systemctl --user enable agmi.service agmi-health.timer
+sh deploy/install-user.sh status
 ```
 
-These paths and units are identical for both harnesses; only private operator configuration differs. Configure user lingering if the service must survive logout. An already-running service needs an explicit restart to load a replaced binary. Keep `TimeoutStopSec` above the configured shutdown deadline; the supplied unit uses 90 seconds. Use `agmi pause` for persistent pause before stopping the service. An ordinary process stop is not a durable change to participation policy.
+Stage never activates anything. Activate stops the units, changes one release pointer, reloads systemd and explicitly restarts; `--stopped` leaves the new release stopped for journal adoption. Neither resumes participation. Installed, loaded and running identities are reported separately. Unsupported unit overrides block activation instead of silently changing operator policy. Configure user lingering if supervision must survive logout.
+
+Adoption refuses missing, uninitialized or authority-less legacy journals; it never creates replacement history. An already-adopted intact journal is accepted idempotently. A fresh installation initializes paused state through normal `run`/control initialization instead.
+
+Releases are retained, but binary rollback requires matching journal compatibility. Schema-1 binaries must not run schema-2 journals; use a compatible release, roll forward or stop—never rewind state. Staging checks actual space for artifacts/legacy retention plus a 256 MiB journal/WAL reserve, without pruning recovery history. The unit uses `TimeoutStopSec=infinity` so systemd does not truncate captured runtime deadlines; agmi bounds shutdown, but a shutdown bug still requires operator intervention.
 
 The example uses control-group cleanup, restrictive umask, private temporary files and restart-on-failure. Account locks live under `.agmi-account-locks` in the operating-system user's canonical home, independently of the state directory and `HOME`/XDG overrides; a tighter sandbox must allow access there. The example is not a complete security sandbox for a compromised harness or local account.
 
@@ -145,9 +161,13 @@ journalctl --user --user-unit=agmi-health.service
 
 Health is a local, read-only check: no network requests, model calls, credential/guidance reads or state initialization. Unhealthy checks return nonzero with structured issues for stale/stopped execution, unresolved or overdue work, missed-answer evidence, identity failures, inactive participation and low disk space. Evidence reflects local observations, not a fresh network verification or proof of rewards. Warnings are reported separately from health failures: a healthy runtime may have warnings, and warnings alone preserve a successful exit status. Neither warnings nor a healthy result permit replaying uncertain work.
 
-Thresholds are CLI options: `--stale-seconds`, `--work-seconds`, `--answer-grace-seconds`, `--min-free-mib` and `--expect-participation`. For deliberate read-only observation use `--expect-participation false`; a live controller is still required. Timing thresholds have safety floors derived from configured model/HTTP/poll/shutdown deadlines, so a legitimate bounded cycle is not reported stalled.
+Thresholds are CLI options: `--stale-seconds`, `--work-seconds`, `--answer-grace-seconds`, `--min-free-mib` and `--expect-participation`. For deliberate read-only observation use `--expect-participation false`; a live controller is still required. Active work is evaluated against captured deadlines/effective policy rather than silently adopting a newly edited timeout. Health distinguishes desired/effective policy, heartbeat, progress and admission blocking, including its operation and age. Repeated unchanged receipts are observations, not fresh transition events.
 
-The timer runs local `health` every two minutes. Failures remain visible in its service exit status and journal. Use user-systemd overrides to change health arguments or timer cadence. The installer never activates services or sends messages.
+Controller heartbeat advances before each bounded HTTP wait, not just at the start of a potentially long cycle. Manual recovery does not refresh it or reload model guidance. Missing both captured and effective model timing produces `model_deadline_unavailable`, not a deadline guessed from desired configuration.
+
+`last_reported_build` and `heartbeat_recent` are persisted local evidence, **not proof of a currently running process**; CLI status/health report `process_identity = "unverified"`. A killed controller can leave a recent report. Use installer `status` for the independently observed systemd process/executable identity.
+
+Disk headroom warns below the larger of 512 MiB or four times `--min-free-mib`; the configured minimum remains the unhealthy floor. Zero disables both disk checks. The two-minute timer keeps failures local in exit status/journal. Agents own any forwarding; agmi does not add a notification transport.
 
 ### Agent-owned forwarding
 
@@ -157,14 +177,20 @@ Local health remains read-only even when another agent consumes its output. Forw
 
 ## Verification and publication
 
-Tests require Node.js for native transport fixtures, but no OpenClaw installation or live credentials.
+Tests require Node.js and Python 3 for native/process fixtures, but no OpenClaw installation or live credentials.
 
 ```sh
 cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 cargo fmt --all -- --check
+cargo build --locked
+python3 tests/recovery_smoke.py target/debug/agmi
+python3 tests/recovery_smoke.py target/debug/agmi --bound-job
+python3 tests/recovery_smoke.py target/debug/agmi --stalled-judge
 cargo package --locked --list --allow-dirty
 ```
+
+The process fixture also supports `--harness hermes` for its Python-only fake native transport; this does not require Node.js or a real Hermes account. Native authentication still needs separate real-harness acceptance.
 
 Local protocol/model fixtures exercise deterministic lifecycle boundaries; they do not prove production authentication or live network outcomes. Production activation needs separate end-to-end verification with the real account and configured harness.
 

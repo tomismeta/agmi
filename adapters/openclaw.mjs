@@ -25,6 +25,8 @@ try {
   if (typeof callGatewayFromCli !== 'function') throw new Error('unsupported native API');
   const runId = randomUUID();
   started = true;
+  // The inspected agent API exposes a single message, not a privileged policy
+  // field. Rust combines policy and envelope here without claiming isolation.
   const response = await callGatewayFromCli('agent', {
     json: true,
     timeout: String(request.timeout_seconds * 1000),

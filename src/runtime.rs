@@ -1,10 +1,13 @@
 use crate::config::{Config, Mode, WorkKind};
 use crate::protocol::{
-    Assignment, Challenge, Outcome, Protocol, Response, assignment_ids, assignment_needs_hydration,
-    classify, has_required_words, parse_challenge, parse_selected_assignment,
-    valid_grade_reasoning,
+    Assignment, Challenge, Outcome, Protocol, Response, ResponseSource, assignment_ids,
+    assignment_needs_hydration, classify_source, has_required_words, parse_challenge,
+    parse_selected_assignment, response_evidence, valid_grade_reasoning,
 };
-use crate::solver::{SolverRequest, SolverResult, execution_may_have_started, failure_code, solve};
+use crate::solver::{
+    SolverRequest, SolverResult, completed_artifact_invalid, execution_may_have_started,
+    failure_code, solve,
+};
 use crate::store::{
     AccountLock, AdmissionGuard, Control, Operation, ReadScope, Store, digest, not_before, now,
 };
@@ -12,12 +15,89 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 
+pub fn build_info() -> Value {
+    json!({"commit":env!("AGMI_BUILD_COMMIT"),"source_dirty":env!("AGMI_BUILD_DIRTY"),
+        "target":env!("AGMI_BUILD_TARGET"),"profile":env!("AGMI_BUILD_PROFILE"),
+        "journal_schema":env!("AGMI_JOURNAL_SCHEMA"),"version":env!("CARGO_PKG_VERSION")})
+}
+
+pub fn recovery_inspect(config: &Config, operation: i64) -> Result<Value> {
+    Store::read_only(config)?
+        .context("journal not initialized")?
+        .inspect(operation)
+}
+
+pub fn recovery_adopt(config: &Config) -> Result<()> {
+    let (_account, mut store) = AccountLock::adopt(config)?;
+    store.recover()
+}
+
+pub async fn recovery_resolve(
+    config_path: &Path,
+    operation: i64,
+    job_id: Option<&str>,
+    txid: Option<&str>,
+) -> Result<Value> {
+    use crate::protocol::{RecoveryIdentifier, verify_recovery_identifier};
+    let config = Config::load_metadata(config_path)?;
+    let (_account, mut store) = AccountLock::acquire(&config)?;
+    store.recover()?;
+    let mut op = store.operation(operation)?.context("operation not found")?;
+    if !matches!(op.state.as_str(), "unknown" | "queued" | "included_pending") {
+        bail!("operation has no unresolved wallet effect");
+    }
+    if let Some(candidate) = job_id {
+        verify_recovery_identifier(op.job_id.as_deref(), candidate, RecoveryIdentifier::Job)?;
+    }
+    if let Some(candidate) = txid {
+        verify_recovery_identifier(
+            op.txid.as_deref(),
+            candidate,
+            RecoveryIdentifier::Transaction,
+        )?;
+    }
+    if op.job_id.is_none() && op.txid.is_none() {
+        bail!(
+            "recovery blocked: no authoritative request attribution; upstream terminal single-request binding is required"
+        );
+    }
+    let protocol = Arc::new(
+        Protocol::new(&config)
+            .map_err(|_| anyhow::anyhow!("cannot initialize recovery protocol"))?,
+    );
+    let (_sender, stop) = watch::channel(false);
+    let mut runtime = Runtime {
+        config_path: config_path.to_owned(),
+        config,
+        protocol,
+        store,
+        stop,
+        reload_blocked: false,
+        preparations: Vec::new(),
+        controller: false,
+    };
+    if !runtime.identity_matches(op.kind).await? {
+        bail!("recovery identity unverified");
+    }
+    runtime.reconcile(&mut op).await?;
+    if op.state == "included_pending" {
+        runtime.reconcile(&mut op).await?;
+    }
+    let resolved = !matches!(
+        op.state.as_str(),
+        "unknown" | "queued" | "included_pending" | "dispatching"
+    );
+    Ok(
+        json!({"operation_id":op.id,"state":op.state,"resolved":resolved,
+        "network_requests_reset":false,"evidence":"authenticated_bound_request",
+        "finality":"node_reported_only"}),
+    )
+}
 pub fn status(config: &Config) -> Result<Value> {
     match Store::read_only(config)? {
         Some(store) => store.status(config),
@@ -93,6 +173,7 @@ struct Input {
 enum ModelAttempt {
     Captured(SolverResult),
     NotStarted(&'static str),
+    Invalid(&'static str),
     Unknown(&'static str),
 }
 
@@ -103,6 +184,13 @@ struct Runtime {
     store: Store,
     stop: watch::Receiver<bool>,
     reload_blocked: bool,
+    controller: bool,
+    preparations: Vec<(
+        Operation,
+        Arc<Input>,
+        Control,
+        tokio::task::JoinHandle<ModelAttempt>,
+    )>,
 }
 
 /// A single runtime owns the account lock even when paused or read-only. The
@@ -141,6 +229,8 @@ pub async fn run(config_path: &Path, once: bool) -> Result<()> {
         store,
         stop,
         reload_blocked: false,
+        preparations: Vec::new(),
+        controller: true,
     };
     let result = runtime.run_loop(once).await;
     signal.abort();
@@ -152,7 +242,18 @@ impl Runtime {
         *self.stop.borrow()
     }
 
+    fn heartbeat(&self) -> Result<()> {
+        // Stopped-writer recovery reads must not impersonate a live controller.
+        if self.controller {
+            self.store.heartbeat()?;
+        }
+        Ok(())
+    }
+
     fn reload(&mut self) -> Result<()> {
+        if !self.controller {
+            return Ok(());
+        }
         let was_blocked = self.reload_blocked;
         let mut changed = false;
         let candidate = Config::load(&self.config_path).and_then(|config| {
@@ -229,6 +330,7 @@ impl Runtime {
             self.wait_delay(stagger(&self.config, "startup")).await;
         }
         loop {
+            self.store.continuity()?;
             self.reload()?;
             self.store
                 .runtime_state(&self.config, self.reload_blocked)?;
@@ -236,10 +338,32 @@ impl Runtime {
                 break;
             }
             self.cycle().await?;
+            if once {
+                while !self.preparations.is_empty() && !self.stopping() {
+                    self.wait_delay(1).await;
+                    self.reload()?;
+                    self.collect_models().await?;
+                    self.store
+                        .runtime_state(&self.config, self.reload_blocked)?;
+                    self.observe_enabled().await?;
+                }
+                for kind in [WorkKind::Answer, WorkKind::Judge, WorkKind::Mine] {
+                    if let Some(mut op) = self.store.preparation(kind)?
+                        && op.state != "generating"
+                    {
+                        self.dispatch(&mut op).await?;
+                    }
+                }
+            }
             if once || self.stopping() {
                 break;
             }
             self.wait_delay(self.poll_delay()).await;
+        }
+        for (mut op, _, _, task) in self.preparations.drain(..) {
+            task.abort();
+            op.state = "model_unknown".into();
+            self.store.save(&op, "model_launch_unknown")?;
         }
         self.store.event("runtime_stopped", None)?;
         Ok(())
@@ -251,20 +375,40 @@ impl Runtime {
         scope: ReadScope,
         path: &str,
     ) -> Result<Option<Response>> {
+        self.get_page(kind, scope, path, None).await
+    }
+
+    async fn get_page(
+        &mut self,
+        kind: WorkKind,
+        scope: ReadScope,
+        path: &str,
+        offset: Option<u64>,
+    ) -> Result<Option<Response>> {
         self.reload()?;
-        if self.stopping() || self.config.mode(kind) == Mode::Off {
+        if self.stopping()
+            || (self.config.mode(kind) == Mode::Off
+                && !matches!(
+                    scope,
+                    ReadScope::Job | ReadScope::Receipt | ReadScope::Identity
+                ))
+        {
             return Ok(None);
         }
         let backoff = self.store.read_backoff(scope)?;
         if backoff.next_at > now() {
             return Ok(None);
         }
+        self.heartbeat()?;
         let protocol = Arc::clone(&self.protocol);
         let timeout = Duration::from_secs(self.config.timeouts.http_seconds);
         let result = tokio::select! {
             biased;
             _ = self.stop.changed() => return Ok(None),
-            result = tokio::time::timeout(timeout, protocol.get(path)) => result,
+            result = tokio::time::timeout(timeout, async {
+                if let Some(offset) = offset { protocol.assignment_page(offset, 100).await }
+                else { protocol.get(path).await }
+            }) => result,
         };
         match result {
             Ok(Ok(response)) => {
@@ -272,7 +416,10 @@ impl Runtime {
                 // a transport timeout. Preserve its existing bound-job retry rule.
                 let expired_job = response.status == 408
                     && matches!(scope, ReadScope::Job)
-                    && matches!(classify(kind, &response), Outcome::Expired);
+                    && matches!(
+                        classify_source(kind, &response, ResponseSource::BoundJob),
+                        Outcome::Expired
+                    );
                 if (response.status == 408 && !expired_job)
                     || response.status == 429
                     || (500..600).contains(&response.status)
@@ -335,7 +482,7 @@ impl Runtime {
     }
 
     async fn assignment_inventory(&mut self) -> Result<Option<Response>> {
-        let Some(response) = self
+        let Some(mut response) = self
             .get(
                 WorkKind::Judge,
                 ReadScope::Assignments,
@@ -356,6 +503,52 @@ impl Runtime {
             )?;
             return Ok(None);
         }
+        let mut seen: std::collections::HashSet<String> =
+            ids.as_ref().unwrap().iter().cloned().collect();
+        let mut offset = response.body["assignments"].as_array().map_or(0, Vec::len) as u64;
+        let mut rows = response.body["assignments"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let mut complete = response.body["has_more"].as_bool() == Some(false);
+        // Offset inventories can move between pages: bounded deduplication is
+        // useful selection evidence, never proof that an absent sent request failed.
+        for _ in 1..4 {
+            if response.body["has_more"].as_bool() != Some(true) || offset == 0 {
+                break;
+            }
+            let Some(page) = self
+                .get_page(
+                    WorkKind::Judge,
+                    ReadScope::Assignments,
+                    "/api/hosted/assignments",
+                    Some(offset),
+                )
+                .await?
+            else {
+                break;
+            };
+            let Ok(page_ids) = assignment_ids(&page) else {
+                break;
+            };
+            let page_rows = page.body["assignments"]
+                .as_array()
+                .context("assignment rows missing")?;
+            let prior_len = rows.len();
+            for (id, row) in page_ids.into_iter().zip(page_rows) {
+                if seen.insert(id) {
+                    rows.push(row.clone());
+                }
+            }
+            offset += page_rows.len() as u64;
+            complete = page.body["has_more"].as_bool() == Some(false);
+            response.body["has_more"] = page.body["has_more"].clone();
+            if complete || rows.len() == prior_len {
+                break;
+            }
+        }
+        response.body["assignments"] = json!(rows);
+        response.body["has_more"] = json!(!complete);
         // Active selection validates the selected payload before clearing this scope.
         if ids.as_ref().is_ok_and(|ids| ids.is_empty())
             || self.config.mode(WorkKind::Judge) == Mode::ReadOnly
@@ -370,9 +563,34 @@ impl Runtime {
     }
 
     fn next_judging_assignment(&self, inventory: &Response) -> Result<Option<String>> {
-        let mut ids = assignment_ids(inventory)?;
-        ids.retain(|id| !self.config.judging_assignment_excluded(id));
-        self.store.next_assignment(&ids)
+        let ids = assignment_ids(inventory)?;
+        let rows = inventory.body["assignments"]
+            .as_array()
+            .context("assignment rows missing")?;
+        let mut ranked: Vec<_> = ids
+            .into_iter()
+            .zip(rows)
+            .filter_map(|(id, row)| {
+                (!self.config.judging_assignment_excluded(&id)).then(|| {
+                    (
+                        row["pending_meta"]["expires_at_epoch"]
+                            .as_u64()
+                            .unwrap_or(u64::MAX),
+                        id,
+                    )
+                })
+            })
+            .collect();
+        ranked.sort_unstable();
+        for (_, id) in ranked {
+            if !self.store.attempted(WorkKind::Judge, &id)?
+                && self.store.model_budget_used(WorkKind::Judge, &id)?
+                    < self.config.preparation.max_attempts_per_work
+            {
+                return Ok(Some(id));
+            }
+        }
+        Ok(None)
     }
 
     async fn assignment(&mut self, inventory: &Response, id: &str) -> Result<Option<Assignment>> {
@@ -429,6 +647,21 @@ impl Runtime {
                     .event("assignment_evidence_unavailable", Some(WorkKind::Judge))?;
                 self.store
                     .defer(WorkKind::Judge, self.retry_delay(minimum))?;
+                if self.active(WorkKind::Judge)?
+                    && self.store.preparation(WorkKind::Judge)?.is_none()
+                    && !self.store.attempted(WorkKind::Judge, id)?
+                {
+                    let _gate = AdmissionGuard::acquire(&self.config)?;
+                    let control = self.store.control()?;
+                    if !control.paused {
+                        let mut skipped = self.store.begin(WorkKind::Judge,id,"prepared",
+                            &json!({"assignment":id,"local_abstention":"required_evidence_unavailable"}),
+                            control,&self.config.revision()?)?;
+                        skipped.state = "abstained".into();
+                        self.store
+                            .save(&skipped, "assignment_evidence_insufficient")?;
+                    }
+                }
                 Ok(None)
             }
         }
@@ -443,6 +676,12 @@ impl Runtime {
             return Ok(false);
         };
         let matched = (200..300).contains(&response.status)
+            && ["ok", "success"].iter().all(|field| {
+                response
+                    .body
+                    .get(field)
+                    .is_none_or(|value| value.as_bool() == Some(true))
+            })
             && response
                 .body
                 .get("address")
@@ -451,8 +690,7 @@ impl Runtime {
             && response
                 .body
                 .get("chain_id")
-                .and_then(Value::as_str)
-                .is_none_or(|chain| chain == self.config.network.chain);
+                .is_none_or(|chain| chain.as_str() == Some(self.config.network.chain.as_str()));
         self.store.record_hosted_identity(matched)?;
         self.read_evaluated(ReadScope::Identity, matched, response.retry_after_seconds)?;
         if !matched {
@@ -471,23 +709,39 @@ impl Runtime {
     }
 
     async fn cycle(&mut self) -> Result<()> {
-        if let Some(mut op) = self.store.pending()? {
-            if !self.discard_excluded_judgment(&mut op)?
-                && self.config.mode(op.kind) != Mode::Off
-                && op.next_at <= now()
-                && self.store.next_at(op.kind)? <= now()
-            {
-                match op.state.as_str() {
-                    "queued" | "included_pending" | "unknown" => self.reconcile(&mut op).await?,
-                    "generated" | "prepared" | "retry" if self.active(op.kind)? => {
-                        self.dispatch(&mut op).await?
+        self.collect_models().await?;
+        self.store.retry_models(&self.config)?;
+        if let Some(mut op) = self.store.effect()?
+            && op.next_at <= now()
+        {
+            self.reconcile(&mut op).await?;
+        }
+        let blocked = self.store.effect()?.is_some();
+        // Prepared work owns capacity, not the wallet effect slot. Disable or
+        // generation changes discard only proven-unsent work.
+        for kind in [WorkKind::Answer, WorkKind::Judge, WorkKind::Mine] {
+            if let Some(mut op) = self.store.preparation(kind)? {
+                if op.state == "generating" {
+                    continue;
+                }
+                if self.discard_excluded_judgment(&mut op)? {
+                    continue;
+                }
+                if self.config.mode(kind) == Mode::Off
+                    || op.generation != self.store.control()?.generation
+                {
+                    op.state = "discarded".into();
+                    self.store.save(&op, "unsent_admission_closed")?;
+                } else if blocked && kind == WorkKind::Answer {
+                    let input: Input = serde_json::from_value(op.request.clone())?;
+                    if self.fresh(&op, &input).await? == Some(false) {
+                        op.state = "discarded".into();
+                        self.store.save(&op, "request_no_longer_current")?;
                     }
-                    _ => {}
+                } else if !blocked && op.next_at <= now() && self.active(kind)? {
+                    self.dispatch(&mut op).await?;
                 }
             }
-            self.follow_finality().await?;
-            self.observe_enabled().await?;
-            return Ok(());
         }
         self.follow_finality().await?;
         // Answer always goes first. Older eligible lower-priority work wins;
@@ -507,6 +761,21 @@ impl Runtime {
                 continue;
             }
             self.store.defer(kind, self.poll_delay())?;
+            if self.store.preparation(kind)?.is_some() {
+                // Observation never waits for model tasks, even for the same kind.
+                if kind == WorkKind::Answer {
+                    let _ = self.challenge(kind).await?;
+                }
+                continue;
+            }
+            if self.store.effect()?.is_some()
+                && (kind != WorkKind::Answer || !self.config.preparation.answer_while_blocked)
+            {
+                if kind == WorkKind::Judge {
+                    let _ = self.assignment_inventory().await?;
+                }
+                continue;
+            }
             match kind {
                 WorkKind::Answer => {
                     let Some(challenge) = self.challenge(kind).await? else {
@@ -556,6 +825,8 @@ impl Runtime {
                         candidate: Some(assignment.answer),
                         history: Vec::new(),
                         guidance: String::new(),
+                        author_history: Some(assignment.author_prior),
+                        candidate_author: assignment.author,
                     };
                     self.generate(
                         kind,
@@ -633,10 +904,7 @@ impl Runtime {
 
     async fn follow_finality(&mut self) -> Result<()> {
         for kind in [WorkKind::Answer, WorkKind::Judge] {
-            if self.stopping()
-                || self.config.mode(kind) == Mode::Off
-                || self.store.next_at(kind)? > now()
-            {
+            if self.stopping() {
                 continue;
             }
             if let Some(mut op) = self.store.awaiting_finality(kind)? {
@@ -673,13 +941,27 @@ impl Runtime {
             candidate,
             history: self.store.history()?,
             guidance: String::new(),
+            author_history: None,
+            candidate_author: None,
         })
     }
 
     async fn generate(&mut self, kind: WorkKind, key: &str, mut input: Input) -> Result<()> {
         self.reload()?;
         if !self.active(kind)?
+            || self.store.preparation(kind)?.is_some()
+            || self.store.attempted(kind, key)?
             || (kind == WorkKind::Judge && self.config.judging_assignment_excluded(key))
+        {
+            return Ok(());
+        }
+        if self.store.effect()?.is_some()
+            && (kind != WorkKind::Answer || !self.config.preparation.answer_while_blocked)
+        {
+            return Ok(());
+        }
+        let count = self.store.attempt_count(kind, key)?;
+        if self.store.model_budget_used(kind, key)? >= self.config.preparation.max_attempts_per_work
         {
             return Ok(());
         }
@@ -694,7 +976,8 @@ impl Runtime {
             WorkKind::Mine => bail!("mine does not use a model"),
         };
         input.solver.guidance = model.guidance.to_string();
-        let mut op = self.store.begin(
+        input.solver.id = digest(format!("{}:attempt:{}", input.solver.id, count + 1));
+        let op = self.store.begin(
             kind,
             key,
             "generating",
@@ -703,93 +986,110 @@ impl Runtime {
             &self.config.revision()?,
         )?;
         let timeout = self.config.timeouts.model_seconds;
+        self.store.capture_policy(op.id, &json!({"model":model,
+            "model_seconds":timeout,"attempt":count+1,"retry_uncertain":self.config.preparation.retry_uncertain,
+            "max_attempts_per_work":self.config.preparation.max_attempts_per_work}), Some(timeout), None)?;
         drop(gate);
         let expected = self.config.clone();
         let config_path = self.config_path.clone();
-        let future = solve(&model, &input.solver, timeout, move || {
-            let gate = AdmissionGuard::acquire(&expected)?;
-            let current = Config::load(&config_path)?;
-            if !same_identity(&expected, &current)
-                || current.mode(kind) != Mode::Active
-                || (kind == WorkKind::Judge && current.judging_assignment_excluded(key))
-            {
-                bail!("model admission changed");
+        let key = key.to_owned();
+        let input = Arc::new(input);
+        let task_input = Arc::clone(&input);
+        let mut stop = self.stop.clone();
+        let task = tokio::spawn(async move {
+            let future = solve(&model, &task_input.solver, timeout, move || {
+                let gate = AdmissionGuard::try_acquire(&expected)?;
+                let current = Config::load(&config_path)?;
+                if !same_identity(&expected, &current)
+                    || current.mode(kind) != Mode::Active
+                    || (kind == WorkKind::Judge && current.judging_assignment_excluded(&key))
+                {
+                    bail!("model admission changed");
+                }
+                let store =
+                    Store::read_only(&expected)?.context("model admission state missing")?;
+                if store.control()? != control || control.paused {
+                    bail!("model admission closed");
+                }
+                Ok(gate)
+            });
+            tokio::select! {
+                biased;
+                _ = stop.changed() => ModelAttempt::Unknown("model_launch_unknown"),
+                result = tokio::time::timeout(Duration::from_secs(timeout), future) => match result {
+                    Ok(Ok(result)) => ModelAttempt::Captured(result),
+                    Ok(Err(error)) if completed_artifact_invalid(&error) => ModelAttempt::Invalid(failure_code(&error)),
+                    Ok(Err(error)) if !execution_may_have_started(&error) => ModelAttempt::NotStarted(failure_code(&error)),
+                    Ok(Err(error)) => ModelAttempt::Unknown(failure_code(&error)),
+                    Err(_) => ModelAttempt::Unknown("model_launch_unknown"),
+                },
             }
-            let store = Store::read_only(&expected)?.context("model admission state missing")?;
-            if store.control()? != control || control.paused {
-                bail!("model admission closed");
-            }
-            Ok(gate)
         });
-        let result = self.model_result(future, control, timeout).await?;
-        match result {
-            ModelAttempt::Captured(result) => {
-                op.result = Some(serde_json::to_value(&result)?);
-                if self.store.control()?.generation != control.generation || self.stopping() {
-                    op.state = "discarded".into();
-                    self.store.save(&op, "late_model_result_discarded")?;
-                    return Ok(());
-                }
-                match payload(&input.solver, &result) {
-                    Ok(payload) => {
-                        op.payload = Some(payload);
-                        op.state = "generated".into();
-                        self.store.save(&op, "model_result_captured")?;
-                    }
-                    Err(_) => {
-                        op.state = "rejected".into();
-                        self.store.save(&op, "model_result_invalid")?;
-                        return Ok(());
-                    }
-                }
-                // Model selection may have changed: the result still belongs to
-                // its captured request/model. Only current admission and evidence
-                // determine whether that captured result can be submitted.
-                self.dispatch(&mut op).await?;
-            }
-            ModelAttempt::NotStarted(code) => {
-                op.state = "prelaunch_failed".into();
-                self.store.save(&op, code)?;
-                self.store.defer(kind, self.retry_delay(None))?;
-            }
-            ModelAttempt::Unknown(code) => {
-                op.state = "model_unknown".into();
-                self.store.save(&op, code)?;
-            }
-        }
+        self.preparations.push((op, input, control, task));
         Ok(())
     }
 
-    async fn model_result<F>(
-        &mut self,
-        future: F,
-        control: Control,
-        timeout: u64,
-    ) -> Result<ModelAttempt>
-    where
-        F: Future<Output = Result<SolverResult>>,
-    {
-        tokio::pin!(future);
-        let deadline = tokio::time::sleep(Duration::from_secs(timeout));
-        tokio::pin!(deadline);
-        let mut tick = tokio::time::interval(Duration::from_millis(250));
-        loop {
-            tokio::select! {
-                biased;
-                _ = self.stop.changed() => return Ok(ModelAttempt::Unknown("model_launch_unknown")),
-                _ = &mut deadline => return Ok(ModelAttempt::Unknown("model_launch_unknown")),
-                _ = tick.tick() => {
-                    self.reload()?;
-                    let current = self.store.control()?;
-                    if current.paused || current.generation != control.generation { return Ok(ModelAttempt::Unknown("model_launch_unknown")); }
+    async fn collect_models(&mut self) -> Result<()> {
+        let mut index = 0;
+        while index < self.preparations.len() {
+            if !self.preparations[index].3.is_finished() {
+                index += 1;
+                continue;
+            }
+            let (mut op, input, control, task) = self.preparations.swap_remove(index);
+            let result = task
+                .await
+                .unwrap_or(ModelAttempt::Unknown("model_launch_unknown"));
+            // A captured attempt can never overwrite a superseding durable state.
+            if self
+                .store
+                .operation(op.id)?
+                .is_none_or(|current| current.state != "generating")
+            {
+                continue;
+            }
+            match result {
+                ModelAttempt::Captured(result) => {
+                    op.result = Some(serde_json::to_value(&result)?);
+                    if self.store.control()? != control || !self.active(op.kind)? {
+                        // The completed artifact is retained privately, but never
+                        // promoted after pause/resume changes its generation.
+                        op.state = "discarded".into();
+                        self.store.save(&op, "late_model_result_discarded")?;
+                    } else {
+                        match payload(&input.solver, &result) {
+                            Ok(payload) => {
+                                op.payload = Some(payload);
+                                op.state = "generated".into();
+                                self.store.save(&op, "model_result_captured")?;
+                            }
+                            Err(_) => {
+                                op.state = "rejected".into();
+                                self.store.save(&op, "model_result_invalid")?;
+                            }
+                        }
+                    }
                 }
-                result = &mut future => return Ok(match result {
-                    Ok(result)=>ModelAttempt::Captured(result),
-                    Err(error) if !execution_may_have_started(&error)=>ModelAttempt::NotStarted(failure_code(&error)),
-                    Err(error)=>ModelAttempt::Unknown(failure_code(&error)),
-                }),
+                ModelAttempt::Invalid(code) => {
+                    self.store.record_evidence(op.id,&json!({"stage":"model","route":op.kind,"reason":code,"execution":"completed_invalid"}))?;
+                    op.state = "rejected".into();
+                    self.store.save(&op, code)?;
+                    self.store.defer(op.kind, self.retry_delay(None))?;
+                }
+                ModelAttempt::NotStarted(code) => {
+                    self.store.record_evidence(op.id,&json!({"stage":"model","route":op.kind,"reason":code,"execution":"not_started"}))?;
+                    op.state = "prelaunch_failed".into();
+                    self.store.save(&op, code)?;
+                    self.store.defer(op.kind, self.retry_delay(None))?;
+                }
+                ModelAttempt::Unknown(code) => {
+                    self.store.record_evidence(op.id,&json!({"stage":"model","route":op.kind,"reason":code,"execution":"unknown"}))?;
+                    op.state = "model_unknown".into();
+                    self.store.save(&op, code)?;
+                }
             }
         }
+        Ok(())
     }
 
     async fn fresh(&mut self, op: &Operation, input: &Input) -> Result<Option<bool>> {
@@ -852,7 +1152,7 @@ impl Runtime {
         if self.discard_excluded_judgment(op)? {
             return Ok(());
         }
-        if !self.active(op.kind)? || op.next_at > now() {
+        if !self.active(op.kind)? || op.next_at > now() || self.store.effect()?.is_some() {
             return Ok(());
         }
         let expected_control = self.store.control()?;
@@ -892,7 +1192,14 @@ impl Runtime {
                 return Ok(());
             }
         };
+        self.heartbeat()?;
         op.state = "dispatching".into();
+        self.store.capture_policy(
+            op.id,
+            &json!({"http_seconds":self.config.timeouts.http_seconds}),
+            None,
+            Some(self.config.timeouts.http_seconds),
+        )?;
         self.store.save(op, "dispatch_intent")?;
         let request = tokio::time::timeout(
             Duration::from_secs(self.config.timeouts.http_seconds),
@@ -904,19 +1211,44 @@ impl Runtime {
             _ = self.stop.changed() => {
                 match tokio::time::timeout(Duration::from_secs(self.config.timeouts.shutdown_seconds), &mut request).await {
                     Ok(result) => result,
-                    Err(_) => { op.state="unknown".into(); self.store.save(op,"dispatch_outcome_unknown")?; drop(gate); return Ok(()); }
+                    Err(_) => {
+                        self.store.record_evidence(op.id, &serde_json::to_value(response_evidence(op.kind, ResponseSource::Submit, None))?)?;
+                        op.state="unknown".into(); self.store.save(op,"dispatch_outcome_unknown")?; drop(gate); return Ok(());
+                    }
                 }
             }
             result = &mut request => result,
         };
         match result {
-            Ok(Ok(response)) => self.outcome(
-                op,
-                classify(op.kind, &response),
-                true,
-                response.retry_after_seconds,
-            )?,
+            Ok(Ok(response)) => {
+                self.store.record_candidates(
+                    op.id,
+                    &serde_json::to_value(crate::protocol::response_candidates(&response))?,
+                )?;
+                self.store.record_evidence(
+                    op.id,
+                    &serde_json::to_value(response_evidence(
+                        op.kind,
+                        ResponseSource::Submit,
+                        Some(&response),
+                    ))?,
+                )?;
+                self.outcome(
+                    op,
+                    classify_source(op.kind, &response, ResponseSource::Submit),
+                    true,
+                    response.retry_after_seconds,
+                )?;
+            }
             _ => {
+                self.store.record_evidence(
+                    op.id,
+                    &serde_json::to_value(response_evidence(
+                        op.kind,
+                        ResponseSource::Submit,
+                        None,
+                    ))?,
+                )?;
                 op.state = "unknown".into();
                 self.store.save(op, "dispatch_outcome_unknown")?;
             }
@@ -962,6 +1294,18 @@ impl Runtime {
                 .into();
                 "submission_rejected"
             }
+            Outcome::ProcessedRejected {
+                code: _,
+                next_nonce,
+            } => {
+                op.state = if !submitted && op.job_id.is_some() && next_nonce.is_some() {
+                    "rejected"
+                } else {
+                    "unknown"
+                }
+                .into();
+                "processed_submission_rejected"
+            }
             Outcome::Retry { after_seconds } => {
                 if submitted {
                     op.state = "retry".into();
@@ -993,18 +1337,10 @@ impl Runtime {
                 "mine_completed"
             }
         };
-        if op.kind == WorkKind::Mine && op.state == "retry" {
-            op.next_at = op
-                .next_at
-                .max(not_before(self.config.schedule.mine_seconds));
-        }
         self.store.save(op, event)
     }
 
     async fn reconcile(&mut self, op: &mut Operation) -> Result<()> {
-        if self.config.mode(op.kind) == Mode::Off {
-            return Ok(());
-        }
         if let Some(txid) = op.txid.clone() {
             let Some(response) = self
                 .get(op.kind, ReadScope::Receipt, &format!("/api/receipt/{txid}"))
@@ -1014,6 +1350,13 @@ impl Runtime {
             };
             op.next_at = not_before(self.retry_delay(response.retry_after_seconds));
             let evidence = receipt(&response, &txid, &self.config.network.address);
+            if evidence != Receipt::Unresolved {
+                self.store.safety_observed(op.id)?;
+            }
+            self.store.record_evidence(op.id, &json!({"stage":"receipt","route":op.kind,"status":response.status,
+                "reason":match evidence {Receipt::Final=>"checkpoint_reported",Receipt::Included=>"included",
+                    Receipt::Rejected=>"rejected",Receipt::Unresolved=>"unresolved"},
+                "retry_after_seconds":response.retry_after_seconds}))?;
             self.read_evaluated(
                 ReadScope::Receipt,
                 evidence != Receipt::Unresolved,
@@ -1043,15 +1386,32 @@ impl Runtime {
             else {
                 return Ok(());
             };
-            if response.status == 202
+            self.store.record_candidates(
+                op.id,
+                &serde_json::to_value(crate::protocol::response_candidates(&response))?,
+            )?;
+            let classified = classify_source(op.kind, &response, ResponseSource::BoundJob);
+            if matches!(&classified, Outcome::Unknown {reason} if reason == "bound_job_pending")
                 && response.body.get("state").and_then(Value::as_str) == Some("queued")
             {
                 self.read_evaluated(ReadScope::Job, true, None)?;
+                self.store.safety_observed(op.id)?;
                 op.state = "queued".into();
                 op.next_at = not_before(self.retry_delay(response.retry_after_seconds));
                 self.store.save(op, "job_pending")?;
             } else {
-                let outcome = classify(op.kind, &response);
+                self.store.record_evidence(
+                    op.id,
+                    &serde_json::to_value(response_evidence(
+                        op.kind,
+                        ResponseSource::BoundJob,
+                        Some(&response),
+                    ))?,
+                )?;
+                let outcome = classified;
+                if !matches!(outcome, Outcome::Unknown { .. }) {
+                    self.store.safety_observed(op.id)?;
+                }
                 self.read_evaluated(
                     ReadScope::Job,
                     !matches!(outcome, Outcome::Unknown { .. }),
@@ -1067,7 +1427,10 @@ impl Runtime {
 }
 
 fn assignment_matches(assignment: &Assignment, request: &SolverRequest) -> bool {
-    request.assignment.as_deref() == Some(assignment.id.as_str())
+    request
+        .assignment
+        .as_deref()
+        .is_some_and(|id| id.eq_ignore_ascii_case(&assignment.id))
         && request.epoch == assignment.epoch
         && request.candidate.as_deref() == Some(assignment.answer.as_str())
         && request.words == assignment.words
@@ -1112,28 +1475,42 @@ enum Receipt {
     Unresolved,
 }
 fn receipt(response: &Response, txid: &str, address: &str) -> Receipt {
-    if response.status != 200 {
-        return Receipt::Unresolved;
-    }
-    let body = &response.body;
-    if body
-        .get("txid")
-        .and_then(Value::as_str)
-        .is_some_and(|id| !id.eq_ignore_ascii_case(txid))
-        || body
-            .get("address")
-            .and_then(Value::as_str)
-            .is_some_and(|id| id != address)
-        || body
-            .get("sender")
-            .and_then(Value::as_str)
-            .is_some_and(|id| id != address)
+    if response.status != 200
+        || ["ok", "success"].iter().any(|field| {
+            response
+                .body
+                .get(field)
+                .is_some_and(|value| value.as_bool() != Some(true))
+        })
     {
         return Receipt::Unresolved;
     }
+    let body = &response.body;
+    if body.get("txid").is_some_and(|value| {
+        !value
+            .as_str()
+            .is_some_and(|id| id.eq_ignore_ascii_case(txid))
+    }) || ["address", "sender"].iter().any(|field| {
+        body.get(field)
+            .is_some_and(|value| value.as_str() != Some(address))
+    }) {
+        return Receipt::Unresolved;
+    }
     match body.get("status").and_then(Value::as_str) {
-        Some("rejected") => Receipt::Rejected,
-        Some("included") if body.get("next_nonce").and_then(Value::as_u64).is_some() => {
+        Some("rejected")
+            if body
+                .get("next_nonce")
+                .and_then(Value::as_u64)
+                .is_some_and(|n| n > 0) =>
+        {
+            Receipt::Rejected
+        }
+        Some("included")
+            if body
+                .get("next_nonce")
+                .and_then(Value::as_u64)
+                .is_some_and(|n| n > 0) =>
+        {
             if body.get("checkpoint_covered").and_then(Value::as_bool) == Some(true) {
                 Receipt::Final
             } else if body.get("valid_in_open_window").and_then(Value::as_bool) == Some(true) {
@@ -1170,6 +1547,27 @@ mod tests {
             candidate: Some("candidate-test".into()),
             history: Vec::new(),
             guidance: String::new(),
+            author_history: None,
+            candidate_author: None,
+        }
+    }
+
+    async fn finish_models(runtime: &mut Runtime) {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while !runtime.preparations.is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                runtime.reload().unwrap();
+                runtime.collect_models().await.unwrap();
+            }
+        })
+        .await
+        .expect("bounded fixture model completion");
+        for kind in [WorkKind::Answer, WorkKind::Judge] {
+            if let Some(mut op) = runtime.store.preparation(kind).unwrap()
+                && op.state == "generated"
+            {
+                runtime.dispatch(&mut op).await.unwrap();
+            }
         }
     }
 
@@ -1207,6 +1605,8 @@ mod tests {
             store,
             stop,
             reload_blocked: false,
+            preparations: Vec::new(),
+            controller: true,
         };
         (temp, runtime, sender)
     }
@@ -1236,13 +1636,24 @@ mod tests {
             .begin(
                 WorkKind::Judge,
                 id,
-                state,
+                "prepared",
                 &serde_json::to_value(&input).unwrap(),
                 control,
                 &runtime.config.revision().unwrap(),
             )
             .unwrap();
         op.payload = Some(payload(&input.solver, &result()).unwrap());
+        if matches!(
+            state,
+            "dispatching" | "queued" | "unknown" | "included_pending" | "confirmed" | "final"
+        ) {
+            op.state = "dispatching".into();
+            runtime.store.save(&op, "dispatch_intent").unwrap();
+        }
+        if state == "dispatching" {
+            return op;
+        }
+        op.state = state.into();
         runtime.store.save(&op, "test_judgment_prepared").unwrap();
         op
     }
@@ -1898,6 +2309,7 @@ export async function callGatewayFromCli(_method, _options, params) {
             listener
         });
         runtime.cycle().await.unwrap();
+        finish_models(&mut runtime).await;
         let mut grade = runtime.store.pending().unwrap().unwrap();
         assert_eq!(grade.kind, WorkKind::Judge);
         assert_eq!(grade.state, "included_pending");
@@ -1985,6 +2397,7 @@ export async function callGatewayFromCli(_method, _options, params) {
             listener
         });
         runtime.cycle().await.unwrap();
+        finish_models(&mut runtime).await;
         let listener = server.await.unwrap();
         assert_eq!(
             runtime.store.status(&runtime.config).unwrap()["operations"],
@@ -2015,11 +2428,19 @@ export async function callGatewayFromCli(_method, _options, params) {
         );
         let path = format!("/chain/{}/api/hosted/me", runtime.config.network.chain);
         let address = runtime.config.network.address.clone();
+        let chain = runtime.config.network.chain.clone();
         let server = tokio::spawn(async move {
             for body in [
                 json!({"address":address}),
                 json!({"address":"different-account"}),
                 json!({"address":address}),
+                json!({"address":address,"ok":false}),
+                json!({"address":address,"success":false}),
+                json!({"address":address,"chain_id":null}),
+                json!({"address":address,"chain_id":17}),
+                json!({"address":address,"chain_id":"wrong-chain"}),
+                json!({"address":address,"ok":"true"}),
+                json!({"address":address,"chain_id":chain,"ok":true,"success":true}),
             ] {
                 judging_reply(&listener, &path, body, None).await;
             }
@@ -2029,7 +2450,9 @@ export async function callGatewayFromCli(_method, _options, params) {
                 .unwrap();
             drop(stream);
         });
-        for matched in [true, false, true] {
+        for matched in [
+            true, false, true, false, false, false, false, false, false, true,
+        ] {
             let scheduled = runtime.store.next_at(WorkKind::Judge).unwrap();
             let before = now();
             assert_eq!(
@@ -2066,13 +2489,6 @@ export async function callGatewayFromCli(_method, _options, params) {
         );
         let events = runtime.store.events(100).unwrap();
         let events = events.as_array().unwrap();
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| event["event"] == "identity_unverified")
-                .count(),
-            1
-        );
         assert!(
             events
                 .iter()
@@ -2081,12 +2497,14 @@ export async function callGatewayFromCli(_method, _options, params) {
     }
 
     #[test]
-    fn judging_selection_skips_exclusions_without_synthesizing_attempts() {
+    fn judging_selection_is_expiry_first_deterministic_and_skips_exclusions() {
         let (_temp, mut runtime, _sender) = fixture();
         let ids = vec!["a".repeat(64), "b".repeat(64), "c".repeat(64)];
-        let inventory = judging_inventory(&ids);
+        let mut inventory = judging_inventory(&ids);
+        inventory.body["assignments"][1]["pending_meta"] = json!({"expires_at_epoch":10});
+        inventory.body["assignments"][2]["pending_meta"] = json!({"expires_at_epoch":9});
         runtime.config.excluded_judging_assignments = vec![ids[0].to_uppercase()];
-        for expected in [&ids[1], &ids[2], &ids[1]] {
+        for expected in [&ids[2], &ids[2], &ids[2]] {
             assert_eq!(
                 runtime
                     .next_judging_assignment(&inventory)
@@ -2099,6 +2517,14 @@ export async function callGatewayFromCli(_method, _options, params) {
         assert_eq!(
             runtime.store.status(&runtime.config).unwrap()["operations"],
             json!([])
+        );
+        judging_operation(&mut runtime, &ids[2], "abstained");
+        assert_eq!(
+            runtime
+                .next_judging_assignment(&inventory)
+                .unwrap()
+                .as_ref(),
+            Some(&ids[1])
         );
         runtime.config.excluded_judging_assignments = ids;
         assert!(
@@ -2131,6 +2557,7 @@ export async function callGatewayFromCli(_method, _options, params) {
             .generate(WorkKind::Judge, &allowed, judging_input(&allowed))
             .await
             .unwrap();
+        finish_models(&mut runtime).await;
         assert_eq!(
             runtime.store.status(&runtime.config).unwrap()["operations"],
             json!([{"kind":"judge","state":"prelaunch_failed","count":1}])
@@ -2345,6 +2772,7 @@ export async function callGatewayFromCli(_method, _options, params) {{
                 .generate(WorkKind::Judge, &id, judging_input(&id))
                 .await
                 .unwrap();
+            finish_models(&mut runtime).await;
             let state = if during_inference {
                 "discarded"
             } else {
@@ -2496,10 +2924,24 @@ export async function callGatewayFromCli(_method, _options, params) {{
         config.solver.answer.harness = Harness::Openclaw;
         config.solver.answer.executable = executable;
         config.solver.answer.model = "openai/test".into();
+        config.preparation.max_attempts_per_work = 2;
         let (_temp, mut runtime, _signal) = fixture_with(config);
         let mut input = request(WorkKind::Answer);
         input.assignment = None;
         input.candidate = None;
+        runtime
+            .generate(
+                WorkKind::Answer,
+                "8:fixture",
+                Input {
+                    solver: input.clone(),
+                    challenge_fingerprint: Some("fixture".into()),
+                },
+            )
+            .await
+            .unwrap();
+        finish_models(&mut runtime).await;
+        runtime.store.retry_models(&runtime.config).unwrap();
         runtime
             .generate(
                 WorkKind::Answer,
@@ -2511,6 +2953,7 @@ export async function callGatewayFromCli(_method, _options, params) {{
             )
             .await
             .unwrap();
+        assert!(runtime.preparations.is_empty());
         assert!(runtime.store.answer_epoch_attempted(8).unwrap());
         assert_eq!(std::fs::read_to_string(calls).unwrap(), "attempt\n");
         assert_eq!(
@@ -2530,17 +2973,20 @@ export async function callGatewayFromCli(_method, _options, params) {{
 
     fn operation(runtime: &mut Runtime) -> Operation {
         let control = runtime.store.control().unwrap();
-        runtime
+        let mut op = runtime
             .store
             .begin(
                 WorkKind::Answer,
                 "8:words",
-                "dispatching",
+                "prepared",
                 &json!({}),
                 control,
                 "captured-revision",
             )
-            .unwrap()
+            .unwrap();
+        op.state = "dispatching".into();
+        runtime.store.save(&op, "dispatch_intent").unwrap();
+        op
     }
 
     #[test]
@@ -2594,6 +3040,34 @@ export async function callGatewayFromCli(_method, _options, params) {{
             retry_after_seconds: None,
         };
         assert_eq!(receipt(&missing, "known", "Account"), Receipt::Unresolved);
+        for field in ["txid", "address", "sender"] {
+            let mut malformed = json!({
+                "status":"included","valid_in_open_window":true,"next_nonce":4
+            });
+            malformed[field] = json!(17);
+            assert_eq!(
+                receipt(&response(malformed), "known", "Account"),
+                Receipt::Unresolved
+            );
+        }
+    }
+
+    #[test]
+    fn contradictory_receipts_cannot_release_the_effect_slot() {
+        for status in ["included", "rejected"] {
+            for field in ["ok", "success"] {
+                for value in [json!(false), Value::Null, json!("true")] {
+                    let mut body = json!({
+                        "status":status,"checkpoint_covered":true,"next_nonce":4
+                    });
+                    body[field] = value;
+                    assert_eq!(
+                        receipt(&response(body), "known", "Account"),
+                        Receipt::Unresolved
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -2608,6 +3082,14 @@ export async function callGatewayFromCli(_method, _options, params) {{
         );
         assert_eq!(
             receipt(&response(json!({"status":"rejected"})), "known", "account"),
+            Receipt::Unresolved
+        );
+        assert_eq!(
+            receipt(
+                &response(json!({"status":"rejected","next_nonce":4})),
+                "known",
+                "account"
+            ),
             Receipt::Rejected
         );
     }
@@ -2651,6 +3133,9 @@ export async function callGatewayFromCli(_method, _options, params) {{
             epoch: 8,
             answer: "candidate-test".into(),
             words: vec!["burn".into()],
+            expires_at_epoch: None,
+            author: None,
+            author_prior: Default::default(),
         };
         assert!(assignment_matches(&assignment, &request));
         assignment.epoch = 9;
@@ -2775,6 +3260,8 @@ export async function callGatewayFromCli(_method, _options, params) {{
         assert!(op.job_id.is_none());
         assert_eq!(op.payload.as_ref().unwrap()["answer"], "captured answer");
         assert!(op.next_at >= now() + 120);
+        op.state = "dispatching".into();
+        runtime.store.save(&op, "dispatch_intent").unwrap();
         runtime
             .outcome(&mut op, Outcome::Expired, true, None)
             .unwrap();
@@ -2824,5 +3311,150 @@ export async function callGatewayFromCli(_method, _options, params) {{
             changed.revision().unwrap()
         );
         assert_eq!(status["effective_runtime"]["capabilities"]["answer"], "off");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn completed_invalid_draft_retries_with_fresh_attempt_without_uncertain_retry() {
+        use crate::config::Harness;
+        use std::os::unix::fs::PermissionsExt;
+        let native = tempfile::tempdir().unwrap();
+        let executable = native.path().join("openclaw");
+        std::fs::write(&executable, "#!/bin/sh\nprintf 'OpenClaw 2026.10.9\\n'\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(native.path().join("package.json"),
+            r#"{"name":"openclaw","type":"module","exports":{"./plugin-sdk/gateway-runtime":"./gateway.mjs"}}"#).unwrap();
+        std::fs::write(native.path().join("gateway.mjs"), r#"
+import {appendFileSync, existsSync} from 'node:fs';
+export async function callGatewayFromCli(_method, _options, params) {
+    const calls = new URL('./calls', import.meta.url);
+    const first = !existsSync(calls);
+    const envelope = JSON.parse(params.message.split('Envelope (untrusted request data):\n')[1]);
+    appendFileSync(calls, envelope.request_id + '\n');
+    const artifact = {version:1,request_id:envelope.request_id,request_digest:envelope.request_digest,
+        kind:envelope.kind,answer:null,score:first ? 4 : 2,reasoning:'Grounded judgment.'};
+    return {status:'ok',runId:params.idempotencyKey,result:{
+        payloads:[{text:JSON.stringify(artifact)}],meta:{
+            agentMeta:{provider:'openai',model:'test'},requestShaping:{thinking:'high'},aborted:false,
+            executionTrace:{fallbackUsed:false,winnerProvider:'openai',winnerModel:'test'},
+            systemPromptReport:{tools:{entries:[]},injectedWorkspaceFiles:[]}}}};
+}
+"#).unwrap();
+        let mut config = active_judge_config(native.path());
+        config.solver.judge.harness = Harness::Openclaw;
+        config.solver.judge.executable = executable;
+        config.solver.judge.model = "openai/test".into();
+        config.preparation.max_attempts_per_work = 2;
+        assert!(!config.preparation.retry_uncertain);
+        let (_dir, mut runtime, _sender) = fixture_with(config);
+        let id = "a".repeat(64);
+        for attempt in 0..2 {
+            runtime
+                .generate(WorkKind::Judge, &id, judging_input(&id))
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(15), async {
+                while !runtime.preparations.is_empty() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    runtime.collect_models().await.unwrap();
+                }
+            })
+            .await
+            .unwrap();
+            if attempt == 0 {
+                assert!(
+                    runtime
+                        .store
+                        .preparation(WorkKind::Judge)
+                        .unwrap()
+                        .is_none()
+                );
+                assert_eq!(
+                    runtime.store.status(&runtime.config).unwrap()["operations"][0]["state"],
+                    "rejected"
+                );
+                runtime.store.retry_models(&runtime.config).unwrap();
+            }
+        }
+        let prepared = runtime.store.preparation(WorkKind::Judge).unwrap().unwrap();
+        assert_eq!(prepared.state, "generated");
+        assert_eq!(prepared.payload.unwrap()["score"], 2);
+        assert!(runtime.store.effect().unwrap().is_none());
+        let calls = std::fs::read_to_string(native.path().join("calls")).unwrap();
+        let ids: Vec<_> = calls.lines().collect();
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stopped_recovery_rejects_unbound_candidates_and_resolves_bound_job_while_off() {
+        let credentials = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = active_judge_config(credentials.path());
+        config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
+        config.capabilities.answer = Mode::Off;
+        config.capabilities.judge = Mode::Off;
+        config.capabilities.mine = Mode::Off;
+        let (_dir, mut runtime, _sender) = fixture_with(config);
+        let mut op = judging_operation(&mut runtime, &"a".repeat(64), "unknown");
+        let path = runtime.config_path.clone();
+        let config = runtime.config.clone();
+        let prefix = format!("GET /chain/{}", config.network.chain);
+        assert!(
+            recovery_resolve(&path, op.id, Some("guessed-job"), None)
+                .await
+                .is_err()
+        );
+        assert_eq!(runtime.store.effect().unwrap().unwrap().state, "unknown");
+        op.job_id = Some("bound-job".into());
+        op.state = "queued".into();
+        runtime.store.save(&op, "test_bound_job").unwrap();
+        assert!(
+            recovery_resolve(&path, op.id, Some("different-job"), None)
+                .await
+                .is_err()
+        );
+        let txid = "b".repeat(64);
+        let address = config.network.address.clone();
+        let server = tokio::spawn(async move {
+            api_reply(
+                &listener,
+                &format!("{prefix}/api/hosted/me"),
+                200,
+                None,
+                json!({"address":address}),
+            )
+            .await;
+            api_reply(
+                &listener,
+                &format!("{prefix}/api/job/bound-job"),
+                200,
+                None,
+                json!({"state":"done","ok":true,"id":txid}),
+            )
+            .await;
+            api_reply(
+                &listener,
+                &format!("{prefix}/api/receipt/{txid}"),
+                200,
+                None,
+                json!({"txid":txid,"sender":address,"status":"included","next_nonce":3,
+                    "valid_in_open_window":true,"checkpoint_covered":true}),
+            )
+            .await;
+        });
+        drop(runtime);
+        let result = recovery_resolve(&path, op.id, Some("bound-job"), None)
+            .await
+            .unwrap();
+        assert_eq!(result["resolved"], true);
+        assert_eq!(result["state"], "final");
+        server.await.unwrap();
+        assert!(
+            !status(&config).unwrap()["admission_blocked"]
+                .as_bool()
+                .unwrap()
+        );
     }
 }

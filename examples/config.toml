@@ -15,6 +15,13 @@ answer = "read_only"
 judge = "read_only"
 mine = "read_only"
 
+# Off stops new participation, not safety reads for already possibly-sent work.
+[preparation]
+answer_while_blocked = true
+# May repeat remote inference at additional cost; never retries a network write.
+retry_uncertain = false
+max_attempts_per_work = 1
+
 [solver.answer]
 harness = "hermes"
 executable = "hermes"

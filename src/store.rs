@@ -4,7 +4,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -59,6 +59,7 @@ fn private_dir(path: &Path) -> Result<()> {
 }
 
 fn private_file(path: &Path) -> Result<File> {
+    private_dir(path.parent().context("private file parent missing")?)?;
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]
@@ -154,7 +155,6 @@ fn lock_path(config: &Config, suffix: &str) -> Result<PathBuf> {
     let root = dirs::home_dir()
         .context("home directory unavailable")?
         .join(".agmi-account-locks");
-    private_dir(&root)?;
     let key = digest(format!(
         "{}\n{}",
         config.network.chain, config.network.address
@@ -163,53 +163,185 @@ fn lock_path(config: &Config, suffix: &str) -> Result<PathBuf> {
 }
 
 pub(crate) struct AccountLock(File);
+const WRITER_MARKER: &[u8] = b"agmi-authority-v2\n";
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct Binding {
+    location: String,
+    identity: String,
+    database_id: String,
+    dispatch_sequence: i64,
+}
+
+fn read_binding(config: &Config) -> Result<Option<Binding>> {
+    let path = lock_path(config, "binding")?;
+    if !path.exists() {
+        let writer = lock_path(config, "writer")?;
+        if writer.exists() {
+            let metadata = fs::symlink_metadata(&writer)?;
+            validate_private_file(&metadata)?;
+            if metadata.len() > 64 {
+                bail!("invalid stable writer marker");
+            }
+            if fs::read(&writer)? == WRITER_MARKER {
+                bail!("independent account binding is missing; authoritative recovery required");
+            }
+        }
+        return Ok(None);
+    }
+    let metadata = fs::symlink_metadata(&path)?;
+    validate_private_file(&metadata)?;
+    if metadata.len() > 4096 {
+        bail!("invalid account binding");
+    }
+    let bytes = fs::read(path)?;
+    if bytes.len() > 4096 {
+        bail!("invalid account binding");
+    }
+    Ok(Some(
+        serde_json::from_slice(&bytes).context("invalid account binding")?,
+    ))
+}
+
+fn write_binding(path: &Path, binding: &Binding) -> Result<()> {
+    let temporary = path.with_extension("binding-next");
+    let mut file = private_file(&temporary)?;
+    file.set_len(0)?;
+    file.write_all(&serde_json::to_vec(binding)?)?;
+    file.sync_all()?;
+    fs::rename(&temporary, path)?;
+    File::open(path.parent().context("binding parent missing")?)?.sync_all()?;
+    Ok(())
+}
+
 impl AccountLock {
     pub(crate) fn acquire(config: &Config) -> Result<(Self, Store)> {
+        Self::acquire_with_migration(config, false)
+    }
+
+    pub(crate) fn adopt(config: &Config) -> Result<(Self, Store)> {
+        Self::acquire_with_migration(config, true)
+    }
+
+    fn acquire_with_migration(config: &Config, migration_allowed: bool) -> Result<(Self, Store)> {
         let _gate = AdmissionGuard::acquire(config)?;
         let mut file = private_file(&lock_path(config, "writer")?)?;
         file.try_lock()
             .map_err(std::io::Error::from)
             .context("another runtime already owns this account")?;
-        let store = Self::open_bound_store(&mut file, config)?;
+        let store = Self::open_bound_store(&mut file, config, migration_allowed)?;
         Ok((Self(file), store))
     }
 
-    fn open_bound_store(file: &mut File, config: &Config) -> Result<Store> {
+    fn open_bound_store(
+        file: &mut File,
+        config: &Config,
+        migration_allowed: bool,
+    ) -> Result<Store> {
         if config.network.address.is_empty()
             || config.network.credential_file.as_os_str().is_empty()
         {
             bail!("durable control requires a configured account and credential file");
         }
-        let expected = digest(config.state_dir.as_os_str().as_encoded_bytes());
-        let initialize = file.metadata()?.len() == 0;
-        if !initialize {
-            let mut binding = [0_u8; 64];
-            if file.metadata()?.len() != 64
-                || file.read_exact(&mut binding).is_err()
-                || binding != expected.as_bytes()
-            {
-                bail!(
-                    "account is bound to a different durable state directory; use its original configuration"
-                );
+        let length = file.metadata()?.len();
+        if length > 64 {
+            bail!("invalid stable writer marker");
+        }
+        let mut bytes = vec![0; length as usize];
+        file.read_exact(&mut bytes)?;
+        let marked = bytes == WRITER_MARKER;
+        let legacy = length != 0 && !marked;
+        if legacy && !migration_allowed {
+            bail!("journal adoption requires an explicit stopped-writer recover adopt");
+        }
+        if legacy
+            && (length != 64
+                || bytes != digest(config.state_dir.as_os_str().as_encoded_bytes()).as_bytes())
+        {
+            bail!("account is bound to a different durable state directory");
+        }
+        let binding = read_binding(config)?;
+        let database = config.state_dir.join("state.sqlite3");
+        if migration_allowed && !database.exists() {
+            bail!("adoption requires an existing initialized journal");
+        }
+        if legacy || binding.is_some() || database.exists() {
+            // Never create or initialize a missing/replaced bound database.
+            if !database.exists() {
+                bail!("bound journal is missing; authoritative recovery required");
+            }
+            let existing = Store::read_only(config)?.context("bound journal is missing")?;
+            if existing.control().is_err() {
+                bail!("bound journal is uninitialized");
+            }
+            if existing.schema_version()? != 2 {
+                if !legacy || binding.is_some() {
+                    bail!("legacy journal authority is missing or inconsistent; writes blocked");
+                }
+                if !migration_allowed {
+                    bail!("journal adoption requires a stopped writer; run recover adopt first");
+                }
             }
         }
-        // Invalid permissions, paths or identity must not reserve an unused account.
-        let store = Store::open(config)?;
-        if initialize {
-            file.write_all(expected.as_bytes())?;
+        let mut store = Store::open(config)?;
+        let location = fs::canonicalize(&config.state_dir)?
+            .to_string_lossy()
+            .into_owned();
+        let (database_id, sequence) = store.database_identity()?;
+        let expected_identity = digest(identity(config)?);
+        let binding = match binding {
+            Some(binding) => {
+                if binding.location != location
+                    || binding.identity != expected_identity
+                    || binding.database_id != database_id
+                    || binding.dispatch_sequence > sequence
+                {
+                    bail!("journal identity or dispatch witness mismatch; writes blocked");
+                }
+                // Journal-ahead gaps happened before the network boundary. Preserve
+                // dispatch intent as uncertain; advancing the witness never replays it.
+                Binding {
+                    dispatch_sequence: sequence,
+                    ..binding
+                }
+            }
+            None => Binding {
+                location,
+                identity: expected_identity,
+                database_id,
+                dispatch_sequence: sequence,
+            },
+        };
+        let binding_path = lock_path(config, "binding")?;
+        write_binding(&binding_path, &binding)?;
+        if !marked {
+            // Never replace the locked inode. The permanent marker only detects
+            // deleted binding metadata; all changing identity/witness data lives separately.
+            file.rewind()?;
+            file.write_all(WRITER_MARKER)?;
+            file.set_len(WRITER_MARKER.len() as u64)?;
             file.sync_all()?;
-            let path = lock_path(config, "writer")?;
-            File::open(path.parent().context("account lock directory missing")?)?.sync_all()?;
-            File::open(account_home()?)?.sync_all()?;
+            File::open(
+                lock_path(config, "writer")?
+                    .parent()
+                    .context("lock parent missing")?,
+            )?
+            .sync_all()?;
         }
+        store.binding = Some((binding_path, binding));
+        store.writer_path = Some((lock_path(config, "writer")?, file.metadata()?));
         Ok(store)
     }
 
-    /// Caller holds AdmissionGuard. The binding survives the writer's lifetime;
-    /// an empty replacement database must never erase unresolved submissions.
+    /// Controls share the admission gate but never migrate beneath a live writer.
     pub(crate) fn control_store(config: &Config) -> Result<Store> {
         let mut file = private_file(&lock_path(config, "writer")?)?;
-        Self::open_bound_store(&mut file, config)
+        let stopped = file.try_lock().is_ok();
+        let result = Self::open_bound_store(&mut file, config, false);
+        if stopped {
+            let _ = file.unlock();
+        }
+        result
     }
 }
 impl Drop for AccountLock {
@@ -226,6 +358,13 @@ impl AdmissionGuard {
         let file = private_file(&lock_path(config, "admission")?)?;
         file.lock()
             .context("cannot acquire account admission gate")?;
+        Ok(Self(file))
+    }
+    pub(crate) fn try_acquire(config: &Config) -> Result<Self> {
+        let file = private_file(&lock_path(config, "admission")?)?;
+        file.try_lock()
+            .map_err(std::io::Error::from)
+            .context("account admission is busy")?;
         Ok(Self(file))
     }
 }
@@ -253,6 +392,8 @@ pub(crate) struct Operation {
     pub job_id: Option<String>,
     pub txid: Option<String>,
     pub next_at: i64,
+    persisted_state: std::cell::RefCell<String>,
+    pub generation: i64,
 }
 
 /// Read failures are independent of normal work cadence and shared by callers
@@ -288,6 +429,9 @@ pub(crate) struct ReadBackoff {
 
 pub(crate) struct Store {
     db: Connection,
+    binding: Option<(PathBuf, Binding)>,
+    writer_path: Option<(PathBuf, fs::Metadata)>,
+    database_file: Option<(PathBuf, fs::Metadata)>,
 }
 
 fn identity(config: &Config) -> Result<String> {
@@ -300,9 +444,91 @@ fn identity(config: &Config) -> Result<String> {
 }
 
 impl Store {
+    fn schema_version(&self) -> Result<i64> {
+        Ok(self
+            .db
+            .query_row("SELECT version FROM control WHERE singleton=1", [], |r| {
+                r.get(0)
+            })?)
+    }
+
+    fn database_identity(&self) -> Result<(String, i64)> {
+        Ok(self.db.query_row(
+            "SELECT database_id,dispatch_sequence FROM authority WHERE singleton=1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?)
+    }
+
+    fn check_binding(&self, config: &Config) -> Result<()> {
+        if let Some(binding) = read_binding(config)? {
+            let (id, sequence) = self.database_identity()?;
+            if id != binding.database_id
+                || sequence < binding.dispatch_sequence
+                || binding.identity != digest(identity(config)?)
+                || binding.location != fs::canonicalize(&config.state_dir)?.to_string_lossy()
+            {
+                bail!("bound journal identity or dispatch witness mismatch");
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn continuity(&self) -> Result<()> {
+        if let Some((path, expected)) = &self.database_file {
+            let current = fs::symlink_metadata(path).context("bound journal disappeared")?;
+            validate_private_file(&current)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if current.dev() != expected.dev() || current.ino() != expected.ino() {
+                    bail!("bound journal inode changed");
+                }
+            }
+        }
+        if let Some((path, expected)) = &self.writer_path {
+            let current = fs::symlink_metadata(path).context("writer lock disappeared")?;
+            validate_private_file(&current)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if current.dev() != expected.dev() || current.ino() != expected.ino() {
+                    bail!("writer lock inode changed; stopping authority");
+                }
+            }
+        }
+        if let Some((path, expected)) = &self.binding {
+            let current: Binding = serde_json::from_slice(&fs::read(path)?)?;
+            let (id, sequence) = self.database_identity()?;
+            if current.database_id != id
+                || current.database_id != expected.database_id
+                || current.dispatch_sequence > sequence
+                || current.identity != expected.identity
+                || current.dispatch_sequence < expected.dispatch_sequence
+                || current.location != expected.location
+            {
+                bail!("account binding continuity lost");
+            }
+            let disk = Path::new(&expected.location).join("state.sqlite3");
+            let db_path: String = self.db.query_row(
+                "SELECT file FROM pragma_database_list WHERE name='main'",
+                [],
+                |r| r.get(0),
+            )?;
+            if !disk.exists() || fs::canonicalize(disk)? != Path::new(&db_path) {
+                bail!("bound journal path disappeared");
+            }
+        }
+        Ok(())
+    }
     pub(crate) fn read_only(config: &Config) -> Result<Option<Self>> {
         let path = config.state_dir.join("state.sqlite3");
         if !path.exists() {
+            if read_binding(config)?.is_some()
+                || fs::metadata(lock_path(config, "writer")?).is_ok_and(|m| m.len() != 0)
+            {
+                bail!("bound journal is missing");
+            }
             return Ok(None);
         }
         private_dir(&config.state_dir)?;
@@ -336,13 +562,23 @@ impl Store {
             db.query_row("SELECT version FROM control WHERE singleton=1", [], |r| {
                 r.get(0)
             })?;
-        if version != 1 {
+        if !matches!(version, 1 | 2) {
             bail!("unsupported state schema");
         }
-        Ok(Some(Self { db }))
+        let store = Self {
+            db,
+            binding: None,
+            writer_path: None,
+            database_file: None,
+        };
+        store.check_binding(config)?;
+        Ok(Some(store))
     }
 
     pub(crate) fn open(config: &Config) -> Result<Self> {
+        if read_binding(config)?.is_some() {
+            Self::read_only(config)?.context("bound journal missing")?;
+        }
         private_dir(&config.state_dir)?;
         let path = fs::canonicalize(&config.state_dir)?.join("state.sqlite3");
         let mut db = {
@@ -402,7 +638,7 @@ impl Store {
             .optional()?;
         match existing {
             Some((stored, version)) => {
-                if version != 1 {
+                if !matches!(version, 1 | 2) {
                     bail!("unsupported state schema; do not downgrade this database");
                 }
                 if stored != expected {
@@ -417,8 +653,34 @@ impl Store {
                 )?;
             }
         }
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS authority (
+                singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                database_id TEXT NOT NULL, dispatch_sequence INTEGER NOT NULL);
+             INSERT OR IGNORE INTO authority VALUES (1,lower(hex(randomblob(16))),0);
+             CREATE TABLE IF NOT EXISTS operation_evidence (
+                operation_id INTEGER PRIMARY KEY REFERENCES operations(id),
+                policy TEXT, model_deadline INTEGER, http_deadline INTEGER,
+                dispatch_sequence INTEGER, blocked_since INTEGER, evidence TEXT,
+                observed_at INTEGER, safety_observed_at INTEGER, resolution TEXT);
+             CREATE TABLE IF NOT EXISTS operation_candidates (
+                operation_id INTEGER PRIMARY KEY REFERENCES operations(id),
+                candidates TEXT NOT NULL, truncated INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE IF NOT EXISTS runtime_policy (
+                singleton INTEGER PRIMARY KEY CHECK(singleton=1), policy TEXT NOT NULL);
+             UPDATE operations SET work_key=lower(work_key) WHERE kind='judge' AND length(work_key)=64;
+             UPDATE operations SET txid=lower(txid) WHERE length(txid)=64;
+             UPDATE control SET version=2 WHERE singleton=1;"
+        )?;
         tx.commit()?;
-        Ok(Self { db })
+        let database_path = fs::canonicalize(&config.state_dir)?.join("state.sqlite3");
+        let database_metadata = fs::symlink_metadata(&database_path)?;
+        Ok(Self {
+            db,
+            binding: None,
+            writer_path: None,
+            database_file: Some((database_path, database_metadata)),
+        })
     }
 
     pub(crate) fn control(&self) -> Result<Control> {
@@ -435,6 +697,7 @@ impl Store {
     }
 
     pub(crate) fn set_paused(&mut self, paused: bool) -> Result<()> {
+        self.continuity()?;
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -451,6 +714,7 @@ impl Store {
     }
 
     pub(crate) fn recover(&mut self) -> Result<()> {
+        self.continuity()?;
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -470,6 +734,7 @@ impl Store {
     }
 
     pub(crate) fn abandon_models(&mut self) -> Result<usize> {
+        self.continuity()?;
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -499,6 +764,10 @@ impl Store {
         control: Control,
         revision: &str,
     ) -> Result<Operation> {
+        self.continuity()?;
+        if !matches!(state, "generating" | "prepared") {
+            bail!("invalid initial operation state");
+        }
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -515,10 +784,14 @@ impl Store {
         if current.paused || current != control {
             bail!("admission generation changed");
         }
-        let unresolved: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE state IN
-            ('generating','generated','prepared','dispatching','queued','unknown','included_pending','retry'))", [], |row| row.get(0))?;
+        let unresolved: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM operations WHERE kind=?1 AND state IN
+            ('generating','generated','prepared','retry'))",
+            [kind.as_str()],
+            |row| row.get(0),
+        )?;
         if unresolved {
-            bail!("an operation already holds the account boundary");
+            bail!("preparation capacity is already occupied");
         }
         // Mining has no model payload; publish its complete prepared intent atomically.
         let payload = (kind == WorkKind::Mine && state == "prepared").then_some("{}");
@@ -534,6 +807,15 @@ impl Store {
     }
 
     pub(crate) fn save(&mut self, op: &Operation, event: &str) -> Result<()> {
+        self.continuity()?;
+        let predecessor = op.persisted_state.borrow().clone();
+        let was_effect = matches!(
+            predecessor.as_str(),
+            "dispatching" | "queued" | "unknown" | "included_pending"
+        );
+        if matches!(op.state.as_str(), "queued" | "unknown" | "included_pending") && !was_effect {
+            bail!("effect transition requires durable dispatch intent");
+        }
         // Only local static codes enter the public event stream.
         if !event.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') {
             bail!("invalid local event code");
@@ -541,18 +823,93 @@ impl Store {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute("UPDATE operations SET state=?1,result=?2,payload=?3,job_id=?4,txid=?5,next_at=?6,updated_at=?7 WHERE id=?8",
-            params![op.state,op.result.as_ref().map(serde_json::to_string).transpose()?,
-                op.payload.as_ref().map(serde_json::to_string).transpose()?,op.job_id,op.txid,op.next_at,now(),op.id])?;
-        tx.execute(
-            "INSERT INTO events(at,code,kind,operation_id) VALUES (?1,?2,?3,?4)",
-            params![now(), event, op.kind.as_str(), op.id],
+        if op.state == "dispatching" && predecessor != "dispatching" {
+            if !matches!(predecessor.as_str(), "generated" | "prepared" | "retry") {
+                bail!("invalid dispatch predecessor");
+            }
+            let occupied: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM operations WHERE id!=?1
+                AND state IN ('dispatching','queued','unknown','included_pending'))",
+                [op.id],
+                |r| r.get(0),
+            )?;
+            if occupied {
+                bail!("wallet effect slot is occupied");
+            }
+            let (paused, generation): (bool, i64) = tx.query_row(
+                "SELECT paused,generation FROM control WHERE singleton=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            if paused || generation != op.generation {
+                bail!("dispatch generation changed");
+            }
+            tx.execute(
+                "UPDATE authority SET dispatch_sequence=dispatch_sequence+1 WHERE singleton=1",
+                [],
+            )?;
+            tx.execute("INSERT INTO operation_evidence(operation_id,dispatch_sequence,blocked_since)
+                VALUES (?1,(SELECT dispatch_sequence FROM authority WHERE singleton=1),?2)
+                ON CONFLICT(operation_id) DO UPDATE SET dispatch_sequence=excluded.dispatch_sequence,
+                blocked_since=COALESCE(operation_evidence.blocked_since,excluded.blocked_since)", params![op.id,now()])?;
+        }
+        let changed = tx.execute(
+            "UPDATE operations SET state=?1,result=?2,payload=?3,job_id=?4,txid=?5,next_at=?6,
+            updated_at=CASE WHEN state!=?1 THEN ?7 ELSE updated_at END WHERE id=?8 AND state=?9",
+            params![
+                op.state,
+                op.result.as_ref().map(serde_json::to_string).transpose()?,
+                op.payload.as_ref().map(serde_json::to_string).transpose()?,
+                op.job_id,
+                op.txid,
+                op.next_at,
+                now(),
+                op.id,
+                predecessor
+            ],
         )?;
+        if changed != 1 {
+            bail!("stale operation transition");
+        }
+        if predecessor != op.state {
+            if matches!(
+                predecessor.as_str(),
+                "dispatching" | "queued" | "unknown" | "included_pending"
+            ) && !matches!(
+                op.state.as_str(),
+                "dispatching" | "queued" | "unknown" | "included_pending"
+            ) {
+                tx.execute(
+                    "INSERT INTO operation_evidence(operation_id,resolution) VALUES (?1,?2)
+                    ON CONFLICT(operation_id) DO UPDATE SET resolution=excluded.resolution",
+                    params![
+                        op.id,
+                        serde_json::to_string(
+                            &json!({"source":"bound_protocol_result","state":op.state,"at":now()})
+                        )?
+                    ],
+                )?;
+            }
+            tx.execute(
+                "INSERT INTO events(at,code,kind,operation_id) VALUES (?1,?2,?3,?4)",
+                params![now(), event, op.kind.as_str(), op.id],
+            )?;
+        }
         tx.execute(
             "DELETE FROM events WHERE id <= (SELECT COALESCE(MAX(id),0)-2000 FROM events)",
             [],
         )?;
         tx.commit()?;
+        *op.persisted_state.borrow_mut() = op.state.clone();
+        if op.state == "dispatching" && predecessor != "dispatching" {
+            let (_, sequence) = self.database_identity()?;
+            if let Some((path, binding)) = &mut self.binding {
+                binding.dispatch_sequence = sequence;
+                // SQLite FULL commit precedes witness fsync+rename+directory fsync;
+                // only then may Runtime poll the prepared network future.
+                write_binding(path, binding)?;
+            }
+        }
         Ok(())
     }
 
@@ -571,11 +928,11 @@ impl Store {
         Ok(())
     }
 
-    fn operation(&self, id: i64) -> Result<Option<Operation>> {
+    pub(crate) fn operation(&self, id: i64) -> Result<Option<Operation>> {
         let row = self
             .db
             .query_row(
-                "SELECT id,kind,work_key,state,request,result,payload,job_id,txid,next_at
+                "SELECT id,kind,work_key,state,request,result,payload,job_id,txid,next_at,generation
             FROM operations WHERE id=?1",
                 [id],
                 |r| {
@@ -590,6 +947,7 @@ impl Store {
                         r.get::<_, Option<String>>(7)?,
                         r.get::<_, Option<String>>(8)?,
                         r.get::<_, i64>(9)?,
+                        r.get::<_, i64>(10)?,
                     ))
                 },
             )
@@ -604,6 +962,8 @@ impl Store {
                     _ => bail!("invalid operation kind in state"),
                 },
                 key: r.2,
+                persisted_state: std::cell::RefCell::new(r.3.clone()),
+                generation: r.10,
                 state: r.3,
                 request: serde_json::from_str(&r.4)?,
                 result: r.5.map(|s| serde_json::from_str(&s)).transpose()?,
@@ -616,6 +976,7 @@ impl Store {
         .transpose()
     }
 
+    #[cfg(test)]
     pub(crate) fn pending(&self) -> Result<Option<Operation>> {
         let id: Option<i64> = self.db.query_row("SELECT id FROM operations WHERE state IN
             ('generating','generated','prepared','dispatching','queued','unknown','included_pending','retry') ORDER BY id LIMIT 1", [], |r| r.get(0)).optional()?;
@@ -623,6 +984,121 @@ impl Store {
             Some(id) => self.operation(id),
             None => Ok(None),
         }
+    }
+
+    pub(crate) fn effect(&self) -> Result<Option<Operation>> {
+        let id: Option<i64> = self
+            .db
+            .query_row(
+                "SELECT id FROM operations WHERE state IN
+            ('dispatching','queued','unknown','included_pending') ORDER BY id LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        id.map(|id| self.operation(id))
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    pub(crate) fn preparation(&self, kind: WorkKind) -> Result<Option<Operation>> {
+        let id: Option<i64> = self
+            .db
+            .query_row(
+                "SELECT id FROM operations WHERE kind=?1 AND state IN
+            ('generating','generated','prepared','retry') ORDER BY id LIMIT 1",
+                [kind.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        id.map(|id| self.operation(id))
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    pub(crate) fn capture_policy(
+        &self,
+        id: i64,
+        policy: &Value,
+        model_seconds: Option<u64>,
+        http_seconds: Option<u64>,
+    ) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO operation_evidence(operation_id,policy,model_deadline,http_deadline)
+            VALUES (?1,?2,?3,?4) ON CONFLICT(operation_id) DO UPDATE SET
+            policy=COALESCE(operation_evidence.policy,excluded.policy),
+            model_deadline=COALESCE(operation_evidence.model_deadline,excluded.model_deadline),
+            http_deadline=COALESCE(excluded.http_deadline,operation_evidence.http_deadline)",
+            params![
+                id,
+                serde_json::to_string(policy)?,
+                model_seconds.map(not_before),
+                http_seconds.map(not_before)
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn record_evidence(&self, id: i64, evidence: &Value) -> Result<()> {
+        let text = serde_json::to_string(evidence)?;
+        if text.len() > 4096 {
+            bail!("diagnostic evidence exceeds bound");
+        }
+        self.db.execute("INSERT INTO operation_evidence(operation_id,evidence,observed_at) VALUES (?1,?2,?3)
+            ON CONFLICT(operation_id) DO UPDATE SET evidence=excluded.evidence,observed_at=excluded.observed_at",
+            params![id,text,now()])?;
+        Ok(())
+    }
+
+    pub(crate) fn record_candidates(&self, id: i64, candidates: &Value) -> Result<()> {
+        if candidates["job_id"].is_null()
+            && candidates["transaction_ids"]
+                .as_array()
+                .is_none_or(Vec::is_empty)
+        {
+            return Ok(());
+        }
+        let text = serde_json::to_string(candidates)?;
+        if text.len() > 4096 {
+            bail!("private candidate evidence exceeds bound");
+        }
+        // Preserve the first nonempty set; differing later sets mark incomplete
+        // coverage rather than turning polling into another unbounded journal.
+        self.db.execute(
+            "INSERT INTO operation_candidates(operation_id,candidates) VALUES (?1,?2)
+            ON CONFLICT(operation_id) DO UPDATE SET truncated=CASE
+            WHEN candidates!=excluded.candidates THEN 1 ELSE truncated END",
+            params![id, text],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn attempt_count(&self, kind: WorkKind, key: &str) -> Result<u32> {
+        Ok(self.db.query_row(
+            "SELECT COUNT(*) FROM operations WHERE kind=?1 AND work_key=?2 COLLATE NOCASE",
+            params![kind.as_str(), key],
+            |r| r.get(0),
+        )?)
+    }
+
+    pub(crate) fn model_budget_used(&self, kind: WorkKind, key: &str) -> Result<u32> {
+        Ok(self.db.query_row(
+            "SELECT COUNT(*) FROM operations WHERE kind=?1 AND work_key=?2 COLLATE NOCASE
+            AND state NOT IN ('prelaunch_failed','abandoned_model')",
+            params![kind.as_str(), key],
+            |r| r.get(0),
+        )?)
+    }
+
+    pub(crate) fn retry_models(&mut self, config: &Config) -> Result<()> {
+        self.db.execute("UPDATE operations SET state=CASE WHEN state='model_unknown'
+            THEN 'superseded_model_unknown' ELSE 'retry_model' END,updated_at=?1
+            WHERE (state='rejected' OR (state='model_unknown' AND ?3))
+            AND payload IS NULL AND job_id IS NULL AND txid IS NULL
+            AND (SELECT COUNT(*) FROM operations b WHERE b.kind=operations.kind AND b.work_key=operations.work_key
+                AND b.state NOT IN ('prelaunch_failed','abandoned_model')) < ?2",
+            params![now(),config.preparation.max_attempts_per_work,config.preparation.retry_uncertain])?;
+        Ok(())
     }
 
     pub(crate) fn awaiting_finality(&self, kind: WorkKind) -> Result<Option<Operation>> {
@@ -634,45 +1110,15 @@ impl Store {
         }
     }
 
-    pub(crate) fn next_assignment(&self, ids: &[String]) -> Result<Option<String>> {
-        let cursor: Option<String> = self
-            .db
-            .query_row("SELECT cursor FROM schedule WHERE kind='judge'", [], |r| {
-                r.get(0)
-            })
-            .optional()?
-            .flatten();
-        let mut first: Option<&String> = None;
-        let mut after: Option<&String> = None;
-        for id in ids {
-            if self.attempted(WorkKind::Judge, id)? {
-                continue;
-            }
-            if first.is_none_or(|current| id < current) {
-                first = Some(id);
-            }
-            if cursor.as_ref().is_none_or(|last| id > last)
-                && after.is_none_or(|current| id < current)
-            {
-                after = Some(id);
-            }
-        }
-        let selected = after.or(first);
-        if let Some(id) = selected {
-            self.db.execute("INSERT INTO schedule(kind,next_at,cursor) VALUES ('judge',0,?1) ON CONFLICT(kind) DO UPDATE SET cursor=excluded.cursor",[id])?;
-        }
-        Ok(selected.cloned())
-    }
-
     pub(crate) fn attempted(&self, kind: WorkKind, key: &str) -> Result<bool> {
-        Ok(self.db.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE kind=?1 AND work_key=?2 AND state NOT IN ('discarded','stale','prelaunch_failed','abandoned_model'))",
+        Ok(self.db.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE kind=?1 AND work_key=?2 COLLATE NOCASE AND state NOT IN ('discarded','stale','prelaunch_failed','abandoned_model','retry_model','superseded_model_unknown'))",
             params![kind.as_str(),key], |r| r.get(0))?)
     }
 
     pub(crate) fn answer_epoch_attempted(&self, epoch: u64) -> Result<bool> {
         Ok(self.db.query_row(
             "SELECT EXISTS(SELECT 1 FROM operations WHERE kind='answer' AND work_key LIKE ?1
-            AND state NOT IN ('discarded','stale','prelaunch_failed','abandoned_model'))",
+            AND state NOT IN ('discarded','stale','prelaunch_failed','abandoned_model','retry_model','superseded_model_unknown'))",
             [format!("{epoch}:%")],
             |r| r.get(0),
         )?)
@@ -790,7 +1236,8 @@ impl Store {
     }
 
     pub(crate) fn history(&self) -> Result<Vec<String>> {
-        let mut stmt = self.db.prepare("SELECT payload FROM operations WHERE kind='answer' AND state IN ('confirmed','final') ORDER BY id DESC LIMIT 8")?;
+        let mut stmt = self.db.prepare("SELECT payload FROM operations WHERE kind='answer' AND payload IS NOT NULL
+            AND state IN ('queued','unknown','included_pending','confirmed','final') ORDER BY id DESC LIMIT 8")?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         let mut answers = Vec::new();
         for row in rows {
@@ -804,6 +1251,10 @@ impl Store {
     }
 
     pub(crate) fn runtime_state(&self, config: &Config, reload_blocked: bool) -> Result<()> {
+        self.continuity()?;
+        self.db.execute("INSERT INTO runtime_policy VALUES (1,?1) ON CONFLICT(singleton) DO UPDATE SET policy=excluded.policy",
+            [serde_json::to_string(&json!({"timeouts":config.timeouts,"schedule":config.schedule,
+                "preparation":config.preparation,"build":crate::runtime::build_info()}))?])?;
         self.db.execute(
             "INSERT INTO runtime_state VALUES (1,?1,?2,?3,?4) ON CONFLICT(singleton) DO UPDATE SET
             effective_revision=excluded.effective_revision,reload_blocked=excluded.reload_blocked,
@@ -824,6 +1275,14 @@ impl Store {
         Ok(())
     }
 
+    pub(crate) fn heartbeat(&self) -> Result<()> {
+        self.db.execute(
+            "UPDATE runtime_state SET observed_at=?1 WHERE singleton=1 AND observed_at<?1",
+            [now()],
+        )?;
+        Ok(())
+    }
+
     /// Latest hosted identity result, independent of bounded diagnostic events.
     /// This is persisted evidence, not a live verification or freshness guarantee.
     pub(crate) fn record_hosted_identity(&self, verified: bool) -> Result<()> {
@@ -832,6 +1291,15 @@ impl Store {
              ON CONFLICT(singleton) DO UPDATE SET
              hosted_identity_verified=excluded.hosted_identity_verified",
             [verified],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn safety_observed(&self, id: i64) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO operation_evidence(operation_id,safety_observed_at) VALUES (?1,?2)
+            ON CONFLICT(operation_id) DO UPDATE SET safety_observed_at=excluded.safety_observed_at",
+            params![id, now()],
         )?;
         Ok(())
     }
@@ -845,16 +1313,46 @@ impl Store {
         )?;
         let counts = stmt.query_map([], |r| Ok(json!({"kind":r.get::<_,String>(0)?,"state":r.get::<_,String>(1)?,"count":r.get::<_,i64>(2)?})))?
             .collect::<std::result::Result<Vec<_>,_>>()?;
-        let pending: Option<Value> = self.db.query_row(
-            "SELECT kind,state,next_at,revision,generation,created_at,updated_at FROM operations
+        let mut pending: Option<Value> = self.db.query_row(
+            "SELECT kind,state,next_at,revision,generation,created_at,updated_at,id FROM operations
              WHERE state IN ('generating','generated','prepared','dispatching','queued','unknown','included_pending','retry')
-             ORDER BY id LIMIT 1", [], |r| {
+             ORDER BY CASE WHEN state IN ('dispatching','queued','unknown','included_pending') THEN 0 ELSE 1 END,id LIMIT 1", [], |r| {
                 Ok(json!({"kind":r.get::<_,String>(0)?,"state":r.get::<_,String>(1)?,
                     "next_at":r.get::<_,i64>(2)?,"captured_revision":r.get::<_,String>(3)?,
                     "captured_generation":r.get::<_,i64>(4)?,"created_at":r.get::<_,i64>(5)?,
-                    "updated_at":r.get::<_,i64>(6)?}))
+                    "updated_at":r.get::<_,i64>(6)?,"operation_id":r.get::<_,i64>(7)?}))
             },
         ).optional()?;
+        if self.schema_version()? == 2
+            && let Some(pending) = pending.as_mut()
+        {
+            struct PendingEvidence {
+                blocked_since: Option<i64>,
+                model_deadline: Option<i64>,
+                http_deadline: Option<i64>,
+                diagnostic: Option<String>,
+            }
+            let detail = self.db.query_row(
+                "SELECT blocked_since,model_deadline,http_deadline,evidence FROM operation_evidence WHERE operation_id=?1",
+                [pending["operation_id"].as_i64().unwrap_or_default()],
+                |row| Ok(PendingEvidence {
+                    blocked_since: row.get(0)?,
+                    model_deadline: row.get(1)?,
+                    http_deadline: row.get(2)?,
+                    diagnostic: row.get(3)?,
+                }),
+            ).optional()?;
+            if let Some(detail) = detail {
+                pending["blocked_since"] = json!(detail.blocked_since);
+                pending["model_deadline"] = json!(detail.model_deadline);
+                pending["http_deadline"] = json!(detail.http_deadline);
+                pending["diagnostic"] = detail
+                    .diagnostic
+                    .map(|value| serde_json::from_str::<Value>(&value))
+                    .transpose()?
+                    .unwrap_or(Value::Null);
+            }
+        }
         let observed: Option<Value> = self
             .db
             .query_row(
@@ -874,6 +1372,20 @@ impl Store {
                     .context("invalid stored capabilities")?,
             )?;
             effective["capabilities"] = capabilities;
+            if self.schema_version()? == 2 {
+                let policy: Option<String> = self
+                    .db
+                    .query_row(
+                        "SELECT policy FROM runtime_policy WHERE singleton=1",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                effective["policy"] = policy
+                    .map(|s| serde_json::from_str::<Value>(&s))
+                    .transpose()?
+                    .unwrap_or(Value::Null);
+            }
         }
         let stored_identity: String =
             self.db
@@ -920,6 +1432,52 @@ impl Store {
             (None, None, None)
         };
         let epoch_evidence = json!({"first_observed_at":first_observed_at,"answered":answered});
+        let effect = self.effect()?;
+        let blocked = effect.is_some();
+        let blocking_operation = effect.as_ref().map(|op| op.id);
+        let blocked_since = if self.schema_version()? == 2 {
+            effect.as_ref().map(|op| self.db.query_row(
+                "SELECT COALESCE((SELECT blocked_since FROM operation_evidence WHERE operation_id=?1),created_at)
+                FROM operations WHERE id=?1", [op.id], |r| r.get::<_,i64>(0))).transpose()?
+        } else {
+            pending.as_ref().and_then(|p| p["created_at"].as_i64())
+        };
+        let last_progress: Option<i64> = self.db.query_row(
+            "SELECT MAX(updated_at) FROM operations
+            WHERE state IN ('confirmed','final','completed')",
+            [],
+            |r| r.get(0),
+        )?;
+        let mut captured_work = Vec::new();
+        let last_safety_observation: Option<i64> = if self.schema_version()? == 2 {
+            let mut statement = self.db.prepare("SELECT o.id,o.kind,o.state,o.revision,o.generation,
+                e.model_deadline,e.http_deadline,e.policy,o.created_at FROM operations o
+                LEFT JOIN operation_evidence e ON e.operation_id=o.id
+                WHERE o.state IN ('generating','generated','prepared','retry') ORDER BY o.id LIMIT 3")?;
+            let rows = statement.query_map([],|r| Ok((json!({"operation_id":r.get::<_,i64>(0)?,
+                "kind":r.get::<_,String>(1)?,"state":r.get::<_,String>(2)?,
+                "captured_revision":r.get::<_,String>(3)?,"captured_generation":r.get::<_,i64>(4)?,
+                "model_deadline":r.get::<_,Option<i64>>(5)?,"http_deadline":r.get::<_,Option<i64>>(6)?,
+                "created_at":r.get::<_,i64>(8)?}),
+                r.get::<_,Option<String>>(7)?)))?;
+            for row in rows {
+                let (mut work, policy) = row?;
+                if let Some(policy) = policy {
+                    let policy: Value = serde_json::from_str(&policy)?;
+                    work["captured_policy"] = json!({"model":policy["model"]["model"],
+                        "harness":policy["model"]["harness"],"reasoning":policy["model"]["reasoning"],
+                        "model_seconds":policy["model_seconds"],"attempt":policy["attempt"]});
+                }
+                captured_work.push(work);
+            }
+            self.db.query_row(
+                "SELECT MAX(safety_observed_at) FROM operation_evidence",
+                [],
+                |r| r.get(0),
+            )?
+        } else {
+            None
+        };
         let status = json!({"initialized":true,"paused":control.paused,"generation":control.generation,
             "identity_fingerprint":digest(format!("{}\n{}",stored["chain"].as_str().unwrap_or_default(),stored["address"].as_str().unwrap_or_default())),
             "chain":stored["chain"],"capabilities":config.capabilities,"observation":observed,
@@ -928,9 +1486,61 @@ impl Store {
             "identity_matches_config":stored_identity==identity(config)?,"last_event":last_event,
             "hosted_identity_verified":hosted_identity_verified,
             "pending":pending,"operations":counts,"evidence":"authenticated_hosted_response",
+            "admission_blocked":blocked,"blocking_operation":blocking_operation,"blocked_since":blocked_since,
+            "affected_capabilities":if blocked {json!(["answer","judge","mine"])} else {json!([])},
+            "last_progress_at":last_progress,"last_reported_build":effective.as_ref().map(|e| &e["policy"]["build"]),
+            "process_identity":"unverified",
+            "captured_work":captured_work,"last_safety_observation_at":last_safety_observation,
             "finality":"node_reported_only","paid":"not_verified"});
         snapshot.commit()?;
         Ok(status)
+    }
+
+    pub(crate) fn inspect(&self, id: i64) -> Result<Value> {
+        let op = self.operation(id)?.context("operation not found")?;
+        let policy = if self.schema_version()? == 2 {
+            self.db.query_row("SELECT policy,evidence,dispatch_sequence,blocked_since,resolution FROM operation_evidence WHERE operation_id=?1",
+                [id], |r| Ok(json!({"captured_policy":r.get::<_,Option<String>>(0)?,
+                    "evidence":r.get::<_,Option<String>>(1)?,"dispatch_sequence":r.get::<_,Option<i64>>(2)?,
+                    "blocked_since":r.get::<_,Option<i64>>(3)?,"resolution":r.get::<_,Option<String>>(4)?}))).optional()?
+        } else {
+            None
+        };
+        let candidates = if self.schema_version()? == 2 {
+            self.db
+                .query_row(
+                    "SELECT candidates,truncated FROM operation_candidates WHERE operation_id=?1",
+                    [id],
+                    |r| {
+                        Ok(json!({"untrusted":true,"candidates":r.get::<_,String>(0)?,
+                    "truncated":r.get::<_,bool>(1)?}))
+                    },
+                )
+                .optional()?
+        } else {
+            None
+        };
+        let window: (i64, i64) = self.db.query_row(
+            "SELECT created_at,updated_at FROM operations WHERE id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let identity_text: String =
+            self.db
+                .query_row("SELECT identity FROM control WHERE singleton=1", [], |r| {
+                    r.get(0)
+                })?;
+        let identity: Value = serde_json::from_str(&identity_text)?;
+        Ok(
+            json!({"private":true,"operation_id":id,"kind":op.kind,"state":op.state,
+            "identity":{"chain":identity["chain"],"address":identity["address"],"origin":identity["base_url"]},
+            "input_digest":digest(serde_json::to_vec(&op.request)?),
+            "work_key":op.key,"request":op.request,"result":op.result,"payload":op.payload,
+            "payload_digest":op.payload.as_ref().map(serde_json::to_vec).transpose()?.map(digest),
+            "job_id":op.job_id,"txid":op.txid,"attempt_started_at":window.0,"last_transition_at":window.1,
+            "untrusted_identifier_candidates":candidates,
+            "details":policy,"binding_requirement":"persisted request identifier and authoritative terminal response; similarity is insufficient"}),
+        )
     }
 
     pub(crate) fn events(&self, limit: usize) -> Result<Value> {
@@ -959,16 +1569,33 @@ mod tests {
 
     fn begin(store: &mut Store, kind: WorkKind, key: &str, state: &str) -> Operation {
         let control = store.control().unwrap();
-        store
+        let initial = if state == "generating" {
+            "generating"
+        } else {
+            "prepared"
+        };
+        let mut op = store
             .begin(
                 kind,
                 key,
-                state,
+                initial,
                 &json!({"private":"request-canary"}),
                 control,
                 "revision",
             )
-            .unwrap()
+            .unwrap();
+        if matches!(
+            state,
+            "queued" | "unknown" | "included_pending" | "confirmed" | "final"
+        ) {
+            op.state = "dispatching".into();
+            store.save(&op, "dispatch_intent").unwrap();
+        }
+        if state != initial {
+            op.state = state.into();
+            store.save(&op, "test_transition").unwrap();
+        }
+        op
     }
 
     #[test]
@@ -1325,8 +1952,9 @@ mod tests {
         let (_temp, config) = fixture();
         let mut store = Store::open(&config).unwrap();
         store.set_paused(false).unwrap();
-        let mut op = begin(&mut store, WorkKind::Answer, "1:word", "dispatching");
+        let mut op = begin(&mut store, WorkKind::Answer, "1:word", "prepared");
         op.payload = Some(json!({"answer":"answer-canary"}));
+        op.state = "dispatching".into();
         store.save(&op, "dispatch_intent").unwrap();
         drop(store);
         let mut store = Store::open(&config).unwrap();
@@ -1345,6 +1973,8 @@ mod tests {
         let mut op = begin(&mut store, WorkKind::Answer, "2:word", "generated");
         op.result = Some(json!({"answer":"result-canary"}));
         op.payload = Some(json!({"answer":"payload-canary"}));
+        op.state = "dispatching".into();
+        store.save(&op, "dispatch_intent").unwrap();
         op.job_id = Some("job-bearer-canary".into());
         op.state = "queued".into();
         op.next_at = now() + 100;
@@ -1376,9 +2006,14 @@ mod tests {
         let (_temp, config) = fixture();
         let mut store = Store::open(&config).unwrap();
         store.set_paused(false).unwrap();
-        let mut op = begin(&mut store, WorkKind::Answer, "3:word", "included_pending");
+        let mut op = begin(&mut store, WorkKind::Answer, "3:word", "prepared");
         op.payload = Some(json!({"answer":"verified-history"}));
-        assert!(store.history().unwrap().is_empty());
+        op.state = "dispatching".into();
+        store.save(&op, "dispatch_intent").unwrap();
+        op.state = "included_pending".into();
+        store.save(&op, "transaction_included_unconfirmed").unwrap();
+        assert_eq!(store.history().unwrap(), vec!["verified-history"]);
+        assert!(store.effect().unwrap().is_some());
         op.state = "confirmed".into();
         store.save(&op, "receipt_included").unwrap();
         assert!(store.pending().unwrap().is_none());
@@ -1404,16 +2039,17 @@ mod tests {
     }
 
     #[test]
-    fn assignment_cursor_advances_past_failed_hydration_and_survives_restart() {
+    fn normalized_assignment_attempt_survives_restart() {
         let (_temp, config) = fixture();
-        let store = Store::open(&config).unwrap();
-        let ids = vec!["a".into(), "b".into(), "c".into()];
-        assert_eq!(store.next_assignment(&ids).unwrap().as_deref(), Some("a"));
+        let mut store = Store::open(&config).unwrap();
+        store.set_paused(false).unwrap();
+        let mut op = begin(&mut store, WorkKind::Judge, &"A".repeat(64), "prepared");
+        op.state = "abstained".into();
+        store.save(&op, "assignment_evidence_insufficient").unwrap();
         drop(store);
         let store = Store::open(&config).unwrap();
-        assert_eq!(store.next_assignment(&ids).unwrap().as_deref(), Some("b"));
-        assert_eq!(store.next_assignment(&ids).unwrap().as_deref(), Some("c"));
-        assert_eq!(store.next_assignment(&ids).unwrap().as_deref(), Some("a"));
+        assert!(store.attempted(WorkKind::Judge, &"a".repeat(64)).unwrap());
+        assert!(!store.attempted(WorkKind::Judge, &"b".repeat(64)).unwrap());
     }
 
     #[test]
@@ -1601,6 +2237,273 @@ mod tests {
                 .mode()
                 & 0o777,
             0o755
+        );
+    }
+
+    fn bound_fixture() -> (tempfile::TempDir, Config) {
+        let (dir, mut config) = fixture();
+        config.network.address = digest(dir.path().as_os_str().as_encoded_bytes());
+        config.network.credential_file = dir.path().join("key");
+        (dir, config)
+    }
+
+    fn remove_anchors(config: &Config) {
+        for suffix in ["writer", "admission", "binding", "binding-next"] {
+            let _ = fs::remove_file(lock_path(config, suffix).unwrap());
+        }
+    }
+
+    #[test]
+    fn preparation_is_not_an_effect_and_stale_transitions_cannot_win() {
+        let (_dir, config) = fixture();
+        let mut store = Store::open(&config).unwrap();
+        store.set_paused(false).unwrap();
+        let mut answer = begin(&mut store, WorkKind::Answer, "1:words", "prepared");
+        let mut judge = begin(&mut store, WorkKind::Judge, &"a".repeat(64), "prepared");
+        assert!(store.effect().unwrap().is_none());
+        let stale = answer.clone();
+        answer.state = "dispatching".into();
+        store.save(&answer, "dispatch_intent").unwrap();
+        judge.state = "dispatching".into();
+        assert!(store.save(&judge, "dispatch_intent").is_err());
+        assert!(store.save(&stale, "stale_transition").is_err());
+        assert_eq!(store.effect().unwrap().unwrap().id, answer.id);
+    }
+
+    #[test]
+    fn bound_missing_and_replaced_journals_fail_closed_everywhere() {
+        let (_dir, config) = bound_fixture();
+        let (lock, store) = AccountLock::acquire(&config).unwrap();
+        store
+            .db
+            .execute("UPDATE authority SET database_id='replacement'", [])
+            .unwrap();
+        drop(store);
+        drop(lock);
+        assert!(AccountLock::acquire(&config).is_err());
+        assert!(Store::read_only(&config).is_err());
+        fs::remove_file(config.state_dir.join("state.sqlite3")).unwrap();
+        assert!(crate::runtime::pause(&config).is_err());
+        assert!(AccountLock::control_store(&config).is_err());
+        assert!(Store::open(&config).is_err());
+        assert!(Store::read_only(&config).is_err());
+        assert!(!config.state_dir.join("state.sqlite3").exists());
+        remove_anchors(&config);
+    }
+
+    #[test]
+    fn independent_dispatch_witness_detects_database_only_rollback() {
+        let (dir, config) = bound_fixture();
+        let (lock, mut store) = AccountLock::acquire(&config).unwrap();
+        store.set_paused(false).unwrap();
+        let backup = fs::canonicalize(dir.path()).unwrap().join("before.sqlite3");
+        store
+            .db
+            .execute("VACUUM INTO ?1", [backup.to_str().unwrap()])
+            .unwrap();
+        let mut op = begin(&mut store, WorkKind::Mine, "1", "prepared");
+        op.state = "dispatching".into();
+        store.save(&op, "dispatch_intent").unwrap();
+        let binding = read_binding(&config).unwrap().unwrap();
+        assert_eq!(binding.dispatch_sequence, 1);
+        drop(store);
+        drop(lock);
+        fs::copy(backup, config.state_dir.join("state.sqlite3")).unwrap();
+        assert!(AccountLock::acquire(&config).is_err());
+        assert!(AccountLock::control_store(&config).is_err());
+        remove_anchors(&config);
+    }
+
+    #[test]
+    fn journal_ahead_crash_gap_preserves_unknown_and_advances_witness() {
+        let (_dir, config) = bound_fixture();
+        drop(AccountLock::acquire(&config).unwrap());
+        // A Store without attached binding simulates death after SQLite commit,
+        // before witness advancement; production dispatch cannot cross that gap.
+        let mut store = Store::open(&config).unwrap();
+        store.set_paused(false).unwrap();
+        let mut op = begin(&mut store, WorkKind::Mine, "1", "prepared");
+        op.state = "dispatching".into();
+        store.save(&op, "dispatch_intent").unwrap();
+        assert_eq!(read_binding(&config).unwrap().unwrap().dispatch_sequence, 0);
+        drop(store);
+        let (lock, mut adopted) = AccountLock::acquire(&config).unwrap();
+        adopted.recover().unwrap();
+        assert_eq!(adopted.effect().unwrap().unwrap().state, "unknown");
+        assert_eq!(read_binding(&config).unwrap().unwrap().dispatch_sequence, 1);
+        drop(adopted);
+        drop(lock);
+        remove_anchors(&config);
+    }
+
+    #[test]
+    fn legacy_binding_adopts_intact_unknown_and_detects_lock_replacement() {
+        let (_dir, config) = bound_fixture();
+        let mut store = Store::open(&config).unwrap();
+        store.set_paused(false).unwrap();
+        let mut op = begin(&mut store, WorkKind::Mine, "1", "prepared");
+        op.state = "dispatching".into();
+        store.save(&op, "dispatch_intent").unwrap();
+        op.state = "unknown".into();
+        store.save(&op, "dispatch_outcome_unknown").unwrap();
+        store
+            .db
+            .execute_batch(
+                "UPDATE control SET version=1; DROP TABLE authority;
+            DROP TABLE operation_evidence; DROP TABLE runtime_policy;",
+            )
+            .unwrap();
+        drop(store);
+        let writer = lock_path(&config, "writer").unwrap();
+        let mut legacy = private_file(&writer).unwrap();
+        legacy
+            .write_all(digest(config.state_dir.as_os_str().as_encoded_bytes()).as_bytes())
+            .unwrap();
+        legacy.sync_all().unwrap();
+        drop(legacy);
+        assert!(AccountLock::acquire(&config).is_err());
+        assert!(AccountLock::control_store(&config).is_err());
+        let (lock, adopted) = AccountLock::adopt(&config).unwrap();
+        assert_eq!(adopted.effect().unwrap().unwrap().id, op.id);
+        assert_eq!(adopted.effect().unwrap().unwrap().state, "unknown");
+        let old = writer.with_extension("fixture-old-lock");
+        fs::rename(&writer, &old).unwrap();
+        drop(private_file(&writer).unwrap());
+        assert!(adopted.continuity().is_err());
+        drop(adopted);
+        drop(lock);
+        fs::remove_file(old).unwrap();
+        remove_anchors(&config);
+    }
+
+    #[test]
+    fn unmarked_legacy_journal_is_not_implicitly_adopted() {
+        let (_dir, config) = bound_fixture();
+        let store = Store::open(&config).unwrap();
+        store
+            .db
+            .execute_batch(
+                "UPDATE control SET version=1; DROP TABLE authority;
+                 DROP TABLE operation_evidence; DROP TABLE runtime_policy;",
+            )
+            .unwrap();
+        drop(store);
+        let acquired = AccountLock::acquire(&config).is_ok();
+        let controlled = AccountLock::control_store(&config).is_ok();
+        let adopted = AccountLock::adopt(&config).is_ok();
+        let schema = Store::read_only(&config)
+            .unwrap()
+            .unwrap()
+            .schema_version()
+            .unwrap();
+        remove_anchors(&config);
+        assert!(!acquired && !controlled && !adopted);
+        assert_eq!(schema, 1);
+    }
+
+    #[test]
+    fn adoption_requires_an_existing_initialized_journal() {
+        let (_dir, config) = bound_fixture();
+        let adopted = AccountLock::adopt(&config).is_ok();
+        let initialized = config.state_dir.join("state.sqlite3").exists();
+        remove_anchors(&config);
+        assert!(!adopted);
+        assert!(!initialized);
+    }
+
+    #[test]
+    fn bounded_model_retry_never_changes_effect_uncertainty() {
+        let (_dir, mut config) = fixture();
+        config.preparation.max_attempts_per_work = 2;
+        let mut store = Store::open(&config).unwrap();
+        store.set_paused(false).unwrap();
+        let mut model = begin(&mut store, WorkKind::Answer, "1:word", "generating");
+        model.state = "model_unknown".into();
+        store.save(&model, "model_launch_unknown").unwrap();
+        let mut effect = begin(&mut store, WorkKind::Judge, &"A".repeat(64), "prepared");
+        effect.state = "dispatching".into();
+        store.save(&effect, "dispatch_intent").unwrap();
+        effect.state = "unknown".into();
+        store.save(&effect, "dispatch_outcome_unknown").unwrap();
+        store.retry_models(&config).unwrap();
+        assert_eq!(
+            store.operation(model.id).unwrap().unwrap().state,
+            "model_unknown"
+        );
+        config.preparation.retry_uncertain = true;
+        store.retry_models(&config).unwrap();
+        assert_eq!(
+            store.operation(model.id).unwrap().unwrap().state,
+            "superseded_model_unknown"
+        );
+        assert_eq!(store.effect().unwrap().unwrap().id, effect.id);
+        assert!(store.attempted(WorkKind::Judge, &"a".repeat(64)).unwrap());
+        let mut retry = begin(&mut store, WorkKind::Answer, "1:word", "generating");
+        retry.state = "model_unknown".into();
+        store.save(&retry, "model_launch_unknown").unwrap();
+        store.retry_models(&config).unwrap();
+        assert_eq!(
+            store.operation(retry.id).unwrap().unwrap().state,
+            "model_unknown"
+        );
+    }
+
+    #[test]
+    fn missing_independent_binding_is_not_silently_readopted() {
+        let (_dir, config) = bound_fixture();
+        drop(AccountLock::acquire(&config).unwrap());
+        fs::remove_file(lock_path(&config, "binding").unwrap()).unwrap();
+        assert!(AccountLock::acquire(&config).is_err());
+        assert!(AccountLock::control_store(&config).is_err());
+        assert!(Store::read_only(&config).is_err());
+        remove_anchors(&config);
+    }
+
+    #[test]
+    fn unchanged_observation_retains_transition_age_and_private_candidates() {
+        let (_dir, config) = fixture();
+        let mut store = Store::open(&config).unwrap();
+        store.set_paused(false).unwrap();
+        let mut op = begin(&mut store, WorkKind::Mine, "1", "prepared");
+        op.state = "dispatching".into();
+        store.save(&op, "dispatch_intent").unwrap();
+        op.state = "unknown".into();
+        store.save(&op, "dispatch_outcome_unknown").unwrap();
+        store
+            .record_candidates(
+                op.id,
+                &json!({"job_id":"private-job-canary","transaction_ids":[]}),
+            )
+            .unwrap();
+        let before = store.events(100).unwrap();
+        store.save(&op, "receipt_unresolved").unwrap();
+        assert_eq!(store.events(100).unwrap(), before);
+        store
+            .record_candidates(op.id, &json!({"job_id":null,"transaction_ids":[]}))
+            .unwrap();
+        for _ in 0..2010 {
+            store.event("test_ring_rotation", None).unwrap();
+        }
+        assert!(
+            store
+                .inspect(op.id)
+                .unwrap()
+                .to_string()
+                .contains("private-job-canary")
+        );
+        assert!(
+            !store
+                .status(&config)
+                .unwrap()
+                .to_string()
+                .contains("private-job-canary")
+        );
+        assert!(
+            !store
+                .events(1000)
+                .unwrap()
+                .to_string()
+                .contains("private-job-canary")
         );
     }
 }

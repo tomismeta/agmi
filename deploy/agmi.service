@@ -1,16 +1,19 @@
 [Unit]
-Description=agmi — Agents Gonna Mine It
+Description=agmi — Agents Gonna Mine It [release=@AGMI_RELEASE_ID@]
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/agmi --config %h/.config/agmi/config.toml run
+ExecStart="%h/.local/share/agmi/releases/@AGMI_RELEASE_ID@/agmi" --config "%h/.config/agmi/config.toml" run
 Environment="PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
 Restart=on-failure
 RestartSec=5
 KillMode=control-group
-TimeoutStopSec=90
+# The runtime owns its validated, captured shutdown budget. A finite unit cap
+# would silently truncate a longer hot-reloaded budget. An operator must force
+# termination if a local bug prevents bounded graceful shutdown.
+TimeoutStopSec=infinity
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true

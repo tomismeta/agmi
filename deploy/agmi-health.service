@@ -1,10 +1,10 @@
 [Unit]
-Description=agmi local participation health
+Description=agmi local participation health [release=@AGMI_RELEASE_ID@]
 After=agmi.service
 
 [Service]
 Type=oneshot
-ExecStart=%h/.local/bin/agmi --config %h/.config/agmi/config.toml --json health --stale-seconds 180 --work-seconds 1800 --answer-grace-seconds 900 --min-free-mib 128
+ExecStart="%h/.local/share/agmi/releases/@AGMI_RELEASE_ID@/agmi" --config "%h/.config/agmi/config.toml" --json health --stale-seconds 180 --work-seconds 1800 --answer-grace-seconds 900 --min-free-mib 256
 Environment="PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
 TimeoutStartSec=30
 UMask=0077

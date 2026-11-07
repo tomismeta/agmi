@@ -21,6 +21,8 @@ jobs:
         run: cargo +1.96.0 fmt --all -- --check
       - name: Native bridge syntax
         run: node --check adapters/openclaw.mjs
+      - name: Installer syntax
+        run: sh -n deploy/install-user.sh
       - name: Behavior tests
         run: cargo +1.96.0 test --locked
       - name: Lints
@@ -29,5 +31,19 @@ jobs:
         run: cargo +1.96.0 build --locked
       - name: CLI discovery
         run: ./target/debug/agmi commands --json
+      - name: Lost-grade cold-restart safety
+        run: python3 tests/recovery_smoke.py target/debug/agmi
+      - name: Bound recovery and identifier rejection
+        run: python3 tests/recovery_smoke.py target/debug/agmi --bound-job
+      - name: Observation during stalled judging
+        run: python3 tests/recovery_smoke.py target/debug/agmi --stalled-judge
+      - name: Python-native recovery transport
+        run: python3 tests/recovery_smoke.py target/debug/agmi --harness hermes --bound-job
+      - name: Liveness during paged network work
+        run: python3 tests/recovery_smoke.py target/debug/agmi --slow-inventory
+      - name: Malformed identity fences effects
+        run: python3 tests/recovery_smoke.py target/debug/agmi --bad-identity
+      - name: Build identity
+        run: ./target/debug/agmi build-info --manifest
       - name: Inspect distributable contents
         run: cargo +1.96.0 package --locked --list --allow-dirty

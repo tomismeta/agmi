@@ -1,5 +1,5 @@
 [Unit]
-Description=Check agmi local participation health every two minutes
+Description=Check agmi local participation health every two minutes [release=@AGMI_RELEASE_ID@]
 
 [Timer]
 OnCalendar=*:0/2
