@@ -22,6 +22,7 @@ const MAX_TEXT_CHARS: usize = 16384;
 // Deliberately no Debug: authentication and queued-job identifiers must not enter logs.
 pub struct Protocol {
     client: Client,
+    read_timeout: Duration,
     origin: Url,
     chain: String,
     address: String,
@@ -152,12 +153,15 @@ impl Protocol {
             .retry(reqwest::retry::never())
             .no_proxy()
             .timeout(timeout)
-            .connect_timeout(timeout)
+            .connect_timeout(timeout.max(Duration::from_secs(
+                config.timeouts.effective_read_http_seconds(),
+            )))
             .user_agent(concat!("agmi/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|_| anyhow::anyhow!("HTTP client initialization failed"))?;
         Ok(Self {
             client,
+            read_timeout: Duration::from_secs(config.timeouts.effective_read_http_seconds()),
             origin: validate_origin(&config.network.base_url)?,
             chain: config.network.chain.clone(),
             address: config.network.address.clone(),
@@ -279,7 +283,12 @@ impl Protocol {
                 .append_pair("offset", &offset.to_string())
                 .append_pair("limit", &limit.to_string());
         }
+        // Hosted mining is effectful despite using GET; it retains the write timeout.
+        let is_read = method == Method::GET && path != "/api/hosted/mine";
         let mut request = self.client.request(method, url);
+        if is_read {
+            request = request.timeout(self.read_timeout);
+        }
         if path.starts_with("/api/hosted/") {
             let key = self
                 .key

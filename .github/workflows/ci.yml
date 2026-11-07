@@ -45,6 +45,10 @@ jobs:
         run: python3 tests/recovery_smoke.py target/debug/agmi --bad-identity
       - name: Unanchored journal and authority integrity
         run: python3 tests/recovery_smoke.py target/debug/agmi --unanchored
+      - name: Bounded participation and CLI policy reload
+        run: python3 tests/participation_smoke.py target/debug/agmi
+      - name: Agent administration and startup identity fencing
+        run: python3 tests/admin_smoke.py target/debug/agmi
       - name: Build identity
         run: ./target/debug/agmi build-info --manifest
       - name: Inspect distributable contents

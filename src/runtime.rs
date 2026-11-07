@@ -1,4 +1,4 @@
-use crate::config::{Config, Mode, WorkKind};
+use crate::config::{Config, Mode, Participation, ParticipationMode, WorkKind};
 use crate::protocol::{
     Assignment, Challenge, Outcome, Protocol, Response, ResponseSource, assignment_ids,
     assignment_needs_hydration, classify_source, has_required_words, parse_challenge,
@@ -37,6 +37,13 @@ pub fn recovery_adopt(config: &Config) -> Result<()> {
     store.recover()
 }
 
+pub fn recovery_authorize(config: &Config, epoch: u64, kind: WorkKind) -> Result<Value> {
+    Store::read_only(config)?.context("journal not initialized")?;
+    let (_account, mut store) = AccountLock::acquire(config)?;
+    let _gate = AdmissionGuard::acquire(config)?;
+    store.authorize(config, epoch, kind)
+}
+
 pub async fn recovery_resolve(
     config_path: &Path,
     operation: i64,
@@ -44,8 +51,10 @@ pub async fn recovery_resolve(
     txid: Option<&str>,
 ) -> Result<Value> {
     use crate::protocol::{RecoveryIdentifier, verify_recovery_identifier};
+    let config_guard = crate::admin::lock_config_directory(config_path)?;
     let config = Config::load_metadata(config_path)?;
     let (_account, mut store) = AccountLock::acquire(&config)?;
+    drop(config_guard);
     store.recover()?;
     let mut op = store.operation(operation)?.context("operation not found")?;
     if !matches!(op.state.as_str(), "unknown" | "queued" | "included_pending") {
@@ -103,8 +112,40 @@ pub fn status(config: &Config) -> Result<Value> {
         Some(store) => store.status(config),
         None => Ok(json!({"initialized":false,"paused":true,"generation":0,
             "configured_revision":config.optional_revision()?,"effective_runtime":null,
-            "hosted_identity_verified":null,"pending":null,"operations":[]})),
+            "hosted_identity_verified":null,"pending":null,"operations":[],
+            "participation":{"policy":Participation::default(),"policy_source":"unavailable",
+                "unresolved_count":0,"risk_admissions":0,
+                "uncertainty_blocks":{"answer":false,"judge":false,"mine":false}}})),
     }
+}
+
+pub fn operations_list(
+    config: &Config,
+    kind: Option<WorkKind>,
+    state: Option<&str>,
+    before: Option<i64>,
+    limit: usize,
+) -> Result<Value> {
+    crate::store::validate_page(before, limit)?;
+    match Store::read_only(config)? {
+        Some(store) => store.operations_list(kind, state, before, limit),
+        None => Ok(json!({"operations":[],"next_before":null})),
+    }
+}
+
+pub fn recovery_grants(config: &Config, before: Option<i64>, limit: usize) -> Result<Value> {
+    crate::store::validate_page(before, limit)?;
+    match Store::read_only(config)? {
+        Some(store) => store.grants(before, limit),
+        None => Ok(json!({"grants":[],"next_before":null})),
+    }
+}
+
+pub fn recovery_revoke(config: &Config, grant_id: i64) -> Result<Value> {
+    Store::read_only(config)?.context("journal not initialized")?;
+    let (_account, mut store) = AccountLock::acquire(config)?;
+    let _gate = AdmissionGuard::acquire(config)?;
+    store.revoke_grant(grant_id)
 }
 pub fn events(config: &Config, limit: usize) -> Result<Value> {
     match Store::read_only(config)? {
@@ -196,6 +237,7 @@ struct Runtime {
 /// A single runtime owns the account lock even when paused or read-only. The
 /// admission lock is separate so local control commands can close admission.
 pub async fn run(config_path: &Path, once: bool) -> Result<()> {
+    let config_guard = crate::admin::lock_config_directory(config_path)?;
     let config = Config::load(config_path)?;
     config.validate()?;
     let protocol = Arc::new(Protocol::new(&config).map_err(|_| {
@@ -204,6 +246,7 @@ pub async fn run(config_path: &Path, once: bool) -> Result<()> {
         )
     })?);
     let (_account, mut store) = AccountLock::acquire(&config)?;
+    drop(config_guard);
     store.recover()?;
     store.runtime_state(&config, false)?;
     let (stop_tx, stop) = watch::channel(false);
@@ -401,7 +444,7 @@ impl Runtime {
         }
         self.heartbeat()?;
         let protocol = Arc::clone(&self.protocol);
-        let timeout = Duration::from_secs(self.config.timeouts.http_seconds);
+        let timeout = Duration::from_secs(self.config.timeouts.effective_read_http_seconds());
         let result = tokio::select! {
             biased;
             _ = self.stop.changed() => return Ok(None),
@@ -426,6 +469,9 @@ impl Runtime {
                     || response.body.is_null()
                 {
                     self.read_failed(scope, response.retry_after_seconds)?;
+                    if let Some(minimum) = response.retry_after_seconds {
+                        self.store.record_scope_retry_minimum(scope, minimum)?;
+                    }
                     self.store.event("read_backoff", Some(kind))?;
                     return Ok(None);
                 }
@@ -711,12 +757,9 @@ impl Runtime {
     async fn cycle(&mut self) -> Result<()> {
         self.collect_models().await?;
         self.store.retry_models(&self.config)?;
-        if let Some(mut op) = self.store.effect()?
-            && op.next_at <= now()
-        {
+        for mut op in self.store.reconciliation_batch()? {
             self.reconcile(&mut op).await?;
         }
-        let blocked = self.store.effect()?.is_some();
         // Prepared work owns capacity, not the wallet effect slot. Disable or
         // generation changes discard only proven-unsent work.
         for kind in [WorkKind::Answer, WorkKind::Judge, WorkKind::Mine] {
@@ -732,13 +775,15 @@ impl Runtime {
                 {
                     op.state = "discarded".into();
                     self.store.save(&op, "unsent_admission_closed")?;
-                } else if blocked && kind == WorkKind::Answer {
+                } else if !self.store.admission_allowed(&self.config, &op)?
+                    && matches!(kind, WorkKind::Answer | WorkKind::Mine)
+                {
                     let input: Input = serde_json::from_value(op.request.clone())?;
                     if self.fresh(&op, &input).await? == Some(false) {
                         op.state = "discarded".into();
                         self.store.save(&op, "request_no_longer_current")?;
                     }
-                } else if !blocked && op.next_at <= now() && self.active(kind)? {
+                } else if op.next_at <= now() && self.active(kind)? {
                     self.dispatch(&mut op).await?;
                 }
             }
@@ -757,7 +802,10 @@ impl Runtime {
             if self.stopping() {
                 break;
             }
-            if self.config.mode(kind) == Mode::Off || self.store.next_at(kind)? > now() {
+            if self.config.mode(kind) == Mode::Off
+                || (self.store.next_at(kind)? > now()
+                    && !(kind == WorkKind::Mine && self.config.schedule.mine_each_epoch))
+            {
                 continue;
             }
             self.store.defer(kind, self.poll_delay())?;
@@ -769,6 +817,8 @@ impl Runtime {
                 continue;
             }
             if self.store.effect()?.is_some()
+                && (self.config.participation.mode == ParticipationMode::Strict
+                    || !self.config.participation.allows(kind))
                 && (kind != WorkKind::Answer || !self.config.preparation.answer_while_blocked)
             {
                 if kind == WorkKind::Judge {
@@ -782,12 +832,20 @@ impl Runtime {
                         continue;
                     };
                     let key = format!("{}:{}", challenge.epoch, challenge.fingerprint);
-                    if challenge.answered
-                        || !self.active(kind)?
-                        || self.store.answer_epoch_attempted(challenge.epoch)?
-                    {
+                    if challenge.answered || !self.active(kind)? {
                         continue;
                     }
+                    let retry = if self.store.answer_epoch_attempted(challenge.epoch)? {
+                        let Some(original) = self.store.uncertain_answer(challenge.epoch)? else {
+                            continue;
+                        };
+                        if !self.store.answer_retry_allowed(&self.config, &original)? {
+                            continue;
+                        }
+                        Some(original)
+                    } else {
+                        None
+                    };
                     if !self.identity_matches(kind).await? {
                         continue;
                     }
@@ -795,7 +853,32 @@ impl Runtime {
                         solver: self.request(kind, &challenge, None)?,
                         challenge_fingerprint: Some(challenge.fingerprint),
                     };
-                    self.generate(kind, &key, input).await?;
+                    if let Some(original) = retry {
+                        if original.key == key {
+                            let gate = AdmissionGuard::acquire(&self.config)?;
+                            self.reload()?;
+                            if !self.active(kind)?
+                                || !self.store.answer_retry_allowed(&self.config, &original)?
+                            {
+                                continue;
+                            }
+                            let mut op = self.store.begin_linked(
+                                kind,
+                                &key,
+                                ("prepared", &original.request),
+                                self.store.control()?,
+                                &self.config.revision()?,
+                                Some((&original, true)),
+                            )?;
+                            drop(gate);
+                            self.dispatch(&mut op).await?;
+                        } else {
+                            self.generate_linked(kind, &key, input, Some(&original))
+                                .await?;
+                        }
+                    } else {
+                        self.generate(kind, &key, input).await?;
+                    }
                     return Ok(());
                 }
                 WorkKind::Judge => {
@@ -845,6 +928,8 @@ impl Runtime {
                     };
                     if !challenge.answered
                         || !self.active(kind)?
+                        || (self.config.schedule.mine_each_epoch
+                            && self.store.mine_epoch_attempted(challenge.epoch)?)
                         || !self.identity_matches(kind).await?
                     {
                         continue;
@@ -871,7 +956,9 @@ impl Runtime {
                         control,
                         &self.config.revision()?,
                     )?;
-                    self.store.defer(kind, self.config.schedule.mine_seconds)?;
+                    if !self.config.schedule.mine_each_epoch {
+                        self.store.defer(kind, self.config.schedule.mine_seconds)?;
+                    }
                     drop(gate);
                     self.dispatch(&mut op).await?;
                     return Ok(());
@@ -946,17 +1033,34 @@ impl Runtime {
         })
     }
 
-    async fn generate(&mut self, kind: WorkKind, key: &str, mut input: Input) -> Result<()> {
+    async fn generate(&mut self, kind: WorkKind, key: &str, input: Input) -> Result<()> {
+        self.generate_linked(kind, key, input, None).await
+    }
+
+    async fn generate_linked(
+        &mut self,
+        kind: WorkKind,
+        key: &str,
+        mut input: Input,
+        retry: Option<&Operation>,
+    ) -> Result<()> {
         self.reload()?;
         if !self.active(kind)?
             || self.store.preparation(kind)?.is_some()
-            || self.store.attempted(kind, key)?
+            || (retry.is_none() && self.store.attempted(kind, key)?)
             || (kind == WorkKind::Judge && self.config.judging_assignment_excluded(key))
         {
             return Ok(());
         }
         if self.store.effect()?.is_some()
+            && (self.config.participation.mode == ParticipationMode::Strict
+                || !self.config.participation.allows(kind))
             && (kind != WorkKind::Answer || !self.config.preparation.answer_while_blocked)
+        {
+            return Ok(());
+        }
+        if let Some(original) = retry
+            && !self.store.answer_retry_allowed(&self.config, original)?
         {
             return Ok(());
         }
@@ -977,13 +1081,13 @@ impl Runtime {
         };
         input.solver.guidance = model.guidance.to_string();
         input.solver.id = digest(format!("{}:attempt:{}", input.solver.id, count + 1));
-        let op = self.store.begin(
+        let op = self.store.begin_linked(
             kind,
             key,
-            "generating",
-            &serde_json::to_value(&input)?,
+            ("generating", &serde_json::to_value(&input)?),
             control,
             &self.config.revision()?,
+            retry.map(|original| (original, false)),
         )?;
         let timeout = self.config.timeouts.model_seconds;
         self.store.capture_policy(op.id, &json!({"model":model,
@@ -1152,7 +1256,7 @@ impl Runtime {
         if self.discard_excluded_judgment(op)? {
             return Ok(());
         }
-        if !self.active(op.kind)? || op.next_at > now() || self.store.effect()?.is_some() {
+        if !self.active(op.kind)? || !self.store.admission_allowed(&self.config, op)? {
             return Ok(());
         }
         let expected_control = self.store.control()?;
@@ -1193,14 +1297,9 @@ impl Runtime {
             }
         };
         self.heartbeat()?;
-        op.state = "dispatching".into();
-        self.store.capture_policy(
-            op.id,
-            &json!({"http_seconds":self.config.timeouts.http_seconds}),
-            None,
-            Some(self.config.timeouts.http_seconds),
-        )?;
-        self.store.save(op, "dispatch_intent")?;
+        if !self.store.dispatch_intent(op, &self.config)? {
+            return Ok(());
+        }
         let request = tokio::time::timeout(
             Duration::from_secs(self.config.timeouts.http_seconds),
             prepared,
@@ -1213,6 +1312,7 @@ impl Runtime {
                     Ok(result) => result,
                     Err(_) => {
                         self.store.record_evidence(op.id, &serde_json::to_value(response_evidence(op.kind, ResponseSource::Submit, None))?)?;
+                        op.next_at = not_before(self.retry_delay(None));
                         op.state="unknown".into(); self.store.save(op,"dispatch_outcome_unknown")?; drop(gate); return Ok(());
                     }
                 }
@@ -1250,6 +1350,7 @@ impl Runtime {
                     ))?,
                 )?;
                 op.state = "unknown".into();
+                op.next_at = not_before(self.retry_delay(None));
                 self.store.save(op, "dispatch_outcome_unknown")?;
             }
         }
@@ -1264,6 +1365,9 @@ impl Runtime {
         submitted: bool,
         retry_after: Option<u64>,
     ) -> Result<()> {
+        if let Some(minimum) = retry_after {
+            self.store.record_retry_minimum(op.id, minimum)?;
+        }
         let event = match outcome {
             Outcome::Queued { job_id } => {
                 op.next_at = not_before(self.retry_delay(retry_after));
@@ -1332,8 +1436,10 @@ impl Runtime {
             }
             Outcome::Completed => {
                 op.state = "completed".into();
-                self.store
-                    .defer(op.kind, self.config.schedule.mine_seconds)?;
+                if !self.config.schedule.mine_each_epoch {
+                    self.store
+                        .defer(op.kind, self.config.schedule.mine_seconds)?;
+                }
                 "mine_completed"
             }
         };
@@ -1349,6 +1455,9 @@ impl Runtime {
                 return Ok(());
             };
             op.next_at = not_before(self.retry_delay(response.retry_after_seconds));
+            if let Some(minimum) = response.retry_after_seconds {
+                self.store.record_retry_minimum(op.id, minimum)?;
+            }
             let evidence = receipt(&response, &txid, &self.config.network.address);
             if evidence != Receipt::Unresolved {
                 self.store.safety_observed(op.id)?;
@@ -1386,6 +1495,9 @@ impl Runtime {
             else {
                 return Ok(());
             };
+            if let Some(minimum) = response.retry_after_seconds {
+                self.store.record_retry_minimum(op.id, minimum)?;
+            }
             self.store.record_candidates(
                 op.id,
                 &serde_json::to_value(crate::protocol::response_candidates(&response))?,
@@ -1420,8 +1532,8 @@ impl Runtime {
                 self.outcome(op, outcome, false, response.retry_after_seconds)?;
             }
         }
-        // Unknown operations with no authoritative identifier intentionally remain
-        // blocked. Account flags and assignment disappearance cannot resolve them.
+        // Identifier-less unknowns remain unresolved, but never monopolize the
+        // reconciliation cursor. Only explicit participation policy permits risk.
         Ok(())
     }
 }
@@ -1774,6 +1886,157 @@ mod tests {
             body.len()
         );
         stream.write_all(reply.as_bytes()).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn participation_policy_is_rechecked_after_freshness_and_identity_reads() {
+        for invalid_reload in [false, true] {
+            let credentials = tempfile::tempdir().unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut config = active_judge_config(credentials.path());
+            config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
+            config.participation.mode = ParticipationMode::ParticipationFirst;
+            config.participation.allow_judge = true;
+            config.participation.uncertainty_grace_seconds = 0;
+            let (_temp, mut runtime, _sender) = fixture_with(config);
+            let old = judging_operation(&mut runtime, &"a".repeat(64), "unknown");
+            let id = "b".repeat(64);
+            let mut op = judging_operation(&mut runtime, &id, "generated");
+            let mut changed = runtime.config.clone();
+            changed.participation.mode = ParticipationMode::Strict;
+            let path = runtime.config_path.clone();
+            let server = tokio::spawn(async move {
+                let prefix = format!("/chain/{}", changed.network.chain);
+                judging_reply(
+                    &listener,
+                    &format!("{prefix}/api/hosted/assignments"),
+                    judging_inventory(&[id]).body,
+                    None,
+                )
+                .await;
+                if invalid_reload {
+                    use tokio::io::AsyncWriteExt;
+                    let mut stream =
+                        accept_api_request(&listener, &format!("GET {prefix}/api/hosted/me")).await;
+                    std::fs::write(&path, "[participation]\nmode='not-a-policy'").unwrap();
+                    let body = json!({"address":changed.network.address}).to_string();
+                    stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()).as_bytes()).await.unwrap();
+                } else {
+                    judging_reply(
+                        &listener,
+                        &format!("{prefix}/api/hosted/me"),
+                        json!({"address":changed.network.address}),
+                        Some((&path, &changed)),
+                    )
+                    .await;
+                }
+                listener
+            });
+            runtime.dispatch(&mut op).await.unwrap();
+            let listener = server.await.unwrap();
+            assert_eq!(op.state, "generated");
+            assert_eq!(
+                runtime.store.operation(old.id).unwrap().unwrap().state,
+                "unknown"
+            );
+            assert_eq!(
+                runtime.store.status(&runtime.config).unwrap()["participation"]["risk_admissions"],
+                0
+            );
+            assert_eq!(runtime.reload_blocked, invalid_reload);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn separate_read_timeout_reaches_runtime_and_reqwest_without_changing_writes() {
+        use tokio::io::AsyncWriteExt;
+        let credentials = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = active_judge_config(credentials.path());
+        config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
+        config.timeouts.http_seconds = 1;
+        config.timeouts.read_http_seconds = Some(3);
+        let (_temp, mut runtime, _sender) = fixture_with(config);
+        let path = format!(
+            "GET /chain/{}/api/hosted/assignments",
+            runtime.config.network.chain
+        );
+        let server = tokio::spawn(async move {
+            let mut stream = accept_api_request(&listener, &path).await;
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+            let body = json!({"assignments":[],"has_more":false}).to_string();
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        assert!(runtime.assignment_inventory().await.unwrap().is_some());
+        server.await.unwrap();
+        assert_eq!(runtime.config.timeouts.http_seconds, 1);
+        assert_eq!(
+            runtime.store.status(&runtime.config).unwrap()["effective_runtime"]["policy"]["timeouts"]
+                ["read_http_seconds"],
+            3
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn effectful_get_mining_retains_write_timeout() {
+        use tokio::io::AsyncWriteExt;
+        let credentials = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = active_judge_config(credentials.path());
+        config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
+        config.capabilities.mine = Mode::Active;
+        config.timeouts.http_seconds = 3;
+        config.timeouts.read_http_seconds = Some(1);
+        let (_temp, runtime, _sender) = fixture_with(config);
+        let path = format!(
+            "GET /chain/{}/api/hosted/mine",
+            runtime.config.network.chain
+        );
+        let server = tokio::spawn(async move {
+            let mut stream = accept_api_request(&listener, &path).await;
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+            let body = json!({"ok":true}).to_string();
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let payload = json!({});
+        assert_eq!(
+            runtime
+                .protocol
+                .prepare_submission(WorkKind::Mine, &payload)
+                .unwrap()
+                .await
+                .unwrap()
+                .status,
+            200
+        );
+        server.await.unwrap();
     }
 
     fn expire_read_deadlines(runtime: &Runtime) {

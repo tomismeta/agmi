@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Add CLI-first configuration schema/show/apply, private guidance show/set, sanitized paginated operation/grant lists and grant revocation. Revision-checked stdin updates validate complete candidates, atomically replace private files and distinguish saved from controller-effective revisions. Serialize cooperating administration with startup identity binding.
+- Add strict-by-default, hot-reloaded bounded participation policy and explicit manual grants. Preserve uncertain outcomes while recording each authorized overlapping dispatch; independently bound and fence optional same-epoch uncertain-answer retries. Retain server delays, account/pause/mode fences and distinct operation linkage across restart.
+- Rotate bounded reconciliation fairly past old identifier-less unknowns. Add opt-in per-answered-epoch mining and separate read HTTP deadlines without misclassifying mining GET effects as reads.
+- Preserve per-epoch mining limits across explicit old-journal adoption, including dispatched discards and conservatively counted pruned legacy history; retain admission for proven-unsent work.
+- Serialize mutable CLI policy saves with final effect admission, and separate server retry minima from local reconciliation cadence so zero-grace/manual policy remains effective without shortening server delays.
+- Scope uncertainty diagnostics to the observed epoch without mislabelling an already accepted answer as an uncertainty blocker.
+- Exercise delayed old-write nonce conflicts, cold restart, policy reload, retry budgets, inclusion/finality exclusion, grant fencing, private administration and startup/config races through real CLI processes.
 - Separate bounded answer/judge preparation from the serialized wallet-effect slot so slow inference and uncertain effects no longer stop epoch observation or current-answer preparation. Preserve captured settings and distinct attempt identities; uncertain-model retries require explicit opt-in and a bounded budget.
 - Pin production credentials to the MinePOA origin. Add stable writer-lock identity checks, versioned operation transitions, database UUID binding and an independent dispatch witness. Require explicit stopped-writer adoption of existing journals; detect missing/replaced or behind-witness state without claiming whole-host rollback protection.
 - Add source-aware outcome diagnostics and stopped-writer recovery inspection/resolution of already-bound evidence. Reject malformed receipt bindings. Preserve identifier-less unknowns rather than treating generic rate limits, errors, nonce movement or elapsed time as nonexecution proof. Continue safety reconciliation while participation is off or paused.

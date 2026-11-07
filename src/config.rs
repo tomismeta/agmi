@@ -87,14 +87,23 @@ pub struct SolverConfig {
 #[serde(deny_unknown_fields)]
 pub struct Timeouts {
     pub http_seconds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_http_seconds: Option<u64>,
     pub model_seconds: u64,
     pub shutdown_seconds: u64,
+}
+impl Timeouts {
+    pub fn effective_read_http_seconds(&self) -> u64 {
+        self.read_http_seconds.unwrap_or(self.http_seconds)
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Schedule {
     pub poll_seconds: u64,
     pub mine_seconds: u64,
+    #[serde(default)]
+    pub mine_each_epoch: bool,
     pub retry_seconds: u64,
     #[serde(default = "default_backoff_max_seconds")]
     pub backoff_max_seconds: u64,
@@ -124,6 +133,53 @@ impl Default for Preparation {
         }
     }
 }
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParticipationMode {
+    #[default]
+    Strict,
+    ParticipationFirst,
+    Manual,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Participation {
+    pub mode: ParticipationMode,
+    pub uncertainty_grace_seconds: u64,
+    pub max_unresolved_operations: u32,
+    pub allow_answer: bool,
+    pub allow_mine: bool,
+    pub allow_judge: bool,
+    pub retry_uncertain_answers: bool,
+    pub uncertain_answer_retry_seconds: u64,
+    pub max_answer_attempts_per_epoch: u32,
+}
+impl Default for Participation {
+    fn default() -> Self {
+        Self {
+            mode: ParticipationMode::Strict,
+            uncertainty_grace_seconds: 300,
+            max_unresolved_operations: 4,
+            allow_answer: true,
+            allow_mine: true,
+            allow_judge: false,
+            retry_uncertain_answers: false,
+            uncertain_answer_retry_seconds: 600,
+            max_answer_attempts_per_epoch: 2,
+        }
+    }
+}
+impl Participation {
+    pub(crate) fn allows(&self, kind: WorkKind) -> bool {
+        match kind {
+            WorkKind::Answer => self.allow_answer,
+            WorkKind::Judge => self.allow_judge,
+            WorkKind::Mine => self.allow_mine,
+        }
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -134,6 +190,7 @@ pub struct Config {
     pub timeouts: Timeouts,
     pub schedule: Schedule,
     pub preparation: Preparation,
+    pub participation: Participation,
     /// Assignment transaction IDs that must never start new judging work.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub excluded_judging_assignments: Vec<String>,
@@ -153,6 +210,7 @@ impl Default for Config {
         Self {
             guidance_loaded: true,
             preparation: Preparation::default(),
+            participation: Participation::default(),
             excluded_judging_assignments: Vec::new(),
             network: NetworkConfig {
                 base_url: "https://minepoa.com".into(),
@@ -174,12 +232,14 @@ impl Default for Config {
             },
             timeouts: Timeouts {
                 http_seconds: 30,
+                read_http_seconds: None,
                 model_seconds: 300,
                 shutdown_seconds: 30,
             },
             schedule: Schedule {
                 poll_seconds: 120,
                 mine_seconds: 86400,
+                mine_each_epoch: false,
                 retry_seconds: 180,
                 backoff_max_seconds: default_backoff_max_seconds(),
                 jitter_seconds: default_jitter_seconds(),
@@ -189,14 +249,7 @@ impl Default for Config {
 }
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
-        let mut config = Self::load_config(path, true)?;
-        for model in [&mut config.solver.answer, &mut config.solver.judge] {
-            if let Some(path) = &model.guidance_file {
-                model.guidance = read_guidance(path)?;
-            }
-        }
-        config.guidance_loaded = true;
-        Ok(config)
+        Self::load_config(path, true)
     }
 
     /// Local controls must not depend on optional model-input files being usable.
@@ -204,21 +257,25 @@ impl Config {
         Self::load_config(path, false)
     }
 
-    fn load_config(path: &Path, check_guidance_paths: bool) -> Result<Self> {
+    fn load_config(path: &Path, load_guidance: bool) -> Result<Self> {
         let file =
             std::fs::File::open(path).map_err(|_| anyhow::anyhow!("cannot read configuration"))?;
         let mut bytes = Vec::new();
         file.take(65537)
             .read_to_end(&mut bytes)
             .map_err(|_| anyhow::anyhow!("cannot read configuration"))?;
+        Self::parse_bytes(path, &bytes, load_guidance)
+    }
+
+    pub(crate) fn parse_bytes(path: &Path, bytes: &[u8], load_guidance: bool) -> Result<Self> {
         ensure!(bytes.len() <= 65536, "configuration exceeds 64 KiB");
-        let text = std::str::from_utf8(&bytes)
+        let text = std::str::from_utf8(bytes)
             .map_err(|_| anyhow::anyhow!("configuration must be UTF-8"))?;
         // Parser diagnostics may echo secrets accidentally placed in an unknown field.
         let mut config: Self = toml::from_str(text).map_err(|_| {
             anyhow::anyhow!("invalid configuration: check field names, types and enum values")
         })?;
-        config.validate_fields(check_guidance_paths)?;
+        config.validate_fields(load_guidance)?;
         for id in &mut config.excluded_judging_assignments {
             id.make_ascii_lowercase();
         }
@@ -247,6 +304,14 @@ impl Config {
         }
         config.guidance_loaded = config.solver.answer.guidance_file.is_none()
             && config.solver.judge.guidance_file.is_none();
+        if load_guidance {
+            for model in [&mut config.solver.answer, &mut config.solver.judge] {
+                if let Some(path) = &model.guidance_file {
+                    model.guidance = read_guidance(path)?;
+                }
+            }
+            config.guidance_loaded = true;
+        }
         Ok(config)
     }
     pub fn validate(&self) -> Result<()> {
@@ -254,6 +319,11 @@ impl Config {
     }
 
     fn validate_fields(&self, check_guidance_paths: bool) -> Result<()> {
+        ensure!(
+            self.participation.max_unresolved_operations > 0
+                && self.participation.max_answer_attempts_per_epoch > 0,
+            "participation operation and answer attempt limits must be positive"
+        );
         ensure!(
             (1..=8).contains(&self.preparation.max_attempts_per_work),
             "preparation.max_attempts_per_work must be between 1 and 8"
@@ -324,6 +394,9 @@ impl Config {
         }
         for (seconds, allow_zero) in [
             (self.timeouts.http_seconds, false),
+            (self.timeouts.effective_read_http_seconds(), false),
+            (self.participation.uncertainty_grace_seconds, true),
+            (self.participation.uncertain_answer_retry_seconds, true),
             (self.timeouts.model_seconds, false),
             (self.timeouts.shutdown_seconds, false),
             (self.schedule.poll_seconds, false),
@@ -421,15 +494,19 @@ fn read_guidance(path: &Path) -> Result<Arc<str>> {
     file.take((MAX_GUIDANCE_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
         .map_err(|_| anyhow::anyhow!("cannot read model guidance file"))?;
+    validate_guidance_bytes(&bytes)
+}
+
+pub(crate) fn validate_guidance_bytes(bytes: &[u8]) -> Result<Arc<str>> {
     ensure!(
         bytes.len() <= MAX_GUIDANCE_BYTES,
         "model guidance exceeds 64 KiB"
     );
     let text =
-        String::from_utf8(bytes).map_err(|_| anyhow::anyhow!("model guidance must be UTF-8"))?;
+        std::str::from_utf8(bytes).map_err(|_| anyhow::anyhow!("model guidance must be UTF-8"))?;
     Ok(Arc::from(text))
 }
-fn resolve_path(root: &Path, path: &Path) -> PathBuf {
+pub(crate) fn resolve_path(root: &Path, path: &Path) -> PathBuf {
     let joined = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -529,6 +606,45 @@ pub(crate) fn validate_origin(value: &str) -> Result<reqwest::Url> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn participation_and_read_timeout_defaults_and_bounds() {
+        let original = Config::default();
+        assert_eq!(original.participation.mode, ParticipationMode::Strict);
+        assert!(!original.participation.retry_uncertain_answers);
+        assert!(!original.schedule.mine_each_epoch);
+        assert_eq!(
+            original.timeouts.effective_read_http_seconds(),
+            original.timeouts.http_seconds
+        );
+        let mut changed = original.clone();
+        changed.participation.mode = ParticipationMode::ParticipationFirst;
+        changed.participation.uncertainty_grace_seconds = 0;
+        changed.participation.uncertain_answer_retry_seconds = 0;
+        changed.participation.max_unresolved_operations = 100;
+        changed.timeouts.read_http_seconds = Some(75);
+        changed.schedule.mine_each_epoch = true;
+        changed.validate().unwrap();
+        assert_eq!(changed.timeouts.effective_read_http_seconds(), 75);
+        assert_ne!(changed.revision().unwrap(), original.revision().unwrap());
+        let encoded = toml::to_string(&changed).unwrap();
+        let decoded = toml::from_str::<Config>(&encoded).unwrap();
+        assert_eq!(decoded.participation, changed.participation);
+        assert_eq!(decoded.timeouts, changed.timeouts);
+        assert_eq!(decoded.schedule, changed.schedule);
+        changed.participation.max_unresolved_operations = 0;
+        assert!(changed.validate().is_err());
+        changed.participation.max_unresolved_operations = 4;
+        changed.participation.max_answer_attempts_per_epoch = 0;
+        assert!(changed.validate().is_err());
+        changed.participation.max_answer_attempts_per_epoch = 2;
+        changed.timeouts.read_http_seconds = Some(0);
+        assert!(changed.validate().is_err());
+        changed.timeouts.read_http_seconds = Some(u64::MAX);
+        assert!(changed.validate().is_err());
+        assert!(toml::from_str::<Config>("[participation]\nmode='optimistic'").is_err());
+        assert!(toml::from_str::<Config>("[participation]\nretry_uncertain_answer=true").is_err());
+    }
     #[test]
     fn judging_exclusions_default_empty_validate_and_change_revision() {
         let dir = tempfile::tempdir().unwrap();

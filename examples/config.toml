@@ -22,6 +22,20 @@ answer_while_blocked = true
 retry_uncertain = false
 max_attempts_per_work = 1
 
+# Strict is the default. Other modes accept bounded remote conflict risk;
+# elapsed time never proves an uncertain request failed.
+[participation]
+mode = "strict" # strict | participation_first | manual
+uncertainty_grace_seconds = 300
+max_unresolved_operations = 4
+allow_answer = true
+allow_mine = true
+allow_judge = false
+# Separate opt-in: may repeat an already accepted answer.
+retry_uncertain_answers = false
+uncertain_answer_retry_seconds = 600
+max_answer_attempts_per_epoch = 2
+
 [solver.answer]
 harness = "hermes"
 executable = "hermes"
@@ -39,12 +53,17 @@ reasoning = "high"
 
 [timeouts]
 http_seconds = 30
+# Optional read-only HTTP deadline; absent means http_seconds.
+# Effectful mine GET requests always use http_seconds.
+# read_http_seconds = 60
 model_seconds = 300
 shutdown_seconds = 30
 
 [schedule]
 poll_seconds = 120
 mine_seconds = 86400
+# Replaces the interval with one dispatched mine per observed answered epoch.
+mine_each_epoch = false
 retry_seconds = 180
 # Caps exponential read backoff; base/server minimum wins, then jitter is added.
 backoff_max_seconds = 900

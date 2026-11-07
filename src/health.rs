@@ -119,6 +119,9 @@ fn evaluate(config: &Config, options: Options, status: &Value, at: i64) -> Value
     let http = policy["timeouts"]["http_seconds"]
         .as_u64()
         .unwrap_or(config.timeouts.http_seconds);
+    let read_http = policy["timeouts"]["read_http_seconds"]
+        .as_u64()
+        .unwrap_or(http);
     let poll = policy["schedule"]["poll_seconds"]
         .as_u64()
         .unwrap_or(config.schedule.poll_seconds);
@@ -129,6 +132,7 @@ fn evaluate(config: &Config, options: Options, status: &Value, at: i64) -> Value
         .as_u64()
         .unwrap_or(config.timeouts.shutdown_seconds);
     let cycle_floor = http
+        .max(read_http)
         .saturating_add(poll)
         .saturating_add(jitter)
         .saturating_add(shutdown)
@@ -263,6 +267,17 @@ fn evaluate(config: &Config, options: Options, status: &Value, at: i64) -> Value
     if unresolved_models > 0 {
         warnings.push("model_execution_unresolved");
     }
+    if status["participation"]["unresolved_count"]
+        .as_u64()
+        .unwrap_or(0)
+        > 0
+        && status["participation"]["risk_admissions"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0
+    {
+        warnings.push("participation_risk_admitted");
+    }
     let preparing = status["operations"]
         .as_array()
         .into_iter()
@@ -301,9 +316,11 @@ fn evaluate(config: &Config, options: Options, status: &Value, at: i64) -> Value
         "affected_capabilities":status["affected_capabilities"],
         "progress_age_seconds":age(&status["last_progress_at"],at),
         "desired_capabilities":config.capabilities,"effective_capabilities":effective["capabilities"],
+        "participation":status["participation"],"desired_participation":config.participation,
         "last_reported_build":status["last_reported_build"],"process_identity":"unverified",
         "thresholds":{"stale_seconds":stale,"work_seconds":work_limit,
-            "answer_grace_seconds":grace,"model_seconds":model_limit,"cycle_floor_seconds":cycle_floor},
+            "answer_grace_seconds":grace,"model_seconds":model_limit,"cycle_floor_seconds":cycle_floor,
+            "read_http_seconds":read_http,"write_http_seconds":http},
         "evidence":"local_only","notifications":"local_exit_status_and_journal"})
 }
 
@@ -583,5 +600,48 @@ mod tests {
             &evaluate(&config, options, &status, 10000),
             "model_work_overdue"
         ));
+    }
+
+    #[test]
+    fn effective_read_timeout_prevents_false_staleness_without_using_desired_policy() {
+        let (mut config, options, mut status) = fixture();
+        config.timeouts.read_http_seconds = Some(6000);
+        status["effective_runtime"]["policy"] = json!({
+            "timeouts":{"http_seconds":5,"read_http_seconds":600,"shutdown_seconds":1},
+            "schedule":{"poll_seconds":1,"jitter_seconds":0}
+        });
+        let within_read = evaluate(&config, options, &status, 10500);
+        assert!(!has(&within_read, "controller_stale"));
+        assert!(!has(&within_read, "challenge_observation_stale"));
+        assert!(has(
+            &evaluate(&config, options, &status, 10604),
+            "controller_stale"
+        ));
+    }
+
+    #[test]
+    fn risk_admission_does_not_hide_unresolved_effects() {
+        let (config, options, mut status) = fixture();
+        status["pending"] = json!({"state":"unknown","created_at":9000});
+        status["participation"] = json!({"unresolved_count":1,"risk_admissions":1});
+        let health = evaluate(&config, options, &status, 10000);
+        assert!(has(&health, "pending_outcome_uncertain"));
+        assert!(
+            health["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning == "participation_risk_admitted")
+        );
+        status["participation"]["unresolved_count"] = json!(0);
+        status["pending"] = Value::Null;
+        let resolved = evaluate(&config, options, &status, 10000);
+        assert!(
+            resolved["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|warning| warning != "participation_risk_admitted")
+        );
     }
 }
