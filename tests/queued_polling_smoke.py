@@ -101,15 +101,17 @@ def risk_health(f):
     f.apply_config({'participation': {'mode': 'participation_first',
                                       'allow_judge': True, 'uncertainty_grace_seconds': 0}})
     f.wait(lambda: not f.status()['admission_blocked'], 'configured admission did not reopen')
-    health = json.loads(f.invoke('health', succeeds=False).stdout)['data']
+    health = f.invoke('health')
     assert health['operational']['status'] == 'clear', health
     assert health['risk']['attention_required'] and health['attention_required']
-    assert not health['healthy'] and 'pending_outcome_uncertain' in health['issues']
+    assert health['healthy'] and not health['issues']
+    assert 'pending_outcome_uncertain' in health['warnings']
     disk = json.loads(f.invoke('health', '--min-free-mib', '999999999', succeeds=False).stdout)['data']
     assert disk['operational']['status'] == 'degraded', disk
     assert 'state_disk_space_low' in disk['operational']['issues']
     assert len(f.writes) == 1 and f.operations('judge')[0]['state'] == 'unknown'
     return {'strict_block_visible': True, 'risk_retained_after_admission_opens': True,
+            'healthy_with_warnings_exits_zero': True,
             'disk_failure_still_operational': True, 'writes': 1}
 
 

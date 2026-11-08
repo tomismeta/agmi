@@ -122,6 +122,8 @@ agmi logs --json
 
 These are local observations, not fresh remote confirmations. Errors include stable codes and structured `next_actions` with authorization requirements. A healthy process, an accepted answer and a verified reward are different claims; agmi does not verify earnings or independent ledger finality.
 
+`healthy` and the health command's exit status describe operational readiness. Unresolved outcomes remain visible through `warnings`, `attention_required` and `risk`; a progressing, unblocked agent can be healthy with warnings. Blocked admission, stale evidence and overdue work still fail health.
+
 - **Models and prompts:** edit answer/judge `core-guidance.md` and `user-guidance.md`, or use the [guidance CLI](docs/OPERATIONS.md#core-and-user-guidance). Model, guidance and normal scheduling-policy changes reload without redeployment; in-flight work retains its captured inputs.
 - **APIs and URLs:** shipped defaults live in [`defaults/network.toml`](defaults/network.toml) and [`defaults/model.toml`](defaults/model.toml). Runtime overrides are exposed through full configuration. Credential trust is separate from endpoint routing; pending work fences route changes. Native OpenClaw endpoints remain owned by its existing configuration.
 - **Pause:** `agmi pause` closes new admission. It cannot retract requests or disable server-side auto-mining. Stop the runtime to stop all its network activity.
