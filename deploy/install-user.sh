@@ -7,27 +7,44 @@ umask 077
 
 usage() {
     printf '%s\n' \
-        'Usage: sh deploy/install-user.sh stage /absolute/path/to/agmi' \
-        '       sh deploy/install-user.sh activate RELEASE_ID [--stopped]' \
+        'Usage: sh deploy/install-user.sh stage /absolute/path/to/agmi --sha256 TRUSTED_SHA256 [--dry-run]' \
+        '       sh deploy/install-user.sh activate r-SHA256 [--stopped] [--dry-run]' \
+        '       sh deploy/install-user.sh install|update /absolute/path/to/agmi --sha256 TRUSTED_SHA256 [--dry-run]' \
+        '       sh deploy/install-user.sh service status|start|stop|restart|enable|disable [--dry-run]' \
         '       sh deploy/install-user.sh status' \
         'Stage validates a matching binary/unit set without stopping or starting anything.' \
-        'Activate explicitly stops, switches current, daemon-reloads and restarts the runtime and health timer.' \
-        '--stopped performs the cutover/reload without starting, for explicit stopped-writer migration.' \
-        'Neither command initializes state, resumes participation, enables units, or rolls back a journal.' \
-        'Config: ~/.config/agmi/config.toml; releases: ~/.local/share/agmi/releases.' \
-        'A previous release may be activated only with the same journal schema.'
+        'Activate preserves each unit running/stopped intent; --stopped leaves all units stopped.' \
+        'Use service start explicitly to start a previously stopped installation.' \
+        'Dry-run is a nonexecuting plan: no candidate binary runs, no files or units change.' \
+        'Install stages, activates stopped and enables a fresh installation; use update for an existing installation.' \
+        'No command initializes state, resumes participation, or restores a journal.' \
+        'Only supply locally trusted binaries and independently trusted SHA256 identities.' \
+        'Checksums and embedded labels prove consistency, NOT signed publisher/source provenance.' \
+        'Config: ~/.config/agmi/config.toml; releases: ~/.local/share/agmi/releases.'
 }
 fail() { printf 'agmi release: %s\n' "$*" >&2; exit 1; }
 case ${HOME-} in /*) ;; *) fail 'HOME must be an absolute per-user directory.' ;; esac
-case ${1-} in
+action=${1-}
+target=${2-}
+dry_run=0
+stopped=0
+expected_hash=
+case $action in
     --help|-h) usage; exit 0 ;;
-    stage) [ "$#" -eq 2 ] || { usage >&2; exit 2; } ;;
-    activate)
-        if [ "$#" -ne 2 ] && { [ "$#" -ne 3 ] || [ "$3" != --stopped ]; }; then
-            usage >&2
-            exit 2
-        fi ;;
     status) [ "$#" -eq 1 ] || { usage >&2; exit 2; } ;;
+    stage|activate|service|install|update)
+        [ "$#" -ge 2 ] || { usage >&2; exit 2; }
+        shift 2
+        while [ "$#" -gt 0 ]; do
+            case $1 in
+                --dry-run) [ "$dry_run" -eq 0 ] || fail 'Repeated --dry-run.'; dry_run=1; shift ;;
+                --stopped) { [ "$action" = activate ] || [ "$action" = update ]; } && [ "$stopped" -eq 0 ] || fail 'Unexpected --stopped.'; stopped=1; shift ;;
+                --sha256)
+                    { [ "$action" = stage ] || [ "$action" = install ] || [ "$action" = update ]; } && [ "$#" -ge 2 ] && [ -z "$expected_hash" ] || fail 'Expected one --sha256 digest.'
+                    expected_hash=$2; shift 2 ;;
+                *) fail 'Unknown installer option.' ;;
+            esac
+        done ;;
     *) usage >&2; exit 2 ;;
 esac
 [ "$(uname -s)" = Linux ] || fail 'Installation requires Linux user-systemd and GNU coreutils.'
@@ -129,7 +146,25 @@ status() {
     esac
     printf '%s\n' 'identity_evidence=checksums_and_build_labels_not_signed_source_provenance'
 }
-if [ "$1" = status ]; then status; exit 0; fi
+if [ "$action" = status ]; then status; exit 0; fi
+if [ "$action" = stage ] || [ "$action" = install ] || [ "$action" = update ]; then
+    case $target in /*) ;; *) fail 'Binary path must be absolute.' ;; esac
+    [ "${#expected_hash}" -eq 64 ] || fail 'Stage requires an independently trusted SHA256 digest.'
+    case $expected_hash in *[!0-9a-f]*) fail 'SHA256 must be lowercase hexadecimal.' ;; esac
+    [ -f "$target" ] && [ -x "$target" ] && [ ! -L "$target" ] || fail 'Supply a regular executable binary, not a symlink.'
+    [ "$(sha256 "$target")" = "$expected_hash" ] || fail 'Binary does not match the operator-supplied trusted digest.'
+elif [ "$action" = activate ]; then
+    valid_id "$target" || fail 'Activation requires an explicit trusted r-SHA256 release.'
+elif [ "$action" = service ]; then
+    case $target in status|start|stop|restart|enable|disable) ;; *) fail 'Unknown service action.' ;; esac
+fi
+if [ "$dry_run" -eq 1 ]; then
+    printf 'plan_action=%s\nplan_target=%s\nforce_stopped=%s\n' "$action" "$target" "$stopped"
+    printf '%s\n' 'dry_run=plan_only_no_candidate_execution_or_state_changes' \
+        'activation=preserve_previous_runtime_and_timer_running_intent_unless_force_stopped' \
+        'trust=operator_trusted_local_artifact_and_digest_not_signed_provenance'
+    exit 0
+fi
 
 for command in sha256sum systemctl systemd-analyze df du sync mktemp sed readlink install; do
     command -v "$command" >/dev/null 2>&1 || fail "Required Linux command is missing: $command"
@@ -143,6 +178,17 @@ stop_units() (
     done
     exit "$failed"
 )
+validate_loaded() {
+    for unit in $units; do
+        description=$(systemctl --user show "$unit" --property=Description --value)
+        case $description in *"[release=$release_id]") ;; *) fail "Loaded unit identity mismatch: $unit" ;; esac
+        dropins=$(systemctl --user show "$unit" --property=DropInPaths --value)
+        [ -z "$dropins" ] || fail "Loaded unit has unsupported overrides: $unit"
+    done
+    stop_timeout=$(systemctl --user show agmi.service --property=TimeoutStopUSec --value)
+    [ "$stop_timeout" = infinity ] || fail 'Loaded stop deadline would truncate configured shutdown policy.'
+}
+if [ "$action" = service ] && [ "$target" = status ]; then status; exit 0; fi
 mkdir -p -- "$root" "$bin_dir" "$unit_dir"
 [ ! -L "$root" ] || fail 'The releases directory must not be a symlink.'
 lock=$root/.install-lock
@@ -168,6 +214,30 @@ trap cleanup 0
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
+if [ "$action" = install ]; then
+    [ ! -e "$root/current" ] && [ ! -L "$root/current" ] && [ ! -e "$bin_dir/agmi" ] && [ ! -L "$bin_dir/agmi" ] \
+        || fail 'An installation already exists; use update with an explicit trusted binary or release.'
+    for unit in $units; do
+        [ ! -e "$unit_dir/$unit" ] && [ ! -L "$unit_dir/$unit" ] || fail 'Service units already exist; use update.'
+    done
+    stopped=1
+fi
+if [ "$action" = service ]; then
+    case $target in
+        stop) stop_units ;;
+        disable) systemctl --user disable agmi.service agmi-health.timer ;;
+        start|restart|enable)
+            [ -L "$root/current" ] || fail 'Install or activate an explicit release first.'
+            release_id=$(readlink "$root/current")
+            validate_release "$root/$release_id" "$release_id"
+            validate_loaded
+            systemctl --user "$target" agmi.service agmi-health.timer
+            if [ "$target" != enable ]; then
+                systemctl --user is-active --quiet agmi.service agmi-health.timer
+            fi ;;
+    esac
+    exit 0
+fi
 
 existing_parent() {
     path=$1
@@ -227,27 +297,32 @@ space_checks() {
     space_at "$unit_dir" "$((reserve_kib + margin_kib))" units
 }
 
-if [ "$1" = stage ]; then
-    binary=$2
+stage_release() {
+    binary=$target
     [ -f "$binary" ] && [ -x "$binary" ] && [ ! -L "$binary" ] || fail 'Supply a regular executable binary, not a symlink.'
     binary=$(readlink -f -- "$binary")
     binary_hash=$(sha256 "$binary")
+    [ "$binary_hash" = "$expected_hash" ] || fail 'Binary changed after trusted digest verification.'
     release_id=r-$binary_hash
     release=$root/$release_id
     if [ -e "$release" ]; then
         validate_release "$release" "$release_id"
         systemd-analyze --user verify "$release/agmi.service" "$release/agmi-health.service" "$release/agmi-health.timer"
         printf 'staged_release=%s\n' "$release_id"
-        exit 0
+        return 0
     fi
-    incoming=$(size_kib "$binary")
+    binary_size=$(size_kib "$binary")
+    incoming=$binary_size
     for unit in $units; do
         [ -f "$source_dir/$unit" ] || fail "Missing unit template: $unit"
         incoming=$((incoming + $(size_kib "$source_dir/$unit")))
     done
-    space_checks "$binary" "$incoming"
+    # Reserve copy headroom without executing the mutable source pathname.
+    space_at "$root" "$((incoming + reserve_kib + margin_kib))" staging
     staging=$(mktemp -d "$root/.stage.XXXXXX")
     install -m 0755 -- "$binary" "$staging/agmi"
+    [ "$(sha256 "$staging/agmi")" = "$expected_hash" ] || fail 'Staged binary changed before execution.'
+    space_checks "$staging/agmi" "$((incoming - binary_size))"
     "$staging/agmi" build-info --manifest > "$staging/MANIFEST"
     [ "$(metadata build_format "$staging/MANIFEST")" = 1 ] || fail 'Unsupported binary build identity.'
     for unit in $units; do
@@ -256,9 +331,11 @@ if [ "$1" = stage ]; then
             agmi-health.service) key=unit_agmi_health_service_sha256 ;;
             agmi-health.timer) key=unit_agmi_health_timer_sha256 ;;
         esac
-        [ "$(sha256 "$source_dir/$unit")" = "$(metadata "$key" "$staging/MANIFEST")" ] \
+        install -m 0600 -- "$source_dir/$unit" "$staging/$unit.template"
+        [ "$(sha256 "$staging/$unit.template")" = "$(metadata "$key" "$staging/MANIFEST")" ] \
             || fail "Unit template does not match this binary's build: $unit"
-        sed "s/@AGMI_RELEASE_ID@/$release_id/g" "$source_dir/$unit" > "$staging/$unit"
+        sed "s/@AGMI_RELEASE_ID@/$release_id/g" "$staging/$unit.template" > "$staging/$unit"
+        rm -- "$staging/$unit.template"
         chmod 0644 "$staging/$unit"
     done
     printf 'release_id=%s\nbinary_sha256=%s\n' "$release_id" "$binary_hash" >> "$staging/MANIFEST"
@@ -273,10 +350,14 @@ if [ "$1" = stage ]; then
     systemd-analyze --user verify "$release/agmi.service" "$release/agmi-health.service" "$release/agmi-health.timer"
     printf 'staged_release=%s\n' "$release_id"
     printf '%s\n' 'No pointer, loaded unit, running process, state, credential or pause setting changed.'
-    exit 0
+}
+if [ "$action" = stage ] || [ "$action" = install ] || [ "$action" = update ]; then
+    stage_release
+    [ "$action" != stage ] || exit 0
+    target=r-$expected_hash
 fi
 
-release_id=$2
+release_id=$target
 valid_id "$release_id" || fail 'Invalid release ID.'
 release=$root/$release_id
 validate_release "$release" "$release_id"
@@ -295,6 +376,11 @@ fi
 for unit in $units; do
     [ ! -d "$unit_dir/$unit.d" ] || fail "Review and remove unsupported unit overrides before activation: $unit.d"
 done
+# Preserve start intent before stopping. A fresh/stopped installation stays stopped.
+runtime_active=0
+timer_active=0
+systemctl --user is-active --quiet agmi.service && runtime_active=1
+systemctl --user is-active --quiet agmi-health.timer && timer_active=1
 activation=1
 stop_units
 pid=$(systemctl --user show agmi.service --property=MainPID --value)
@@ -336,26 +422,28 @@ mv -Tf -- "$link_temp" "$root/current"
 link_temp=
 sync -f "$root"
 systemctl --user daemon-reload
-for unit in $units; do
-    description=$(systemctl --user show "$unit" --property=Description --value)
-    case $description in *"[release=$release_id]") ;; *) fail "Loaded unit identity mismatch: $unit" ;; esac
-    dropins=$(systemctl --user show "$unit" --property=DropInPaths --value)
-    [ -z "$dropins" ] || fail "Loaded unit has unsupported overrides: $unit"
-done
-stop_timeout=$(systemctl --user show agmi.service --property=TimeoutStopUSec --value)
-[ "$stop_timeout" = infinity ] || fail 'Loaded stop deadline would truncate configured shutdown policy.'
-if [ "${3-}" = --stopped ]; then
+validate_loaded
+if [ "$stopped" -eq 1 ]; then
+    if [ "$action" = install ]; then
+        systemctl --user enable agmi.service agmi-health.timer
+    fi
     activation=0
     status
     printf '%s\n' 'Activated and daemon-reloaded, remaining stopped for explicit journal migration.' \
-        'No journal or pause state was changed; activate this release again to restart afterward.'
+        'No journal or pause state was changed; use service start explicitly afterward.'
     exit 0
 fi
-systemctl --user restart agmi.service agmi-health.timer
-systemctl --user is-active --quiet agmi.service agmi-health.timer
-pid=$(systemctl --user show agmi.service --property=MainPID --value)
-case $pid in ''|0|*[!0-9]*) fail 'No running runtime identity after activation.' ;; esac
-[ "$(sha256 "/proc/$pid/exe")" = "${release_id#r-}" ] || fail 'Running binary does not match the activated release.'
+if [ "$runtime_active" -eq 1 ]; then
+    systemctl --user start agmi.service
+    systemctl --user is-active --quiet agmi.service
+    pid=$(systemctl --user show agmi.service --property=MainPID --value)
+    case $pid in ''|0|*[!0-9]*) fail 'No running runtime identity after activation.' ;; esac
+    [ "$(sha256 "/proc/$pid/exe")" = "${release_id#r-}" ] || fail 'Running binary does not match the activated release.'
+fi
+if [ "$timer_active" -eq 1 ]; then
+    systemctl --user start agmi-health.timer
+    systemctl --user is-active --quiet agmi-health.timer
+fi
 activation=0
 status
 printf '%s\n' 'Activated without changing pause/admission, credentials, native harnesses, or journal history.' \

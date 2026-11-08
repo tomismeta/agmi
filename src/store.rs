@@ -248,6 +248,38 @@ fn write_binding(path: &Path, binding: &Binding) -> Result<()> {
 }
 
 impl AccountLock {
+    fn rotation_lock_file(config: &Config, suffix: &str) -> Result<File> {
+        let mut options = OpenOptions::new();
+        options.read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+        }
+        let file = options
+            .open(lock_path(config, suffix)?)
+            .context("initialize and pause the account before credential rotation")?;
+        validate_private_file(&file.metadata()?)?;
+        Ok(file)
+    }
+
+    /// Existing gate only: even previews must not create lock/state artifacts.
+    pub(crate) fn rotation_admission(config: &Config) -> Result<AdmissionGuard> {
+        let file = Self::rotation_lock_file(config, "admission")?;
+        file.lock()
+            .context("cannot acquire credential rotation admission gate")?;
+        Ok(AdmissionGuard(file))
+    }
+
+    /// Caller must hold admission first. Never opens or changes a journal/binding.
+    pub(crate) fn stopped(config: &Config) -> Result<Self> {
+        let file = Self::rotation_lock_file(config, "writer")?;
+        file.try_lock()
+            .map_err(std::io::Error::from)
+            .context("stop the runtime before credential rotation")?;
+        Ok(Self(file))
+    }
+
     pub(crate) fn acquire(config: &Config) -> Result<(Self, Store)> {
         Self::acquire_with_migration(config, false)
     }
@@ -440,6 +472,44 @@ pub(crate) struct Operation {
     pub next_at: i64,
     persisted_state: std::cell::RefCell<String>,
     pub generation: i64,
+}
+
+/// Only retained transition events establish phase starts; updated_at is
+/// intentionally not treated as historical phase evidence.
+#[derive(Default)]
+struct WaitEvidence {
+    generating: Option<i64>,
+    captured: Option<i64>,
+    queued: Option<i64>,
+    dispatch: Option<i64>,
+}
+
+impl WaitEvidence {
+    fn projection(&self, state: &str, effect_since: Option<i64>, current: i64) -> Value {
+        let valid = |at: Option<i64>| at.filter(|at| *at >= 0 && *at <= current);
+        let generating = valid(self.generating).filter(|_| state == "generating");
+        let captured = valid(self.captured).filter(|_| {
+            matches!(state, "generated" | "prepared")
+                && self.dispatch.is_none()
+                && effect_since.is_none()
+        });
+        let queued = valid(self.queued).filter(|_| state == "queued");
+        let effect = valid(effect_since.or(self.dispatch)).filter(|_| {
+            matches!(
+                state,
+                "dispatching" | "queued" | "unknown" | "included_pending"
+            )
+        });
+        let age = |at: Option<i64>| at.map(|at| current.saturating_sub(at));
+        json!({
+            "observed_at":current,
+            "generation_started_at":generating,"generation_age_seconds":age(generating),
+            "model_captured_at":captured,"unsent_since_capture_seconds":age(captured),
+            "queued_since":queued,"queued_age_seconds":age(queued),
+            "effect_since":effect,"effect_age_seconds":age(effect),
+            "basis":"durable_transition_evidence"
+        })
+    }
 }
 
 /// Read failures are independent of normal work cadence and shared by callers
@@ -1318,7 +1388,7 @@ impl Store {
                 COALESCE(MAX(o.state IN ('dispatching','queued','unknown','included_pending')),0)
                 FROM operations o LEFT JOIN operation_evidence e ON e.operation_id=o.id
                 WHERE o.kind='answer' AND o.work_key LIKE ?1 AND o.id!=?2
-                AND (e.dispatch_sequence IS NOT NULL OR o.state IN ('dispatching','queued','unknown','included_pending','confirmed','final'))",
+                AND (e.dispatch_sequence IS NOT NULL OR o.job_id IS NOT NULL OR o.state IN ('dispatching','queued','unknown','included_pending','confirmed','final'))",
                 params![pattern,op.id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
             )?;
             if accepted
@@ -1435,7 +1505,7 @@ impl Store {
             COALESCE(MAX(o.state IN ('dispatching','queued','unknown','included_pending')),0)
             FROM operations o LEFT JOIN operation_evidence e ON e.operation_id=o.id
             WHERE o.kind=?1 AND o.work_key LIKE ?2
-            AND (e.dispatch_sequence IS NOT NULL OR o.state IN ('dispatching','queued','unknown','included_pending','confirmed','final'))",
+            AND (e.dispatch_sequence IS NOT NULL OR o.job_id IS NOT NULL OR o.state IN ('dispatching','queued','unknown','included_pending','confirmed','final'))",
             params![kind.as_str(),format!("{epoch}:%")], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
         )?;
         if kind == WorkKind::Answer
@@ -1507,7 +1577,7 @@ impl Store {
             "SELECT COUNT(*),COALESCE(MAX(o.txid IS NOT NULL OR o.state IN ('included_pending','confirmed','final')),0)
             FROM operations o LEFT JOIN operation_evidence e ON e.operation_id=o.id
             WHERE o.kind='answer' AND o.work_key LIKE ?1
-            AND (e.dispatch_sequence IS NOT NULL OR o.state IN ('dispatching','queued','unknown','included_pending','confirmed','final'))",
+            AND (e.dispatch_sequence IS NOT NULL OR o.job_id IS NOT NULL OR o.state IN ('dispatching','queued','unknown','included_pending','confirmed','final'))",
             [format!("{epoch}:%")], |r| Ok((r.get(0)?,r.get(1)?)),
         )?;
         let eligible = !accepted
@@ -1813,15 +1883,26 @@ impl Store {
                 deadline = deadline.min(next);
             }
         }
+        let mut job_not_before = 0;
         for scope in ReadScope::ALL {
             let next = self.read_backoff(scope)?.next_at;
+            if scope == ReadScope::Job {
+                job_not_before = next;
+            }
             if next > current {
                 deadline = deadline.min(next);
             }
         }
-        let operation: Option<i64> = self.db.query_row("SELECT MIN(next_at) FROM operations
-            WHERE next_at>?1 AND state IN ('prepared','generated','retry','queued','unknown','included_pending')",
-            [current],|r| r.get(0))?;
+        // Only opted-in bound queued jobs contribute already-due deadlines.
+        // Their endpoint and durable retry fences prevent a wake/read busy loop.
+        let operation: Option<i64> = self.db.query_row(
+            "SELECT MIN(CASE WHEN ?3 AND o.state='queued' AND o.job_id IS NOT NULL AND o.txid IS NULL
+                THEN MAX(o.next_at,COALESCE(t.retry_not_before,o.next_at),?2) ELSE o.next_at END)
+             FROM operations o LEFT JOIN operation_timing t ON t.operation_id=o.id
+             WHERE o.state IN ('prepared','generated','retry','queued','unknown','included_pending')
+                AND (o.next_at>?1 OR (?3 AND o.state='queued' AND o.job_id IS NOT NULL AND o.txid IS NULL))",
+            params![current,job_not_before,config.schedule.queued_job_polling.is_some()],
+            |r|r.get(0))?;
         if let Some(next) = operation {
             deadline = deadline.min(next);
         }
@@ -2134,6 +2215,52 @@ impl Store {
         Ok(())
     }
 
+    fn wait_evidence(&self) -> Result<std::collections::BTreeMap<i64, WaitEvidence>> {
+        // Bound work even on legacy databases whose diagnostic pruning lagged.
+        // Filtering happens after LIMIT so absent evidence remains unknown.
+        let mut statement = self.db.prepare(
+            "SELECT operation_id,code,at FROM
+             (SELECT id,operation_id,code,at FROM events ORDER BY id DESC LIMIT 2000)
+             WHERE operation_id IS NOT NULL AND code IN
+             ('generating','model_result_captured','submission_queued','job_pending','dispatch_intent')
+             ORDER BY id DESC",
+        )?;
+        let mut rows = statement.query([])?;
+        let mut evidence = std::collections::BTreeMap::<i64, WaitEvidence>::new();
+        while let Some(row) = rows.next()? {
+            let entry = evidence.entry(row.get(0)?).or_default();
+            let code = row.get_ref(1)?.as_str()?;
+            let slot = match code {
+                "generating" => &mut entry.generating,
+                "model_result_captured" => &mut entry.captured,
+                "submission_queued" | "job_pending" => &mut entry.queued,
+                _ => &mut entry.dispatch,
+            };
+            if slot.is_none() {
+                *slot = Some(row.get(2)?);
+            }
+        }
+        Ok(evidence)
+    }
+
+    pub(crate) fn operation_poll_timing(&self, id: i64) -> Result<(Option<i64>, i64)> {
+        let (queued_since, minimum): (Option<i64>, i64) = self.db.query_row(
+            "SELECT
+             (SELECT at FROM
+              (SELECT id,operation_id,code,at FROM events ORDER BY id DESC LIMIT 2000)
+              WHERE operation_id=o.id AND o.state='queued'
+              AND code IN ('submission_queued','job_pending') ORDER BY id DESC LIMIT 1),
+             COALESCE((SELECT retry_not_before FROM operation_timing WHERE operation_id=o.id),o.next_at)
+             FROM operations o WHERE o.id=?1",
+            [id], |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let current = now();
+        Ok((
+            queued_since.filter(|at| *at >= 0 && *at <= current),
+            minimum,
+        ))
+    }
+
     fn work_projection(
         &self,
         config: &Config,
@@ -2145,6 +2272,8 @@ impl Store {
     ) -> Result<Value> {
         let control = self.control()?;
         let current = now();
+        let waits = self.wait_evidence()?;
+        let has_evidence = self.has_table("operation_evidence")?;
         let mut work = json!({});
         for kind in [WorkKind::Answer, WorkKind::Judge, WorkKind::Mine] {
             let prepared = self.preparation(kind)?;
@@ -2430,6 +2559,29 @@ impl Store {
             work[kind.as_str()] = json!({"phase":phase,"reason":reason,"next_action":action,
                 "next_at":next_at,"epoch":epoch,"operation_id":op.map(|op| op.id),
                 "operation_epoch":op.and_then(|op| op.request["solver"]["epoch"].as_u64())});
+            let effect_since = if let Some(op) = op.filter(|op| {
+                has_evidence
+                    && matches!(
+                        op.state.as_str(),
+                        "dispatching" | "queued" | "unknown" | "included_pending"
+                    )
+            }) {
+                self.db
+                    .query_row(
+                        "SELECT blocked_since FROM operation_evidence WHERE operation_id=?1",
+                        [op.id],
+                        |row| row.get::<_, Option<i64>>(0),
+                    )
+                    .optional()?
+                    .flatten()
+            } else {
+                None
+            };
+            let empty = WaitEvidence::default();
+            work[kind.as_str()]["wait"] = waits
+                .get(&op.map_or(-1, |op| op.id))
+                .unwrap_or(&empty)
+                .projection(op.map_or("", |op| op.state.as_str()), effect_since, current);
         }
         Ok(work)
     }
@@ -2794,6 +2946,8 @@ impl Store {
             bail!("invalid operation state filter");
         }
         let snapshot = self.db.unchecked_transaction()?;
+        let current = now();
+        let waits = self.wait_evidence()?;
         let (link_columns, link_join) = if self.has_table("operation_links")? {
             (
                 "l.retry_of,COALESCE(l.payload_reused,0)",
@@ -2850,6 +3004,15 @@ impl Store {
             operation["epoch"] = request["solver"]["epoch"]
                 .as_u64()
                 .map_or(Value::Null, Value::from);
+            let empty = WaitEvidence::default();
+            operation["wait"] = waits
+                .get(&operation["operation_id"].as_i64().unwrap_or(-1))
+                .unwrap_or(&empty)
+                .projection(
+                    operation["state"].as_str().unwrap_or_default(),
+                    operation["blocked_since"].as_i64(),
+                    current,
+                );
             operations.push(operation);
         }
         let next_before = more
@@ -3501,6 +3664,31 @@ mod tests {
     }
 
     #[test]
+    fn bound_legacy_stale_answer_retains_epoch_dispatch_budget() {
+        let (_temp, mut config, mut store) = participation_fixture();
+        let mut old = dispatched_unknown(&mut store, &config, WorkKind::Answer, 7);
+        old.job_id = Some("legacy-bound-job".into());
+        old.state = "stale".into();
+        store.save(&old, "processed_submission_rejected").unwrap();
+        // Adopted schema-v1 operations have no per-operation dispatch witness.
+        store
+            .db
+            .execute(
+                "UPDATE operation_evidence SET dispatch_sequence=NULL WHERE operation_id=?1",
+                [old.id],
+            )
+            .unwrap();
+        store.db.execute("DELETE FROM events", []).unwrap();
+        drop(store);
+        let mut store = Store::open(&config).unwrap();
+        let mut current = prepared_epoch(&mut store, WorkKind::Answer, 7, "rotated");
+        config.participation.max_answer_attempts_per_epoch = 1;
+        assert!(!store.dispatch_intent(&mut current, &config).unwrap());
+        config.participation.max_answer_attempts_per_epoch = 2;
+        assert!(store.dispatch_intent(&mut current, &config).unwrap());
+    }
+
+    #[test]
     fn safe_retry_redispatch_restarts_uncertainty_grace_without_resetting_work_age() {
         let (_temp, mut config, mut store) = participation_fixture();
         let mut old = dispatched_unknown(&mut store, &config, WorkKind::Judge, 1);
@@ -3526,6 +3714,274 @@ mod tests {
         drop(store);
         let mut store = Store::open(&config).unwrap();
         assert!(!store.dispatch_intent(&mut answer, &config).unwrap());
+    }
+
+    #[test]
+    fn queued_wake_accounts_for_overdue_work_without_bypassing_floors() {
+        let (_temp, mut config, mut store) = participation_fixture();
+        let mut op = dispatched_unknown(&mut store, &config, WorkKind::Judge, 1);
+        op.state = "queued".into();
+        op.job_id = Some("bound-job".into());
+        op.next_at = now() + 60;
+        store.save(&op, "submission_queued").unwrap();
+        config.capabilities.answer = Mode::Off;
+        config.capabilities.judge = Mode::Off;
+        config.capabilities.mine = Mode::Off;
+        config.schedule.queued_job_polling = Some(crate::config::QueuedJobPolling {
+            initial_seconds: 15,
+            max_seconds: 120,
+        });
+        let future = store.wake_delay(&config, 600).unwrap();
+        assert!(future > 1 && future <= 60);
+        // A deadline may pass while other work runs after the reconciliation batch.
+        op.next_at = 0;
+        store.save(&op, "job_pending").unwrap();
+        assert_eq!(store.wake_delay(&config, 600).unwrap(), 1);
+        store.record_retry_minimum(op.id, 90).unwrap();
+        assert!(store.wake_delay(&config, 600).unwrap() >= 60);
+        store.fail_read(ReadScope::Job, 180, 900, 0, None).unwrap();
+        assert!(store.wake_delay(&config, 600).unwrap() >= 120);
+        store.reset_read(ReadScope::Job).unwrap();
+        config.schedule.queued_job_polling = None;
+        assert_eq!(store.wake_delay(&config, 600).unwrap(), 600);
+    }
+
+    #[test]
+    fn wait_ages_are_state_scoped_and_reject_future_or_missing_evidence() {
+        let evidence = WaitEvidence {
+            generating: Some(10),
+            captured: Some(30),
+            queued: Some(50),
+            dispatch: Some(40),
+        };
+        let generating = evidence.projection("generating", None, 100);
+        assert_eq!(generating["generation_age_seconds"], 90);
+        assert!(generating["unsent_since_capture_seconds"].is_null());
+        let unsent = WaitEvidence {
+            captured: Some(30),
+            ..WaitEvidence::default()
+        };
+        for state in ["generated", "prepared"] {
+            let wait = unsent.projection(state, None, 100);
+            assert_eq!(wait["unsent_since_capture_seconds"], 70);
+            assert!(wait["generation_age_seconds"].is_null());
+            assert!(wait["effect_age_seconds"].is_null());
+        }
+        for state in ["generated", "prepared", "retry"] {
+            assert!(
+                evidence.projection(state, Some(40), 100)["unsent_since_capture_seconds"].is_null()
+            );
+        }
+        assert!(unsent.projection("retry", None, 100)["unsent_since_capture_seconds"].is_null());
+        let queued = evidence.projection("queued", Some(45), 100);
+        assert_eq!(queued["queued_age_seconds"], 50);
+        assert_eq!(queued["effect_age_seconds"], 55);
+        assert!(queued["unsent_since_capture_seconds"].is_null());
+        for state in ["unknown", "included_pending", "dispatching"] {
+            let wait = evidence.projection(state, None, 100);
+            assert_eq!(wait["effect_age_seconds"], 60);
+            assert!(wait["queued_age_seconds"].is_null());
+        }
+        for state in [
+            "confirmed",
+            "final",
+            "completed",
+            "discarded",
+            "model_unknown",
+        ] {
+            let wait = evidence.projection(state, Some(40), 100);
+            for field in [
+                "generation_age_seconds",
+                "unsent_since_capture_seconds",
+                "queued_age_seconds",
+                "effect_age_seconds",
+            ] {
+                assert!(wait[field].is_null(), "{state}: {field}");
+            }
+        }
+        assert_eq!(
+            evidence.projection("queued", None, 50)["queued_age_seconds"],
+            0
+        );
+        assert!(evidence.projection("queued", None, 49)["queued_age_seconds"].is_null());
+        assert!(WaitEvidence::default().projection("generated", None, 100)
+            ["unsent_since_capture_seconds"].is_null());
+        assert!(
+            WaitEvidence {
+                generating: Some(-1),
+                ..WaitEvidence::default()
+            }
+            .projection("generating", None, 100)["generation_age_seconds"]
+                .is_null()
+        );
+        assert_eq!(
+            WaitEvidence {
+                generating: Some(0),
+                ..WaitEvidence::default()
+            }
+            .projection("generating", None, i64::MAX)["generation_age_seconds"],
+            i64::MAX
+        );
+    }
+
+    #[test]
+    fn wait_reporting_reuses_current_effective_cause_without_attributing_elapsed_age() {
+        let (_temp, mut config, mut store) = participation_fixture();
+        dispatched_unknown(&mut store, &config, WorkKind::Judge, 1);
+        let mut answer = begin(&mut store, WorkKind::Answer, "2:wait", "generating");
+        let started = now() - 120;
+        store
+            .db
+            .execute(
+                "UPDATE events SET at=?1 WHERE operation_id=?2 AND code='generating'",
+                params![started, answer.id],
+            )
+            .unwrap();
+        let generating = store.status(&config).unwrap();
+        assert_eq!(
+            generating["work"]["answer"]["wait"]["generation_started_at"],
+            started
+        );
+        answer.state = "generated".into();
+        answer.payload = Some(json!({"answer":"private-wait-canary"}));
+        store.save(&answer, "model_result_captured").unwrap();
+        let captured = now() - 80;
+        store
+            .db
+            .execute(
+                "UPDATE events SET at=?1 WHERE operation_id=?2 AND code='model_result_captured'",
+                params![captured, answer.id],
+            )
+            .unwrap();
+        store
+            .db
+            .execute(
+                "UPDATE operations SET updated_at=1 WHERE id=?1",
+                [answer.id],
+            )
+            .unwrap();
+        config.participation.mode = ParticipationMode::Strict;
+        store.runtime_state(&config, false).unwrap();
+        config.participation.mode = ParticipationMode::ParticipationFirst;
+        let status = store.status(&config).unwrap();
+        assert_eq!(status["work"]["answer"]["reason"], "strict_uncertainty");
+        assert_eq!(
+            status["work"]["answer"]["next_action"],
+            "await_reconciliation"
+        );
+        assert_eq!(
+            status["work"]["answer"]["wait"]["model_captured_at"],
+            captured
+        );
+        assert!(
+            status["work"]["answer"]["wait"]["unsent_since_capture_seconds"]
+                .as_i64()
+                .unwrap()
+                >= 80
+        );
+        drop(store);
+        let store = Store::read_only(&config).unwrap().unwrap();
+        let inventory = store
+            .operations_list(Some(WorkKind::Answer), None, None, 1)
+            .unwrap();
+        assert_eq!(
+            inventory["operations"][0]["wait"]["model_captured_at"],
+            captured
+        );
+        assert!(inventory["operations"][0]["wait"]["generation_age_seconds"].is_null());
+        assert!(!inventory.to_string().contains("private-wait-canary"));
+        assert!(
+            inventory["operations"][0]["wait"]
+                .get("blocked_seconds")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn wait_evidence_is_bounded_and_never_falls_back_to_mutable_timestamps() {
+        let (_temp, _config, mut store) = participation_fixture();
+        let mut op = begin(&mut store, WorkKind::Answer, "1:wait", "generating");
+        op.state = "generated".into();
+        store.save(&op, "model_result_captured").unwrap();
+        store
+            .db
+            .execute_batch(
+                "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<2000)
+             INSERT INTO events(at,code) SELECT 1,'diagnostic' FROM n;",
+            )
+            .unwrap();
+        let inventory = store.operations_list(None, None, None, 1).unwrap();
+        assert!(inventory["operations"][0]["wait"]["model_captured_at"].is_null());
+        assert!(inventory["operations"][0]["wait"]["unsent_since_capture_seconds"].is_null());
+        store.db.execute("DELETE FROM events", []).unwrap();
+        store
+            .db
+            .execute("DROP TABLE operation_evidence", [])
+            .unwrap();
+        let legacy = store.operations_list(None, None, None, 1).unwrap();
+        assert!(legacy["operations"][0]["wait"]["unsent_since_capture_seconds"].is_null());
+        assert!(legacy["operations"][0]["wait"]["effect_age_seconds"].is_null());
+    }
+
+    #[test]
+    fn queued_transition_timing_survives_polling_and_preserves_retry_minima() {
+        let (_temp, config, mut store) = participation_fixture();
+        let mut op = prepared_epoch(&mut store, WorkKind::Mine, 1, "queued");
+        assert!(store.dispatch_intent(&mut op, &config).unwrap());
+        op.state = "queued".into();
+        op.next_at = now() + 300;
+        store.save(&op, "submission_queued").unwrap();
+        let queued = now() - 120;
+        store
+            .db
+            .execute(
+                "UPDATE events SET at=?1 WHERE operation_id=?2 AND code='submission_queued'",
+                params![queued, op.id],
+            )
+            .unwrap();
+        store.save(&op, "job_pending").unwrap();
+        assert_eq!(
+            store.operation_poll_timing(op.id).unwrap(),
+            (Some(queued), 0)
+        );
+        store
+            .db
+            .execute("UPDATE operations SET updated_at=1 WHERE id=?1", [op.id])
+            .unwrap();
+        let inventory = store.operations_list(None, None, None, 1).unwrap();
+        assert_eq!(inventory["operations"][0]["wait"]["queued_since"], queued);
+        assert!(
+            inventory["operations"][0]["wait"]["queued_age_seconds"]
+                .as_i64()
+                .unwrap()
+                >= 120
+        );
+        op.state = "unknown".into();
+        store.save(&op, "dispatch_outcome_unknown").unwrap();
+        assert_eq!(store.operation_poll_timing(op.id).unwrap().0, None);
+        op.state = "queued".into();
+        store.save(&op, "job_pending").unwrap();
+        let requeued = store.operation_poll_timing(op.id).unwrap().0.unwrap();
+        assert!(requeued > queued);
+        store
+            .db
+            .execute(
+                "DELETE FROM operation_timing WHERE operation_id=?1",
+                [op.id],
+            )
+            .unwrap();
+        assert_eq!(store.operation_poll_timing(op.id).unwrap().1, op.next_at);
+        store
+            .db
+            .execute("DELETE FROM events WHERE operation_id=?1", [op.id])
+            .unwrap();
+        assert_eq!(
+            store.operation_poll_timing(op.id).unwrap(),
+            (None, op.next_at)
+        );
+        let pruned = store.operations_list(None, None, None, 1).unwrap();
+        assert!(pruned["operations"][0]["wait"]["queued_since"].is_null());
+        assert!(pruned["operations"][0]["wait"]["effect_since"].is_i64());
     }
 
     #[test]

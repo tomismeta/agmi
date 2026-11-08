@@ -147,13 +147,13 @@ def main():
                 stdin = patch if isinstance(patch, bytes) else json.dumps(patch).encode()
                 return invoke(*words, stdin=stdin, expected=error)
 
-            def guidance(kind='answer'):
-                return invoke('guidance', 'show', '--kind', kind)
+            def guidance(kind='answer', layer='user'):
+                return invoke('guidance', 'show', '--kind', kind, '--layer', layer)
 
             def set_guidance(content, kind='answer', config_rev=None, guidance_rev=None,
-                             dry=False, error=None):
-                current = guidance(kind) if config_rev is None or guidance_rev is None else None
-                words = ['guidance', 'set', '--kind', kind,
+                             dry=False, error=None, layer='user'):
+                current = guidance(kind, layer) if config_rev is None or guidance_rev is None else None
+                words = ['guidance', 'set', '--kind', kind, '--layer', layer,
                          '--expected-config-revision', config_rev if config_rev is not None else current['config_file_revision'],
                          '--expected-revision', guidance_rev if guidance_rev is not None else current['guidance_revision']]
                 if dry:
@@ -165,11 +165,14 @@ def main():
             assert not config.exists() and not state.exists()
             settings = {entry['path']: entry for entry in schema['settings']}
             for name in ('network.address', 'state_dir', 'solver.answer.guidance_file',
+                         'solver.answer.core_guidance_file', 'solver.judge.core_guidance_file',
                          'solver.judge.harness', 'timeouts.read_http_seconds',
                          'participation.retry_uncertain_answers', 'schedule.mine_each_epoch'):
                 assert name in settings, name
             assert settings['network.address']['immutable_when_initialized']
             assert settings['participation.mode']['enum'] == ['strict', 'participation_first', 'manual']
+            assert schema['guidance']['layers'] == ['core', 'user']
+            assert schema['guidance']['default_layer'] == 'user'
             invoke('config', 'init')
             initial = show()
             assert not state.exists()
@@ -214,6 +217,30 @@ def main():
                 apply(patch, error=error)
                 assert config.read_bytes() == before and not state.exists()
             apply(b' ' * 65537, error='admin_input_too_large')
+            # Active routes cannot silently fall back to compiled-in core instructions.
+            apply({'capabilities': {'answer': 'active'}}, error='admin_validation')
+            for kind in ('answer', 'judge'):
+                missing_core = guidance(kind, 'core')
+                assert missing_core['status'] == 'unconfigured' and missing_core['layer'] == 'core'
+                core_text = (secret + '\n' + kind + ' core instructions\n').encode()
+                preview = set_guidance(core_text, kind=kind, layer='core', dry=True)
+                assert not preview['saved']
+                core_path = root / (kind + '-core-guidance.md')
+                assert not core_path.exists()
+                saved = set_guidance(core_text, kind=kind, layer='core')
+                assert saved['saved'] and secret not in json.dumps(saved)
+                assert core_path.read_bytes() == core_text
+                assert core_path.stat().st_mode & 0o777 == 0o600
+                current = guidance(kind, 'core')
+                assert current['content'] == core_text.decode()
+                assert current['guidance_revision'] == revision(core_text)
+                set_guidance(b'stale', kind=kind, layer='core',
+                             config_rev=current['config_file_revision'], guidance_rev='missing',
+                             error='admin_revision_conflict')
+                for invalid in (b'', b' \n', b'\xff'):
+                    set_guidance(invalid, kind=kind, layer='core', error='admin_validation')
+                assert core_path.read_bytes() == core_text
+            assert invoke('guidance', 'show', '--kind', 'answer')['layer'] == 'user'
             before = config.read_bytes()
             dry = apply({'capabilities': {'answer': 'active'},
                          'solver': {'answer': {'model': 'configured-model', 'reasoning': 'medium'}},
@@ -291,6 +318,28 @@ def main():
             set_guidance(text)
             assert guidance()['content'] == text.decode()
 
+
+            # Missing/invalid core files block model configuration, not diagnostics or repair.
+            core_path = root / 'answer-core-guidance.md'
+            core_text = core_path.read_bytes()
+            core_path.unlink()
+            assert guidance(layer='core')['status'] == 'missing'
+            assert show()['guidance_validation'] == 'not_loaded'
+            apply({'schedule': {'poll_seconds': 5}}, error='admin_guidance_missing')
+            for words in (('status',), ('logs',), ('agents',), ('config', 'show')):
+                assert secret not in json.dumps(invoke(*words))
+            checked = subprocess.run(base + ['config', 'check'], capture_output=True,
+                                     timeout=15, env=environment)
+            assert checked.returncode != 0 and secret.encode() not in checked.stdout + checked.stderr
+            assert not state.exists()
+            set_guidance(core_text, layer='core')
+            assert guidance(layer='core')['content'] == core_text.decode()
+            assert answer_path.read_bytes() == text, 'core repair overwrote user guidance'
+            core_path.write_bytes(b' \n')
+            core_path.chmod(0o600)
+            apply({'schedule': {'poll_seconds': 5}}, error='admin_validation')
+            set_guidance(core_text, layer='core')
+            assert invoke('config', 'check') is not None
             # Config/guidance files must not be symlinks, hardlinks, FIFOs or directories.
             preserved = answer_path.read_bytes()
             answer_path.unlink()
@@ -386,6 +435,7 @@ def main():
             assert not requests and not (root / 'model-called').exists()
             assert not list(root.glob('.agmi-admin-*.tmp'))
             print(json.dumps({'admin_smoke': 'ok', 'cas_conflict': True, 'private_guidance': True,
+                              'core_guidance_required_repairable': True,
                               'immutable_initialized_identity': True, 'network_requests': 0,
                               'model_calls': 0, 'journal_unchanged_by_admin': True,
                               'startup_identity_race_fenced': True, 'mutable_policy_admission_fenced': True}))

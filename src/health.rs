@@ -55,6 +55,11 @@ pub fn check(config: &Config, options: Options) -> Result<Value> {
                 .expect("health issues array")
                 .push(json!(code));
             result["healthy"] = json!(false);
+            result["operational"]["status"] = json!("degraded");
+            result["operational"]["issues"]
+                .as_array_mut()
+                .expect("operational health issues array")
+                .push(json!(code));
         }
     }
     result["thresholds"]["min_free_mib"] = json!(options.min_free_mib);
@@ -298,7 +303,39 @@ fn evaluate(config: &Config, options: Options, status: &Value, at: i64) -> Value
         }
     }
     let attention_required = !issues.is_empty() || !warnings.is_empty();
-    json!({"healthy":issues.is_empty(),"checked_at":at,"issues":issues,
+    // Retained uncertainty remains an overall health issue. Separately expose
+    // whether local evidence reports an operational problem or admission block.
+    // "clear" is not a guarantee of remote availability or successful submission.
+    let admission = status["admission_blocked"].as_bool();
+    let mut operational_issues: Vec<_> = issues
+        .iter()
+        .copied()
+        .filter(|code| *code != "pending_outcome_uncertain")
+        .collect();
+    let operational_status = if !operational_issues.is_empty() {
+        "degraded"
+    } else if admission == Some(true) {
+        "blocked"
+    } else if admission == Some(false) {
+        "clear"
+    } else {
+        "unknown"
+    };
+    if admission == Some(true) {
+        operational_issues.push("admission_blocked");
+    }
+    let risk_attention = issues.iter().any(|code| {
+        matches!(
+            *code,
+            "pending_outcome_uncertain" | "dispatch_outcome_uncertain"
+        )
+    }) || warnings.iter().any(|code| {
+        matches!(
+            *code,
+            "model_execution_unresolved" | "participation_risk_admitted"
+        )
+    });
+    let mut result = json!({"healthy":issues.is_empty(),"checked_at":at,"issues":issues,
         "warnings":warnings,"attention_required":attention_required,
         "unresolved_model_attempts":unresolved_models,
         "initialized":initialized,"paused":paused,"expect_participation":options.expect_participation,
@@ -326,7 +363,13 @@ fn evaluate(config: &Config, options: Options, status: &Value, at: i64) -> Value
         "thresholds":{"stale_seconds":stale,"work_seconds":work_limit,
             "answer_grace_seconds":grace,"model_seconds":model_limit,"cycle_floor_seconds":cycle_floor,
             "read_http_seconds":read_http,"write_http_seconds":http},
-        "evidence":"local_only","notifications":"local_exit_status_and_journal"})
+        "evidence":"local_only","notifications":"local_exit_status_and_journal"});
+    result["operational"] = json!({"status":operational_status,"issues":operational_issues,
+        "evidence":"local_only_not_a_submission_guarantee"});
+    result["risk"] = json!({"attention_required":risk_attention,
+        "unresolved_effects":status["participation"]["unresolved_count"].as_u64(),
+        "unresolved_model_attempts":unresolved_models});
+    result
 }
 
 #[cfg(test)]
@@ -648,6 +691,48 @@ mod tests {
                 .iter()
                 .all(|warning| warning != "participation_risk_admitted")
         );
+    }
+
+    #[test]
+    fn retained_risk_does_not_hide_operational_blockage_or_staleness() {
+        let (config, options, mut status) = fixture();
+        status["pending"] = json!({"state":"unknown","created_at":9000});
+        status["participation"] = json!({"unresolved_count":1,"risk_admissions":1});
+        status["admission_blocked"] = json!(false);
+        let clear = evaluate(&config, options, &status, 10000);
+        assert_eq!(clear["healthy"], false);
+        assert_eq!(clear["attention_required"], true);
+        assert_eq!(clear["operational"]["status"], "clear");
+        assert_eq!(clear["operational"]["issues"], json!([]));
+        assert_eq!(clear["risk"]["attention_required"], true);
+        assert_eq!(clear["risk"]["unresolved_effects"], 1);
+
+        status["admission_blocked"] = json!(true);
+        let blocked = evaluate(&config, options, &status, 10000);
+        assert_eq!(blocked["operational"]["status"], "blocked");
+        assert_eq!(
+            blocked["operational"]["issues"],
+            json!(["admission_blocked"])
+        );
+        assert!(has(&blocked, "pending_outcome_uncertain"));
+
+        status["admission_blocked"] = json!(false);
+        status["observation"]["observed_at"] = json!(1);
+        let stale = evaluate(&config, options, &status, 10000);
+        assert_eq!(stale["operational"]["status"], "degraded");
+        assert_eq!(
+            stale["operational"]["issues"],
+            json!(["challenge_observation_stale"])
+        );
+        assert_eq!(stale["risk"]["attention_required"], true);
+    }
+
+    #[test]
+    fn absent_admission_evidence_is_not_operational_clear() {
+        let (config, options, status) = fixture();
+        let health = evaluate(&config, options, &status, 10000);
+        assert_eq!(health["operational"]["status"], "unknown");
+        assert_eq!(health["risk"]["unresolved_effects"], Value::Null);
     }
 
     #[test]

@@ -44,15 +44,22 @@ harness = "hermes"
 executable = "hermes"
 model = "gpt-6.1-sol"
 reasoning = "high"
-# Optional plain UTF-8 context; edits reload without restart.
-# guidance_file = "answer-guidance.md"
+# Required nonempty core instructions for active routes. Copy the answer/judge
+# directories beside this config; each layer is limited to 64 KiB and hot reloads.
+core_guidance_file = "answer/core-guidance.md"
+# Optional user preferences, subordinate to core instructions and output/security.
+guidance_file = "answer/user-guidance.md"
 
 [solver.judge]
 harness = "hermes"
 executable = "hermes"
 model = "gpt-6.1-sol"
 reasoning = "high"
-# guidance_file = "judge-guidance.md"
+core_guidance_file = "judge/core-guidance.md"
+guidance_file = "judge/user-guidance.md"
+# Admin discovery: agmi config schema; guidance show/set --layer core|user.
+# Omitted --layer selects user. Both layers are captured per model attempt.
+# Missing/empty configured core files fail loading; no built-in prose fallback.
 
 [timeouts]
 http_seconds = 30
@@ -76,3 +83,10 @@ backoff_max_seconds = 900
 # challenge_backoff_max_seconds = 120
 # Deterministic per-identity startup/poll/retry staggering; 0 disables staggering.
 jitter_seconds = 30
+
+# Optional accepted-job polling, independent of error retries and receipt cadence.
+# Both positive fields required. Omit the table to retain the existing cadence.
+# The local cap includes jitter; server minima and read backoff still win.
+# [schedule.queued_job_polling]
+# initial_seconds = 15
+# max_seconds = 120

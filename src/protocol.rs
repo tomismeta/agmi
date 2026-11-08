@@ -201,6 +201,16 @@ impl Protocol {
         } else {
             Some(read_credential(&config.network.credential_file)?)
         };
+        Self::with_key(config, key)
+    }
+
+    /// Read-only administration can validate a replacement without persisting it.
+    pub(crate) fn with_credential(config: &Config, bytes: &[u8]) -> Result<Self> {
+        config.validate()?;
+        Self::with_key(config, Some(parse_credential(bytes)?))
+    }
+
+    fn with_key(config: &Config, key: Option<HeaderValue>) -> Result<Self> {
         let timeout = Duration::from_secs(config.timeouts.http_seconds);
         let client = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -557,8 +567,12 @@ fn read_credential(path: &Path) -> Result<HeaderValue> {
     file.take(4097)
         .read_to_end(&mut bytes)
         .map_err(|_| anyhow::anyhow!("cannot read credential file"))?;
+    parse_credential(&bytes)
+}
+
+fn parse_credential(bytes: &[u8]) -> Result<HeaderValue> {
     ensure!(bytes.len() <= 4096, "credential file exceeds size limit");
-    let text = std::str::from_utf8(&bytes)
+    let text = std::str::from_utf8(bytes)
         .map_err(|_| anyhow::anyhow!("invalid credential encoding"))?
         .trim_end_matches(['\r', '\n']);
     #[derive(Deserialize)]

@@ -48,6 +48,10 @@ pub struct ModelConfig {
     pub reasoning: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guidance_file: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub core_guidance_file: Option<PathBuf>,
+    #[serde(skip)]
+    pub(crate) core_guidance: Arc<str>,
     #[serde(skip)]
     pub(crate) guidance: Arc<str>,
 }
@@ -59,6 +63,7 @@ impl std::fmt::Debug for ModelConfig {
             .field("model", &self.model)
             .field("reasoning", &self.reasoning)
             .field("guidance_file", &self.guidance_file)
+            .field("core_guidance_file", &self.core_guidance_file)
             .finish_non_exhaustive()
     }
 }
@@ -111,8 +116,16 @@ pub struct Schedule {
     pub challenge_retry_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub challenge_backoff_max_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queued_job_polling: Option<QueuedJobPolling>,
     #[serde(default = "default_jitter_seconds")]
     pub jitter_seconds: u64,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueuedJobPolling {
+    pub initial_seconds: u64,
+    pub max_seconds: u64,
 }
 fn default_backoff_max_seconds() -> u64 {
     900
@@ -220,6 +233,8 @@ impl Default for Config {
             model: "gpt-6.1-sol".into(),
             reasoning: "high".into(),
             guidance_file: None,
+            core_guidance_file: None,
+            core_guidance: Arc::from(""),
             guidance: Arc::from(""),
         };
         Self {
@@ -259,6 +274,7 @@ impl Default for Config {
                 backoff_max_seconds: default_backoff_max_seconds(),
                 challenge_retry_seconds: None,
                 challenge_backoff_max_seconds: None,
+                queued_job_polling: None,
                 jitter_seconds: default_jitter_seconds(),
             },
         }
@@ -315,18 +331,30 @@ impl Config {
             if model.executable.components().count() > 1 {
                 model.executable = resolve_path(root, &model.executable);
             }
-            if let Some(path) = &mut model.guidance_file {
+            for path in [&mut model.guidance_file, &mut model.core_guidance_file]
+                .into_iter()
+                .flatten()
+            {
                 *path = resolve_path(root, path);
             }
         }
-        config.guidance_loaded = config.solver.answer.guidance_file.is_none()
-            && config.solver.judge.guidance_file.is_none();
+        config.guidance_loaded = [&config.solver.answer, &config.solver.judge]
+            .iter()
+            .all(|model| model.guidance_file.is_none() && model.core_guidance_file.is_none());
         if load_guidance {
             for model in [&mut config.solver.answer, &mut config.solver.judge] {
                 if let Some(path) = &model.guidance_file {
                     model.guidance = read_guidance(path)?;
                 }
+                if let Some(path) = &model.core_guidance_file {
+                    model.core_guidance = read_guidance(path)?;
+                    ensure!(
+                        !model.core_guidance.trim().is_empty(),
+                        "core guidance must not be empty"
+                    );
+                }
             }
+            config.validate_core_guidance()?;
             config.guidance_loaded = true;
         }
         Ok(config)
@@ -388,17 +416,22 @@ impl Config {
             );
         }
         for model in [&self.solver.answer, &self.solver.judge] {
-            if check_guidance_paths && let Some(path) = &model.guidance_file {
-                ensure!(
-                    !path.as_os_str().is_empty()
-                        && !path.starts_with("~")
-                        && !path
-                            .as_os_str()
-                            .to_string_lossy()
-                            .chars()
-                            .any(char::is_control),
-                    "guidance_file must be an absolute or config-relative path"
-                );
+            if check_guidance_paths {
+                for path in [&model.guidance_file, &model.core_guidance_file]
+                    .into_iter()
+                    .flatten()
+                {
+                    ensure!(
+                        !path.as_os_str().is_empty()
+                            && !path.starts_with("~")
+                            && !path
+                                .as_os_str()
+                                .to_string_lossy()
+                                .chars()
+                                .any(char::is_control),
+                        "guidance paths must be absolute or config-relative"
+                    );
+                }
             }
             ensure!(
                 !model.executable.as_os_str().is_empty(),
@@ -412,6 +445,12 @@ impl Config {
                     "invalid model or reasoning setting"
                 );
             }
+        }
+        if let Some(policy) = &self.schedule.queued_job_polling {
+            ensure!(
+                policy.initial_seconds <= policy.max_seconds,
+                "queued job polling initial interval must not exceed its maximum"
+            );
         }
         for (seconds, allow_zero) in [
             (self.timeouts.http_seconds, false),
@@ -434,6 +473,20 @@ impl Config {
                 self.schedule
                     .challenge_backoff_max_seconds
                     .unwrap_or(self.schedule.backoff_max_seconds),
+                false,
+            ),
+            (
+                self.schedule
+                    .queued_job_polling
+                    .as_ref()
+                    .map_or(1, |policy| policy.initial_seconds),
+                false,
+            ),
+            (
+                self.schedule
+                    .queued_job_polling
+                    .as_ref()
+                    .map_or(1, |policy| policy.max_seconds),
                 false,
             ),
             (self.schedule.jitter_seconds, true),
@@ -489,6 +542,21 @@ impl Config {
         }
         Ok(())
     }
+    pub(crate) fn validate_core_guidance(&self) -> Result<()> {
+        for (kind, model) in [
+            (WorkKind::Answer, &self.solver.answer),
+            (WorkKind::Judge, &self.solver.judge),
+        ] {
+            ensure!(
+                self.mode(kind) != Mode::Active
+                    || (model.core_guidance_file.is_some()
+                        && !model.core_guidance.trim().is_empty()),
+                "active {} route requires a nonempty core_guidance_file",
+                kind.as_str()
+            );
+        }
+        Ok(())
+    }
     pub fn revision(&self) -> Result<String> {
         ensure!(self.guidance_loaded, "model guidance has not been loaded");
         let mut digest = Sha256::new();
@@ -496,6 +564,8 @@ impl Config {
         for model in [&self.solver.answer, &self.solver.judge] {
             digest.update((model.guidance.len() as u64).to_le_bytes());
             digest.update(model.guidance.as_bytes());
+            digest.update((model.core_guidance.len() as u64).to_le_bytes());
+            digest.update(model.core_guidance.as_bytes());
         }
         Ok(format!("{:x}", digest.finalize()))
     }
@@ -651,6 +721,41 @@ pub(crate) fn validate_origin(value: &str) -> Result<reqwest::Url> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queued_job_polling_is_optional_bounded_and_serialized() {
+        let mut config = Config::default();
+        assert_eq!(config.schedule.queued_job_polling, None);
+        let original_revision = config.revision().unwrap();
+        assert!(
+            !toml::to_string(&config)
+                .unwrap()
+                .contains("queued_job_polling")
+        );
+        config.schedule.queued_job_polling = Some(QueuedJobPolling {
+            initial_seconds: 2,
+            max_seconds: 30,
+        });
+        config.validate().unwrap();
+        assert_ne!(original_revision, config.revision().unwrap());
+        let decoded: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(decoded.schedule, config.schedule);
+        for (initial_seconds, max_seconds) in [(0, 30), (2, 0), (31, 30), (1, u64::MAX)] {
+            config.schedule.queued_job_polling = Some(QueuedJobPolling {
+                initial_seconds,
+                max_seconds,
+            });
+            assert!(config.validate().is_err());
+        }
+        config.schedule.queued_job_polling = Some(QueuedJobPolling {
+            initial_seconds: 1,
+            max_seconds: 1,
+        });
+        config.validate().unwrap();
+        assert!(
+            toml::from_str::<Config>("[schedule.queued_job_polling]\ninitial_seconds=2").is_err()
+        );
+    }
 
     #[test]
     fn challenge_policy_and_answer_reserve_are_opt_in_and_validated() {
@@ -887,6 +992,89 @@ mod tests {
         config.schedule.jitter_seconds = 0;
         config.schedule.backoff_max_seconds = 0;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn core_guidance_requires_active_routes_and_remains_recoverable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut config = Config::default();
+        std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+        assert!(Config::load(&path).is_ok());
+        config.capabilities.answer = Mode::Active;
+        config.network.address = format!("poa1{}", "1".repeat(32));
+        config.network.credential_file = "credential".into();
+        std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+        assert!(Config::load(&path).is_err());
+        assert!(Config::load_metadata(&path).is_ok());
+        config.solver.answer.core_guidance_file = Some("core.md".into());
+        std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+        assert!(Config::load(&path).is_err());
+        std::fs::write(dir.path().join("core.md"), " \n").unwrap();
+        assert!(Config::load(&path).is_err());
+        std::fs::write(dir.path().join("core.md"), "Produce an original mechanism.").unwrap();
+        assert!(Config::load(&path).is_ok());
+        config.capabilities.judge = Mode::Active;
+        std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+        assert!(Config::load(&path).is_err());
+        assert!(Config::load_metadata(&path).is_ok());
+    }
+
+    #[test]
+    fn core_edits_reload_both_routes_without_exposing_or_mutating_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut config = Config::default();
+        config.solver.answer.core_guidance_file = Some("answer-core.md".into());
+        config.solver.judge.core_guidance_file = Some("judge-core.md".into());
+        std::fs::write(
+            dir.path().join("answer-core.md"),
+            "private-answer-core-canary",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("judge-core.md"),
+            "private-judge-core-canary",
+        )
+        .unwrap();
+        std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+        let first = Config::load(&path).unwrap();
+        assert_eq!(
+            first.solver.answer.core_guidance_file,
+            Some(dir.path().join("answer-core.md"))
+        );
+        let public = format!("{} {first:?}", serde_json::to_string(&first).unwrap());
+        assert!(!public.contains("private-answer-core-canary"));
+        assert!(!public.contains("private-judge-core-canary"));
+        std::fs::write(
+            dir.path().join("answer-core.md"),
+            "Updated answer instructions.",
+        )
+        .unwrap();
+        let second = Config::load(&path).unwrap();
+        assert_ne!(first.revision().unwrap(), second.revision().unwrap());
+        assert_eq!(
+            &*first.solver.answer.core_guidance,
+            "private-answer-core-canary"
+        );
+        std::fs::write(
+            dir.path().join("judge-core.md"),
+            "Updated judging instructions.",
+        )
+        .unwrap();
+        let third = Config::load(&path).unwrap();
+        assert_ne!(second.revision().unwrap(), third.revision().unwrap());
+        assert_eq!(
+            &*second.solver.judge.core_guidance,
+            "private-judge-core-canary"
+        );
+        assert!(
+            Config::load_metadata(&path)
+                .unwrap()
+                .optional_revision()
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

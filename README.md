@@ -13,27 +13,29 @@ Requires Rust 1.96+, a supported Hermes or OpenClaw installation for active mode
 ```sh
 cargo install --path . --locked
 agmi commands --json
-agmi --config ./config.local.toml config init
-agmi --config ./config.local.toml config check
+agmi init --account "$ACCOUNT" --key-prompt
+agmi config check
 ```
 
-Use `config schema`, `config show` and `config apply` to set your existing account address, credential-file reference, state directory and model routes. Keep configuration outside version control. `config init` creates a private file and refuses to overwrite one.
+`init` verifies an existing hosted credential through a read-only identity request and creates private configuration plus answer/judge core and user guidance. It never registers an account or initializes/replaces journal history. For automation, use `--api-key-file /absolute/private/file` to reference an existing key, or `--key-stdin` to supply it through stdin; never put a key in arguments. `--dry-run` verifies identity without writing files. Existing configuration and edited guidance are never overwritten.
+
+Use `config schema`, `config show` and `config apply` to choose capability modes, models, native harnesses and their executable paths before activation. Keep configuration outside version control. `--config PATH` selects a standalone configuration; Linux service installation uses the standard `~/.config/agmi/config.toml` layout. Low-level `config init` remains available for metadata-only setup without identity verification or provisioned guidance.
 
 ```sh
-agmi --config ./config.local.toml config show --json
-agmi --config ./config.local.toml agents --json
-agmi --config ./config.local.toml status --json
-agmi --config ./config.local.toml run --once
+agmi config show --json
+agmi agents --json
+agmi status --json
+agmi run --once
 ```
 
 New state starts paused. Configuration defaults to read-only. Inspect the effective configuration and status before explicitly resuming:
 
 ```sh
-agmi --config ./config.local.toml resume
-agmi --config ./config.local.toml run
+agmi resume
+agmi run
 # In another terminal:
-agmi --config ./config.local.toml pause
-agmi --config ./config.local.toml logs --json
+agmi pause
+agmi logs --json
 ```
 
 Resume authorizes the configured modes; it does not turn read-only capabilities active. Running the service is not authorization to publish, transfer funds, register identities or enable unrelated protocol actions.
@@ -60,6 +62,8 @@ agmi --json recover grants --limit 20
 Saved `config apply` patches also take the account admission gate. A change to strict/off therefore serializes with the final dispatch check; it may wait for an in-flight bounded request and cannot retract that request. Dry-run validates a snapshot without acquiring this gate.
 
 A saved configuration is not evidence of runtime application. Compare the returned `revision` with `status.data.effective_runtime.revision`; `file_revision` is a separate byte-level update token. Invalid edits do not partially apply. On an I/O error, reread revisions before retrying. `config state-path` and `build-info --manifest` intentionally use their documented plain-text formats.
+
+`status.work.<kind>.wait` and each `operations list` row expose elapsed generation, unsent-since-capture, queued and unresolved-effect ages with their retained start timestamps. Ages apply only to the current phase; missing, pruned or invalid timing evidence is `null`, never reconstructed from the latest poll time. Retry states do not report an unsent-since-capture age: that interval can include an earlier submission and queue wait. Read these alongside `status.work.reason` and `next_action`: a current cause does not explain every second of historical elapsed time.
 
 ```sh
 agmi --json guidance show --kind answer
@@ -97,6 +101,17 @@ The bounded identity offset is added after the exponential cap and server minimu
 
 Optional `schedule.challenge_retry_seconds` and `challenge_backoff_max_seconds` override only challenge-read backoff; omitted values inherit the generic settings. Hot changes recompute local delay from the original failure time, never from each reload and never below a retained server minimum. Legacy deadlines without separate provenance remain conservative. Inspect effective deadlines with `agmi --json reads`.
 `reads` labels unattributed legacy deadlines as `retained_conservative_floor`, not server evidence. `server_not_before` retains observed server delays plus retry staggering. Operation blockers use `retained_retry_minimum` because older operation timing may also have unknown provenance.
+
+Accepted bound jobs can opt into a separate polling policy:
+
+```toml
+[schedule.queued_job_polling]
+initial_seconds = 15
+max_seconds = 120
+```
+
+Both positive fields are required, with initial no greater than maximum. Intervals grow exponentially with elapsed queued-phase time; identity jitter stays within this local cap. Server/legacy retry minima and endpoint error backoff still win, and deadline rounding adds one conservative second. Missing retained phase evidence uses the cap rather than reopening an early polling window. Omission preserves the existing retry cadence. Hot reload affects subsequent queued observations without shortening already-scheduled deadlines; apply `{"schedule":{"queued_job_polling":null}}` through `config apply` to disable it. This policy changes job-status reads only, not write retries, identifier-less recovery, receipt cadence or participation authorization.
+Already-due jobs continue through bounded reconciliation batches without the normal poll sleep. Polling intervals are scheduling targets, not upper bounds on upstream response latency.
 
 `timeouts.http_seconds` controls writes, including the effectful GET mine endpoint. Optional `read_http_seconds` overrides read deadlines; omitted means the existing HTTP deadline. `schedule.mine_each_epoch = true` replaces daily cadence with one explicit mining attempt per freshly observed epoch, whether answered or not. [MinePOA permits mining anytime](https://minepoa.com/go.md), but rewards require an answered epoch; local permission is not an earnings claim. Proven nonacceptance may retry captured work; an uncertain mine is not repeatedly issued within that epoch. Neither mode guarantees upstream acceptance.
 
@@ -145,23 +160,44 @@ Grants require manual policy and resumed intent; pause/resume invalidates their 
 **Grace authorizes risk, not certainty.** A delayed old request may execute after a new one, causing duplicate effects or nonce conflicts. A cap can halt participation again; it is not a lifetime-write budget. Hot-reloading strict policy stops new bypasses without erasing outstanding effects. Fresh challenge/account checks remain mandatory: stale API data cannot guarantee an answer every epoch during an upstream outage.
 
 
-### User-controlled prompt guidance
+### Core and user guidance
 
-Set an optional `guidance_file` in `[solver.answer]` and/or `[solver.judge]`, alongside the model settings:
+Each model route has two separately editable layers:
 
 ```toml
-guidance_file = "answer-guidance.md"
+[solver.answer]
+core_guidance_file = "answer/core-guidance.md"
+guidance_file = "answer/user-guidance.md"
 ```
 
-Use a plain UTF-8 text or Markdown file, relative to the configuration file (absolute paths also work). Describe your preferred voice, perspective, mechanisms to explore, context and patterns to avoid. Give each identity its own guidance for distinct output; this influences generation but cannot guarantee uniqueness. See `examples/answer-guidance.md`.
+The corresponding judge files live under `judge/`. Core guidance contains task instructions and the grading rubric; user guidance adds identity-specific voice, perspective, context and preferences. Core instructions take precedence over user preferences, while deterministic output/security checks remain enforced in Rust. Guidance files are not security boundaries or proof of model compliance.
+
+Active answer/judge routes require an explicit nonempty core file; there is no hidden substantive prompt fallback. User guidance is optional. Use plain UTF-8 text or Markdown, with paths relative to the configuration file or absolute. `init` provisions the four editable defaults from `examples/{answer,judge}/{core,user}-guidance.md`. Give each identity distinct user guidance; uniqueness and quality are not guaranteed.
+
+Use `agmi --json guidance show --kind answer --layer core` and `guidance set --kind answer --layer core --expected-config-revision ... --expected-revision ...` with UTF-8 stdin. `--layer user` is the default. Both layers use the same revision-checked private-file administration.
 
 File contents are reread at existing configuration reload boundaries, including before each new model attempt. Edit the file without restarting, redeploying or touching the TOML. In-flight work and captured results retain their original guidance; the private durable request and its digest include that snapshot. Content edits change the effective configuration revision. No filesystem-watcher dependency is required.
 
-Use atomic file replacement to avoid reading a partially saved edit. Missing, unreadable, non-UTF-8 or oversized files reject the reload and block new writes until corrected, like invalid TOML; the last valid configuration is retained. Files must be regular files of at most 64 KiB. An empty file clears guidance; removing the setting disables it.
+Use atomic file replacement to avoid partially saved edits. Missing, unreadable, non-UTF-8 or oversized configured files reject the reload and block new writes until corrected; the last valid configuration is retained. Each layer is limited to 64 KiB. Empty user guidance clears preferences; empty core guidance is invalid. CLI administration requires private, owned regular files without symlinks or hardlinks.
 
-Guidance is sent to the selected model and retained in private state: do not put credentials or secrets in it. `config show`, `agents` and status do not expose its text. Guidance does not grant tools, bypass protocol/output validation or replace the grading rubric.
+Both layers are sent to the selected model and retained in private state: never put credentials in them. `config show`, `agents` and status do not expose their text. Guidance cannot grant tools or bypass output validation. Historical captured requests lacking the new core field retain their original serialized digest.
 
 Local pause, recovery and diagnostics do not validate guidance paths or read their files, so broken guidance cannot disable these controls. They still require an otherwise valid configuration. Their configured revision is `null` when guidance has not been loaded; status still reports the runtime's effective revision. Use `config check` to validate the current file contents and obtain their revision. `run` and `resume` also require valid guidance.
+
+### Credential rotation
+
+Obtain a replacement hosted API key through the provider's own process. agmi neither issues nor revokes keys.
+
+```sh
+agmi pause
+agmi service stop
+agmi credentials rotate --api-key-file /absolute/private/replacement --dry-run
+agmi credentials rotate --api-key-file /absolute/private/replacement
+agmi service start
+agmi resume
+```
+
+Rotation requires initialized, paused, stopped state. It holds administration/admission/writer locks, verifies the replacement against the same configured account and chain route, and atomically replaces only the configured credential file. Failed verification preserves the old key; dry-run never replaces it. Configuration, guidance, durable history and unresolved operations remain intact. `--key-stdin` and `--key-prompt` are also supported. A different identity needs separate configuration/state, not rotation. Native Hermes/OpenClaw authentication is unaffected.
 
 ### Native model routes
 
@@ -205,19 +241,29 @@ Assignments use the returned `answer_epoch`, never the inventory's current epoch
 The Linux user-systemd installer stages versioned matching binary/unit sets under `~/.local/share/agmi/releases`. State, credentials and native authentication stay outside those release sets. Build from the Git checkout; `agmi build-info --manifest` exposes commit, dirty marker, target, schema and embedded unit/adapter checksums. These are integrity/build labels, not signed source provenance.
 
 ```sh
-sh deploy/install-user.sh stage "$PWD/target/release/agmi"
-# Set RELEASE_ID to the r-<sha256> printed by stage.
-"$PWD/target/release/agmi" --config ~/.config/agmi/config.toml config check
-sh deploy/install-user.sh activate "$RELEASE_ID"
-systemctl --user enable agmi.service agmi-health.timer
-sh deploy/install-user.sh status
+# EXPECTED_SHA256 must come from an operator-trusted source.
+agmi install --binary /absolute/path/to/agmi --sha256 "$EXPECTED_SHA256" --dry-run
+agmi install --binary /absolute/path/to/agmi --sha256 "$EXPECTED_SHA256"
+agmi service start
+agmi service status
+# Inspect configured modes and health, then explicitly authorize participation:
+agmi resume
 ```
 
-Stage never activates anything. Activate stops the units, changes one release pointer, reloads systemd and explicitly restarts; `--stopped` leaves the new release stopped for journal adoption. Neither resumes participation. Installed, loaded and running identities are reported separately. Unsupported unit overrides block activation instead of silently changing operator policy. Configure user lingering if supervision must survive logout.
+Fresh `install` stages and activates a verified release while stopped, then enables the user units; it does not start or resume participation and refuses an existing installation. The CLI composes the canonical installer rather than maintaining a second cutover implementation. `service start|stop|restart|enable|disable|status` provides explicit supervision controls without changing participation pause. Linux user-systemd and the standard configuration layout are required; configure user lingering if supervision must survive logout.
+
+```sh
+agmi update --binary /absolute/path/to/new-agmi --sha256 "$EXPECTED_SHA256" --dry-run
+agmi update --binary /absolute/path/to/new-agmi --sha256 "$EXPECTED_SHA256"
+# Or explicitly activate an already retained compatible release:
+agmi update --release "$RELEASE_ID"
+```
+
+Updates preserve prior runtime/timer running intent and unit enablement. `--stopped` forces a stopped cutover. An incoming binary is privately copied and checked against the expected digest before it can execute; its own embedded installer/assets own the cutover. Hashes establish integrity relative to the operator-trusted digest, not signed publisher provenance. No automatic download, “latest” selection or background self-update occurs. Dry-run reports a nonexecuting plan, not a guarantee that operational preconditions will pass. Installed, loaded and running identities are reported separately.
 
 Ordinary upgrades preserve pause intent and generation: use normal activation, not `pause`/`resume`. Completed unsent drafts survive stop/start and are revalidated before dispatch; explicitly paused/off or obsolete work is not silently revived. Clean shutdown captures completed model results; genuine unfinished execution remains uncertain.
 
-For a journal that requires explicit adoption, first use `activate "$RELEASE_ID" --stopped`, then `agmi recover adopt`, before normal activation. Adoption is not part of an ordinary already-anchored upgrade.
+For a journal that requires explicit adoption, first use `agmi update --release "$RELEASE_ID" --stopped`, then `agmi recover adopt` and explicit `agmi service start`. Adoption is not part of an ordinary already-anchored upgrade.
 
 Adoption refuses missing, uninitialized or authority-less legacy journals; it never creates replacement history. An already-adopted intact journal is accepted idempotently. A fresh installation initializes paused state through normal `run`/control initialization instead.
 
@@ -238,6 +284,8 @@ journalctl --user --user-unit=agmi-health.service
 Health is a local, read-only check: no network requests, model calls, credential/guidance reads or state initialization. Unhealthy checks return nonzero with structured issues for stale/stopped execution, unresolved or overdue work, missed-answer evidence, identity failures, inactive participation and low disk space. Evidence reflects local observations, not a fresh network verification or proof of rewards. Warnings are reported separately from health failures: a healthy runtime may have warnings, and warnings alone preserve a successful exit status. Neither warnings nor a healthy result permit replaying uncertain work.
 
 Thresholds are CLI options: `--stale-seconds`, `--work-seconds`, `--answer-grace-seconds`, `--min-free-mib` and `--expect-participation`. For deliberate read-only observation use `--expect-participation false`; a live controller is still required. Active work is evaluated against captured deadlines/effective policy rather than silently adopting a newly edited timeout. Health distinguishes desired/effective policy, heartbeat, progress and admission blocking, including its operation and age. Repeated unchanged receipts are observations, not fresh transition events.
+
+`operational.status` separates `clear` (no observed operational issue under the requested checks), `blocked` (admission fenced), `degraded` (other operational issues) and `unknown` (admission evidence unavailable). `operational.issues` retains actionable conditions; `risk` separately reports unresolved-effect/model attention. An old unknown can leave overall `healthy = false` and a nonzero exit while operational status is clear. These additions do not hide uncertainty, change exit semantics, prove remote availability or authorize a submission.
 
 Controller heartbeat advances before each bounded HTTP wait, not just at the start of a potentially long cycle. Manual recovery does not refresh it or reload model guidance. Missing both captured and effective model timing produces `model_deadline_unavailable`, not a deadline guessed from desired configuration.
 

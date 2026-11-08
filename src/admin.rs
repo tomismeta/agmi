@@ -130,6 +130,14 @@ impl DirectoryLock {
 pub struct ConfigDirectoryGuard {
     _lock: DirectoryLock,
 }
+impl ConfigDirectoryGuard {
+    pub(crate) fn additional(&self, path: &Path) -> Result<Option<Self>> {
+        let target = absolute_target(path)?;
+        self._lock
+            .additional(&target)
+            .map(|lock| lock.map(|lock| Self { _lock: lock }))
+    }
+}
 pub fn lock_config_directory(path: &Path) -> Result<ConfigDirectoryGuard> {
     let path = absolute_target(path)?;
     Ok(ConfigDirectoryGuard {
@@ -152,7 +160,7 @@ fn regular(metadata: &fs::Metadata, private: bool) -> Result<()> {
     }
     Ok(())
 }
-fn read_optional(path: &Path, private: bool) -> Result<Option<Vec<u8>>> {
+pub(crate) fn read_optional(path: &Path, private: bool) -> Result<Option<Vec<u8>>> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => regular(&metadata, private)?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -283,8 +291,8 @@ fn guidance_target(config_path: &Path, config: &Config, target: &Path) -> Result
 }
 fn validate_complete(path: &Path, config: &mut Config) -> Result<()> {
     config.validate().map_err(|_| invalid())?;
-    let load = |model: &crate::config::ModelConfig| -> Result<std::sync::Arc<str>> {
-        if let Some(target) = &model.guidance_file {
+    let load = |target: &Option<PathBuf>, core: bool| -> Result<std::sync::Arc<str>> {
+        if let Some(target) = target {
             let target = guidance_target(path, config, target)?;
             let bytes = read_optional(&target, true)?.ok_or_else(|| {
                 error(
@@ -292,15 +300,24 @@ fn validate_complete(path: &Path, config: &mut Config) -> Result<()> {
                     "A configured guidance file is missing.",
                 )
             })?;
-            validate_guidance_bytes(&bytes).map_err(|_| invalid())
+            let text = validate_guidance_bytes(&bytes).map_err(|_| invalid())?;
+            if core && text.trim().is_empty() {
+                return Err(invalid());
+            }
+            Ok(text)
         } else {
             Ok(std::sync::Arc::from(""))
         }
     };
-    let answer = load(&config.solver.answer)?;
-    let judge = load(&config.solver.judge)?;
+    let answer = load(&config.solver.answer.guidance_file, false)?;
+    let judge = load(&config.solver.judge.guidance_file, false)?;
+    let answer_core = load(&config.solver.answer.core_guidance_file, true)?;
+    let judge_core = load(&config.solver.judge.core_guidance_file, true)?;
     config.solver.answer.guidance = answer;
     config.solver.judge.guidance = judge;
+    config.solver.answer.core_guidance = answer_core;
+    config.solver.judge.core_guidance = judge_core;
+    config.validate_core_guidance().map_err(|_| invalid())?;
     config.guidance_loaded = true;
     Ok(())
 }
@@ -310,7 +327,7 @@ impl Drop for Temporary {
         let _ = fs::remove_file(&self.0);
     }
 }
-fn persist(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn persist(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path.parent().ok_or_else(unsafe_file)?;
     let (temporary, mut file) = loop {
         let serial = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
@@ -344,10 +361,20 @@ fn defaults() -> Value {
     value["timeouts"]["read_http_seconds"] = Value::Null;
     value["schedule"]["challenge_retry_seconds"] = Value::Null;
     value["schedule"]["challenge_backoff_max_seconds"] = Value::Null;
+    value["schedule"]["queued_job_polling"] = Value::Null;
     value["solver"]["answer"]["guidance_file"] = Value::Null;
     value["solver"]["judge"]["guidance_file"] = Value::Null;
+    value["solver"]["answer"]["core_guidance_file"] = Value::Null;
+    value["solver"]["judge"]["core_guidance_file"] = Value::Null;
     value["excluded_judging_assignments"] = json!([]);
     value
+}
+fn patch_shape() -> Value {
+    let mut shape = defaults();
+    // Optional objects have no enabled default, but their fields still belong
+    // to the patch allowlist. Config validation owns types and bounds.
+    shape["schedule"]["queued_job_polling"] = json!({"initial_seconds":1,"max_seconds":1});
+    shape
 }
 fn describe(path: &str, value: &Value, settings: &mut Vec<Value>) {
     if let Some(object) = value.as_object() {
@@ -365,6 +392,7 @@ fn describe(path: &str, value: &Value, settings: &mut Vec<Value>) {
         Value::Bool(_) => "boolean",
         Value::Number(_) => "integer",
         Value::Array(_) => "array<string>",
+        Value::Null if path == "schedule.queued_job_polling" => "object|null",
         Value::Null
             if matches!(
                 path,
@@ -387,16 +415,27 @@ fn describe(path: &str, value: &Value, settings: &mut Vec<Value>) {
     } else {
         Value::Null
     };
-    settings.push(
-        json!({"path":path,"type":kind,"default":value,"enum":choices,
-        "immutable_when_initialized":path.starts_with("network.") || path == "state_dir"}),
-    );
+    let mut setting = json!({"path":path,"type":kind,"default":value,"enum":choices,
+            "immutable_when_initialized":path.starts_with("network.") || path == "state_dir"});
+    if path == "schedule.queued_job_polling" {
+        setting["properties"] = json!({
+            "initial_seconds":{"type":"integer","minimum":1},
+            "max_seconds":{"type":"integer","minimum":1}
+        });
+        setting["required"] = json!(["initial_seconds", "max_seconds"]);
+        setting["constraint"] = json!("initial_seconds <= max_seconds; null disables the policy");
+    }
+    settings.push(setting);
 }
 pub fn schema() -> Value {
     let defaults = defaults();
     let mut settings = Vec::new();
     describe("", &defaults, &mut settings);
     json!({"schema":"agmi.config.v1","settings":settings,"defaults":defaults,
+        "guidance":{"layers":["core","user"],"default_layer":"user",
+            "core":"Required nonempty core_guidance_file for active answer/judge routes; no embedded fallback.",
+            "user":"Optional guidance_file; voice and preferences subordinate to core guidance.",
+            "reload":"Both files reload with configuration; each model attempt captures both layers privately."},
         "max_input_bytes":MAX_INPUT_BYTES,"patch":"nested JSON merge patch; null removes a field; the resulting TOML must pass Config validation",
         "persistence":"canonical TOML; comments and formatting are not preserved",
         "runtime_applied":null,"runtime_application":"unverified","note":"Saved files are loaded by the runtime separately; status reports its effective revision."})
@@ -460,7 +499,7 @@ pub fn apply(
     if !patch.is_object() {
         return Err(invalid());
     }
-    validate_patch(&patch, &defaults(), 0)?;
+    validate_patch(&patch, &patch_shape(), 0)?;
     let source_path = path;
     let path = absolute_target(path)?;
     let _lock = DirectoryLock::acquire(&path, true)?;
@@ -492,24 +531,49 @@ fn model<'a>(config: &'a Config, kind: &str) -> Result<&'a crate::config::ModelC
         _ => Err(invalid()),
     }
 }
-fn selected_target(path: &Path, config: &Config, kind: &str) -> Result<(PathBuf, bool)> {
+fn guidance_field(layer: &str) -> Result<&'static str> {
+    match layer {
+        "core" => Ok("core_guidance_file"),
+        "user" => Ok("guidance_file"),
+        _ => Err(invalid()),
+    }
+}
+fn conventional_guidance(kind: &str, layer: &str) -> String {
+    if layer == "core" {
+        format!("{kind}-core-guidance.md")
+    } else {
+        format!("{kind}-guidance.md")
+    }
+}
+fn selected_target(
+    path: &Path,
+    config: &Config,
+    kind: &str,
+    layer: &str,
+) -> Result<(PathBuf, bool)> {
+    guidance_field(layer)?;
     let selected = model(config, kind)?;
-    let configured = selected.guidance_file.is_some();
-    let target = selected.guidance_file.clone().unwrap_or_else(|| {
+    let reference = if layer == "core" {
+        &selected.core_guidance_file
+    } else {
+        &selected.guidance_file
+    };
+    let configured = reference.is_some();
+    let target = reference.clone().unwrap_or_else(|| {
         resolve_path(
             path.parent().expect("absolute parent"),
-            Path::new(&format!("{kind}-guidance.md")),
+            Path::new(&conventional_guidance(kind, layer)),
         )
     });
     Ok((guidance_target(path, config, &target)?, configured))
 }
-pub fn guidance_show(path: &Path, kind: &str) -> Result<Value> {
+pub fn guidance_show(path: &Path, kind: &str, layer: &str) -> Result<Value> {
     let source_path = path;
     let path = absolute_target(path)?;
     let lock = DirectoryLock::acquire(&path, true)?;
     let bytes = config_bytes(&path)?;
     let config = parse(source_path, &bytes)?;
-    let (target, configured) = selected_target(&path, &config, kind)?;
+    let (target, configured) = selected_target(&path, &config, kind, layer)?;
     let _guidance_lock = lock.additional(&target)?;
     let guidance = read_optional(&target, true)?;
     let content = guidance
@@ -517,22 +581,29 @@ pub fn guidance_show(path: &Path, kind: &str) -> Result<Value> {
         .map(|b| validate_guidance_bytes(b).map(|s| s.to_string()))
         .transpose()
         .map_err(|_| invalid())?;
-    Ok(json!({"private":true,"kind":kind,"configured":configured,
+    Ok(
+        json!({"private":true,"kind":kind,"layer":layer,"configured":configured,
         "status":if !configured { "unconfigured" } else if guidance.is_none() { "missing" } else { "present" },
         "guidance_revision":guidance.as_ref().map(|b| digest(b)).unwrap_or_else(|| "missing".into()),
         "config_file_revision":digest(&bytes),"content":content,
-        "note":"Private guidance content; never forward to public events. Unconfigured content, if present, is an inactive conventional file."}))
+        "note":"Private guidance content; never forward to public events. Unconfigured content, if present, is an inactive conventional file."}),
+    )
 }
 pub fn guidance_set(
     path: &Path,
     kind: &str,
+    layer: &str,
     expected_config_revision: &str,
     expected_guidance_revision: &str,
     content_bytes: &[u8],
     dry_run: bool,
 ) -> Result<Value> {
     check_input(content_bytes)?;
-    validate_guidance_bytes(content_bytes).map_err(|_| invalid())?;
+    let content = validate_guidance_bytes(content_bytes).map_err(|_| invalid())?;
+    let field = guidance_field(layer)?;
+    if layer == "core" && content.trim().is_empty() {
+        return Err(invalid());
+    }
     let source_path = path;
     let path = absolute_target(path)?;
     let lock = DirectoryLock::acquire(&path, true)?;
@@ -540,7 +611,7 @@ pub fn guidance_set(
     check_revision(expected_config_revision, &digest(&bytes))?;
     let config = parse(source_path, &bytes)?;
     config.validate().map_err(|_| invalid())?;
-    let (target, configured) = selected_target(&path, &config, kind)?;
+    let (target, configured) = selected_target(&path, &config, kind, layer)?;
     let _guidance_lock = lock.additional(&target)?;
     let old = read_optional(&target, true)?;
     let old_revision = old
@@ -553,7 +624,7 @@ pub fn guidance_set(
     } else {
         let mut value = raw_config(&bytes)?;
         let mut patch = json!({"solver":{}});
-        patch["solver"][kind] = json!({"guidance_file":format!("{kind}-guidance.md")});
+        patch["solver"][kind] = json!({(field):conventional_guidance(kind, layer)});
         merge(&mut value, patch);
         let next = encode(value)?;
         parse(source_path, &next)?
@@ -575,11 +646,101 @@ pub fn guidance_set(
         next_config.as_ref().unwrap_or(&bytes)
     };
     Ok(
-        json!({"private":true,"kind":kind,"saved":!dry_run,"dry_run":dry_run,
+        json!({"private":true,"kind":kind,"layer":layer,"saved":!dry_run,"dry_run":dry_run,
         "guidance_revision":if dry_run { old_revision } else { digest(content_bytes) },
         "candidate_guidance_revision":digest(content_bytes),"config_file_revision":digest(current_config),
         "candidate_config_file_revision":digest(next_config.as_ref().unwrap_or(&bytes)),
         "configured":configured || !dry_run,"runtime_applied":null,"runtime_application":"unverified",
         "note":"Private guidance saved locally only; runtime status reports the effective loaded revision."}),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guidance_layers_are_discoverable_and_updated_independently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, toml::to_string(&Config::default()).unwrap()).unwrap();
+        assert_eq!(schema()["guidance"]["layers"], json!(["core", "user"]));
+        for kind in ["answer", "judge"] {
+            for layer in ["core", "user"] {
+                let before = guidance_show(&path, kind, layer).unwrap();
+                assert_eq!(before["status"], "unconfigured");
+                let config_revision = before["config_file_revision"].as_str().unwrap();
+                let content = format!("{kind} {layer} private instructions");
+                let preview = guidance_set(
+                    &path,
+                    kind,
+                    layer,
+                    config_revision,
+                    "missing",
+                    content.as_bytes(),
+                    true,
+                )
+                .unwrap();
+                assert_eq!(preview["saved"], false);
+                assert!(!dir.path().join(conventional_guidance(kind, layer)).exists());
+                guidance_set(
+                    &path,
+                    kind,
+                    layer,
+                    config_revision,
+                    "missing",
+                    content.as_bytes(),
+                    false,
+                )
+                .unwrap();
+                let after = guidance_show(&path, kind, layer).unwrap();
+                assert_eq!(after["status"], "present");
+                assert_eq!(after["layer"], layer);
+                assert_eq!(after["content"], content);
+                assert!(
+                    guidance_set(
+                        &path,
+                        kind,
+                        layer,
+                        config_revision,
+                        "missing",
+                        b"stale",
+                        false,
+                    )
+                    .is_err()
+                );
+            }
+        }
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(
+            &*loaded.solver.answer.core_guidance,
+            "answer core private instructions"
+        );
+        assert_eq!(
+            &*loaded.solver.answer.guidance,
+            "answer user private instructions"
+        );
+        assert_eq!(
+            &*loaded.solver.judge.core_guidance,
+            "judge core private instructions"
+        );
+        assert_eq!(
+            &*loaded.solver.judge.guidance,
+            "judge user private instructions"
+        );
+        let current = guidance_show(&path, "answer", "core").unwrap();
+        assert!(
+            guidance_set(
+                &path,
+                "answer",
+                "core",
+                current["config_file_revision"].as_str().unwrap(),
+                current["guidance_revision"].as_str().unwrap(),
+                b" \n",
+                false,
+            )
+            .is_err()
+        );
+        assert!(guidance_show(&path, "answer", "unknown").is_err());
+    }
 }

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Externalize answer/judge task and rubric prose into explicit core guidance alongside user guidance, with layer-aware CLI administration, content-aware reload and captured snapshots. Preserve legacy request digests; keep mechanical security/output enforcement in Rust.
+- Add read-only credential onboarding from a private file, stdin or hidden terminal input, and stopped/paused same-account credential rotation without changing durable history or native harness authentication.
+- Add CLI install/update/service workflows over the canonical versioned installer. Require operator-trusted SHA256, verify incoming private copies before execution, preserve running/stopped intent and keep fresh installs stopped. No automatic downloads or hooks.
+- Permit bounded fresh-answer regeneration after authoritative bound-job stale-seed rejection while preserving ambiguous outcomes, server floors and epoch attempt limits.
+- Preserve legacy bound-job answer attempts in epoch budgets after terminal rejection, even without a per-operation dispatch witness. Reuse an identical verified managed credential after interrupted onboarding without rewriting it. Verify private staged executables and unit templates before using them in the direct installer.
+- Add optional hot-loaded, capped accepted-job polling independent of error retries, preserving server/legacy minima and endpoint backoff across restart and policy changes. Expose the optional object through CLI schema and atomic configuration patches.
+- Expose current-phase operation ages from retained evidence through status and operation inventory; missing timing remains unknown rather than inferred from polling timestamps.
+- Separate operational health conditions from unresolved-risk attention while preserving unhealthy exit status and uncertainty warnings. Exercise queue timing, no replay, restart floors and agent configuration through local CLI fixtures.
 - Keep bounded background HTTP requests progressing while urgent epoch/answer work runs; wake on model completion and drain useful transitions without a full post-cycle sleep. Preserve serialized writes and one journal owner.
 - Retain completed model artifacts during clean shutdown and ordinary upgrade without changing pause generation. Explicit pause/off fencing and genuine execution uncertainty remain intact.
 - Add hot-reloaded challenge-only retry settings, durable local/server deadline provenance, sanitized `reads` diagnostics and actionable per-capability `status.work`. Distinguish current-epoch evidence freshness from heartbeat.

@@ -5,6 +5,7 @@
 pub mod admin;
 pub mod config;
 pub mod health;
+pub mod lifecycle;
 pub mod protocol;
 pub mod runtime;
 pub mod solver;

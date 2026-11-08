@@ -49,8 +49,16 @@ jobs:
         run: python3 tests/participation_smoke.py target/debug/agmi
       - name: Urgent work and retained background progress
         run: python3 tests/work_first_smoke.py target/debug/agmi
+      - name: Accepted-job polling and operational risk reporting
+        run: python3 tests/queued_polling_smoke.py target/debug/agmi
       - name: Agent administration and startup identity fencing
         run: python3 tests/admin_smoke.py target/debug/agmi
+      - name: Terminal stale-seed regeneration and attempt limits
+        run: python3 tests/stale_seed_smoke.py target/debug/agmi
+      - name: Credential onboarding rotation and terminal confidentiality
+        run: python3 tests/lifecycle_smoke.py target/debug/agmi
+      - name: Installer candidate replacement fence
+        run: python3 tests/installer_smoke.py target/debug/agmi
       - name: Build identity
         run: ./target/debug/agmi build-info --manifest
       - name: Inspect distributable contents

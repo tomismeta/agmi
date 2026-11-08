@@ -178,6 +178,14 @@ print(json.dumps({'provider': 'openai-codex', 'model': payload['model'],
                 runtime = json.dumps([str(interpreter), '-I', '-c', 'fixture-bootstrap'])
                 native.write_text("#!/bin/sh\nprintf '%s' '" + runtime + "'\n")
             config = root / 'config.toml'
+            core_original = {
+                'answer': 'Produce an original mechanism with meaningful required words.',
+                'judge': 'Evaluate the exact candidate independently using scores zero through three.',
+            }
+            for kind, content in core_original.items():
+                target = root / (kind + '-core.md')
+                target.write_text(content)
+                target.chmod(0o600)
             config.write_text(f'''state_dir = "{root / 'state'}"
 [network]
 base_url = "http://127.0.0.1:{server.server_port}"
@@ -208,6 +216,14 @@ mine_seconds = 86400
 retry_seconds = 1
 jitter_seconds = 0
 ''')
+            def enable_core_paths():
+                text = config.read_text()
+                for kind in ('answer', 'judge'):
+                    text = text.replace(f'[solver.{kind}]',
+                                        f'[solver.{kind}]\ncore_guidance_file = "{kind}-core.md"')
+                config.write_text(text)
+            if not args.baseline and not args.old_binary:
+                enable_core_paths()
             shared['database'] = root / 'state/state.sqlite3'
             if args.slow_inventory:
                 config.write_text(config.read_text().replace('= "active"', '= "read_only"')
@@ -284,6 +300,28 @@ jitter_seconds = 0
             wait_until(lambda: (invoke('status')['data'].get('pending') or {}).get('state') == expected)
             before = invoke('status')['data']
             assert len(shared['writes']) == 1 and shared['writes'][0][0].endswith('/grade')
+            captured = None
+            updated_core = {}
+            if not args.baseline and not args.old_binary:
+                with sqlite3.connect(shared['database'].as_uri() + '?mode=ro', uri=True) as connection:
+                    captured = connection.execute(
+                        "SELECT id,request,result,payload FROM operations WHERE kind='judge' ORDER BY id LIMIT 1"
+                    ).fetchone()
+                assert json.loads(captured[1])['solver']['core_guidance'] == core_original['judge']
+                revision_before = invoke('config', 'check')['data']['revision']
+                for kind in ('answer', 'judge'):
+                    current = invoke('guidance', 'show', '--kind', kind, '--layer', 'core')['data']
+                    updated_core[kind] = core_original[kind] + ' Updated for future attempts.'
+                    changed = subprocess.run(command + ['guidance', 'set', '--kind', kind,
+                        '--layer', 'core', '--expected-config-revision', current['config_file_revision'],
+                        '--expected-revision', current['guidance_revision']],
+                        input=updated_core[kind], capture_output=True, text=True, timeout=10)
+                    assert changed.returncode == 0, changed.stderr
+                assert invoke('config', 'check')['data']['revision'] != revision_before
+                with sqlite3.connect(shared['database'].as_uri() + '?mode=ro', uri=True) as connection:
+                    assert connection.execute(
+                        'SELECT id,request,result,payload FROM operations WHERE id=?', (captured[0],)
+                    ).fetchone() == captured, 'core edit changed captured work'
             child.kill()
             child.wait(timeout=5)
             child = None
@@ -297,17 +335,21 @@ jitter_seconds = 0
                 assert denied.returncode != 0, 'unanchored journal silently rebound'
                 invoke('recover', 'adopt')
             if args.old_binary:
+                legacy_config = root / 'legacy-config.toml'
+                legacy_config.write_bytes(config.read_bytes())
                 command[0] = binary
+                enable_core_paths()
                 denied = subprocess.run(command + ['run', '--once'], capture_output=True, text=True, timeout=10)
                 assert denied.returncode != 0, 'legacy journal silently adopted'
                 invoke('recover', 'adopt')
-                rollback = subprocess.run([initial_binary, '--config', str(config), '--json', 'resume'],
+                rollback = subprocess.run([initial_binary, '--config', str(legacy_config), '--json', 'resume'],
                                           capture_output=True, text=True, timeout=10)
                 assert rollback.returncode != 0, 'old binary accepted the upgraded journal'
             if args.bound_job:
                 prior_heartbeat = invoke('status')['data']['effective_runtime']['observed_at']
                 config.write_text(config.read_text().replace('= "active"', '= "off"')
                                   .replace('[solver.answer]', '[solver.answer]\nguidance_file = "missing-guidance.md"'))
+                (root / 'judge-core.md').unlink()
                 database = root / 'state' / 'state.sqlite3'
                 with sqlite3.connect(database.as_uri() + '?mode=ro', uri=True) as connection:
                     operation = connection.execute(
@@ -335,6 +377,11 @@ jitter_seconds = 0
                     assert time.monotonic() < deadline, 'bound receipt did not recover after read cooldown'
                     time.sleep(0.1)
                 assert recovered['resolved'] is True and recovered['state'] == 'final'
+                if captured is not None:
+                    with sqlite3.connect(database.as_uri() + '?mode=ro', uri=True) as connection:
+                        assert connection.execute(
+                            'SELECT id,request,result,payload FROM operations WHERE id=?', (captured[0],)
+                        ).fetchone() == captured, 'recovery rewrote captured guidance'
                 assert len(shared['writes']) == 1, 'recovery submitted a new wallet effect'
                 status = invoke('status')['data']
                 assert status['pending'] is None
@@ -343,6 +390,7 @@ jitter_seconds = 0
                     'wrong_identifier_rejected': True, 'contradictory_receipt_rejected': True,
                     'wallet_mutations': 1,
                     'all_capabilities_off': True, 'missing_guidance_did_not_block_recovery': True,
+                    'missing_core_did_not_block_recovery': True,
                     'recovery_did_not_refresh_heartbeat': True}))
                 return
             with guard:
@@ -364,6 +412,15 @@ jitter_seconds = 0
                 assert prepared == 1, f'expected one bounded answer preparation, observed {prepared}'
                 assert any(row['kind'] == 'answer' and row['state'] == 'generated'
                            for row in after['operations']), 'answer draft was not durably captured'
+                if captured is not None:
+                    with sqlite3.connect(shared['database'].as_uri() + '?mode=ro', uri=True) as connection:
+                        assert connection.execute(
+                            'SELECT id,request,result,payload FROM operations WHERE id=?', (captured[0],)
+                        ).fetchone() == captured, 'restart rewrote captured guidance'
+                        answer_request = connection.execute(
+                            "SELECT request FROM operations WHERE kind='answer' AND state='generated' ORDER BY id DESC LIMIT 1"
+                        ).fetchone()[0]
+                    assert json.loads(answer_request)['solver']['core_guidance'] == updated_core['answer']
             child.kill()
             child.wait(timeout=5)
             child = None
@@ -381,6 +438,7 @@ jitter_seconds = 0
             print(json.dumps({'mode': mode,
                 'cold_restart': True, 'epoch_observed': 11, 'wallet_mutations': 1,
                 'unknown_preserved': True, 'answer_preparations': prepared,
+                'core_edit_preserved_captured_work': captured is not None,
                 'health_blocked': True}))
     finally:
         release_page.set()

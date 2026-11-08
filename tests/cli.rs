@@ -69,6 +69,14 @@ fn invalid_guidance_does_not_block_pause_or_local_diagnostics() {
     config.network.address = "poa111111111111111111111111111111111".into();
     config.network.credential_file = dir.path().join("api-key");
     config.solver.answer.guidance_file = Some(guidance.clone());
+    config.capabilities.answer = agmi::config::Mode::Active;
+    config.capabilities.judge = agmi::config::Mode::Active;
+    let core = dir.path().join("answer-core.md");
+    let judge_core = dir.path().join("judge-core.md");
+    config.solver.answer.core_guidance_file = Some(core.clone());
+    config.solver.judge.core_guidance_file = Some(judge_core.clone());
+    fs::write(&core, "Produce an original mechanism.").unwrap();
+    fs::write(&judge_core, "Evaluate the candidate independently.").unwrap();
     fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
     fs::write(&guidance, "Prefer concrete mechanisms.").unwrap();
     let invoke = |args: &[&str]| {
@@ -85,7 +93,12 @@ fn invalid_guidance_does_not_block_pause_or_local_diagnostics() {
         String::from_utf8_lossy(&resumed.stderr)
     );
     fs::remove_file(&guidance).unwrap();
-    for invalid in [guidance, "".into(), "~/voice.md".into(), "bad\npath".into()] {
+    for invalid in [
+        guidance.clone(),
+        "".into(),
+        "~/voice.md".into(),
+        "bad\npath".into(),
+    ] {
         config.solver.answer.guidance_file = Some(invalid);
         fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
         assert!(invoke(&["pause"]).status.success());
@@ -100,6 +113,31 @@ fn invalid_guidance_does_not_block_pause_or_local_diagnostics() {
         assert!(!invoke(&["resume"]).status.success());
         assert!(!invoke(&["config", "check"]).status.success());
     }
+    config.solver.answer.guidance_file = Some(guidance.clone());
+    fs::write(&guidance, "Restored user preferences.").unwrap();
+    fs::remove_file(&core).unwrap();
+    for invalid in [
+        Some(core.clone()),
+        None,
+        Some("".into()),
+        Some("~/core.md".into()),
+    ] {
+        config.solver.answer.core_guidance_file = invalid;
+        fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+        assert!(invoke(&["pause"]).status.success());
+        for args in [&["status"][..], &["logs"], &["agents"], &["config", "show"]] {
+            assert!(invoke(args).status.success());
+        }
+        assert!(!invoke(&["resume"]).status.success());
+        assert!(!invoke(&["config", "check"]).status.success());
+    }
+    config.solver.answer.core_guidance_file = Some(core.clone());
+    fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+    fs::write(&core, " \n").unwrap();
+    assert!(invoke(&["pause"]).status.success());
+    assert!(!invoke(&["resume"]).status.success());
+    fs::write(&core, "Restored core instructions.").unwrap();
+    assert!(invoke(&["resume"]).status.success());
 }
 
 #[cfg(unix)]

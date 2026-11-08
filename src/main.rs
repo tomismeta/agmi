@@ -1,7 +1,7 @@
 use agmi::{
     admin,
     config::{Config, WorkKind},
-    health, runtime,
+    health, lifecycle, runtime,
 };
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -38,6 +38,63 @@ enum Command {
     BuildInfo {
         #[arg(long)]
         manifest: bool,
+    },
+    /// Verify an existing hosted credential and create read-only, paused configuration.
+    Init {
+        #[arg(long)]
+        account: String,
+        #[arg(long, default_value = "poa-mainnet-1")]
+        chain: String,
+        #[arg(long, default_value = "https://minepoa.com")]
+        base_url: String,
+        /// Reference an existing private credential; never copy or replace it.
+        #[arg(long, conflicts_with_all = ["key_stdin", "key_prompt"], required_unless_present_any = ["key_stdin", "key_prompt"])]
+        api_key_file: Option<PathBuf>,
+        /// Read a key from stdin, never from a command argument.
+        #[arg(long)]
+        key_stdin: bool,
+        /// Prompt on the controlling terminal with echo disabled.
+        #[arg(long, conflicts_with = "key_stdin")]
+        key_prompt: bool,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Replace a local credential only after paused/stopped and same-identity checks.
+    Credentials {
+        #[command(subcommand)]
+        command: CredentialCommand,
+    },
+    /// Verify, install and enable a fresh local release without starting or resuming.
+    Install {
+        #[arg(long)]
+        binary: PathBuf,
+        /// Expected digest obtained through an operator-trusted channel.
+        #[arg(long)]
+        sha256: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Update from an operator-trusted local binary or explicit retained r-SHA256.
+    Update {
+        #[arg(long, conflicts_with_all = ["binary", "sha256"], required_unless_present = "binary")]
+        release: Option<String>,
+        #[arg(long, requires = "sha256")]
+        binary: Option<PathBuf>,
+        #[arg(long, requires = "binary")]
+        sha256: Option<String>,
+        #[arg(long)]
+        stopped: bool,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Explicit user-systemd controls; never change participation pause.
+    Service {
+        #[arg(value_parser = ["status", "start", "stop", "restart", "enable", "disable"])]
+        action: String,
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Inspect private recovery evidence or reconcile an already-bound request.
     Recover {
@@ -102,6 +159,21 @@ enum Command {
     Agents,
     /// Discover commands and their effects.
     Commands,
+}
+
+#[derive(Subcommand)]
+enum CredentialCommand {
+    /// Never issues or revokes a remote key; stdin/file must already hold a replacement.
+    Rotate {
+        #[arg(long, conflicts_with_all = ["key_stdin", "key_prompt"], required_unless_present_any = ["key_stdin", "key_prompt"])]
+        api_key_file: Option<PathBuf>,
+        #[arg(long)]
+        key_stdin: bool,
+        #[arg(long, conflicts_with = "key_stdin")]
+        key_prompt: bool,
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -194,11 +266,15 @@ enum GuidanceCommand {
     Show {
         #[arg(long, value_parser = ["answer", "judge"])]
         kind: String,
+        #[arg(long, default_value = "user", value_parser = ["core", "user"])]
+        layer: String,
     },
     /// Atomically set private UTF-8 guidance from stdin; missing means create-only.
     Set {
         #[arg(long, value_parser = ["answer", "judge"])]
         kind: String,
+        #[arg(long, default_value = "user", value_parser = ["core", "user"])]
+        layer: String,
         #[arg(long)]
         expected_config_revision: String,
         #[arg(long)]
@@ -252,6 +328,11 @@ fn initialize(path: &Path) -> Result<Value> {
 
 fn discovery() -> Value {
     json!({"commands":[
+        {"name":"init","network_reads":true,"network_writes":false,"local_writes":"unless --dry-run","purpose":"existing identity only; --account and --api-key-file, --key-stdin or --key-prompt; never registers or resumes"},
+        {"name":"credentials rotate","network_reads":true,"network_writes":false,"local_writes":"credential only unless --dry-run","purpose":"requires initialized, paused, stopped account; verifies replacement identity; file/stdin/hidden prompt"},
+        {"name":"install","network_reads":false,"network_writes":false,"local_writes":"unless --dry-run","purpose":"fresh install --binary local-path --sha256 trusted-digest; stage, activate stopped, enable; never starts/resumes"},
+        {"name":"update","network_reads":false,"network_writes":false,"local_writes":"unless --dry-run","purpose":"--binary local-path --sha256 trusted-digest or retained --release r-SHA256; preserves service intent, --stopped forces stopped"},
+        {"name":"service","network_reads":false,"network_writes":false,"local_writes":"unless status or --dry-run","purpose":"status/start/stop/restart/enable/disable; does not resume participation"},
         {"name":"run","network_reads":true,"model_calls":"active capabilities only","network_writes":"active capabilities and resumed state only","local_writes":true},
         {"name":"status","network_reads":false,"network_writes":false,"purpose":"local state and blockers"},
         {"name":"reads","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":false,"purpose":"sanitized read progress, failure categories and retry deadlines"},
@@ -262,8 +343,8 @@ fn discovery() -> Value {
         {"name":"config state-path","network_writes":false,"local_writes":false,"purpose":"plain absolute state path without opening journal"},
         {"name":"config schema","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":false,"purpose":"setting types, defaults and immutable boundaries; no config required"},
         {"name":"config apply","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":"unless --dry-run","purpose":"nested JSON merge patch on stdin; --expected-revision from config show.file_revision"},
-        {"name":"guidance show","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":false,"private_output":true,"purpose":"--kind answer|judge; private text and revision tokens"},
-        {"name":"guidance set","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":"unless --dry-run","private_output":true,"purpose":"UTF-8 stdin; --kind, --expected-config-revision and --expected-revision; missing means create-only"},
+        {"name":"guidance show","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":false,"private_output":true,"purpose":"--kind answer|judge --layer core|user (default user); private text and revision tokens"},
+        {"name":"guidance set","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":"unless --dry-run","private_output":true,"purpose":"UTF-8 stdin; --kind, --layer core|user, --expected-config-revision and --expected-revision; missing means create-only"},
         {"name":"build-info","network_writes":false,"local_writes":false,"purpose":"compiled release identity; --manifest emits installer manifest verbatim"},
         {"name":"pause","network_writes":false,"local_writes":true},
         {"name":"resume","network_writes":false,"local_writes":true,"purpose":"authorize configured capabilities"},
@@ -299,6 +380,141 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
         return Ok(("config_schema", admin::schema()));
     }
     let path = config_path(cli)?;
+    match &cli.command {
+        Command::Init {
+            account,
+            chain,
+            base_url,
+            api_key_file,
+            key_stdin,
+            state_dir,
+            dry_run,
+            ..
+        } => {
+            let bytes = lifecycle::credential_input(api_key_file.as_deref(), *key_stdin)?;
+            return Ok((
+                "init",
+                lifecycle::init(
+                    &path,
+                    lifecycle::InitOptions {
+                        account,
+                        chain,
+                        base_url,
+                        credential_file: api_key_file.as_deref(),
+                        state_dir: state_dir.as_deref(),
+                        dry_run: *dry_run,
+                    },
+                    &bytes,
+                )
+                .await?,
+            ));
+        }
+        Command::Credentials {
+            command:
+                CredentialCommand::Rotate {
+                    api_key_file,
+                    key_stdin,
+                    dry_run,
+                    ..
+                },
+        } => {
+            let bytes = lifecycle::credential_input(api_key_file.as_deref(), *key_stdin)?;
+            return Ok((
+                "credential_rotate",
+                lifecycle::rotate(&path, &bytes, *dry_run).await?,
+            ));
+        }
+        Command::Install {
+            binary,
+            sha256,
+            dry_run,
+        } => {
+            anyhow::ensure!(
+                sha256.len() == 64
+                    && sha256
+                        .bytes()
+                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+                "expected SHA256 must be 64 lowercase hex digits"
+            );
+            let binary = std::path::absolute(binary).context("cannot resolve local binary path")?;
+            anyhow::ensure!(
+                cli.config.is_none(),
+                "installer uses ~/.config/agmi/config.toml; --config is unsupported"
+            );
+            return Ok((
+                "install",
+                lifecycle::installer(
+                    &[
+                        "install".into(),
+                        binary.to_string_lossy().into_owned(),
+                        "--sha256".into(),
+                        sha256.clone(),
+                    ],
+                    *dry_run,
+                )?,
+            ));
+        }
+        Command::Update {
+            release,
+            binary,
+            sha256,
+            stopped,
+            dry_run,
+        } => {
+            anyhow::ensure!(
+                cli.config.is_none(),
+                "installer uses ~/.config/agmi/config.toml; --config is unsupported"
+            );
+            let mut arguments = if let Some(release) = release {
+                anyhow::ensure!(
+                    release
+                        .strip_prefix("r-")
+                        .is_some_and(|hash| hash.len() == 64
+                            && hash
+                                .bytes()
+                                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())),
+                    "release must be an explicit r-SHA256 identity"
+                );
+                vec!["activate".into(), release.clone()]
+            } else {
+                let binary = std::path::absolute(
+                    binary
+                        .as_ref()
+                        .context("update requires --binary or --release")?,
+                )
+                .context("cannot resolve local binary path")?;
+                let hash = sha256.as_ref().context("update binary requires --sha256")?;
+                anyhow::ensure!(
+                    hash.len() == 64
+                        && hash
+                            .bytes()
+                            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+                    "expected SHA256 must be 64 lowercase hex digits"
+                );
+                vec![
+                    "update".into(),
+                    binary.to_string_lossy().into_owned(),
+                    "--sha256".into(),
+                    hash.clone(),
+                ]
+            };
+            if *stopped {
+                arguments.push("--stopped".into());
+            }
+            return Ok(("update", lifecycle::installer(&arguments, *dry_run)?));
+        }
+        Command::Service { action, dry_run } => {
+            anyhow::ensure!(
+                cli.config.is_none(),
+                "service uses ~/.config/agmi/config.toml; --config is unsupported"
+            );
+            return Ok((
+                "service",
+                lifecycle::installer(&["service".into(), action.clone()], *dry_run)?,
+            ));
+        }
+        _ => {}
+    }
     if matches!(
         cli.command,
         Command::Config {
@@ -330,14 +546,15 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
             ));
         }
         Command::Guidance {
-            command: GuidanceCommand::Show { kind },
+            command: GuidanceCommand::Show { kind, layer },
         } => {
-            return Ok(("guidance", admin::guidance_show(&path, kind)?));
+            return Ok(("guidance", admin::guidance_show(&path, kind, layer)?));
         }
         Command::Guidance {
             command:
                 GuidanceCommand::Set {
                     kind,
+                    layer,
                     expected_config_revision,
                     expected_revision,
                     dry_run,
@@ -348,6 +565,7 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
                 admin::guidance_set(
                     &path,
                     kind,
+                    layer,
                     expected_config_revision,
                     expected_revision,
                     &administration_input()?,
@@ -490,6 +708,11 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
             ))
         }
         Command::BuildInfo { .. }
+        | Command::Init { .. }
+        | Command::Credentials { .. }
+        | Command::Install { .. }
+        | Command::Update { .. }
+        | Command::Service { .. }
         | Command::Run { .. }
         | Command::Config {
             command: ConfigCommand::StatePath,

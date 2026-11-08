@@ -217,6 +217,17 @@ fn stagger(config: &Config, phase: &str) -> u64 {
     }
 }
 
+fn queued_poll_interval(initial: u64, cap: u64, mut elapsed: u64) -> u64 {
+    let mut interval = initial;
+    // Cumulative boundaries (initial, 3*initial, 7*initial, ...) retain
+    // progression from the durable queued transition, not process uptime.
+    while interval < cap && elapsed >= interval {
+        elapsed -= interval;
+        interval = interval.saturating_mul(2).min(cap);
+    }
+    interval
+}
+
 #[derive(Serialize, Deserialize)]
 struct Input {
     solver: SolverRequest,
@@ -396,6 +407,36 @@ impl Runtime {
             .retry_seconds
             .max(server_minimum.unwrap_or(0))
             .saturating_add(stagger(&self.config, "retry"))
+    }
+
+    fn queued_job_next_at(
+        &self,
+        op: &Operation,
+        submitted: bool,
+        server_minimum: Option<u64>,
+    ) -> Result<i64> {
+        let (queued_since, retained_minimum) = self.store.operation_poll_timing(op.id)?;
+        let delay = if let Some(policy) = &self.config.schedule.queued_job_polling {
+            let interval = if submitted || op.state != "queued" {
+                policy.initial_seconds
+            } else if let Some(since) = queued_since {
+                queued_poll_interval(
+                    policy.initial_seconds,
+                    policy.max_seconds,
+                    now().saturating_sub(since).max(0) as u64,
+                )
+            } else {
+                // Pruned or legacy evidence cannot justify a new early window.
+                policy.max_seconds
+            };
+            interval
+                .saturating_add(stagger(&self.config, "queued-job"))
+                .min(policy.max_seconds)
+                .max(server_minimum.unwrap_or(0))
+        } else {
+            self.retry_delay(server_minimum)
+        };
+        Ok(not_before(delay).max(retained_minimum))
     }
 
     fn read_policy(&self, scope: ReadScope) -> (u64, u64) {
@@ -1120,6 +1161,7 @@ impl Runtime {
                         candidate: Some(assignment.answer),
                         history: Vec::new(),
                         guidance: String::new(),
+                        core_guidance: String::new(),
                         author_history: Some(assignment.author_prior),
                         candidate_author: assignment.author,
                     };
@@ -1239,6 +1281,7 @@ impl Runtime {
             candidate,
             history: self.store.history()?,
             guidance: String::new(),
+            core_guidance: String::new(),
             author_history: None,
             candidate_author: None,
         })
@@ -1291,6 +1334,7 @@ impl Runtime {
             WorkKind::Mine => bail!("mine does not use a model"),
         };
         input.solver.guidance = model.guidance.to_string();
+        input.solver.core_guidance = model.core_guidance.to_string();
         input.solver.id = digest(format!("{}:attempt:{}", input.solver.id, count + 1));
         let op = self.store.begin_linked(
             kind,
@@ -1642,11 +1686,12 @@ impl Runtime {
         }
         let event = match outcome {
             Outcome::Queued { job_id } => {
-                op.next_at = not_before(self.retry_delay(retry_after));
                 if !submitted && op.job_id.as_ref().is_some_and(|known| known != &job_id) {
+                    op.next_at = not_before(self.retry_delay(retry_after));
                     op.state = "unknown".into();
                     "job_binding_mismatch"
                 } else {
+                    op.next_at = self.queued_job_next_at(op, submitted, retry_after)?;
                     op.job_id = Some(job_id);
                     op.state = "queued".into();
                     "submission_queued"
@@ -1670,12 +1715,13 @@ impl Runtime {
                 .into();
                 "submission_rejected"
             }
-            Outcome::ProcessedRejected {
-                code: _,
-                next_nonce,
-            } => {
+            Outcome::ProcessedRejected { code, next_nonce } => {
                 op.state = if !submitted && op.job_id.is_some() && next_nonce.is_some() {
-                    "rejected"
+                    if code == "stale_seed" {
+                        "stale"
+                    } else {
+                        "rejected"
+                    }
                 } else {
                     "unknown"
                 }
@@ -1761,6 +1807,12 @@ impl Runtime {
                 }
             }
         } else if let Some(job) = op.job_id.clone() {
+            // A later response, restart, or config reload must not erase an
+            // earlier server/legacy minimum, even if local next_at is earlier.
+            let (_, retained_minimum) = self.store.operation_poll_timing(op.id)?;
+            if retained_minimum > now() {
+                return Ok(());
+            }
             let Some(response) = self
                 .get(op.kind, ReadScope::Job, &format!("/api/job/{job}"))
                 .await?
@@ -1780,8 +1832,8 @@ impl Runtime {
             {
                 self.read_evaluated(ReadScope::Job, true, None)?;
                 self.store.safety_observed(op.id)?;
+                op.next_at = self.queued_job_next_at(op, false, response.retry_after_seconds)?;
                 op.state = "queued".into();
-                op.next_at = not_before(self.retry_delay(response.retry_after_seconds));
                 self.store.save(op, "job_pending")?;
             } else {
                 self.store.record_evidence(
@@ -1932,6 +1984,7 @@ mod tests {
             candidate: Some("candidate-test".into()),
             history: Vec::new(),
             guidance: String::new(),
+            core_guidance: "Evaluate the supplied task against its protocol requirements.".into(),
             author_history: None,
             candidate_author: None,
         }
@@ -1975,6 +2028,15 @@ mod tests {
         config.schedule.jitter_seconds = 0;
         let temp = tempfile::tempdir().unwrap();
         config.state_dir = temp.path().join("state");
+        let core = temp.path().join("core-guidance.md");
+        std::fs::write(
+            &core,
+            "Evaluate the supplied task against its protocol requirements.",
+        )
+        .unwrap();
+        for model in [&mut config.solver.answer, &mut config.solver.judge] {
+            model.core_guidance_file = Some(core.clone());
+        }
         let path = temp.path().join("config.toml");
         std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
         let config = Config::load(&path).unwrap();
@@ -3885,6 +3947,332 @@ export async function callGatewayFromCli(_method, _options, params) {{
         assert_eq!(events(&config, 10).unwrap(), json!([]));
         assert_eq!(reads(&config).unwrap(), json!([]));
         assert!(!config.state_dir.exists());
+    }
+
+    #[test]
+    fn queued_polling_default_is_compatible_and_jitter_cannot_exceed_cap() {
+        let (_temp, mut runtime, _sender) = fixture();
+        let op = operation(&mut runtime);
+        let before = now();
+        let next = runtime.queued_job_next_at(&op, true, None).unwrap();
+        assert!(next > before + runtime.config.schedule.retry_seconds as i64);
+        assert!(next <= now() + runtime.config.schedule.retry_seconds as i64 + 1);
+        runtime.config.schedule.jitter_seconds = 30;
+        runtime.config.schedule.queued_job_polling = Some(crate::config::QueuedJobPolling {
+            initial_seconds: 2,
+            max_seconds: 2,
+        });
+        let next = runtime.queued_job_next_at(&op, true, None).unwrap();
+        assert!(next >= before + 3 && next <= now() + 3);
+        let before = now();
+        assert!(runtime.queued_job_next_at(&op, true, Some(90)).unwrap() >= before + 91);
+    }
+
+    #[test]
+    fn queued_polling_growth_has_exact_boundaries_and_saturates() {
+        for (elapsed, expected) in [(0, 2), (1, 2), (2, 4), (5, 4), (6, 8), (13, 8), (14, 10)] {
+            assert_eq!(queued_poll_interval(2, 10, elapsed), expected);
+        }
+        assert_eq!(queued_poll_interval(2, 10, u64::MAX), 10);
+        assert_eq!(queued_poll_interval(1, 1, u64::MAX), 1);
+        assert_eq!(
+            queued_poll_interval(u64::MAX / 2 + 1, u64::MAX, u64::MAX),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn queued_polling_retains_phase_and_minima_across_restart_and_reload() {
+        let mut config = Config::default();
+        config.schedule.queued_job_polling = Some(crate::config::QueuedJobPolling {
+            initial_seconds: 15,
+            max_seconds: 120,
+        });
+        let (_temp, mut runtime, _sender) = fixture_with(config);
+        let mut op = operation(&mut runtime);
+        let before = now();
+        runtime
+            .outcome(
+                &mut op,
+                Outcome::Queued {
+                    job_id: "private-job".into(),
+                },
+                true,
+                None,
+            )
+            .unwrap();
+        assert!(op.next_at >= before + 16 && op.next_at <= now() + 16);
+        let db =
+            rusqlite::Connection::open(runtime.config.state_dir.join("state.sqlite3")).unwrap();
+        let phase_start = now() - 45;
+        db.execute(
+            "UPDATE events SET at=?1 WHERE operation_id=?2 AND code='submission_queued'",
+            rusqlite::params![phase_start, op.id],
+        )
+        .unwrap();
+        runtime.store = Store::open(&runtime.config).unwrap();
+        op = runtime.store.operation(op.id).unwrap().unwrap();
+        let next = runtime.queued_job_next_at(&op, false, None).unwrap();
+        assert!(next >= now() + 60 && next <= now() + 61);
+        let scheduled = op.next_at;
+        let mut changed = runtime.config.clone();
+        changed.schedule.queued_job_polling = Some(crate::config::QueuedJobPolling {
+            initial_seconds: 1,
+            max_seconds: 4,
+        });
+        std::fs::write(&runtime.config_path, toml::to_string(&changed).unwrap()).unwrap();
+        runtime.reload().unwrap();
+        assert_eq!(
+            runtime.store.status(&runtime.config).unwrap()["effective_runtime"]["policy"]["schedule"]
+                ["queued_job_polling"],
+            json!({"initial_seconds":1,"max_seconds":4})
+        );
+        assert_eq!(
+            runtime.store.operation(op.id).unwrap().unwrap().next_at,
+            scheduled
+        );
+        assert_eq!(
+            runtime.store.operation_poll_timing(op.id).unwrap().0,
+            Some(phase_start)
+        );
+        let next = runtime.queued_job_next_at(&op, false, None).unwrap();
+        assert!(next >= now() + 4 && next <= now() + 5);
+        runtime.store.record_retry_minimum(op.id, 600).unwrap();
+        let minimum = runtime.store.operation_poll_timing(op.id).unwrap().1;
+        runtime
+            .outcome(
+                &mut op,
+                Outcome::Queued {
+                    job_id: "private-job".into(),
+                },
+                false,
+                Some(1),
+            )
+            .unwrap();
+        assert_eq!(op.next_at, minimum);
+        runtime.store = Store::open(&runtime.config).unwrap();
+        assert_eq!(
+            runtime.queued_job_next_at(&op, false, None).unwrap(),
+            minimum
+        );
+        assert_eq!(
+            runtime.store.operation_poll_timing(op.id).unwrap().0,
+            Some(phase_start)
+        );
+        changed.schedule.queued_job_polling = None;
+        std::fs::write(&runtime.config_path, toml::to_string(&changed).unwrap()).unwrap();
+        runtime.reload().unwrap();
+        assert_eq!(
+            runtime.queued_job_next_at(&op, false, None).unwrap(),
+            minimum
+        );
+
+        // Missing legacy minima retain next_at; missing phase evidence uses
+        // the cap rather than incorrectly restarting an early-poll window.
+        db.execute(
+            "DELETE FROM operation_timing WHERE operation_id=?1",
+            [op.id],
+        )
+        .unwrap();
+        assert_eq!(
+            runtime.queued_job_next_at(&op, false, None).unwrap(),
+            minimum
+        );
+        db.execute("UPDATE operations SET next_at=0 WHERE id=?1", [op.id])
+            .unwrap();
+        db.execute("DELETE FROM events WHERE operation_id=?1", [op.id])
+            .unwrap();
+        changed.schedule.queued_job_polling = Some(crate::config::QueuedJobPolling {
+            initial_seconds: 2,
+            max_seconds: 30,
+        });
+        std::fs::write(&runtime.config_path, toml::to_string(&changed).unwrap()).unwrap();
+        runtime.reload().unwrap();
+        let next = runtime.queued_job_next_at(&op, false, None).unwrap();
+        assert!(next >= now() + 30 && next <= now() + 31);
+    }
+
+    #[tokio::test]
+    async fn queued_polling_honors_server_and_endpoint_floors_without_extra_submissions() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = Config::default();
+        config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
+        config.capabilities.answer = Mode::Off;
+        config.capabilities.judge = Mode::Off;
+        config.capabilities.mine = Mode::Off;
+        config.schedule.queued_job_polling = Some(crate::config::QueuedJobPolling {
+            initial_seconds: 2,
+            max_seconds: 8,
+        });
+        let (_temp, mut runtime, _sender) = fixture_with(config);
+        let mut op = operation(&mut runtime);
+        op.payload = Some(json!({"answer":"captured answer"}));
+        runtime
+            .outcome(
+                &mut op,
+                Outcome::Queued {
+                    job_id: "private-job".into(),
+                },
+                true,
+                None,
+            )
+            .unwrap();
+        let payload = op.payload.clone();
+        let path = format!(
+            "GET /chain/{}/api/job/private-job",
+            runtime.config.network.chain
+        );
+        let server = tokio::spawn(async move {
+            api_reply(&listener, &path, 202, Some(600), json!({"state":"queued"})).await;
+            listener
+        });
+        let before = now();
+        runtime.reconcile(&mut op).await.unwrap();
+        assert_eq!(op.state, "queued");
+        assert!(op.next_at >= before + 600);
+        let listener = server.await.unwrap();
+        runtime.store = Store::open(&runtime.config).unwrap();
+        let mut changed = runtime.config.clone();
+        changed
+            .schedule
+            .queued_job_polling
+            .as_mut()
+            .unwrap()
+            .max_seconds = 2;
+        std::fs::write(&runtime.config_path, toml::to_string(&changed).unwrap()).unwrap();
+        runtime.reload().unwrap();
+        // Even an earlier local deadline cannot bypass the retained server floor.
+        op.next_at = 0;
+        runtime.store.save(&op, "job_pending").unwrap();
+        runtime.reconcile(&mut op).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+
+        let db =
+            rusqlite::Connection::open(runtime.config.state_dir.join("state.sqlite3")).unwrap();
+        db.execute(
+            "UPDATE operation_timing SET retry_not_before=0 WHERE operation_id=?1",
+            [op.id],
+        )
+        .unwrap();
+        runtime.read_failed(ReadScope::Job, None).unwrap();
+        runtime.reconcile(&mut op).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+        runtime.read_evaluated(ReadScope::Job, true, None).unwrap();
+        let path = format!(
+            "GET /chain/{}/api/job/private-job",
+            runtime.config.network.chain
+        );
+        let server = tokio::spawn(async move {
+            api_reply(&listener, &path, 202, None, json!({"state":"queued"})).await;
+            listener
+        });
+        runtime.reconcile(&mut op).await.unwrap();
+        assert_eq!(op.state, "queued");
+        assert_eq!(op.payload, payload);
+        assert_eq!(op.job_id.as_deref(), Some("private-job"));
+        assert!(op.next_at <= now() + 3);
+        assert_eq!(
+            runtime
+                .store
+                .events(100)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|event| event["event"] == "dispatch_intent")
+                .count(),
+            1
+        );
+        let listener = server.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+
+        // Inclusion changes only the binding: receipt polling keeps the
+        // existing retry cadence rather than inheriting the fast queue policy.
+        let txid = "a".repeat(64);
+        runtime
+            .outcome(
+                &mut op,
+                Outcome::Included { txid: txid.clone() },
+                false,
+                None,
+            )
+            .unwrap();
+        let path = format!(
+            "GET /chain/{}/api/receipt/{txid}",
+            runtime.config.network.chain
+        );
+        let server = tokio::spawn(async move {
+            api_reply(
+                &listener,
+                &path,
+                200,
+                None,
+                json!({"status":"included","next_nonce":1,"valid_in_open_window":true}),
+            )
+            .await;
+            listener
+        });
+        let before = now();
+        runtime.reconcile(&mut op).await.unwrap();
+        assert_eq!(op.state, "confirmed");
+        assert!(op.next_at >= before + runtime.config.schedule.retry_seconds as i64);
+        let listener = server.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_polling_does_not_accelerate_unknown_or_definitive_refusal_retry() {
+        let (_temp, mut runtime, _sender) = fixture();
+        runtime.config.schedule.queued_job_polling = Some(crate::config::QueuedJobPolling {
+            initial_seconds: 1,
+            max_seconds: 2,
+        });
+        let mut op = operation(&mut runtime);
+        let before = now();
+        runtime
+            .outcome(
+                &mut op,
+                Outcome::Unknown {
+                    reason: "unbound".into(),
+                },
+                true,
+                None,
+            )
+            .unwrap();
+        assert!(op.job_id.is_none());
+        assert!(op.next_at >= before + runtime.config.schedule.retry_seconds as i64);
+        runtime.reconcile(&mut op).await.unwrap();
+        assert!(
+            runtime
+                .store
+                .reads()
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|read| { read["started_at"].is_null() })
+        );
+        runtime
+            .outcome(&mut op, Outcome::Retry { after_seconds: 1 }, true, None)
+            .unwrap();
+        assert_eq!(op.state, "retry");
+        assert!(op.next_at >= before + runtime.config.schedule.retry_seconds as i64);
     }
 
     #[test]

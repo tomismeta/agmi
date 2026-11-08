@@ -88,6 +88,9 @@ print(json.dumps({'provider': 'openai-codex', 'model': payload['model'],
         self.native.write_text("#!/bin/sh\nprintf '%s' '" + runtime + "'\n")
         self.native.chmod(0o700)
         self.config = root / 'config.toml'
+        self.core = root / 'core-guidance.md'
+        self.core.write_text('Evaluate the supplied task against its protocol requirements.')
+        self.core.chmod(0o600)
         self.database = root / 'state/state.sqlite3'
         self.command = [self.binary, '--config', str(self.config), '--json']
         self.env = dict(os.environ, NO_PROXY='127.0.0.1,localhost', no_proxy='127.0.0.1,localhost')
@@ -218,7 +221,8 @@ print(json.dumps({'provider': 'openai-codex', 'model': payload['model'],
 harness = "hermes"
 executable = {json.dumps(str(self.native))}
 model = "openai/test"
-reasoning = "high"''' for kind in ('answer', 'judge'))
+reasoning = "high"
+core_guidance_file = {json.dumps(str(self.core))}''' for kind in ('answer', 'judge'))
         text = f'''state_dir = {json.dumps(str(self.root / 'state'))}
 [network]
 base_url = "http://127.0.0.1:{self.server.server_port}"
@@ -325,10 +329,11 @@ jitter_seconds = 0
                                              stderr=(self.root / 'runtime.stderr').read_text())))
 
     def loaded(self):
+        expected_revision = self.invoke('config', 'check')['revision']
         def matches():
             status = self.status()
             runtime = status.get('effective_runtime') or {}
-            return (runtime.get('revision') == status.get('configured_revision')
+            return (runtime.get('revision') == expected_revision
                     and not runtime.get('reload_blocked'))
         self.wait(matches, 'effective participation policy did not reload')
 
