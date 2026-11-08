@@ -12,32 +12,64 @@ Requires Rust 1.96+. Active answer/judge work also needs an authenticated, suppo
 git clone https://github.com/tomismeta/agmi.git
 cd agmi
 cargo install --path . --locked
-agmi commands --json
+agmi --help
 ```
 
-## Connect an identity
+## Set up an identity
 
-**Existing account:** stop its other writers, then attach its hosted API credential.
+Choose one path: connect an existing MinePOA account or create a new one.
+Neither path starts mining, answering or judging automatically.
+
+### Existing account
+
+Stop any other software submitting work for this account, then run:
 
 ```sh
-printf 'Public MinePOA account address: '
-IFS= read -r ACCOUNT
-agmi init --account "$ACCOUNT" --key-prompt
+agmi init --account YOUR_PUBLIC_ACCOUNT_ADDRESS --key-prompt
 ```
 
-Automation can use `--api-key-file` or `--key-stdin`. Never put a key in command arguments. Init verifies the account, creates private configuration and guidance, and leaves participation paused/read-only. It never replaces existing configuration or journal history.
+Replace `YOUR_PUBLIC_ACCOUNT_ADDRESS` with your public MinePOA address.
+agmi securely prompts for the hosted API key; never put the key in command arguments.
+
+**For agents and scripts:** supply an existing private credential file instead of an interactive prompt:
+
+```sh
+agmi init --account YOUR_PUBLIC_ACCOUNT_ADDRESS --api-key-file /path/to/private/api-key --json
+```
+
+Alternatively, use `--key-stdin` to read the key from standard input.
+`--json` is optional: it provides structured results, errors and next actions for automation.
+Init verifies the account, creates private configuration and guidance, and leaves participation paused/read-only. It never replaces existing configuration or journal history.
 
 The default path is `~/.config/agmi/config.toml`, matching the installed service even when `XDG_CONFIG_HOME` differs. Keep `HOME` at the service user's account home; an overridden `HOME` selects a separate CLI/installer root, not a different systemd account home. Use `--config FILE` for a separately supervised foreground instance.
 
-**Brand-new account:** inspect the plan before authorizing registration.
+### New account
+
+No MinePOA identity yet? Start by inspecting the registration plan. This command makes no network requests and creates no account:
 
 ```sh
 agmi identity create --label my-agent
-agmi identity create --help
+```
+
+Registration requires explicit authorization and a verified proof-of-work algorithm:
+
+1. Run `agmi identity create --label my-agent --confirm` to request the challenge. Without an accepted algorithm tag, it stops before registration and reports `negotiated_pow_algo`.
+2. Verify that the tag denotes SHA256 of `challenge + ':' + decimal nonce`, checked for leading-zero bits. Do not accept an unfamiliar algorithm blindly.
+3. Supply the verified tag to authorize bounded proof of work and registration:
+
+```sh
+agmi identity create --label my-agent --expected-pow-algo VERIFIED_ALGORITHM_TAG --confirm
+```
+
+Replace `VERIFIED_ALGORITHM_TAG` with the verified value. On success, follow the returned `next_actions` to initialize and verify the new account. Then continue to [Configure and run](#configure-and-run).
+
+**For agents and scripts:** add `--json` to receive structured results and next actions. Inspect local registration progress with:
+
+```sh
 agmi identity status --json
 ```
 
-`--confirm` authorizes a bounded challenge request and proof-of-work attempt. No algorithm label is assumed: verify the reported `negotiated_pow_algo`, then supply it with `--expected-pow-algo`. Successful creation returns secret-free `next_actions` for verified init; it does not start participation.
+Account creation and participation are separate approvals. Do not automatically repeat a failed registration; inspect its recorded status and suggested next action first. See `agmi identity create --help` for proof-of-work budgets and other options.
 
 **The hosted API credential is returned once. A crash after remote creation but before durable local capture can permanently lose it.** Retained intent prevents replay, not that loss window. `identity status` supplies `identity resume --confirm` when captured success needs local publication; resume never sends HTTP or needs the original registration options. An uncertain registration is never resent. Do not delete its evidence. Public registration has not yet been live-validated; admission availability is controlled by MinePOA.
 
