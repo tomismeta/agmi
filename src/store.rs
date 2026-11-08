@@ -796,6 +796,11 @@ impl Store {
                 status INTEGER, local_next_at INTEGER NOT NULL DEFAULT 0,
                 server_not_before INTEGER NOT NULL DEFAULT 0,
                 retained_conservative_floor INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE IF NOT EXISTS assignment_selection (
+                singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                revision TEXT NOT NULL, generation INTEGER NOT NULL, observed_at INTEGER NOT NULL,
+                observed_count INTEGER NOT NULL, inventory_complete INTEGER NOT NULL,
+                eligible INTEGER NOT NULL);
              INSERT OR IGNORE INTO read_observations(scope,retained_conservative_floor)
                 SELECT scope,next_at FROM read_backoff;
              CREATE TABLE IF NOT EXISTS observation (singleton INTEGER PRIMARY KEY CHECK(singleton=1),
@@ -1845,33 +1850,40 @@ impl Store {
         )?)
     }
 
-    /// At most two bound requests per cycle; a durable cursor survives restarts.
+    /// At most two bound candidates per cycle; selection does not consume fairness.
     pub(crate) fn reconciliation_batch(&self) -> Result<Vec<Operation>> {
         let cursor: i64 = self.db.query_row(
             "SELECT COALESCE(CAST(cursor AS INTEGER),0) FROM schedule WHERE kind='reconciliation'",
             [], |r| r.get(0),
         ).optional()?.unwrap_or(0);
         let mut statement = self.db.prepare(
-            "SELECT id FROM operations WHERE state IN ('queued','unknown','included_pending')
-            AND (job_id IS NOT NULL OR txid IS NOT NULL) AND next_at<=?1
-            ORDER BY CASE WHEN id>?2 THEN 0 ELSE 1 END,id LIMIT 2",
+            "SELECT o.id FROM operations o
+            LEFT JOIN read_backoff r ON r.scope=CASE WHEN o.txid IS NOT NULL THEN 'receipt' ELSE 'job' END
+            LEFT JOIN operation_timing t ON t.operation_id=o.id
+            WHERE o.state IN ('queued','unknown','included_pending')
+            AND (o.job_id IS NOT NULL OR o.txid IS NOT NULL) AND o.next_at<=?1
+            AND COALESCE(r.next_at,0)<=?1
+            AND (o.txid IS NOT NULL OR COALESCE(t.retry_not_before,o.next_at)<=?1)
+            ORDER BY CASE WHEN o.id>?2 THEN 0 ELSE 1 END,o.id LIMIT 2",
         )?;
         let ids = statement
             .query_map(params![now(), cursor], |r| r.get::<_, i64>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        if let Some(last) = ids.last() {
-            self.db.execute(
-                "INSERT INTO schedule(kind,next_at,cursor) VALUES ('reconciliation',0,?1)
-                ON CONFLICT(kind) DO UPDATE SET cursor=excluded.cursor",
-                [last.to_string()],
-            )?;
-        }
         ids.into_iter()
             .map(|id| {
                 self.operation(id)?
                     .context("reconciliation operation missing")
             })
             .collect()
+    }
+
+    pub(crate) fn reconciliation_attempted(&self, operation: i64) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO schedule(kind,next_at,cursor) VALUES ('reconciliation',0,?1)
+             ON CONFLICT(kind) DO UPDATE SET cursor=excluded.cursor",
+            [operation.to_string()],
+        )?;
+        Ok(())
     }
 
     pub(crate) fn effect(&self) -> Result<Option<Operation>> {
@@ -2100,7 +2112,48 @@ impl Store {
         Ok(())
     }
 
+    pub(crate) fn record_assignment_selection(
+        &self,
+        revision: &str,
+        generation: i64,
+        observed_count: usize,
+        inventory_complete: bool,
+        eligible: bool,
+    ) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO assignment_selection SELECT 1,?1,?2,?3,?4,?5,?6
+            WHERE EXISTS (SELECT 1 FROM control WHERE singleton=1 AND generation=?2)
+            ON CONFLICT(singleton) DO UPDATE SET revision=excluded.revision,
+            generation=excluded.generation,observed_at=excluded.observed_at,
+            observed_count=excluded.observed_count,inventory_complete=excluded.inventory_complete,
+            eligible=excluded.eligible",
+            params![
+                revision,
+                generation,
+                now(),
+                observed_count as u64,
+                inventory_complete,
+                eligible
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn cancel_read(&self, scope: ReadScope) -> Result<()> {
+        // Cancellation is neither an HTTP failure nor validated observation.
+        // Preserve prior success/failure evidence and all retained retry floors.
+        self.db.execute(
+            "UPDATE read_observations SET in_flight=0,finished_at=?2
+            WHERE scope=?1 AND in_flight=1",
+            params![scope.as_str(), now()],
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn read_started(&self, scope: ReadScope) -> Result<()> {
+        if scope == ReadScope::Assignments {
+            self.db.execute("DELETE FROM assignment_selection", [])?;
+        }
         self.db.execute(
             "INSERT INTO read_observations(scope,in_flight,started_at) VALUES (?1,1,?2)
             ON CONFLICT(scope) DO UPDATE SET in_flight=1,started_at=excluded.started_at",
@@ -2461,6 +2514,26 @@ impl Store {
         let current = now();
         let waits = self.wait_evidence()?;
         let has_evidence = self.has_table("operation_evidence")?;
+        let selection = if self.has_table("assignment_selection")? {
+            self.db
+                .query_row(
+                    "SELECT s.observed_at,s.observed_count,s.inventory_complete,s.eligible
+                FROM assignment_selection s JOIN runtime_state r
+                    ON r.effective_revision=s.revision
+                WHERE s.generation=?1",
+                    [control.generation],
+                    |row| {
+                        Ok(json!({"observed_at":row.get::<_,i64>(0)?,
+                    "observed_count":row.get::<_,u64>(1)?,
+                    "inventory_complete":row.get::<_,bool>(2)?,
+                    "eligible":row.get::<_,bool>(3)?,
+                    "evidence":"observed_inventory_only"}))
+                    },
+                )
+                .optional()?
+        } else {
+            None
+        };
         let mut work = json!({});
         for kind in [WorkKind::Answer, WorkKind::Judge, WorkKind::Mine] {
             let prepared = self.preparation(kind)?;
@@ -2517,6 +2590,16 @@ impl Store {
                 reason = "read_backoff";
             } else if next_at.is_some_and(|at| at > current) {
                 reason = "cadence";
+            }
+            if kind == WorkKind::Judge
+                && op.is_none()
+                && selection
+                    .as_ref()
+                    .is_some_and(|value| value["eligible"] == false)
+                && !read.is_some_and(|row| row["state"] == "in_flight")
+                && read_at <= current
+            {
+                reason = "no_eligible_in_observed_inventory";
             }
             if kind == WorkKind::Answer && answered == Some(true) {
                 phase = "answered";
@@ -2752,6 +2835,9 @@ impl Store {
             work[kind.as_str()] = json!({"phase":phase,"reason":reason,"next_action":action,
                 "next_at":next_at,"epoch":epoch,"operation_id":op.map(|op| op.id),
                 "operation_epoch":op.and_then(|op| op.request["solver"]["epoch"].as_u64())});
+            if kind == WorkKind::Judge {
+                work[kind.as_str()]["selection"] = json!(selection);
+            }
             let effect_since = if let Some(op) = op.filter(|op| {
                 has_evidence
                     && matches!(
@@ -2984,13 +3070,22 @@ impl Store {
             "historical_unknown_answer_count":historical.len(),
             "historical_unknown_answers":historical,
             "observation_epoch":epoch,"uncertainty_blocks":uncertainty_blocks});
-        let blocking_operation = effect.as_ref().map(|op| op.id);
-        let blocked_since = if self.schema_version()? == 2 {
+        let oldest_unresolved_operation = effect.as_ref().map(|op| op.id);
+        let oldest_unresolved_since = if self.schema_version()? == 2 {
             effect.as_ref().map(|op| self.db.query_row(
                 "SELECT COALESCE((SELECT blocked_since FROM operation_evidence WHERE operation_id=?1),created_at)
                 FROM operations WHERE id=?1", [op.id], |r| r.get::<_,i64>(0))).transpose()?
         } else {
-            pending.as_ref().and_then(|p| p["created_at"].as_i64())
+            effect
+                .as_ref()
+                .map(|op| {
+                    self.db.query_row(
+                        "SELECT created_at FROM operations WHERE id=?1",
+                        [op.id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                })
+                .transpose()?
         };
         let last_progress: Option<i64> = self.db.query_row(
             "SELECT MAX(updated_at) FROM operations
@@ -3049,7 +3144,8 @@ impl Store {
             "hosted_identity_verified":hosted_identity_verified,
             "reads":reads,"work":work,
             "pending":pending,"operations":counts,"evidence":"authenticated_hosted_response",
-            "admission_blocked":blocked,"blocking_operation":blocking_operation,"blocked_since":blocked_since,
+            "admission_blocked":blocked,"oldest_unresolved_operation":oldest_unresolved_operation,
+            "oldest_unresolved_since":oldest_unresolved_since,
             "affected_capabilities":affected,"participation":participation,
             "last_progress_at":last_progress,"last_reported_build":effective.as_ref().map(|e| &e["policy"]["build"]),
             "process_identity":"unverified",
@@ -4028,6 +4124,67 @@ mod tests {
     }
 
     #[test]
+    fn reconciliation_scope_floors_do_not_hide_other_due_scopes() {
+        let (_temp, mut config, mut store) = participation_fixture();
+        config.participation.max_unresolved_operations = 8;
+        let mut jobs = Vec::new();
+        for epoch in 1..3 {
+            let mut op = dispatched_unknown(&mut store, &config, WorkKind::Mine, epoch);
+            op.job_id = Some(format!("blocked-job-{epoch}"));
+            op.state = "queued".into();
+            store.save(&op, "submission_queued").unwrap();
+            jobs.push(op.id);
+        }
+        let mut receipt = dispatched_unknown(&mut store, &config, WorkKind::Mine, 3);
+        receipt.txid = Some("a".repeat(64));
+        receipt.state = "included_pending".into();
+        store.save(&receipt, "receipt_included").unwrap();
+        store.fail_read(ReadScope::Job, 60, 60, 0, None).unwrap();
+        let selected = store.reconciliation_batch().unwrap();
+        assert_eq!(
+            selected.iter().map(|op| op.id).collect::<Vec<_>>(),
+            vec![receipt.id]
+        );
+        store.reset_read(ReadScope::Job).unwrap();
+        for id in jobs {
+            store.record_retry_minimum(id, 60).unwrap();
+        }
+        let selected = store.reconciliation_batch().unwrap();
+        assert_eq!(
+            selected.iter().map(|op| op.id).collect::<Vec<_>>(),
+            vec![receipt.id]
+        );
+    }
+
+    #[test]
+    fn legacy_oldest_uncertainty_requires_an_effect() {
+        let (_temp, config, mut store) = participation_fixture();
+        let op = begin(&mut store, WorkKind::Mine, "legacy", "prepared");
+        store
+            .db
+            .execute_batch(
+                "UPDATE control SET version=1;
+             DROP TABLE authority; DROP TABLE operation_evidence; DROP TABLE runtime_policy;
+             DROP TABLE operation_timing;",
+            )
+            .unwrap();
+        let status = store.status(&config).unwrap();
+        assert_eq!(status["pending"]["operation_id"], op.id);
+        assert!(status["oldest_unresolved_operation"].is_null());
+        assert!(status["oldest_unresolved_since"].is_null());
+        store
+            .db
+            .execute(
+                "UPDATE operations SET state='unknown',created_at=100 WHERE id=?1",
+                [op.id],
+            )
+            .unwrap();
+        let status = store.status(&config).unwrap();
+        assert_eq!(status["oldest_unresolved_operation"], op.id);
+        assert_eq!(status["oldest_unresolved_since"], 100);
+    }
+
+    #[test]
     fn bounded_reconciliation_rotates_past_identifierless_oldest_across_restart() {
         let (_temp, mut config, mut store) = participation_fixture();
         config.participation.max_unresolved_operations = 8;
@@ -4049,6 +4206,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             ids[..2]
         );
+        // A failed first request can impose a scope floor that skips the second.
+        store.reconciliation_attempted(ids[0]).unwrap();
         drop(store);
         let store = Store::open(&config).unwrap();
         assert_eq!(
@@ -4058,8 +4217,9 @@ mod tests {
                 .iter()
                 .map(|o| o.id)
                 .collect::<Vec<_>>(),
-            ids[2..]
+            ids[1..3]
         );
+        store.reconciliation_attempted(ids[2]).unwrap();
         assert_eq!(
             store
                 .reconciliation_batch()
@@ -4067,7 +4227,7 @@ mod tests {
                 .iter()
                 .map(|o| o.id)
                 .collect::<Vec<_>>(),
-            ids[..2]
+            vec![ids[3], ids[0]]
         );
     }
 
@@ -4153,6 +4313,106 @@ mod tests {
         assert!(!store.dispatch_intent(&mut current, &config).unwrap());
         config.participation.max_answer_attempts_per_epoch = 2;
         assert!(store.dispatch_intent(&mut current, &config).unwrap());
+    }
+
+    #[test]
+    fn oldest_unresolved_is_not_the_current_grace_blocker() {
+        let (_temp, mut config, mut store) = participation_fixture();
+        config.participation.allow_judge = true;
+        config.participation.allow_mine = true;
+        config.participation.max_unresolved_operations = 4;
+        let old = dispatched_unknown(&mut store, &config, WorkKind::Judge, 1);
+        let old_since = now() - 86400;
+        store
+            .db
+            .execute(
+                "UPDATE operation_evidence SET blocked_since=?1 WHERE operation_id=?2",
+                params![old_since, old.id],
+            )
+            .unwrap();
+        let recent = dispatched_unknown(&mut store, &config, WorkKind::Mine, 2);
+        let prepared = prepared_epoch(&mut store, WorkKind::Answer, 3, "current");
+        store.observe(3, false).unwrap();
+        config.participation.uncertainty_grace_seconds = 300;
+        store.runtime_state(&config, false).unwrap();
+        let status = store.status(&config).unwrap();
+        assert_eq!(status["oldest_unresolved_operation"], old.id);
+        assert_eq!(status["oldest_unresolved_since"], old_since);
+        assert_eq!(status["admission_blocked"], true);
+        assert_eq!(status["work"]["answer"]["reason"], "uncertainty_grace");
+        assert!(status["work"]["answer"]["next_at"].as_i64().unwrap() >= now() + 299);
+        assert!(!store.admission_allowed(&config, &prepared).unwrap());
+        assert!(status.get("blocking_operation").is_none());
+        assert!(status.get("blocked_since").is_none());
+
+        config.participation.uncertainty_grace_seconds = 0;
+        store.runtime_state(&config, false).unwrap();
+        let status = store.status(&config).unwrap();
+        assert_eq!(status["admission_blocked"], false);
+        assert_eq!(status["oldest_unresolved_operation"], old.id);
+        assert_eq!(
+            store.operation(recent.id).unwrap().unwrap().state,
+            "unknown"
+        );
+        assert!(store.admission_allowed(&config, &prepared).unwrap());
+    }
+
+    #[test]
+    fn inventory_selection_is_durable_bounded_evidence_not_admission_or_global_absence() {
+        let (_temp, mut config, store) = participation_fixture();
+        store.runtime_state(&config, false).unwrap();
+        let revision = config.revision().unwrap();
+        let generation = store.control().unwrap().generation;
+        store
+            .record_assignment_selection(&revision, generation, 2, false, false)
+            .unwrap();
+        store.defer(WorkKind::Judge, 120).unwrap();
+        drop(store);
+        let mut store = Store::open(&config).unwrap();
+        let work = store.status(&config).unwrap()["work"]["judge"].clone();
+        assert_eq!(work["reason"], "no_eligible_in_observed_inventory");
+        assert_eq!(work["selection"]["observed_count"], 2);
+        assert_eq!(work["selection"]["inventory_complete"], false);
+        assert_eq!(work["selection"]["evidence"], "observed_inventory_only");
+        assert!(work["next_at"].as_i64().unwrap() > now());
+        store
+            .fail_read(ReadScope::Assignments, 1, 10, 0, Some(600))
+            .unwrap();
+        let floor = store.read_backoff(ReadScope::Assignments).unwrap().next_at;
+        let work = store.status(&config).unwrap()["work"]["judge"].clone();
+        assert_eq!(work["reason"], "read_backoff");
+        assert!(work["next_at"].as_i64().unwrap() >= floor);
+        store.read_started(ReadScope::Assignments).unwrap();
+        assert!(store.status(&config).unwrap()["work"]["judge"]["selection"].is_null());
+        store.cancel_read(ReadScope::Assignments).unwrap();
+        assert_eq!(
+            store.read_backoff(ReadScope::Assignments).unwrap().next_at,
+            floor
+        );
+        store
+            .record_assignment_selection(&revision, generation, 0, true, false)
+            .unwrap();
+        config.preparation.max_attempts_per_work += 1;
+        store.runtime_state(&config, false).unwrap();
+        assert!(store.status(&config).unwrap()["work"]["judge"]["selection"].is_null());
+        store.set_paused(true).unwrap();
+        store.set_paused(false).unwrap();
+        let revision = config.revision().unwrap();
+        store
+            .record_assignment_selection(
+                &revision,
+                store.control().unwrap().generation,
+                1,
+                true,
+                true,
+            )
+            .unwrap();
+        store
+            .record_assignment_selection(&revision, generation, 0, true, false)
+            .unwrap();
+        let selection = store.status(&config).unwrap()["work"]["judge"]["selection"].clone();
+        assert_eq!(selection["observed_count"], 1);
+        assert_eq!(selection["eligible"], true);
     }
 
     #[test]

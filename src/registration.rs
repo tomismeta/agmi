@@ -717,10 +717,9 @@ fn summary(
             let metadata = json!({"schema":1,"attempt":saved.intent.attempt,"intent_sha256":saved.intent_hash,"account":address,"chain":saved.intent.binding.chain,"base_url":saved.intent.binding.base_url,"credential_file":paths.credential,"config_file":paths.config,"state_dir":paths.state});
             let metadata_bytes = serde_json::to_vec(&metadata).map_err(|_| io_error())?;
             let existing_key = read_private(&paths.credential, 4096)?;
-            if existing_key
-                .as_deref()
-                .is_some_and(|bytes| bytes != key.as_bytes())
-            {
+            let credential_matches_capture =
+                existing_key.as_deref().map(|bytes| bytes == key.as_bytes());
+            if publish_identity && credential_matches_capture == Some(false) {
                 return Err(conflict());
             }
             let existing_metadata = read_private(&paths.metadata, 65536)?;
@@ -792,13 +791,15 @@ fn summary(
             } else {
                 "response_captured"
             };
-            let note = if complete {
+            let note = if !publish_identity && credential_matches_capture == Some(false) {
+                "Historical registration succeeded, but the current credential differs from its captured response. This history does not verify the current credential or establish why it changed; local publication will not overwrite it."
+            } else if complete {
                 "Hosted registration is not verified initialization, controller liveness, participation or ledger finality."
             } else {
                 "The complete response is retained privately. Confirm identity resume to finish local-only publication from retained evidence; no registration is resent."
             };
             Ok(
-                json!({"stage":stage,"attempt":saved.intent.attempt,"created":true,"credential_saved":credential_saved,"metadata_saved":publish_identity || existing_metadata.is_some(),"network_config_saved":publish_identity || existing_network.is_some(),"network_config_file":paths.network,"account":address,"chain":saved.intent.binding.chain,"base_url":saved.intent.binding.base_url,"credential_file":paths.credential,"identity_verified":false,"ready_for_participation":false,"next_actions":if !complete { vec![resume_action(paths)] } else if config.is_none() { vec![init_action(saved, &address)] } else { Vec::new() },"note":note}),
+                json!({"stage":stage,"attempt":saved.intent.attempt,"created":true,"credential_saved":credential_saved,"current_credential_matches_registration":if publish_identity { Some(true) } else { credential_matches_capture },"current_credential_verified":false,"metadata_saved":publish_identity || existing_metadata.is_some(),"network_config_saved":publish_identity || existing_network.is_some(),"network_config_file":paths.network,"account":address,"chain":saved.intent.binding.chain,"base_url":saved.intent.binding.base_url,"credential_file":paths.credential,"identity_verified":false,"ready_for_participation":false,"next_actions":if !complete && credential_matches_capture != Some(false) { vec![resume_action(paths)] } else if complete && config.is_none() { vec![init_action(saved, &address)] } else { Vec::new() },"note":note}),
             )
         }
     }
@@ -835,8 +836,12 @@ pub fn resume(config_path: &Path, confirm: bool) -> Result<Value> {
 }
 fn resume_inner(config_path: &Path, confirm: bool) -> Result<Value> {
     if !confirm {
+        let status = status_inner(config_path)?;
+        if status["current_credential_matches_registration"] == false {
+            return Err(conflict());
+        }
         return Ok(
-            json!({"stage":"plan","confirmed":false,"local_only":true,"status":status_inner(config_path)?,"effects":["validate the retained intent and complete successful response","create-only local credential, identity metadata and network profile publication; no HTTP, proof search, init or participation"]}),
+            json!({"stage":"plan","confirmed":false,"local_only":true,"status":status,"effects":["validate the retained intent and complete successful response","create-only local credential, identity metadata and network profile publication; no HTTP, proof search, init or participation"]}),
         );
     }
     let paths = Paths::new(config_path)?;

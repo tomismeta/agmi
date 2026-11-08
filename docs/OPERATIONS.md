@@ -97,7 +97,7 @@ The runtime reloads model guidance and ordinary participation policy at safe bou
 
 Configuration inspection shows references and model names, not credential values. `agents` reports configured routes; it does not claim they are authenticated or invoke a model.
 
-`excluded_judging_assignments = []` is a root-level list of assignment transaction IDs, before any TOML table header. IDs must be 64 hexadecimal characters; matching ignores case. Use it to exclude known prior attempts from new judging work. Changes reload without restart. Excluded, proven-unsent work releases its local pending boundary even during backoff or pause; queued or possibly-sent work still reconciles and cannot be cleared by this setting.
+`excluded_judging_assignments = []` is a root-level list of assignment transaction IDs, before any TOML table header. IDs must be 64 hexadecimal characters; matching ignores case. Use it to exclude known prior attempts from new judging work. Changes reload without restart. Exclusion is rechecked before local abstention so excluding an unjudgeable seat does not consume its attempt. Excluded, proven-unsent work releases its local pending boundary even during backoff or pause; queued or possibly-sent work still reconciles and cannot be cleared by this setting.
 
 ### Network profiles
 
@@ -175,6 +175,8 @@ Both layers are sent to the selected model and retained in private state: never 
 
 Local pause, recovery and diagnostics do not validate guidance paths or read their files, so broken guidance cannot disable these controls. They still require an otherwise valid configuration. Their configured revision is `null` when guidance has not been loaded; status still reports the runtime's effective revision. Use `config check` to validate the current file contents and obtain their revision. `run` and `resume` also require valid guidance.
 
+Configuration failures include a bounded `details.reason` and, where known, a source-defined field or answer/judge guidance-layer selector. `config check` suggests a repair path rather than repeatedly recommending the same failing check. Parser contents, private values and native diagnostics are not printed.
+
 ### Credential rotation
 
 Obtain a replacement hosted API key through the provider's own process. Credential rotation neither issues nor revokes keys; explicit identity creation is a separate new-account operation, not a rotation mechanism.
@@ -189,6 +191,8 @@ agmi resume
 ```
 
 Rotation requires initialized, paused, stopped state. It holds administration/admission/writer locks, verifies the replacement against the same configured account and chain route, and atomically replaces only the configured credential file. Failed verification preserves the old key; dry-run never replaces it. Configuration, guidance, durable history and unresolved operations remain intact. `--key-stdin` and `--key-prompt` are also supported. A different identity needs separate configuration/state, not rotation. Native Hermes/OpenClaw authentication is unaffected.
+
+For identities created through agmi, `identity status` retains the original successful registration evidence after credential replacement. A different current credential is reported as unverified by that historical capture, not as failed registration or proof of authorized rotation. `identity resume` still refuses to overwrite a different credential.
 
 ### Native model routes
 
@@ -205,7 +209,7 @@ Unsupported native contracts fail explicitly; a matching product name alone does
 
 OpenClaw uses its existing Gateway and native authentication through a small embedded Node bridge to `callGatewayFromCli`. Prompts travel over stdin, never argv. Each request is a fresh one-shot raw model run with tools, bootstrap context and delivery disabled. The Gateway chooses its configured default agent; no shared configuration is changed. Model overrides require the native `operator.admin` scope; insufficient authority fails rather than silently using another model.
 
-Choosing OpenClaw trusts that Gateway's configuration, plugins and hooks. This is not isolated execution: hooks may influence routing before inference. agmi checks the returned model, reasoning, run binding and explicit no-tool/no-bootstrap/no-fallback evidence before accepting output; that cannot undo calls already made by the trusted Gateway. Hermes places policy in its native `system_message` channel. The inspected OpenClaw interface still combines policy and untrusted request data in one message; agmi does not claim privileged policy isolation or prompt-injection immunity there. Pause or timeout kills agmi's local adapter, not the shared Gateway. Remote inference may continue until its native deadline.
+Choosing OpenClaw trusts that Gateway's configuration, plugins and hooks. This is not isolated execution: hooks may influence routing before inference. agmi checks the returned model, reasoning, run binding and explicit no-tool/no-bootstrap/no-fallback evidence before accepting output; that cannot undo calls already made by the trusted Gateway. Hermes places policy in its native `system_message` channel. The inspected OpenClaw interface still combines policy and untrusted request data in one message; agmi does not claim privileged policy isolation or prompt-injection immunity there. Pause closes new admission and fences pre-pause results; already-started inference may continue. Timeout or shutdown cancels agmi's local adapter, not the shared Gateway. Remote inference may continue until its native deadline.
 
 ## Reliability boundaries
 
@@ -254,6 +258,8 @@ agmi update --release "$RELEASE_ID"
 
 Updates preserve prior runtime/timer running intent and unit enablement. `--stopped` forces a stopped cutover. An incoming binary is privately copied and checked against the expected digest before it can execute; its own embedded installer/assets own the cutover. Hashes establish integrity relative to the operator-trusted digest, not signed publisher provenance. No automatic download, “latest” selection or background self-update occurs. Dry-run reports a nonexecuting plan, not a guarantee that operational preconditions will pass. Installed, loaded and running identities are reported separately.
 
+Installer failures include a finite `failure_code` and relevant repair guidance without forwarding raw subprocess output. Installation needs an executable temporary filesystem for its private candidate copy; use an appropriate `TMPDIR` when the default temporary directory is mounted `noexec`. Do not disable host protections globally to install a release.
+
 Ordinary upgrades preserve pause intent and generation: use normal activation, not `pause`/`resume`. Completed unsent drafts survive stop/start and are revalidated before dispatch; explicitly paused/off or obsolete work is not silently revived. Clean shutdown captures completed model results; genuine unfinished execution remains uncertain.
 
 For a journal that requires explicit adoption, first use `agmi update --release "$RELEASE_ID" --stopped`, then `agmi recover adopt` and explicit `agmi service start`. Adoption is not part of an ordinary already-anchored upgrade.
@@ -278,9 +284,13 @@ Health is a local, read-only check: no network requests, model calls, credential
 
 `hosted_identity_unobserved` means no identity result exists yet for unpaused active participation. It is an operational readiness failure, not a fabricated mismatch; the evidence stays null. Paused or read-only installations do not acquire this failure merely for avoiding upstream requests.
 
-Thresholds are CLI options: `--stale-seconds`, `--work-seconds`, `--answer-grace-seconds`, `--min-free-mib` and `--expect-participation`. For deliberate read-only observation use `--expect-participation false`; a live controller is still required. Active work is evaluated against captured deadlines/effective policy rather than silently adopting a newly edited timeout. Health distinguishes desired/effective policy, heartbeat, progress and admission blocking, including its operation and age. Repeated unchanged receipts are observations, not fresh transition events.
+Thresholds are CLI options: `--stale-seconds`, `--work-seconds`, `--answer-grace-seconds`, `--min-free-mib` and `--expect-participation`. For deliberate read-only observation use `--expect-participation false`; a live controller is still required. Active work is evaluated against captured deadlines/effective policy rather than silently adopting a newly edited timeout. Health distinguishes desired/effective policy, heartbeat, progress and admission blocking. Repeated unchanged receipts are observations, not fresh transition events.
 
 `operational.status` separates `clear` (no observed operational issue under the requested checks), `blocked` (admission fenced), `degraded` (other operational issues) and `unknown` (admission evidence unavailable). `operational.issues` retains actionable conditions; `risk` separately reports unresolved-effect/model attention. An old unknown can leave overall `healthy = false` and a nonzero exit while operational status is clear. These additions do not hide uncertainty, change exit semantics, prove remote availability or authorize a submission.
+
+`oldest_unresolved_operation` and `oldest_unresolved_since` identify historical uncertainty; health also reports `oldest_unresolved_age_seconds`. They do not identify the current cause or duration of an admission block. Use `admission_blocked`, `affected_capabilities` and each `work` entry's reason/deadline for current policy waits.
+
+`work.judge.selection` records selection time, observed candidate count, inventory completeness and whether that observation contained eligible work. Eligibility requires a usable parsed assignment, not merely a selectable identifier. `no_eligible_in_observed_inventory` is an idle-selection reason, not a claim that no assignments exist globally. Partial inventories remain explicitly partial; new observations and policy changes invalidate stale selection evidence. Inventory retains its starting control generation, so a response spanning pause/resume cannot become current selection evidence. Read backoff, active preparation and capacity constraints take precedence.
 
 Controller heartbeat advances before each bounded HTTP wait, not just at the start of a potentially long cycle. Manual recovery does not refresh it or reload model guidance. Missing both captured and effective model timing produces `model_deadline_unavailable`, not a deadline guessed from desired configuration.
 
@@ -313,6 +323,10 @@ cargo package --locked --list --allow-dirty
 ```
 
 The process fixture also supports `--harness hermes` for its Python-only fake native transport; this does not require Node.js or a real Hermes account. Native authentication still needs separate real-harness acceptance.
+
+`python3 tests/native_bridge_smoke.py` executes the actual embedded Python and Node bridges against isolated native API substitutes. It covers authentication-route checks, isolation settings, policy delivery, failure cleanup and encoded input limits without live credentials. This is separate from the scheduler fixtures' fake inference transports.
+
+CI also runs `tests/systemd_smoke.py` inside the disposable image defined by `tests/systemd_fixture.Dockerfile`. The container owns its user manager, home and units; it has no external network or host home/bus/cgroup mounts. This exercises real install/update/retained-release activation and post-switch failure cleanup. Do not run this fixture against a production user's services.
 
 Local protocol/model fixtures exercise deterministic lifecycle boundaries; they do not prove production authentication or live network outcomes. Production activation needs separate end-to-end verification with the real account and configured harness.
 

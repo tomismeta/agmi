@@ -43,6 +43,16 @@ fn missing_installation_is_nonzero_structured_and_does_not_initialize_state() {
     assert_eq!(value["data"]["healthy"], false);
     assert_eq!(value["data"]["thresholds"]["warn_free_mib"], 0);
     assert_eq!(value["data"]["admission_blocked"], false);
+    for field in [
+        "oldest_unresolved_operation",
+        "oldest_unresolved_since",
+        "oldest_unresolved_age_seconds",
+    ] {
+        assert_eq!(value["data"].get(field), Some(&Value::Null));
+    }
+    for obsolete in ["blocking_operation", "blocked_since", "blocked_age_seconds"] {
+        assert!(value["data"].get(obsolete).is_none());
+    }
     assert!(
         value["data"]["issues"]
             .as_array()

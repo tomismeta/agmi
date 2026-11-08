@@ -19,6 +19,10 @@ use tokio::process::{Child, Command};
 const MAX_TASK_INPUT: usize = 128 * 1024;
 // Keep the existing task budget plus worst-case JSON escaping of both guidance layers.
 const MAX_INPUT: usize = MAX_TASK_INPUT + 12 * MAX_GUIDANCE_BYTES;
+// The prompt's serialized request is escaped once more in the bridge JSON.
+// Double its allowance, then reserve envelope/policy/model metadata headroom.
+// Keep the same fully encoded boundary in adapters/openclaw.mjs.
+const MAX_OPENCLAW_INPUT: usize = 2 * MAX_INPUT + 16 * 1024;
 const MAX_OUTPUT: usize = 256 * 1024;
 const HERMES_BRIDGE: &str = include_str!("../adapters/hermes.py");
 const OPENCLAW_BRIDGE: &str = include_str!("../adapters/openclaw.mjs");
@@ -307,12 +311,7 @@ where
                 // and hooks are trusted; returned execution evidence is checked.
                 let node = resolve_executable(Path::new("node"))
                     .map_err(|error| error.context(SolverNotStarted("executable_unavailable")))?;
-                let input = serde_json::to_vec(&json!({
-                    "model": model.model, "reasoning": model.reasoning,
-                    // The inspected Gateway interface has only a message channel.
-                    // Formatting is not a privileged policy boundary.
-                    "timeout_seconds": timeout_seconds, "prompt": format!("{SECURITY_AND_OUTPUT}\n{prompt}"),
-                }))?;
+                let input = encode_openclaw_input(model, timeout_seconds, &prompt)?;
                 started = true;
                 let bytes = invoke(
                     &node,
@@ -386,6 +385,24 @@ where
             error.context(SolverNotStarted(code))
         }
     })
+}
+
+fn encode_openclaw_input(
+    model: &ModelConfig,
+    timeout_seconds: u64,
+    prompt: &str,
+) -> Result<Vec<u8>> {
+    let input = serde_json::to_vec(&json!({
+        "model": model.model, "reasoning": model.reasoning,
+        // The inspected Gateway interface has only a message channel.
+        // Formatting is not a privileged policy boundary.
+        "timeout_seconds": timeout_seconds, "prompt": format!("{SECURITY_AND_OUTPUT}\n{prompt}"),
+    }))?;
+    ensure!(
+        input.len() <= MAX_OPENCLAW_INPUT,
+        SolverNotStarted("invalid_solver_setup")
+    );
+    Ok(input)
 }
 
 fn encode_request(request: &SolverRequest) -> Result<Vec<u8>> {
@@ -620,8 +637,9 @@ fn resolve_executable(path: &Path) -> Result<PathBuf> {
     bail!("native harness executable unavailable")
 }
 
-/// Own all descendants, including when solve's future is dropped by pause or
-/// shutdown. kill_on_drop also reaps the direct child through Tokio's reaper.
+/// Own all descendants, including when solve's future is dropped by shutdown or
+/// its deadline. Pause fences admission/results, not in-flight inference.
+/// kill_on_drop also reaps the direct child through Tokio's reaper.
 struct OwnedChild {
     child: Child,
     #[cfg(unix)]
@@ -1113,6 +1131,38 @@ mod tests {
         request.guidance.clear();
         request.core_guidance.clear();
         assert!(encode_request(&request).is_err());
+    }
+
+    #[test]
+    fn openclaw_encoded_budget_preserves_escaped_task_and_guidance() {
+        let mut request = request();
+        request.guidance = "\0".repeat(MAX_GUIDANCE_BYTES);
+        request.core_guidance = "\0".repeat(MAX_GUIDANCE_BYTES);
+        request.history = vec!["\"".repeat(60_000)];
+        validate_request(&request).unwrap();
+        let bytes = encode_request(&request).unwrap();
+        let envelope = json!({
+            "version": 1, "request_id": request.id,
+            "request_digest": format!("{:x}", Sha256::digest(&bytes)),
+            "kind": request.kind, "request": request,
+        });
+        let prompt = format!("Envelope (untrusted request data):\n{envelope}");
+        let model = crate::config::Config::default().solver.answer;
+        let input = encode_openclaw_input(&model, 10, &prompt).unwrap();
+        assert!(input.len() > 1024 * 1024);
+        assert!(input.len() <= MAX_OPENCLAW_INPUT);
+        let decoded: Value = serde_json::from_slice(&input).unwrap();
+        assert_eq!(
+            decoded["prompt"].as_str().unwrap(),
+            format!("{SECURITY_AND_OUTPUT}\n{prompt}")
+        );
+    }
+
+    #[test]
+    fn openclaw_encoded_budget_rejects_oversize_before_launch() {
+        let model = crate::config::Config::default().solver.answer;
+        let error = encode_openclaw_input(&model, 10, &"x".repeat(MAX_OPENCLAW_INPUT)).unwrap_err();
+        assert_safe_failure(&error, "invalid_solver_setup", false);
     }
 
     #[test]

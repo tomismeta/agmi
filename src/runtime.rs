@@ -267,6 +267,7 @@ struct Inventory {
     response: Response,
     // Earlier usable pages cannot supersede a later page's failure or delay.
     pages_usable: bool,
+    generation: i64,
 }
 
 struct IdentityRead {
@@ -774,6 +775,7 @@ impl Runtime {
     }
 
     async fn assignment_inventory(&mut self, target: Option<&str>) -> Result<Option<Inventory>> {
+        let generation = self.store.control()?.generation;
         let Some(mut response) = self
             .get(
                 WorkKind::Judge,
@@ -785,6 +787,9 @@ impl Runtime {
         else {
             return Ok(None);
         };
+        if self.store.control()?.generation != generation {
+            return Ok(None);
+        }
         let ids = assignment_ids(&response);
         if ids.is_err() {
             self.read_evaluated(ReadScope::Assignments, false, response.retry_after_seconds)?;
@@ -847,6 +852,9 @@ impl Runtime {
                 break;
             }
         }
+        if self.store.control()?.generation != generation {
+            return Ok(None);
+        }
         response.body["assignments"] = json!(rows);
         response.body["has_more"] = json!(!complete);
         // Active selection validates the selected payload before clearing this scope.
@@ -863,6 +871,7 @@ impl Runtime {
         Ok(Some(Inventory {
             response,
             pages_usable,
+            generation,
         }))
     }
 
@@ -900,7 +909,11 @@ impl Runtime {
     async fn assignment(&mut self, snapshot: &Inventory, id: &str) -> Result<Option<Assignment>> {
         let inventory = &snapshot.response;
         self.reload()?;
-        if self.stopping() || self.config.mode(WorkKind::Judge) == Mode::Off {
+        if self.stopping()
+            || self.config.mode(WorkKind::Judge) == Mode::Off
+            || self.store.control()?.generation != snapshot.generation
+            || self.config.judging_assignment_excluded(id)
+        {
             return Ok(None);
         }
         let hydrated = match assignment_needs_hydration(inventory, id) {
@@ -932,6 +945,14 @@ impl Runtime {
                 return Ok(None);
             }
         };
+        if hydrated.is_some() {
+            self.reload()?;
+        }
+        if self.store.control()?.generation != snapshot.generation
+            || self.config.judging_assignment_excluded(id)
+        {
+            return Ok(None);
+        }
         let minimum = hydrated
             .as_ref()
             .and_then(|r| r.retry_after_seconds)
@@ -949,6 +970,10 @@ impl Runtime {
                 if snapshot.pages_usable {
                     self.read_evaluated(ReadScope::Assignments, true, None)?;
                 }
+                if assignment.words.is_empty() {
+                    self.abstain_assignment(id, snapshot.generation)?;
+                    return Ok(None);
+                }
                 Ok(Some(assignment))
             }
             Err(_) => {
@@ -959,24 +984,36 @@ impl Runtime {
                     .event("assignment_evidence_unavailable", Some(WorkKind::Judge))?;
                 self.store
                     .defer_until(WorkKind::Judge, self.store.read_backoff(scope)?.next_at)?;
-                if self.active(WorkKind::Judge)?
-                    && self.store.preparation(WorkKind::Judge)?.is_none()
-                    && !self.store.attempted(WorkKind::Judge, id)?
-                {
-                    let _gate = AdmissionGuard::acquire(&self.config)?;
-                    let control = self.store.control()?;
-                    if !control.paused {
-                        let mut skipped = self.store.begin(WorkKind::Judge,id,"prepared",
-                            &json!({"assignment":id,"local_abstention":"required_evidence_unavailable"}),
-                            control,&self.config.revision()?)?;
-                        skipped.state = "abstained".into();
-                        self.store
-                            .save(&skipped, "assignment_evidence_insufficient")?;
-                    }
-                }
+                self.abstain_assignment(id, snapshot.generation)?;
                 Ok(None)
             }
         }
+    }
+
+    fn abstain_assignment(&mut self, id: &str, generation: i64) -> Result<()> {
+        let _gate = AdmissionGuard::acquire(&self.config)?;
+        self.reload()?;
+        if self.active(WorkKind::Judge)?
+            && !self.config.judging_assignment_excluded(id)
+            && self.store.preparation(WorkKind::Judge)?.is_none()
+            && !self.store.attempted(WorkKind::Judge, id)?
+        {
+            let control = self.store.control()?;
+            if !control.paused && control.generation == generation {
+                let mut skipped = self.store.begin(
+                    WorkKind::Judge,
+                    id,
+                    "prepared",
+                    &json!({"assignment":id,"local_abstention":"required_evidence_unavailable"}),
+                    control,
+                    &self.config.revision()?,
+                )?;
+                skipped.state = "abstained".into();
+                self.store
+                    .save(&skipped, "assignment_evidence_insufficient")?;
+            }
+        }
+        Ok(())
     }
 
     async fn cancel_identity(&mut self) -> Result<()> {
@@ -1246,8 +1283,14 @@ impl Runtime {
                 drop(gate);
                 self.dispatch(&mut op).await?;
             } else {
-                self.generate_linked(kind, &key, input, Some(&original))
-                    .await?;
+                self.generate_linked(
+                    kind,
+                    &key,
+                    input,
+                    Some(&original),
+                    self.store.control()?.generation,
+                )
+                .await?;
             }
         } else {
             self.generate(kind, &key, input).await?;
@@ -1265,6 +1308,21 @@ impl Runtime {
             return Ok(());
         }
         for mut op in self.store.reconciliation_batch()? {
+            let scope = if op.txid.is_some() {
+                ReadScope::Receipt
+            } else {
+                ReadScope::Job
+            };
+            if self.stopping() {
+                break;
+            }
+            if self.store.read_backoff(scope)?.next_at > now()
+                || (scope == ReadScope::Job && self.store.operation_poll_timing(op.id)?.1 > now())
+            {
+                continue;
+            }
+            // Skipped requests must not advance past the next eligible poll.
+            self.store.reconciliation_attempted(op.id)?;
             self.reconcile(&mut op).await?;
         }
         for kind in [WorkKind::Judge, WorkKind::Mine] {
@@ -1313,13 +1371,40 @@ impl Runtime {
                     if !self.active(kind)? {
                         continue;
                     }
-                    let Some(key) = self.next_judging_assignment(&inventory.response)? else {
+                    let key = self.next_judging_assignment(&inventory.response)?;
+                    let exhausted = key.is_none();
+                    let selected = match key {
+                        Some(key) => self
+                            .assignment(&inventory, &key)
+                            .await?
+                            .map(|assignment| (key, assignment)),
+                        None => {
+                            if inventory.pages_usable {
+                                self.read_evaluated(ReadScope::Assignments, true, None)?;
+                            }
+                            None
+                        }
+                    };
+                    if selected.is_some()
+                        || exhausted
+                        || self.next_judging_assignment(&inventory.response)?.is_none()
+                    {
+                        self.store.record_assignment_selection(
+                            &self.config.revision()?,
+                            inventory.generation,
+                            inventory.response.body["assignments"]
+                                .as_array()
+                                .map_or(0, Vec::len),
+                            inventory.pages_usable && inventory.response.body["has_more"] == false,
+                            selected.is_some(),
+                        )?;
+                    }
+                    let Some((key, assignment)) = selected else {
                         continue;
                     };
-                    let Some(assignment) = self.assignment(&inventory, &key).await? else {
-                        continue;
-                    };
-                    if !self.identity_matches(kind).await? {
+                    if !self.identity_matches(kind).await?
+                        || self.store.control()?.generation != inventory.generation
+                    {
                         continue;
                     }
                     let request = SolverRequest {
@@ -1337,13 +1422,15 @@ impl Runtime {
                         author_history: Some(assignment.author_prior),
                         candidate_author: assignment.author,
                     };
-                    self.generate(
+                    self.generate_linked(
                         kind,
                         &key,
                         Input {
                             solver: request,
                             challenge_fingerprint: None,
                         },
+                        None,
+                        inventory.generation,
                     )
                     .await?;
                     return Ok(());
@@ -1460,7 +1547,8 @@ impl Runtime {
     }
 
     async fn generate(&mut self, kind: WorkKind, key: &str, input: Input) -> Result<()> {
-        self.generate_linked(kind, key, input, None).await
+        self.generate_linked(kind, key, input, None, self.store.control()?.generation)
+            .await
     }
 
     async fn generate_linked(
@@ -1469,7 +1557,9 @@ impl Runtime {
         key: &str,
         mut input: Input,
         retry: Option<&Operation>,
+        generation: i64,
     ) -> Result<()> {
+        let gate = AdmissionGuard::acquire(&self.config)?;
         self.reload()?;
         if !self.active(kind)?
             || self.store.preparation(kind)?.is_some()
@@ -1495,9 +1585,8 @@ impl Runtime {
         {
             return Ok(());
         }
-        let gate = AdmissionGuard::acquire(&self.config)?;
         let control = self.store.control()?;
-        if control.paused {
+        if control.paused || control.generation != generation {
             return Ok(());
         }
         let model = match kind {
@@ -1548,12 +1637,11 @@ impl Runtime {
             });
             let attempt = tokio::select! {
                 biased;
-                result = tokio::time::timeout(Duration::from_secs(timeout), future) => match result {
-                    Ok(Ok(result)) => ModelAttempt::Captured(result),
-                    Ok(Err(error)) if completed_artifact_invalid(&error) => ModelAttempt::Invalid(failure_code(&error)),
-                    Ok(Err(error)) if !execution_may_have_started(&error) => ModelAttempt::NotStarted(failure_code(&error)),
-                    Ok(Err(error)) => ModelAttempt::Unknown(failure_code(&error)),
-                    Err(_) => ModelAttempt::Unknown("model_launch_unknown"),
+                result = future => match result {
+                    Ok(result) => ModelAttempt::Captured(result),
+                    Err(error) if completed_artifact_invalid(&error) => ModelAttempt::Invalid(failure_code(&error)),
+                    Err(error) if !execution_may_have_started(&error) => ModelAttempt::NotStarted(failure_code(&error)),
+                    Err(error) => ModelAttempt::Unknown(failure_code(&error)),
                 },
                 _ = stop.changed() => ModelAttempt::Unknown("model_launch_unknown"),
             };
@@ -1761,11 +1849,12 @@ impl Runtime {
         if !self.store.dispatch_intent(op, &self.config)? {
             return Ok(());
         }
-        let request = tokio::time::timeout(
-            Duration::from_secs(self.config.timeouts.http_seconds),
-            prepared,
-        );
+        // Protocol owns the complete HTTP deadline and retains received headers
+        // even when the response body times out. Only shutdown may cancel early.
+        let request = prepared;
         tokio::pin!(request);
+        let mut observation_error = None;
+        let mut observation_cancelled = false;
         let result = loop {
             if self.stopping() {
                 match tokio::time::timeout(
@@ -1788,6 +1877,9 @@ impl Runtime {
                         op.state = "unknown".into();
                         self.store.save(op, "dispatch_outcome_unknown")?;
                         drop(gate);
+                        if observation_cancelled {
+                            self.store.cancel_read(ReadScope::Challenge)?;
+                        }
                         return Ok(());
                     }
                 }
@@ -1799,23 +1891,32 @@ impl Runtime {
                 result = &mut request => break result,
                 _ = self.stop.changed() => continue,
                 _ = wake.notified() => self.collect_models().await?,
-                _ = tokio::time::sleep(delay) => {
-                    // Poll the effect while observing too: receiving an urgent
-                    // read must not hide an already-completed write response.
+                _ = tokio::time::sleep(delay), if observation_error.is_none() => {
+                    let previous_context = self.urgent_context;
                     let mut observation = Box::pin(self.service_urgent(false));
                     tokio::select! {
                         biased;
                         result = &mut request => {
-                            observation.await?;
+                            // Drop aborts the result-only challenge transport.
+                            // Restore the continuation's context explicitly; its
+                            // post-await cleanup does not run on cancellation.
+                            drop(observation);
+                            self.urgent_context = previous_context;
+                            observation_cancelled = true;
                             break result;
                         },
-                        observed = &mut observation => observed?,
+                        observed = &mut observation => {
+                            if let Err(error) = observed {
+                                observation_error = Some(error);
+                                observation_cancelled = true;
+                            }
+                        },
                     }
                 },
             }
         };
         match result {
-            Ok(Ok(response)) => {
+            Ok(response) => {
                 self.store.record_candidates(
                     op.id,
                     &serde_json::to_value(crate::protocol::response_candidates(&response))?,
@@ -1850,6 +1951,12 @@ impl Runtime {
             }
         }
         drop(gate);
+        if observation_cancelled {
+            self.store.cancel_read(ReadScope::Challenge)?;
+        }
+        if let Some(error) = observation_error {
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -2421,10 +2528,9 @@ mod tests {
         stream.write_all(reply.as_bytes()).await.unwrap();
     }
 
-    async fn accept_api_request(
+    async fn read_api_request(
         listener: &tokio::net::TcpListener,
-        expected: &str,
-    ) -> tokio::net::TcpStream {
+    ) -> (tokio::net::TcpStream, String) {
         use tokio::io::AsyncReadExt;
         let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
             .await
@@ -2441,10 +2547,7 @@ mod tests {
             }
         };
         let headers = std::str::from_utf8(&bytes[..header_end]).unwrap();
-        assert!(
-            headers.starts_with(&format!("{expected} HTTP/1.1")),
-            "{headers}"
-        );
+        let request_line = headers.lines().next().unwrap().to_owned();
         let length = headers
             .lines()
             .find_map(|line| {
@@ -2458,6 +2561,15 @@ mod tests {
             assert!(count > 0);
             bytes.extend_from_slice(&buffer[..count]);
         }
+        (stream, request_line)
+    }
+
+    async fn accept_api_request(
+        listener: &tokio::net::TcpListener,
+        expected: &str,
+    ) -> tokio::net::TcpStream {
+        let (stream, request_line) = read_api_request(listener).await;
+        assert_eq!(request_line, format!("{expected} HTTP/1.1"));
         stream
     }
 
@@ -2479,6 +2591,336 @@ mod tests {
             body.len()
         );
         stream.write_all(reply.as_bytes()).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn completed_write_is_durable_before_cancelled_urgent_read_and_releases_admission() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for previous_context in [false, true] {
+            let credentials = tempfile::tempdir().unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut config = active_judge_config(credentials.path());
+            config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
+            config.capabilities.answer = Mode::ReadOnly;
+            config.schedule.poll_seconds = 1;
+            config.timeouts.http_seconds = 8;
+            config.timeouts.read_http_seconds = Some(15);
+            let (_temp, mut runtime, _sender) = fixture_with(config);
+            runtime.urgent_context = previous_context;
+            let id = "a".repeat(64);
+            let mut op = judging_operation(&mut runtime, &id, "generated");
+            let prefix = format!("/chain/{}", runtime.config.network.chain);
+            let address = runtime.config.network.address.clone();
+            let observed_config = runtime.config.clone();
+            let server = tokio::spawn(async move {
+                let mut write = loop {
+                    let (mut stream, request) = read_api_request(&listener).await;
+                    if request == format!("POST {prefix}/api/hosted/grade HTTP/1.1") {
+                        break stream;
+                    }
+                    let body =
+                        if request == format!("GET {prefix}/api/hosted/assignments HTTP/1.1") {
+                            judging_inventory(std::slice::from_ref(&id)).body
+                        } else if request == format!("GET {prefix}/api/hosted/me HTTP/1.1") {
+                            json!({"address":address})
+                        } else {
+                            assert_eq!(
+                                request,
+                                format!("GET {prefix}/api/hosted/challenge HTTP/1.1")
+                            );
+                            json!({"epoch":10,"words":["clock","bridge"],"answered":true,
+                            "min_chars":120,"max_chars":600})
+                        }
+                        .to_string();
+                    stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()).as_bytes()).await.unwrap();
+                };
+                let mut urgent =
+                    accept_api_request(&listener, &format!("GET {prefix}/api/hosted/challenge"))
+                        .await;
+                let reads = Store::read_only(&observed_config)
+                    .unwrap()
+                    .unwrap()
+                    .reads()
+                    .unwrap();
+                let prior_success = reads
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|row| row["scope"] == "challenge")
+                    .unwrap()["last_success_at"]
+                    .clone();
+                let body = json!({"state":"queued","job_id":"ready-job"}).to_string();
+                write.write_all(format!("HTTP/1.1 202 Accepted\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()).as_bytes()).await.unwrap();
+                let mut byte = [0];
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(2), urgent.read(&mut byte))
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    0
+                );
+                prior_success
+            });
+            tokio::time::timeout(Duration::from_secs(5), runtime.dispatch(&mut op))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(op.job_id.as_deref(), Some("ready-job"));
+            assert_eq!(
+                runtime.store.operation(op.id).unwrap().unwrap().state,
+                "queued"
+            );
+            assert_eq!(runtime.urgent_context, previous_context);
+            assert!(AdmissionGuard::try_acquire(&runtime.config).is_ok());
+            let reads = runtime.store.status(&runtime.config).unwrap()["reads"].clone();
+            let challenge = reads
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["scope"] == "challenge")
+                .unwrap();
+            assert_ne!(challenge["state"], "in_flight");
+            assert_eq!(challenge["last_success_at"], server.await.unwrap());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_body_timeout_retains_server_floor_for_later_admission() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let credentials = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = active_judge_config(credentials.path());
+        config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
+        config.timeouts.http_seconds = 1;
+        config.participation.mode = ParticipationMode::ParticipationFirst;
+        config.participation.allow_judge = true;
+        config.participation.uncertainty_grace_seconds = 0;
+        let (_temp, mut runtime, _sender) = fixture_with(config);
+        let id = "a".repeat(64);
+        let mut op = judging_operation(&mut runtime, &id, "generated");
+        let prefix = format!("/chain/{}", runtime.config.network.chain);
+        let address = runtime.config.network.address.clone();
+        let server = tokio::spawn(async move {
+            api_reply(
+                &listener,
+                &format!("GET {prefix}/api/hosted/assignments"),
+                200,
+                None,
+                judging_inventory(&[id]).body,
+            )
+            .await;
+            api_reply(
+                &listener,
+                &format!("GET {prefix}/api/hosted/me"),
+                200,
+                None,
+                json!({"address":address}),
+            )
+            .await;
+            let mut stream =
+                accept_api_request(&listener, &format!("POST {prefix}/api/hosted/grade")).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 503 Unavailable\r\nRetry-After: 60\r\nContent-Length: 100\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let mut byte = [0];
+            let _ = tokio::time::timeout(Duration::from_secs(4), stream.read(&mut byte)).await;
+        });
+        let before = now();
+        runtime.dispatch(&mut op).await.unwrap();
+        assert_eq!(op.state, "unknown");
+        assert!(runtime.store.operation_poll_timing(op.id).unwrap().1 >= before + 60);
+        let later = judging_operation(&mut runtime, &"b".repeat(64), "generated");
+        assert!(
+            !runtime
+                .store
+                .admission_allowed(&runtime.config, &later)
+                .unwrap()
+        );
+        assert_eq!(
+            runtime.store.status(&runtime.config).unwrap()["work"]["judge"]["reason"],
+            "retained_retry_minimum"
+        );
+        server.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stale_inventory_cannot_consume_model_or_abstention_attempts() {
+        let credentials = tempfile::tempdir().unwrap();
+        let (_temp, mut runtime, _sender) = fixture_with(active_judge_config(credentials.path()));
+        let generation = runtime.store.control().unwrap().generation;
+        runtime.store.set_paused(true).unwrap();
+        runtime.store.set_paused(false).unwrap();
+        let id = "a".repeat(64);
+        runtime.abstain_assignment(&id, generation).unwrap();
+        runtime
+            .generate_linked(WorkKind::Judge, &id, judging_input(&id), None, generation)
+            .await
+            .unwrap();
+        assert!(!runtime.store.attempted(WorkKind::Judge, &id).unwrap());
+        assert_eq!(
+            runtime.store.attempt_count(WorkKind::Judge, &id).unwrap(),
+            0
+        );
+        assert!(runtime.preparations.is_empty());
+        runtime
+            .abstain_assignment(&id, runtime.store.control().unwrap().generation)
+            .unwrap();
+        assert!(runtime.store.attempted(WorkKind::Judge, &id).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn missing_words_abstains_only_selected_assignment_including_hydration() {
+        for hydrated in [false, true] {
+            let credentials = tempfile::tempdir().unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut config = active_judge_config(credentials.path());
+            config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
+            let (_temp, mut runtime, _sender) = fixture_with(config);
+            let ids = ["a".repeat(64), "b".repeat(64)];
+            let mut response = judging_inventory(&ids);
+            response.body["assignments"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("words");
+            if hydrated {
+                response.body["assignments"][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("answer_epoch");
+            }
+            let inventory = Inventory {
+                response,
+                pages_usable: true,
+                generation: runtime.store.control().unwrap().generation,
+            };
+            let id = ids[0].clone();
+            let path = format!(
+                "GET /chain/{}/api/explorer/tx/{id}",
+                runtime.config.network.chain
+            );
+            let server = tokio::spawn(async move {
+                if hydrated {
+                    api_reply(&listener, &path, 200, None,
+                        json!({"id":id,"body":{"type":"challenge","epoch":8,"answer":"candidate-test"}})).await;
+                }
+            });
+            assert!(
+                runtime
+                    .assignment(&inventory, &ids[0])
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            server.await.unwrap();
+            assert!(runtime.preparations.is_empty());
+            assert_eq!(
+                runtime
+                    .store
+                    .model_budget_used(WorkKind::Judge, &ids[0])
+                    .unwrap(),
+                1
+            );
+            assert!(runtime.store.attempted(WorkKind::Judge, &ids[0]).unwrap());
+            assert_eq!(
+                runtime
+                    .store
+                    .read_backoff(ReadScope::Assignments)
+                    .unwrap()
+                    .failures,
+                0
+            );
+            assert_eq!(
+                runtime
+                    .store
+                    .read_backoff(ReadScope::AssignmentEvidence)
+                    .unwrap()
+                    .failures,
+                0
+            );
+            assert_eq!(
+                runtime
+                    .next_judging_assignment(&inventory.response)
+                    .unwrap(),
+                Some(ids[1].clone())
+            );
+            assert!(
+                runtime
+                    .assignment(&inventory, &ids[1])
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(
+                runtime.store.status(&runtime.config).unwrap()["operations"],
+                json!([{"kind":"judge","state":"abstained","count":1}])
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn solver_owns_discovery_and_inference_timeout_classification() {
+        use crate::config::Harness;
+        use std::os::unix::fs::PermissionsExt;
+        for inference in [false, true] {
+            let native = tempfile::tempdir().unwrap();
+            let executable = native.path().join("hermes");
+            let interpreter = native.path().join("interpreter");
+            std::fs::write(&interpreter, "#!/bin/sh\nsleep 5\n").unwrap();
+            std::fs::set_permissions(&interpreter, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let command =
+                serde_json::to_string(&json!([interpreter, "-I", "-c", "fixture"])).unwrap();
+            std::fs::write(
+                &executable,
+                if inference {
+                    format!("#!/bin/sh\nprintf '%s' '{command}'\n")
+                } else {
+                    "#!/bin/sh\nsleep 5\n".into()
+                },
+            )
+            .unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let mut config = active_judge_config(native.path());
+            config.solver.judge.harness = Harness::Hermes;
+            config.solver.judge.executable = executable;
+            config.timeouts.model_seconds = 1;
+            let (_temp, mut runtime, _sender) = fixture_with(config);
+            let id = "a".repeat(64);
+            runtime
+                .generate(WorkKind::Judge, &id, judging_input(&id))
+                .await
+                .unwrap();
+            finish_models(&mut runtime).await;
+            let expected = if inference {
+                "model_unknown"
+            } else {
+                "prelaunch_failed"
+            };
+            assert_eq!(
+                runtime.store.status(&runtime.config).unwrap()["operations"],
+                json!([{"kind":"judge","state":expected,"count":1}])
+            );
+            assert_eq!(
+                runtime
+                    .store
+                    .model_budget_used(WorkKind::Judge, &id)
+                    .unwrap(),
+                u32::from(inference)
+            );
+            assert_eq!(
+                runtime.store.attempted(WorkKind::Judge, &id).unwrap(),
+                inference
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -2938,6 +3380,7 @@ mod tests {
         let inventory = Inventory {
             response: inventory,
             pages_usable: true,
+            generation: runtime.store.control().unwrap().generation,
         };
         let selected = runtime.assignment(&inventory, &id).await.unwrap().unwrap();
         assert_eq!(selected.epoch, 8);
@@ -2990,6 +3433,7 @@ mod tests {
         let inventory = Inventory {
             response: inventory,
             pages_usable: true,
+            generation: runtime.store.control().unwrap().generation,
         };
         let server = tokio::spawn(async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};

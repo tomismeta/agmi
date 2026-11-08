@@ -45,7 +45,7 @@ class WorkFixture(Fixture):
         super().__init__(*args)
         self.policy['answer_reserved_slots'] = 0
         self.configure()
-        # Exercise the actual native bridge with a deterministic local model.
+        # Exercise Rust scheduling with a deterministic fake native transport.
         # A separate launch log includes epoch/time without changing the journal.
         interpreter = self.root / 'fixture-python'
         interpreter.write_text(f'#!{sys.executable}\n' + '''import json, pathlib, sys, time

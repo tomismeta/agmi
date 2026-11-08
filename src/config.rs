@@ -1,5 +1,5 @@
 use crate::endpoints::{ApiEndpoints, network_defaults};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io::Read;
@@ -20,6 +20,75 @@ pub(crate) fn default_hermes_api_url() -> String {
 }
 
 pub(crate) const MAX_GUIDANCE_BYTES: usize = 64 * 1024;
+
+/// Only source-defined selectors and messages may cross the CLI error boundary.
+/// Parser errors, file paths and configuration values are deliberately excluded.
+#[derive(Debug, Serialize)]
+pub struct ConfigDiagnostic {
+    reason: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    field: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<WorkKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    layer: Option<&'static str>,
+    #[serde(skip)]
+    message: &'static str,
+}
+
+impl ConfigDiagnostic {
+    fn new(reason: &'static str, message: &'static str) -> Self {
+        Self {
+            reason,
+            field: None,
+            kind: None,
+            layer: None,
+            message,
+        }
+    }
+
+    fn model(kind: WorkKind, field: &'static str, message: &'static str) -> Self {
+        Self {
+            kind: Some(kind),
+            ..Self::field(field, message)
+        }
+    }
+
+    fn field(field: &'static str, message: &'static str) -> Self {
+        Self {
+            field: Some(field),
+            ..Self::new("field_invalid", message)
+        }
+    }
+
+    fn guidance(
+        reason: &'static str,
+        kind: WorkKind,
+        layer: &'static str,
+        message: &'static str,
+    ) -> Self {
+        Self {
+            kind: Some(kind),
+            layer: Some(layer),
+            ..Self::new(reason, message)
+        }
+    }
+
+    pub fn is_missing(&self) -> bool {
+        self.reason == "file_missing"
+    }
+
+    pub fn guidance_selector(&self) -> Option<(WorkKind, &'static str)> {
+        self.kind.zip(self.layer)
+    }
+}
+
+impl std::fmt::Display for ConfigDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message)
+    }
+}
+impl std::error::Error for ConfigDiagnostic {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -355,22 +424,36 @@ impl Config {
     }
 
     fn load_config(path: &Path, load_guidance: bool) -> Result<Self> {
-        let file =
-            std::fs::File::open(path).map_err(|_| anyhow::anyhow!("cannot read configuration"))?;
+        let file = std::fs::File::open(path).map_err(|error| {
+            ConfigDiagnostic::new(
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    "file_missing"
+                } else {
+                    "file_unreadable"
+                },
+                "Cannot open configuration; inspect the selected file and its access permissions.",
+            )
+        })?;
         let mut bytes = Vec::new();
         file.take(65537)
             .read_to_end(&mut bytes)
-            .map_err(|_| anyhow::anyhow!("cannot read configuration"))?;
+            .map_err(|_| ConfigDiagnostic::new("file_unreadable", "Cannot read configuration."))?;
         Self::parse_bytes(path, &bytes, load_guidance)
     }
 
     pub(crate) fn parse_bytes(path: &Path, bytes: &[u8], load_guidance: bool) -> Result<Self> {
-        ensure!(bytes.len() <= 65536, "configuration exceeds 64 KiB");
+        ensure!(
+            bytes.len() <= 65536,
+            ConfigDiagnostic::new("file_too_large", "Configuration exceeds 64 KiB.")
+        );
         let text = std::str::from_utf8(bytes)
-            .map_err(|_| anyhow::anyhow!("configuration must be UTF-8"))?;
-        // Parser diagnostics may echo secrets accidentally placed in an unknown field.
+            .map_err(|_| ConfigDiagnostic::new("file_not_utf8", "Configuration must be UTF-8."))?;
+        // Never expose parser diagnostics: even unknown field names may contain secrets.
         let mut config: Self = toml::from_str(text).map_err(|_| {
-            anyhow::anyhow!("invalid configuration: check field names, types and enum values")
+            ConfigDiagnostic::new(
+                "parse_invalid",
+                "Invalid configuration syntax, field names, types or enum values.",
+            )
         })?;
         config.validate_fields(load_guidance)?;
         for id in &mut config.excluded_judging_assignments {
@@ -381,11 +464,21 @@ impl Config {
         let absolute = if path.is_absolute() {
             path.to_path_buf()
         } else {
-            std::env::current_dir()?.join(path)
+            std::env::current_dir()
+                .map_err(|_| {
+                    ConfigDiagnostic::new(
+                        "location_unavailable",
+                        "Cannot resolve the configuration directory.",
+                    )
+                })?
+                .join(path)
         };
-        let root = absolute
-            .parent()
-            .context("configuration has no parent directory")?;
+        let root = absolute.parent().ok_or_else(|| {
+            ConfigDiagnostic::new(
+                "location_unavailable",
+                "Configuration has no parent directory.",
+            )
+        })?;
         config.state_dir = resolve_path(root, &config.state_dir);
         if !config.network.credential_file.as_os_str().is_empty() {
             config.network.credential_file = resolve_path(root, &config.network.credential_file);
@@ -406,15 +499,23 @@ impl Config {
             .iter()
             .all(|model| model.guidance_file.is_none() && model.core_guidance_file.is_none());
         if load_guidance {
-            for model in [&mut config.solver.answer, &mut config.solver.judge] {
+            for (kind, model) in [
+                (WorkKind::Answer, &mut config.solver.answer),
+                (WorkKind::Judge, &mut config.solver.judge),
+            ] {
                 if let Some(path) = &model.guidance_file {
-                    model.guidance = read_guidance(path)?;
+                    model.guidance = read_guidance(path, kind, "user")?;
                 }
                 if let Some(path) = &model.core_guidance_file {
-                    model.core_guidance = read_guidance(path)?;
+                    model.core_guidance = read_guidance(path, kind, "core")?;
                     ensure!(
                         !model.core_guidance.trim().is_empty(),
-                        "core guidance must not be empty"
+                        ConfigDiagnostic::guidance(
+                            "guidance_empty",
+                            kind,
+                            "core",
+                            "Core guidance must not be empty."
+                        )
                     );
                 }
             }
@@ -428,44 +529,68 @@ impl Config {
     }
 
     fn validate_fields(&self, check_guidance_paths: bool) -> Result<()> {
-        ensure!(
-            self.participation.max_unresolved_operations > 0
-                && self.participation.max_answer_attempts_per_epoch > 0,
-            "participation operation and answer attempt limits must be positive"
-        );
+        for (field, limit) in [
+            (
+                "participation.max_unresolved_operations",
+                self.participation.max_unresolved_operations,
+            ),
+            (
+                "participation.max_answer_attempts_per_epoch",
+                self.participation.max_answer_attempts_per_epoch,
+            ),
+        ] {
+            ensure!(
+                limit > 0,
+                ConfigDiagnostic::field(field, "Participation limits must be positive.")
+            );
+        }
         ensure!(
             self.participation.answer_reserved_slots < self.participation.max_unresolved_operations,
-            "participation.answer_reserved_slots must be below max_unresolved_operations"
+            ConfigDiagnostic::field(
+                "participation.answer_reserved_slots",
+                "Reserved slots must be below max_unresolved_operations."
+            )
         );
         ensure!(
             (1..=8).contains(&self.preparation.max_attempts_per_work),
-            "preparation.max_attempts_per_work must be between 1 and 8"
+            ConfigDiagnostic::field(
+                "preparation.max_attempts_per_work",
+                "Preparation attempts must be between 1 and 8."
+            )
         );
         ensure!(
             self.excluded_judging_assignments
                 .iter()
                 .all(|id| id.len() == 64 && id.bytes().all(|byte| byte.is_ascii_hexdigit())),
-            "excluded_judging_assignments must contain 64-character hexadecimal transaction IDs"
+            ConfigDiagnostic::field(
+                "excluded_judging_assignments",
+                "Excluded assignments must be 64-character hexadecimal transaction IDs."
+            )
         );
-        self.network.origin()?;
-        self.network.api.validate()?;
+        self.network.origin().map_err(|_| ConfigDiagnostic::field("network.base_url", "Inspect base_url and trusted_origins: use explicitly trusted HTTPS or loopback HTTP origins without paths, credentials, query or fragment."))?;
+        self.network.api.validate().map_err(|_| {
+            ConfigDiagnostic::field(
+                "network.api",
+                "Invalid API endpoint paths; inspect the endpoint schema.",
+            )
+        })?;
         ensure!(
             safe_segment(&self.network.chain, 64),
-            "invalid network chain"
+            ConfigDiagnostic::field("network.chain", "Invalid network chain.")
         );
         ensure!(
             self.network.address.is_empty() || valid_address(&self.network.address),
-            "invalid account address"
+            ConfigDiagnostic::field("network.address", "Invalid account address.")
         );
         ensure!(
             !self.state_dir.as_os_str().is_empty(),
-            "state directory is empty"
+            ConfigDiagnostic::field("state_dir", "State directory is empty.")
         );
-        for path in [
-            &self.state_dir,
-            &self.network.credential_file,
-            &self.solver.answer.executable,
-            &self.solver.judge.executable,
+        for (field, path) in [
+            ("state_dir", &self.state_dir),
+            ("network.credential_file", &self.network.credential_file),
+            ("solver.answer.executable", &self.solver.answer.executable),
+            ("solver.judge.executable", &self.solver.judge.executable),
         ] {
             ensure!(
                 !path
@@ -473,16 +598,23 @@ impl Config {
                     .to_string_lossy()
                     .chars()
                     .any(char::is_control),
-                "path contains control characters"
+                ConfigDiagnostic::field(field, "Path contains control characters.")
             );
             ensure!(
                 !path.starts_with("~"),
-                "use an absolute or config-relative path, not a tilde"
+                ConfigDiagnostic::field(
+                    field,
+                    "Use an absolute or config-relative path, not a tilde."
+                )
             );
         }
-        for model in [&self.solver.answer, &self.solver.judge] {
-            let api_url = reqwest::Url::parse(&model.hermes_api_url)
-                .map_err(|_| anyhow::anyhow!("invalid Hermes API URL"))?;
+        for (kind, model) in [
+            (WorkKind::Answer, &self.solver.answer),
+            (WorkKind::Judge, &self.solver.judge),
+        ] {
+            let api_url = reqwest::Url::parse(&model.hermes_api_url).map_err(|_| {
+                ConfigDiagnostic::model(kind, "hermes_api_url", "Invalid Hermes API URL.")
+            })?;
             ensure!(
                 model.hermes_api_url.len() <= 2048
                     && !model
@@ -495,13 +627,18 @@ impl Config {
                     && api_url.password().is_none()
                     && api_url.query().is_none()
                     && api_url.fragment().is_none(),
-                "Hermes API URL requires HTTPS without credentials, query or fragment"
+                ConfigDiagnostic::model(
+                    kind,
+                    "hermes_api_url",
+                    "Hermes API URL requires HTTPS without credentials, query or fragment."
+                )
             );
             if check_guidance_paths {
-                for path in [&model.guidance_file, &model.core_guidance_file]
-                    .into_iter()
-                    .flatten()
-                {
+                for (layer, path) in [
+                    ("user", &model.guidance_file),
+                    ("core", &model.core_guidance_file),
+                ] {
+                    let Some(path) = path else { continue };
                     ensure!(
                         !path.as_os_str().is_empty()
                             && !path.starts_with("~")
@@ -510,65 +647,102 @@ impl Config {
                                 .to_string_lossy()
                                 .chars()
                                 .any(char::is_control),
-                        "guidance paths must be absolute or config-relative"
+                        ConfigDiagnostic::guidance(
+                            "guidance_path_invalid",
+                            kind,
+                            layer,
+                            "Guidance paths must be nonempty absolute or config-relative paths without control characters or a tilde."
+                        )
                     );
                 }
             }
             ensure!(
                 !model.executable.as_os_str().is_empty(),
-                "model executable is empty"
+                ConfigDiagnostic::model(kind, "executable", "Model executable is empty.")
             );
-            for value in [&model.model, &model.reasoning] {
+            for (field, value) in [("model", &model.model), ("reasoning", &model.reasoning)] {
                 ensure!(
                     !value.trim().is_empty()
                         && value.len() <= 256
                         && !value.chars().any(char::is_control),
-                    "invalid model or reasoning setting"
+                    ConfigDiagnostic::model(
+                        kind,
+                        field,
+                        "Model and reasoning settings must be nonempty, at most 256 bytes and contain no control characters."
+                    )
                 );
             }
         }
         if let Some(policy) = &self.schedule.queued_job_polling {
             ensure!(
                 policy.initial_seconds <= policy.max_seconds,
-                "queued job polling initial interval must not exceed its maximum"
+                ConfigDiagnostic::field(
+                    "schedule.queued_job_polling",
+                    "Queued job polling initial interval must not exceed its maximum."
+                )
             );
         }
-        for (seconds, allow_zero) in [
-            (self.timeouts.http_seconds, false),
-            (self.timeouts.effective_read_http_seconds(), false),
-            (self.participation.uncertainty_grace_seconds, true),
-            (self.participation.uncertain_answer_retry_seconds, true),
-            (self.timeouts.model_seconds, false),
-            (self.timeouts.shutdown_seconds, false),
-            (self.schedule.poll_seconds, false),
-            (self.schedule.mine_seconds, false),
-            (self.schedule.retry_seconds, false),
-            (self.schedule.backoff_max_seconds, false),
+        for (field, seconds, allow_zero) in [
+            ("timeouts.http_seconds", self.timeouts.http_seconds, false),
             (
+                "timeouts.read_http_seconds",
+                self.timeouts.effective_read_http_seconds(),
+                false,
+            ),
+            (
+                "participation.uncertainty_grace_seconds",
+                self.participation.uncertainty_grace_seconds,
+                true,
+            ),
+            (
+                "participation.uncertain_answer_retry_seconds",
+                self.participation.uncertain_answer_retry_seconds,
+                true,
+            ),
+            ("timeouts.model_seconds", self.timeouts.model_seconds, false),
+            (
+                "timeouts.shutdown_seconds",
+                self.timeouts.shutdown_seconds,
+                false,
+            ),
+            ("schedule.poll_seconds", self.schedule.poll_seconds, false),
+            ("schedule.mine_seconds", self.schedule.mine_seconds, false),
+            ("schedule.retry_seconds", self.schedule.retry_seconds, false),
+            (
+                "schedule.backoff_max_seconds",
+                self.schedule.backoff_max_seconds,
+                false,
+            ),
+            (
+                "schedule.challenge_retry_seconds",
                 self.schedule
                     .challenge_retry_seconds
                     .unwrap_or(self.schedule.retry_seconds),
                 false,
             ),
             (
+                "schedule.challenge_backoff_max_seconds",
                 self.schedule
                     .challenge_backoff_max_seconds
                     .unwrap_or(self.schedule.backoff_max_seconds),
                 false,
             ),
             (
+                "schedule.assignments_retry_seconds",
                 self.schedule
                     .assignments_retry_seconds
                     .unwrap_or(self.schedule.retry_seconds),
                 false,
             ),
             (
+                "schedule.assignments_backoff_max_seconds",
                 self.schedule
                     .assignments_backoff_max_seconds
                     .unwrap_or(self.schedule.backoff_max_seconds),
                 false,
             ),
             (
+                "schedule.queued_job_polling.initial_seconds",
                 self.schedule
                     .queued_job_polling
                     .as_ref()
@@ -576,20 +750,27 @@ impl Config {
                 false,
             ),
             (
+                "schedule.queued_job_polling.max_seconds",
                 self.schedule
                     .queued_job_polling
                     .as_ref()
                     .map_or(1, |policy| policy.max_seconds),
                 false,
             ),
-            (self.schedule.jitter_seconds, true),
             (
+                "schedule.jitter_seconds",
+                self.schedule.jitter_seconds,
+                true,
+            ),
+            (
+                "schedule",
                 self.schedule
                     .poll_seconds
                     .saturating_add(self.schedule.jitter_seconds),
                 false,
             ),
             (
+                "schedule",
                 self.schedule
                     .backoff_max_seconds
                     .max(self.schedule.retry_seconds)
@@ -597,6 +778,7 @@ impl Config {
                 false,
             ),
             (
+                "schedule",
                 self.schedule
                     .challenge_backoff_max_seconds
                     .unwrap_or(self.schedule.backoff_max_seconds)
@@ -609,6 +791,7 @@ impl Config {
                 false,
             ),
             (
+                "schedule",
                 self.schedule
                     .assignments_backoff_max_seconds
                     .unwrap_or(self.schedule.backoff_max_seconds)
@@ -623,7 +806,10 @@ impl Config {
         ] {
             ensure!(
                 seconds > 0 || allow_zero,
-                "timeouts and schedule intervals must be positive (jitter may be zero)"
+                ConfigDiagnostic::field(
+                    field,
+                    "Timeouts and schedule intervals must be positive; jitter and uncertainty grace/retry may be zero."
+                )
             );
             let duration = std::time::Duration::from_secs(seconds);
             ensure!(
@@ -632,7 +818,10 @@ impl Config {
                         .checked_add(duration)
                         .and_then(|deadline| deadline.duration_since(std::time::UNIX_EPOCH).ok())
                         .is_some_and(|deadline| deadline.as_millis() <= i64::MAX as u128),
-                "timeout or schedule interval overflows a representable deadline"
+                ConfigDiagnostic::field(
+                    field,
+                    "Timeout or schedule interval (including jitter) overflows a representable deadline."
+                )
             );
         }
         if [WorkKind::Answer, WorkKind::Judge, WorkKind::Mine]
@@ -640,9 +829,18 @@ impl Config {
             .any(|&kind| self.mode(kind) == Mode::Active)
         {
             ensure!(
-                !self.network.address.is_empty()
-                    && !self.network.credential_file.as_os_str().is_empty(),
-                "active capabilities require an address and credential file"
+                !self.network.address.is_empty(),
+                ConfigDiagnostic::field(
+                    "network.address",
+                    "Active capabilities require an account address."
+                )
+            );
+            ensure!(
+                !self.network.credential_file.as_os_str().is_empty(),
+                ConfigDiagnostic::field(
+                    "network.credential_file",
+                    "Active capabilities require a credential file."
+                )
             );
         }
         Ok(())
@@ -656,8 +854,12 @@ impl Config {
                 self.mode(kind) != Mode::Active
                     || (model.core_guidance_file.is_some()
                         && !model.core_guidance.trim().is_empty()),
-                "active {} route requires a nonempty core_guidance_file",
-                kind.as_str()
+                ConfigDiagnostic::guidance(
+                    "guidance_required",
+                    kind,
+                    "core",
+                    "Active model routes require a nonempty core_guidance_file."
+                )
             );
         }
         Ok(())
@@ -691,7 +893,7 @@ impl Config {
     }
 }
 
-fn read_guidance(path: &Path) -> Result<Arc<str>> {
+fn read_guidance(path: &Path, kind: WorkKind, layer: &'static str) -> Result<Arc<str>> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -699,22 +901,73 @@ fn read_guidance(path: &Path) -> Result<Arc<str>> {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NONBLOCK);
     }
-    let file = options
-        .open(path)
-        .map_err(|_| anyhow::anyhow!("cannot open model guidance file"))?;
-    let metadata = file
-        .metadata()
-        .map_err(|_| anyhow::anyhow!("cannot inspect model guidance file"))?;
-    ensure!(metadata.is_file(), "model guidance must be a regular file");
+    let file = options.open(path).map_err(|error| {
+        ConfigDiagnostic::guidance(
+            if error.kind() == std::io::ErrorKind::NotFound {
+                "guidance_missing"
+            } else {
+                "guidance_unreadable"
+            },
+            kind,
+            layer,
+            "Cannot open model guidance; inspect the configured file and its access permissions.",
+        )
+    })?;
+    let metadata = file.metadata().map_err(|_| {
+        ConfigDiagnostic::guidance(
+            "guidance_unreadable",
+            kind,
+            layer,
+            "Cannot inspect model guidance file.",
+        )
+    })?;
+    ensure!(
+        metadata.is_file(),
+        ConfigDiagnostic::guidance(
+            "guidance_not_regular",
+            kind,
+            layer,
+            "Model guidance must be a regular file."
+        )
+    );
     ensure!(
         metadata.len() <= MAX_GUIDANCE_BYTES as u64,
-        "model guidance exceeds 64 KiB"
+        ConfigDiagnostic::guidance(
+            "guidance_too_large",
+            kind,
+            layer,
+            "Model guidance exceeds 64 KiB."
+        )
     );
     let mut bytes = Vec::new();
     file.take((MAX_GUIDANCE_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
-        .map_err(|_| anyhow::anyhow!("cannot read model guidance file"))?;
-    validate_guidance_bytes(&bytes)
+        .map_err(|_| {
+            ConfigDiagnostic::guidance(
+                "guidance_unreadable",
+                kind,
+                layer,
+                "Cannot read model guidance file.",
+            )
+        })?;
+    ensure!(
+        bytes.len() <= MAX_GUIDANCE_BYTES,
+        ConfigDiagnostic::guidance(
+            "guidance_too_large",
+            kind,
+            layer,
+            "Model guidance exceeds 64 KiB."
+        )
+    );
+    validate_guidance_bytes(&bytes).map_err(|_| {
+        ConfigDiagnostic::guidance(
+            "guidance_not_utf8",
+            kind,
+            layer,
+            "Model guidance must be UTF-8.",
+        )
+        .into()
+    })
 }
 
 pub(crate) fn validate_guidance_bytes(bytes: &[u8]) -> Result<Arc<str>> {
@@ -1210,9 +1463,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("guidance");
         std::fs::write(&path, [0xff]).unwrap();
-        assert!(read_guidance(&path).is_err());
+        assert!(read_guidance(&path, WorkKind::Answer, "user").is_err());
         std::fs::write(&path, vec![b'a'; MAX_GUIDANCE_BYTES + 1]).unwrap();
-        assert!(read_guidance(&path).is_err());
-        assert!(read_guidance(dir.path()).is_err());
+        assert!(read_guidance(&path, WorkKind::Answer, "user").is_err());
+        assert!(read_guidance(dir.path(), WorkKind::Answer, "user").is_err());
     }
 }

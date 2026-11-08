@@ -28,7 +28,28 @@ raise SystemExit(subprocess.run(['/usr/bin/du', *sys.argv[1:]]).returncode)
     result = subprocess.run(['sh', str(installer), 'stage', str(candidate), '--sha256', digest], env=env, capture_output=True, text=True)
     assert result.returncode != 0, result.stdout
     assert (root/'swapped').exists(), result.stderr
+    evidence = json.loads(result.stdout.splitlines()[-1])
+    assert evidence['failure_code'] == 'digest_mismatch'
+    assert evidence['activation'] == 'not_started'
     observed = marker.exists()
     assert not observed, 'A candidate replaced after verification was executed'
     assert not (home/'.local/share/agmi/releases/current').exists()
     print(json.dumps({'scenario':'candidate_replaced_after_hash','unverified_candidate_executed':observed,'pointer_changed':False}))
+    lock = home / '.local/share/agmi/releases/.install-lock'
+    lock.mkdir()
+    result = subprocess.run(['sh', str(installer), 'service', 'stop'],
+                            env=env, capture_output=True, text=True, timeout=15)
+    evidence = json.loads(result.stdout.splitlines()[-1])
+    assert result.returncode != 0 and evidence['failure_code'] == 'installer_busy'
+    assert lock.is_dir(), 'installer must not remove another owner lock'
+    minimal = root / 'minimal-tools'
+    minimal.mkdir()
+    for name in ('uname', 'dirname', 'sha256sum'):
+        (minimal / name).symlink_to(shutil.which(name))
+    result = subprocess.run(['/bin/sh', str(installer), 'service', 'stop'],
+                            env=dict(env, PATH=str(minimal)), capture_output=True, text=True, timeout=15)
+    evidence = json.loads(result.stdout.splitlines()[-1])
+    assert result.returncode != 0 and evidence['failure_code'] == 'missing_prerequisite'
+    assert evidence['activation'] == 'not_started' and lock.is_dir()
+    print(json.dumps({'scenario': 'safe_failure_categories', 'lock_preserved': True,
+                      'failure_codes': ['digest_mismatch', 'installer_busy', 'missing_prerequisite']}))

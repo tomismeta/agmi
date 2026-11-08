@@ -10,11 +10,12 @@ phase=preflight
 stage_state=not_started
 activation_state=not_started
 service_state=unknown
+failure_code=invalid_arguments
 report_result() {
     result=$1
-    if [ "$result" -eq 0 ]; then outcome=success; else outcome=failed; fi
-    printf '{"schema":"agmi.installer.v1","outcome":"%s","stage":"%s","staging":"%s","activation":"%s","service":"%s","evidence":"this_invocation_only","next_actions":[{"kind":"command","argv":["agmi","service","status"],"authorization_required":false}]}\n' \
-        "$outcome" "$phase" "$stage_state" "$activation_state" "$service_state"
+    if [ "$result" -eq 0 ]; then outcome=success; failure_code=none; else outcome=failed; fi
+    printf '{"schema":"agmi.installer.v1","outcome":"%s","stage":"%s","staging":"%s","activation":"%s","service":"%s","failure_code":"%s","evidence":"this_invocation_only","next_actions":[{"kind":"command","argv":["agmi","service","status"],"authorization_required":false}]}\n' \
+        "$outcome" "$phase" "$stage_state" "$activation_state" "$service_state" "$failure_code"
 }
 trap 'result=$?; trap - 0; report_result "$result"; exit "$result"' 0
 
@@ -36,6 +37,7 @@ usage() {
         'Config: ~/.config/agmi/config.toml; releases: ~/.local/share/agmi/releases.'
 }
 fail() { printf 'agmi release: %s\n' "$*" >&2; exit 1; }
+fail_code() { failure_code=$1; shift; fail "$@"; }
 case ${HOME-} in /*) ;; *) fail 'HOME must be an absolute per-user directory.' ;; esac
 action=${1-}
 target=${2-}
@@ -60,7 +62,7 @@ case $action in
         done ;;
     *) usage >&2; exit 2 ;;
 esac
-[ "$(uname -s)" = Linux ] || fail 'Installation requires Linux user-systemd and GNU coreutils.'
+[ "$(uname -s)" = Linux ] || fail_code unsupported_platform 'Installation requires Linux user-systemd and GNU coreutils.'
 source_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 root=$HOME/.local/share/agmi/releases
 bin_dir=$HOME/.local/bin
@@ -164,8 +166,10 @@ if [ "$action" = stage ] || [ "$action" = install ] || [ "$action" = update ]; t
     case $target in /*) ;; *) fail 'Binary path must be absolute.' ;; esac
     [ "${#expected_hash}" -eq 64 ] || fail 'Stage requires an independently trusted SHA256 digest.'
     case $expected_hash in *[!0-9a-f]*) fail 'SHA256 must be lowercase hexadecimal.' ;; esac
-    [ -f "$target" ] && [ -x "$target" ] && [ ! -L "$target" ] || fail 'Supply a regular executable binary, not a symlink.'
-    [ "$(sha256 "$target")" = "$expected_hash" ] || fail 'Binary does not match the operator-supplied trusted digest.'
+    command -v sha256sum >/dev/null 2>&1 || fail_code missing_prerequisite 'Required Linux command is missing: sha256sum'
+    [ -f "$target" ] && [ ! -L "$target" ] || fail_code candidate_unavailable 'Supply a regular binary, not a symlink.'
+    [ -x "$target" ] || fail_code candidate_execution_unavailable 'Candidate execution is unavailable; check execute permissions and executable staging filesystems.'
+    [ "$(sha256 "$target")" = "$expected_hash" ] || fail_code digest_mismatch 'Binary does not match the operator-supplied trusted digest.'
 elif [ "$action" = activate ]; then
     valid_id "$target" || fail 'Activation requires an explicit trusted r-SHA256 release.'
 elif [ "$action" = service ]; then
@@ -180,7 +184,7 @@ if [ "$dry_run" -eq 1 ]; then
 fi
 
 for command in sha256sum systemctl systemd-analyze df du sync mktemp sed readlink install; do
-    command -v "$command" >/dev/null 2>&1 || fail "Required Linux command is missing: $command"
+    command -v "$command" >/dev/null 2>&1 || fail_code missing_prerequisite "Required Linux command is missing: $command"
 done
 stop_units() (
     failed=0
@@ -202,10 +206,11 @@ validate_loaded() {
     [ "$stop_timeout" = infinity ] || fail 'Loaded stop deadline would truncate configured shutdown policy.'
 }
 if [ "$action" = service ] && [ "$target" = status ]; then phase=status; status; exit 0; fi
+failure_code=preparation_failed
 mkdir -p -- "$root" "$bin_dir" "$unit_dir"
 [ ! -L "$root" ] || fail 'The releases directory must not be a symlink.'
 lock=$root/.install-lock
-mkdir -- "$lock" 2>/dev/null || fail "Another installer or an interrupted installation owns $lock; inspect its owner before removing that lock directory."
+mkdir -- "$lock" 2>/dev/null || fail_code installer_busy "Another installer or an interrupted installation owns $lock; inspect its owner before removing that lock directory."
 printf '%s\n' "$$" > "$lock/owner"
 staging=
 link_temp=
@@ -240,6 +245,7 @@ if [ "$action" = install ]; then
 fi
 if [ "$action" = service ]; then
     phase=service
+    failure_code=service_failed
     case $target in
         stop) stop_units ;;
         disable) systemctl --user disable agmi.service agmi-health.timer ;;
@@ -282,7 +288,7 @@ space_at() {
     label=$3
     available=$(free_kib "$path") || fail "Cannot measure free space for $label."
     printf 'space_%s_available_kib=%s required_kib=%s\n' "$label" "$available" "$required" >&2
-    [ "$available" -ge "$required" ] || fail "Insufficient $label space; retain the journal/history and free unrelated capacity manually."
+    [ "$available" -ge "$required" ] || fail_code insufficient_space "Insufficient $label space; retain the journal/history and free unrelated capacity manually."
 }
 legacy_size() {
     total=0
@@ -294,13 +300,13 @@ legacy_size() {
 space_checks() {
     binary=$1
     incoming=$2
-    state_dir=$("$binary" --config "$config" config state-path) || fail 'Cannot read configured state path (no state was opened).'
-    case $state_dir in /*) ;; *) fail 'Configured state path must be absolute.' ;; esac
+    state_dir=$("$binary" --config "$config" config state-path) || fail_code configuration_invalid 'Cannot read configured state path (no state was opened).'
+    case $state_dir in /*) ;; *) fail_code configuration_invalid 'Configured state path must be absolute.' ;; esac
     state_parent=$(existing_parent "$state_dir")
     canonical_state=$(readlink -m -- "$state_dir")
     canonical_releases=$(readlink -f -- "$root")
     case $canonical_state in
-        "$canonical_releases"|"$canonical_releases"/*) fail 'Participation state must remain outside the releases directory.' ;;
+        "$canonical_releases"|"$canonical_releases"/*) fail_code configuration_invalid 'Participation state must remain outside the releases directory.' ;;
     esac
     retained=$(size_kib "$root")
     legacy=$(legacy_size)
@@ -318,15 +324,18 @@ space_checks() {
 stage_release() {
     phase=staging
     stage_state=in_progress
+    failure_code=release_invalid
     binary=$target
-    [ -f "$binary" ] && [ -x "$binary" ] && [ ! -L "$binary" ] || fail 'Supply a regular executable binary, not a symlink.'
+    [ -f "$binary" ] && [ ! -L "$binary" ] || fail_code candidate_unavailable 'Supply a regular binary, not a symlink.'
+    [ -x "$binary" ] || fail_code candidate_execution_unavailable 'Candidate execution is unavailable; check execute permissions and executable staging filesystems.'
     binary=$(readlink -f -- "$binary")
     binary_hash=$(sha256 "$binary")
-    [ "$binary_hash" = "$expected_hash" ] || fail 'Binary changed after trusted digest verification.'
+    [ "$binary_hash" = "$expected_hash" ] || fail_code digest_mismatch 'Binary changed after trusted digest verification.'
     release_id=r-$binary_hash
     release=$root/$release_id
     if [ -e "$release" ]; then
         validate_release "$release" "$release_id"
+        failure_code=unit_invalid
         systemd-analyze --user verify "$release/agmi.service" "$release/agmi-health.service" "$release/agmi-health.timer"
         stage_state=complete
         printf 'staged_release=%s\n' "$release_id"
@@ -342,7 +351,8 @@ stage_release() {
     space_at "$root" "$((incoming + reserve_kib + margin_kib))" staging
     staging=$(mktemp -d "$root/.stage.XXXXXX")
     install -m 0755 -- "$binary" "$staging/agmi"
-    [ "$(sha256 "$staging/agmi")" = "$expected_hash" ] || fail 'Staged binary changed before execution.'
+    [ "$(sha256 "$staging/agmi")" = "$expected_hash" ] || fail_code digest_mismatch 'Staged binary changed before execution.'
+    [ -x "$staging/agmi" ] || fail_code candidate_execution_unavailable 'Staged candidate execution is unavailable; check execute permissions and executable staging filesystems.'
     space_checks "$staging/agmi" "$((incoming - binary_size))"
     "$staging/agmi" build-info --manifest > "$staging/MANIFEST"
     [ "$(metadata build_format "$staging/MANIFEST")" = 1 ] || fail 'Unsupported binary build identity.'
@@ -370,6 +380,7 @@ stage_release() {
     sync -f "$root"
     # ExecStart is release-pinned, so verification happens after the complete
     # directory is in its final location, but before it is current/activatable.
+    failure_code=unit_invalid
     systemd-analyze --user verify "$release/agmi.service" "$release/agmi-health.service" "$release/agmi-health.timer"
     stage_state=complete
     printf 'staged_release=%s\n' "$release_id"
@@ -382,12 +393,15 @@ if [ "$action" = stage ] || [ "$action" = install ] || [ "$action" = update ]; t
 fi
 
 phase=activation_preflight
+failure_code=release_invalid
 release_id=$target
 valid_id "$release_id" || fail 'Invalid release ID.'
 release=$root/$release_id
 validate_release "$release" "$release_id"
 space_checks "$release/agmi" 0
+failure_code=unit_invalid
 systemd-analyze --user verify "$release/agmi.service" "$release/agmi-health.service" "$release/agmi-health.timer"
+failure_code=release_invalid
 if [ -L "$root/current" ]; then
     previous=$(readlink "$root/current")
     valid_id "$previous" || fail 'Current is not a versioned release pointer.'
@@ -399,7 +413,7 @@ elif [ -e "$root/current" ]; then
     fail 'Current exists but is not a release symlink.'
 fi
 for unit in $units; do
-    [ ! -d "$unit_dir/$unit.d" ] || fail "Review and remove unsupported unit overrides before activation: $unit.d"
+    [ ! -d "$unit_dir/$unit.d" ] || fail_code unit_invalid "Review and remove unsupported unit overrides before activation: $unit.d"
 done
 # Preserve start intent before stopping. A fresh/stopped installation stays stopped.
 runtime_active=0
@@ -407,6 +421,7 @@ timer_active=0
 systemctl --user is-active --quiet agmi.service && runtime_active=1
 systemctl --user is-active --quiet agmi-health.timer && timer_active=1
 phase=stopping
+failure_code=stop_failed
 activation_state=in_progress
 service_state=unknown
 activation=1
@@ -416,6 +431,7 @@ pid=${pid:-0}
 [ "$pid" = 0 ] || fail 'The previous runtime did not stop; activation is blocked.'
 service_state=stopped
 phase=switching
+failure_code=switch_failed
 
 # Keep the unversioned pilot artifacts for inspection only. They are not a
 # compatible rollback release and are never offered as an activation target.
@@ -454,6 +470,7 @@ activation_state=selected
 link_temp=
 sync -f "$root"
 phase=reloading
+failure_code=reload_failed
 systemctl --user daemon-reload
 validate_loaded
 activation_state=loaded_verified
@@ -469,6 +486,7 @@ if [ "$stopped" -eq 1 ]; then
     exit 0
 fi
 phase=starting
+failure_code=start_failed
 service_state=unknown
 if [ "$runtime_active" -eq 1 ]; then
     systemctl --user start agmi.service

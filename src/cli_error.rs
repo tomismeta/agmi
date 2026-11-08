@@ -76,6 +76,46 @@ pub(crate) fn parser(error: &clap::Error, config: Option<&Path>) -> Value {
 }
 
 pub(crate) fn execution(error: &Error, config: Option<&Path>) -> Value {
+    if let Some(diagnostic) = error.downcast_ref::<agmi::config::ConfigDiagnostic>() {
+        let mut actions = vec![action(
+            config,
+            if diagnostic.is_missing() {
+                &["init", "--help"]
+            } else {
+                &["config", "schema"]
+            },
+            false,
+        )];
+        if let Some((kind, layer)) = diagnostic.guidance_selector() {
+            actions = vec![
+                action(config, &["config", "show"], false),
+                json!({"kind":"instruction","authorization_required":true,
+                    "message":"Repair the selected route's guidance file or configured path. Use a readable UTF-8 regular file of at most 64 KiB; core guidance must be nonempty. Do not disable the route or replace core instructions merely to bypass validation."}),
+                action(
+                    config,
+                    &[
+                        "guidance",
+                        "set",
+                        "--kind",
+                        kind.as_str(),
+                        "--layer",
+                        layer,
+                        "--help",
+                    ],
+                    false,
+                ),
+            ];
+        } else {
+            actions.push(json!({"kind":"instruction","authorization_required":true,
+                "message":"Inspect the selected configuration locally and repair the reported field, file format or file access. Use the schema for supported names, types and values; preserve account identity, credentials and journal state. Run config check after repair."}));
+        }
+        return json!({
+            "code":if diagnostic.is_missing() { "config_missing" } else { "config_invalid" },
+            "message":diagnostic.to_string(),
+            "details":diagnostic,
+            "next_actions":actions
+        });
+    }
     if error.is::<agmi::store::RoutingProfileError>() {
         return json!({
             "code":"api_routing_pending",
@@ -113,7 +153,7 @@ pub(crate) fn execution(error: &Error, config: Option<&Path>) -> Value {
     });
     let command: &[&str] = match code {
         "config_missing" => &["init", "--help"],
-        "config_invalid" => &["config", "check"],
+        "config_invalid" => &["config", "schema"],
         "registration_configuration_invalid" => &["identity", "create", "--help"],
         "admin_routing_runtime_active" => &["status"],
         "admin_revision_conflict" | "admin_io" | "admin_unsafe_file" => &["config", "show"],
@@ -164,7 +204,51 @@ pub(crate) fn execution(error: &Error, config: Option<&Path>) -> Value {
         value["message"] =
             json!("Installer did not complete; inspect installation before retrying.");
         value["details"] = error.evidence.clone();
-        value["next_actions"] = json!([action(None, &["service", "status"], false)]);
+        let reason = error.evidence["failure_code"].as_str().unwrap_or("unknown");
+        let repair = match reason {
+            "unsupported_platform" => "Use Linux with an available user-systemd manager.",
+            "invalid_arguments" => {
+                "Inspect install or update help and correct the requested arguments."
+            }
+            "missing_prerequisite" => {
+                "Install the required Linux command dependencies before retrying."
+            }
+            "candidate_unavailable" => "Select an accessible regular executable release candidate.",
+            "candidate_execution_unavailable" => {
+                "Inspect candidate execute permissions and access, and use an executable TMPDIR and staging filesystem."
+            }
+            "digest_mismatch" => {
+                "Recheck the candidate against an independently trusted SHA256 digest; do not execute an unverified candidate."
+            }
+            "installer_busy" => {
+                "Inspect the current installer and lock ownership; do not remove a lock held by another installer."
+            }
+            "preparation_failed" => {
+                "Inspect installation directory permissions and filesystem capacity."
+            }
+            "release_invalid" => "Select a verified release compatible with this host.",
+            "configuration_invalid" => {
+                "Repair the selected configuration before retrying installation."
+            }
+            "insufficient_space" => {
+                "Free unrelated filesystem capacity; never delete the journal, WAL, retained evidence or credentials."
+            }
+            "unit_invalid" => {
+                "Inspect the user-service unit and overrides before changing installation state."
+            }
+            "stop_failed" | "switch_failed" | "reload_failed" | "start_failed"
+            | "service_failed" => {
+                "Inspect the installed release, user-service state and unit overrides manually before any retry or rollback."
+            }
+            _ => {
+                "Inspect installation and user-service state manually; the failure reason is unavailable. Do not infer that activation was rolled back."
+            }
+        };
+        value["next_actions"] = json!([
+            action(None, &["service", "status"], false),
+            {"kind":"instruction","authorization_required":false,"message":repair},
+            action(config, if reason == "configuration_invalid" { &["config", "check"] } else { &["install", "--help"] }, false)
+        ]);
     }
     value
 }
@@ -374,6 +458,60 @@ fn print_actions(actions: &Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installer_failures_offer_reason_specific_repairs_without_outer_context() {
+        for (reason, instruction) in [
+            ("unknown", "reason is unavailable"),
+            ("unsupported_platform", "Linux"),
+            ("invalid_arguments", "arguments"),
+            ("missing_prerequisite", "dependencies"),
+            ("candidate_unavailable", "regular executable"),
+            ("candidate_execution_unavailable", "executable TMPDIR"),
+            ("digest_mismatch", "trusted SHA256"),
+            ("installer_busy", "lock ownership"),
+            ("preparation_failed", "permissions"),
+            ("release_invalid", "compatible"),
+            ("configuration_invalid", "configuration"),
+            ("insufficient_space", "never delete the journal"),
+            ("unit_invalid", "overrides"),
+            ("stop_failed", "manually"),
+            ("switch_failed", "manually"),
+            ("reload_failed", "manually"),
+            ("start_failed", "manually"),
+            ("service_failed", "manually"),
+        ] {
+            let error = Error::new(agmi::lifecycle::InstallerError {
+                evidence: json!({"failure_code":reason,"stage":"preflight","activation":"not_started","service":"unknown"}),
+            }).context("private-installer-path-and-output");
+            let value = execution(&error, Some(Path::new("/selected/config.toml")));
+            assert_eq!(value["code"], "installer_failed");
+            assert_eq!(value["details"]["failure_code"], reason);
+            assert!(
+                value["next_actions"][1]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains(instruction)
+            );
+            assert_eq!(
+                value["next_actions"][0]["argv"],
+                json!(["agmi", "service", "status"])
+            );
+            if reason == "configuration_invalid" {
+                assert_eq!(
+                    value["next_actions"][2]["argv"],
+                    json!([
+                        "agmi",
+                        "--config",
+                        "/selected/config.toml",
+                        "config",
+                        "check"
+                    ])
+                );
+            }
+            assert!(!value.to_string().contains("private-installer"));
+        }
+    }
 
     #[test]
     fn diagnostic_actions_use_only_supplied_future_deadlines_and_keep_risk() {

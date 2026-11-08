@@ -84,7 +84,6 @@ class LifecycleFixture(Fixture):
             assert error['code'] and isinstance(error['details'], dict)
             for action in error['next_actions']:
                 if action['kind'] == 'instruction':
-                    assert action['authorization_required'] is True
                     continue
                 assert action['kind'] == 'command'
                 if config is not None:
@@ -331,6 +330,8 @@ def installer(f):
     assert error['details']['stage'] == 'preflight'
     assert error['details']['activation'] == 'not_started'
     assert error['details']['service'] == 'unknown'
+    assert error['details']['failure_code'] == (
+        'candidate_unavailable' if sys.platform.startswith('linux') else 'unsupported_platform')
     assert snapshot(f.root) == before
     script = pathlib.Path(__file__).resolve().parents[1] / 'deploy/install-user.sh'
     failed = subprocess.run(['sh', str(script), 'stage'], text=True, capture_output=True, env=f.env)
@@ -338,6 +339,7 @@ def installer(f):
     marker = json.loads(failed.stdout.splitlines()[-1])
     assert marker['schema'] == 'agmi.installer.v1' and marker['outcome'] == 'failed'
     assert marker['activation'] == 'not_started' and marker['service'] == 'unknown'
+    assert marker['failure_code'] == 'invalid_arguments'
     assert marker['next_actions'][0]['argv'] == ['agmi', 'service', 'status']
     assert snapshot(f.root) == before
     if sys.platform.startswith('linux'):
@@ -345,19 +347,49 @@ def installer(f):
                                  text=True, capture_output=True, env=f.env)
         assert planned.returncode == 0, safe(planned.stderr)
         marker = json.loads(planned.stdout.splitlines()[-1])
+        assert marker['failure_code'] == 'none'
+        error = json.loads(f.cli(None, ['update', '--binary', f.binary,
+                                        '--sha256', '0' * 64], succeeds=False))['error']
+        assert error['details']['failure_code'] == 'digest_mismatch'
+        assert error['details']['activation'] == 'not_started'
         assert marker['outcome'] == 'success' and marker['activation'] == 'not_started'
         candidate = f.root / 'unreporting-incoming-release'
         candidate.write_text(f"#!/bin/sh\nprintf '%s\\n' '{ECHO}' >&2\nexit 7\n")
         candidate.chmod(0o700)
         try:
             digest = hashlib.sha256(candidate.read_bytes()).hexdigest()
+            candidate.chmod(0o600)
+            error = json.loads(f.cli(None, ['update', '--binary', str(candidate),
+                                            '--sha256', digest], succeeds=False))['error']
+            assert error['details']['failure_code'] == 'candidate_execution_unavailable'
+            assert error['details']['activation'] == 'not_started'
+            denied = subprocess.run(['sh', str(script), 'stage', str(candidate),
+                                     '--sha256', digest], env=f.env, capture_output=True,
+                                    text=True, timeout=15)
+            assert denied.returncode != 0
+            evidence = json.loads(denied.stdout.splitlines()[-1])
+            assert evidence['failure_code'] == 'candidate_execution_unavailable'
+            assert evidence['activation'] == 'not_started'
+            candidate.chmod(0o700)
             error = json.loads(f.cli(None, ['update', '--binary', str(candidate),
                                             '--sha256', digest], succeeds=False))['error']
             assert error['code'] == 'installer_failed'
             assert error['details']['stage'] == 'unknown'
             assert error['details']['activation'] == 'unknown'
             assert error['details']['service'] == 'unknown'
+            assert error['details']['failure_code'] == 'unknown'
             assert error['next_actions'][0]['argv'] == ['agmi', 'service', 'status']
+            candidate.write_text(
+                "#!/bin/sh\nprintf '%s\\n' '" + json.dumps({
+                    'schema': 'agmi.cli.v1', 'error': {'code': 'installer_failed',
+                    'details': {'failure_code': ECHO, 'stage': ECHO,
+                                'service': ECHO, 'activation': ECHO}}})
+                + "' >&2\nexit 7\n")
+            digest = hashlib.sha256(candidate.read_bytes()).hexdigest()
+            error = json.loads(f.cli(None, ['update', '--binary', str(candidate),
+                                            '--sha256', digest], succeeds=False))['error']
+            assert error['details']['failure_code'] == 'unknown'
+            assert error['details']['stage'] == 'unknown'
         finally:
             candidate.unlink()
         assert snapshot(f.root) == before

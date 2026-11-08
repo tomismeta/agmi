@@ -8,6 +8,9 @@ import { randomUUID } from 'node:crypto';
 const emit = process.stdout.write.bind(process.stdout);
 process.stdout.write = process.stderr.write.bind(process.stderr);
 let started = false;
+// Match solver.rs: one more JSON escaping pass over the complete request
+// allowance, plus envelope/policy/model metadata. Do not reduce guidance/task limits.
+const MAX_INPUT_BYTES = 2 * (128 * 1024 + 12 * 64 * 1024) + 16 * 1024;
 
 try {
   let input = '';
@@ -15,7 +18,7 @@ try {
   process.stdin.setEncoding('utf8');
   for await (const chunk of process.stdin) {
     bytes += Buffer.byteLength(chunk);
-    if (bytes > 1024 * 1024) throw new Error('input limit');
+    if (bytes > MAX_INPUT_BYTES) throw new Error('input limit');
     input += chunk;
   }
   const request = JSON.parse(input);

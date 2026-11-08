@@ -796,8 +796,11 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
     };
     let config = match config {
         Ok(config) => config,
-        Err(_) => {
-            let code = if path.try_exists().ok() == Some(false) {
+        Err(error) => {
+            let code = if error
+                .downcast_ref::<agmi::config::ConfigDiagnostic>()
+                .is_some_and(agmi::config::ConfigDiagnostic::is_missing)
+            {
                 "config_missing"
             } else {
                 "config_invalid"
@@ -805,8 +808,7 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
             if matches!(cli.command, Command::Health { .. }) {
                 return Ok(("health", health_prerequisite(code)));
             }
-            return Err(cli_error::BoundaryError(code,
-                "Configuration is missing, unreadable or invalid; private contents are not displayed.").into());
+            return Err(error);
         }
     };
     match &cli.command {
@@ -1063,9 +1065,10 @@ async fn main() {
                 );
             } else {
                 eprintln!(
-                    "agmi: {} [{}]",
+                    "agmi: {} [{}] {}",
                     error["message"].as_str().unwrap_or("Operation failed"),
-                    error["code"].as_str().unwrap_or("operation_failed")
+                    error["code"].as_str().unwrap_or("operation_failed"),
+                    error["details"]
                 );
                 eprintln!("Next: {}", error["next_actions"]);
             }

@@ -161,6 +161,50 @@ def due_backlog(f):
             'writes_unchanged': 3}
 
 
+def independent_scope(f):
+    f.pending_polls = 100
+    f.retry_seconds = 1
+    f.configure(mode='participation_first', uncertainty_grace_seconds=0,
+                max_unresolved_operations=8)
+    f.apply_config({'schedule': {'queued_job_polling': {'initial_seconds': 60, 'max_seconds': 60}}})
+    f.start(resume=True)
+    for count in range(1, 4):
+        expected = 'included_pending' if count == 3 else 'queued'
+        f.wait(lambda: len(f.writes) == count and
+               any(o['state'] == expected and o['work_key'].startswith(str(f.epoch) + ':')
+                   for o in f.operations('answer')), 'bound fixture work did not settle locally')
+        if count < 3:
+            with f.lock:
+                if count == 2:
+                    f.answer_response = 'included'
+                    f.receipt_state = 'included_pending'
+                f.epoch += 1
+    f.stop()
+    f.apply_config({'capabilities': {'answer': 'off'}})
+    receipt_deadline = f.rows("SELECT next_at FROM read_backoff WHERE scope='receipt'")
+    if receipt_deadline:
+        f.wait(lambda: int(time.time()) >= receipt_deadline[0]['next_at'],
+               'fixture receipt scope is not yet eligible', seconds=3)
+    floor = int(time.time()) + 60
+    # Isolated deadline setup only: preserve actual queued/included payloads
+    # and evidence, but make two Job rows due behind their endpoint floor.
+    with sqlite3.connect(f.database) as db:
+        db.execute("UPDATE operations SET next_at=0 WHERE state IN ('queued','included_pending')")
+        db.execute("INSERT OR REPLACE INTO read_backoff(scope,failures,next_at) VALUES ('job',1,?)", (floor,))
+        db.execute("INSERT INTO read_observations(scope,server_not_before) VALUES ('job',?) "
+                   "ON CONFLICT(scope) DO UPDATE SET server_not_before=excluded.server_not_before", (floor,))
+    f.receipt_state = 'final'
+    before = len(f.job_polls)
+    f.start()
+    f.wait(lambda: any(o['state'] == 'final' for o in f.operations('answer')),
+           'Job endpoint floor starved an eligible Receipt poll', seconds=5)
+    assert len(f.job_polls) == before
+    assert sum(o['state'] == 'queued' for o in f.operations('answer')) == 2
+    assert len(f.writes) == 3
+    return dict(receipt_finalized_behind_two_blocked_jobs=True, blocked_jobs_not_polled=True,
+                writes_unchanged=3)
+
+
 def retry_age(f):
     f.expire_jobs = True
     f.apply_config({'schedule': {'queued_job_polling': {'initial_seconds': 1, 'max_seconds': 4}}})
@@ -176,7 +220,7 @@ def retry_age(f):
 
 SCENARIOS = {'fast_polling': fast_polling, 'retained_floor': retained_floor,
              'risk_health': risk_health, 'policy_administration': policy_administration,
-             'due_backlog': due_backlog, 'retry_age': retry_age}
+             'due_backlog': due_backlog, 'independent_scope': independent_scope, 'retry_age': retry_age}
 
 
 def main():

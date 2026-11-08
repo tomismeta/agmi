@@ -526,10 +526,44 @@ impl std::fmt::Display for InstallerError {
 }
 impl std::error::Error for InstallerError {}
 
+fn installer_preflight_error(code: &'static str) -> anyhow::Error {
+    InstallerError {
+        evidence: installer_evidence(Some(&json!({
+            "stage":"preflight","staging":"not_started","activation":"not_started",
+            "service":"unknown","failure_code":code
+        }))),
+    }
+    .into()
+}
+
 fn installer_evidence(value: Option<&Value>) -> Value {
     let mut result = json!({"stage":"unknown","staging":"unknown","activation":"unknown","service":"unknown",
-        "evidence":"this_invocation_only","installation_state":"not_inspected"});
+        "failure_code":"unknown","evidence":"this_invocation_only","installation_state":"not_inspected"});
     for (key, allowed) in [
+        (
+            "failure_code",
+            &[
+                "unknown",
+                "none",
+                "unsupported_platform",
+                "invalid_arguments",
+                "missing_prerequisite",
+                "candidate_unavailable",
+                "candidate_execution_unavailable",
+                "digest_mismatch",
+                "installer_busy",
+                "preparation_failed",
+                "release_invalid",
+                "configuration_invalid",
+                "insufficient_space",
+                "unit_invalid",
+                "stop_failed",
+                "switch_failed",
+                "reload_failed",
+                "start_failed",
+                "service_failed",
+            ][..],
+        ),
         (
             "stage",
             &[
@@ -596,12 +630,16 @@ fn incoming_installer(binary: &Path, action: &str, digest: &str, stopped: bool) 
     if stopped {
         command.arg("--stopped");
     }
-    let result = command
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|_| InstallerError {
-            evidence: installer_evidence(None),
-        })?;
+    let result = command.stdin(Stdio::null()).output().map_err(|error| {
+        if error.kind() == std::io::ErrorKind::PermissionDenied {
+            installer_preflight_error("candidate_execution_unavailable")
+        } else {
+            InstallerError {
+                evidence: installer_evidence(None),
+            }
+            .into()
+        }
+    })?;
     if !result.status.success() {
         let evidence = result
             .stderr
@@ -637,12 +675,7 @@ pub fn installer(arguments: &[String], dry_run: bool) -> Result<Value> {
         if error.downcast_ref::<InstallerError>().is_some() {
             error
         } else {
-            InstallerError {
-                evidence: json!({"stage":"preflight","staging":"not_started",
-            "activation":"not_started","service":"unknown","evidence":"this_invocation_only",
-            "installation_state":"not_inspected"}),
-            }
-            .into()
+            installer_preflight_error("preparation_failed")
         }
     })
 }
@@ -651,15 +684,14 @@ fn installer_inner(arguments: &[String], dry_run: bool) -> Result<Value> {
     let mut plan = json!({"arguments":arguments,"dry_run":dry_run,"network_downloads":false,
         "trust":"Local operator-trusted binary and expected SHA256 only; hashes/build labels are not signed publisher or source provenance.",
         "pause_state":"unchanged","journal":"never copied, restored or migrated by installer","preview":"plan only; operational preconditions are checked on execution",
-        "stage":"preflight","staging":"not_started","activation":"not_started","service":"unknown"});
+        "stage":"preflight","staging":"not_started","activation":"not_started","service":"unknown","failure_code":"none"});
     if dry_run {
         plan["installation"] = installer_evidence(Some(&plan));
         return Ok(plan);
     }
-    ensure!(
-        cfg!(target_os = "linux"),
-        "service installation requires Linux user-systemd"
-    );
+    if !cfg!(target_os = "linux") {
+        return Err(installer_preflight_error("unsupported_platform"));
+    }
     let root = std::env::temp_dir();
     let directory = (0..1000)
         .find_map(|n| {
@@ -688,15 +720,14 @@ fn installer_inner(arguments: &[String], dry_run: bool) -> Result<Value> {
         let source = Path::new(
             arguments
                 .get(1)
-                .context("local release binary is required")?,
+                .ok_or_else(|| installer_preflight_error("invalid_arguments"))?,
         );
-        ensure!(
-            arguments.get(2).map(String::as_str) == Some("--sha256"),
-            "expected trusted SHA256 argument is missing"
-        );
+        if arguments.get(2).map(String::as_str) != Some("--sha256") {
+            return Err(installer_preflight_error("invalid_arguments"));
+        }
         let expected = arguments
             .get(3)
-            .context("expected trusted SHA256 digest is missing")?;
+            .ok_or_else(|| installer_preflight_error("invalid_arguments"))?;
         let mut options = fs::OpenOptions::new();
         options.read(true);
         #[cfg(unix)]
@@ -706,21 +737,19 @@ fn installer_inner(arguments: &[String], dry_run: bool) -> Result<Value> {
         }
         let mut source = options
             .open(source)
-            .context("cannot open local release binary")?;
+            .map_err(|_| installer_preflight_error("candidate_unavailable"))?;
         let metadata = source
             .metadata()
-            .context("cannot inspect local release binary")?;
-        ensure!(
-            metadata.is_file(),
-            "local release binary must be a regular file"
-        );
+            .map_err(|_| installer_preflight_error("candidate_unavailable"))?;
+        if !metadata.is_file() {
+            return Err(installer_preflight_error("candidate_unavailable"));
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            ensure!(
-                metadata.permissions().mode() & 0o111 != 0,
-                "local release binary is not executable"
-            );
+            if metadata.permissions().mode() & 0o111 == 0 {
+                return Err(installer_preflight_error("candidate_execution_unavailable"));
+            }
         }
         let candidate = directory.0.join("incoming-agmi");
         let mut options = fs::OpenOptions::new();
@@ -741,10 +770,9 @@ fn installer_inner(arguments: &[String], dry_run: bool) -> Result<Value> {
         let actual = binary_digest(
             fs::File::open(&candidate).context("cannot inspect copied incoming executable")?,
         )?;
-        ensure!(
-            &actual == expected,
-            "incoming executable does not match the operator-supplied trusted SHA256; nothing was executed"
-        );
+        if &actual != expected {
+            return Err(installer_preflight_error("digest_mismatch"));
+        }
         // Linux /proc pins the running image even if its installation path changed.
         let running = binary_digest(
             fs::File::open("/proc/self/exe")

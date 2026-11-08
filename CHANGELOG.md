@@ -4,6 +4,13 @@
 
 Source change history; this heading does not assert publication, signed release provenance or live acceptance of every feature.
 
+- Give HTTP transport and model execution one normal deadline each, preserving received retry evidence and known-prelaunch failure classification. Persist completed submissions before unrelated observations and retain explicit shutdown cleanup.
+- Abstain locally from assignments without original-word evidence before model preparation; keep later usable seats eligible. Record bounded, revision-fenced inventory selection evidence without claiming global absence from partial pages.
+- Advance reconciliation fairness only for eligible polling candidates, so endpoint backoff cannot repeatedly skip newer bound work while consuming its cursor position.
+- Replace misleading top-level blocker identity/age fields with explicit oldest-unresolved evidence; keep actual per-capability blocking reasons separate. Add sanitized configuration reasons and actionable installer failure categories, including executable staging prerequisites.
+- Preserve historical registration success after credential replacement without verifying the replacement or permitting create-only publication to overwrite it.
+- Align the fully encoded OpenClaw input boundary with supported task/guidance budgets. Exercise actual native bridges with isolated API substitutes and release activation with disposable real user-systemd acceptance. Clarify that pause fences admission/results rather than cancelling existing inference.
+
 - Add explicit hosted identity creation with a nonmutating plan, confirmation, bounded proof of work, private one-time credential capture and local registration status. Durable intent fences duplicate POSTs; captured results resume locally without automatic registration retry. Disclose the remote-creation-to-durable-capture lost-key crash window. Public live admission compatibility remains unverified; the latest observed join-PoW request returned HTTP 503.
 - Centralize network origin, chain, explicit trusted origins and every typed API route in `defaults/network.toml`; support runtime `[network.api]` overrides and onboarding `--network-config` profiles. Adding trust authorizes credential delivery. Require stopped, drained state for profile changes; preserve prepared/unresolved work and reconciliation under the old profile.
 - Add default-zero `max_historical_unknown_answers`, a bounded participation-first capacity allowance backed by a later linked accepted answer, while retaining original uncertainty and durable witnesses. No settlement or nonexecution claim is inferred.

@@ -48,6 +48,12 @@ fn malformed_configuration_does_not_echo_its_contents() {
     assert!(output.stdout.is_empty());
     let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
     assert_eq!(error["ok"], false);
+    assert_eq!(error["error"]["code"], "config_invalid");
+    assert_eq!(error["error"]["details"]["reason"], "parse_invalid");
+    assert_eq!(
+        error["error"]["next_actions"][0]["argv"],
+        serde_json::json!(["agmi", "--config", path, "config", "schema"])
+    );
 }
 
 #[test]
@@ -634,9 +640,9 @@ fn suggested_actions_preserve_selected_config_across_working_directories() {
         .args(argv.iter().skip(1).map(|value| value.as_str().unwrap()))
         .output()
         .unwrap();
-    assert!(!replay.status.success());
-    let replay: serde_json::Value = serde_json::from_slice(&replay.stderr).unwrap();
-    assert_eq!(replay["error"]["code"], "config_invalid");
+    assert!(replay.status.success());
+    let replay: serde_json::Value = serde_json::from_slice(&replay.stdout).unwrap();
+    assert_eq!(replay["ok"], true);
     assert!(!first.join("state").exists() && !second.join("state").exists());
 }
 
@@ -659,4 +665,236 @@ fn default_onboarding_path_matches_service_despite_xdg_override() {
     );
     assert!(home.join(".config/agmi/config.toml").is_file());
     assert!(!xdg.exists());
+}
+
+#[test]
+fn configuration_check_reports_safe_file_and_field_repairs() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let marker = "private-config-diagnostic-canary";
+    let mut config = agmi::config::Config::default();
+    config.state_dir = dir.path().join("uncreated-state");
+    let valid = toml::to_string(&config).unwrap();
+    let mut cases = vec![
+        (None, "file_missing", None),
+        (Some(vec![0xff]), "file_not_utf8", None),
+        (Some(vec![b' '; 65537]), "file_too_large", None),
+        (
+            Some(format!("{marker} = 'secret'\n").into_bytes()),
+            "parse_invalid",
+            None,
+        ),
+        (
+            Some(format!("[timeouts]\nhttp_seconds = '{marker}'\n").into_bytes()),
+            "parse_invalid",
+            None,
+        ),
+    ];
+    config.timeouts.model_seconds = 0;
+    cases.push((
+        Some(toml::to_string(&config).unwrap().into_bytes()),
+        "field_invalid",
+        Some("timeouts.model_seconds"),
+    ));
+    config.timeouts.model_seconds = u64::MAX;
+    cases.push((
+        Some(toml::to_string(&config).unwrap().into_bytes()),
+        "field_invalid",
+        Some("timeouts.model_seconds"),
+    ));
+    config = toml::from_str(&valid).unwrap();
+    config.schedule.poll_seconds = 0;
+    cases.push((
+        Some(toml::to_string(&config).unwrap().into_bytes()),
+        "field_invalid",
+        Some("schedule.poll_seconds"),
+    ));
+    config = toml::from_str(&valid).unwrap();
+    config.network.base_url = format!("https://{marker}:secret@example.invalid");
+    cases.push((
+        Some(toml::to_string(&config).unwrap().into_bytes()),
+        "field_invalid",
+        Some("network.base_url"),
+    ));
+    config = toml::from_str(&valid).unwrap();
+    config.solver.judge.reasoning = format!("{marker}\n");
+    cases.push((
+        Some(toml::to_string(&config).unwrap().into_bytes()),
+        "field_invalid",
+        Some("reasoning"),
+    ));
+    for (bytes, reason, field) in cases {
+        if let Some(bytes) = bytes {
+            fs::write(&path, bytes).unwrap();
+        }
+        for json in [true, false] {
+            let mut command = binary();
+            command.args(["--config", path.to_str().unwrap()]);
+            if json {
+                command.arg("--json");
+            }
+            let output = command.args(["config", "check"]).output().unwrap();
+            assert!(!output.status.success());
+            assert!(output.stdout.is_empty());
+            let text = String::from_utf8_lossy(&output.stderr);
+            assert!(!text.contains(marker));
+            assert!(text.contains(reason), "{text}");
+            if json {
+                let envelope: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+                let error = &envelope["error"];
+                assert_eq!(
+                    error["code"],
+                    if reason == "file_missing" {
+                        "config_missing"
+                    } else {
+                        "config_invalid"
+                    }
+                );
+                assert_eq!(error["details"]["reason"], reason);
+                assert_eq!(error["details"]["field"], serde_json::json!(field));
+                assert_eq!(error["next_actions"][0]["authorization_required"], false);
+                assert!(
+                    error["next_actions"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .all(|action| {
+                            action["argv"].as_array().is_none_or(|argv| {
+                                !argv.ends_with(&[
+                                    serde_json::json!("config"),
+                                    serde_json::json!("check"),
+                                ])
+                            })
+                        })
+                );
+            } else if let Some(field) = field {
+                assert!(text.contains(field));
+            }
+        }
+    }
+    fs::remove_file(&path).unwrap();
+    fs::create_dir(&path).unwrap();
+    let output = binary()
+        .args([
+            "--config",
+            path.to_str().unwrap(),
+            "--json",
+            "config",
+            "check",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(error["error"]["details"]["reason"], "file_unreadable");
+    assert!(!dir.path().join("uncreated-state").exists());
+}
+
+#[test]
+fn configuration_check_identifies_guidance_route_and_layer_without_private_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let marker = "private-guidance-diagnostic-canary";
+    let guidance = dir.path().join(marker);
+    let mut config = agmi::config::Config::default();
+    config.state_dir = dir.path().join("uncreated-state");
+    config.network.address = "poa111111111111111111111111111111111".into();
+    config.network.credential_file = dir.path().join(marker);
+    for (kind, layer) in [
+        ("answer", "core"),
+        ("answer", "user"),
+        ("judge", "core"),
+        ("judge", "user"),
+    ] {
+        config.solver.answer.core_guidance_file = None;
+        config.solver.answer.guidance_file = None;
+        config.solver.judge.core_guidance_file = None;
+        config.solver.judge.guidance_file = None;
+        config.capabilities.answer = agmi::config::Mode::ReadOnly;
+        config.capabilities.judge = agmi::config::Mode::ReadOnly;
+        let reasons: &[&str] = if layer == "core" {
+            &[
+                "guidance_required",
+                "guidance_missing",
+                "guidance_empty",
+                "guidance_not_utf8",
+                "guidance_too_large",
+                "guidance_not_regular",
+                "guidance_path_invalid",
+            ]
+        } else {
+            &[
+                "guidance_missing",
+                "guidance_not_utf8",
+                "guidance_too_large",
+                "guidance_not_regular",
+                "guidance_path_invalid",
+            ]
+        };
+        for &reason in reasons {
+            let model = if kind == "answer" {
+                &mut config.solver.answer
+            } else {
+                &mut config.solver.judge
+            };
+            let selected = if layer == "core" {
+                &mut model.core_guidance_file
+            } else {
+                &mut model.guidance_file
+            };
+            *selected = Some(guidance.clone());
+            match reason {
+                "guidance_required" => *selected = None,
+                "guidance_missing" => {
+                    let _ = fs::remove_file(&guidance);
+                }
+                "guidance_empty" => fs::write(&guidance, " \n").unwrap(),
+                "guidance_not_utf8" => fs::write(&guidance, [0xff]).unwrap(),
+                "guidance_too_large" => fs::write(&guidance, vec![b'x'; 65537]).unwrap(),
+                "guidance_not_regular" => *selected = Some(dir.path().to_path_buf()),
+                "guidance_path_invalid" => *selected = Some(format!("~/{marker}").into()),
+                _ => unreachable!(),
+            }
+            if layer == "core" {
+                if kind == "answer" {
+                    config.capabilities.answer = agmi::config::Mode::Active;
+                } else {
+                    config.capabilities.judge = agmi::config::Mode::Active;
+                }
+            }
+            fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+            let output = binary()
+                .args([
+                    "--config",
+                    path.to_str().unwrap(),
+                    "--json",
+                    "config",
+                    "check",
+                ])
+                .output()
+                .unwrap();
+            assert!(!output.status.success());
+            assert!(output.stdout.is_empty());
+            assert!(!String::from_utf8_lossy(&output.stderr).contains(marker));
+            let envelope: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+            let error = &envelope["error"];
+            assert_eq!(error["code"], "config_invalid");
+            assert_eq!(
+                error["details"],
+                serde_json::json!({"reason":reason,"kind":kind,"layer":layer})
+            );
+            assert_eq!(
+                error["next_actions"][0]["argv"],
+                serde_json::json!(["agmi", "--config", path, "config", "show"])
+            );
+            assert_eq!(
+                error["next_actions"][2]["argv"],
+                serde_json::json!([
+                    "agmi", "--config", path, "guidance", "set", "--kind", kind, "--layer", layer,
+                    "--help"
+                ])
+            );
+        }
+    }
+    assert!(!dir.path().join("uncreated-state").exists());
 }

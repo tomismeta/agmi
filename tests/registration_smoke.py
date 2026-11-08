@@ -10,6 +10,7 @@ import http.server
 import json
 import os
 import pathlib
+import pwd
 import signal
 import socket
 import stat
@@ -17,11 +18,13 @@ import subprocess
 import tempfile
 import threading
 import time
+import uuid
 
 KEY = 'pk_registration_private_fixture'
+ROTATED_KEY = 'pk_registration_rotated_fixture'
 ADDRESS = 'poa1' + '1' * 32
 ALGO = 'fixture-sha256-leading-zero-bits'
-CHAIN = 'registration-fixture-chain'
+CHAIN = 'registration-fixture-' + uuid.uuid4().hex
 
 
 def snapshot(root):
@@ -36,6 +39,7 @@ class Fixture:
         self.directory = self.root / 'identity'
         self.config = self.directory / 'config.toml'
         self.mode = 'success'
+        self.identity_key = KEY
         self.bits = 0
         self.expires = None
         self.algorithm = ALGO
@@ -78,7 +82,7 @@ class Fixture:
 
             def do_GET(self):
                 if self.path == fixture.identity_path:
-                    assert self.headers.get('X-Api-Key') == KEY
+                    assert self.headers.get('X-Api-Key') == fixture.identity_key
                     fixture.requests.append((self.command, self.path))
                     if fixture.mode == 'identity-unavailable':
                         self.reply(503, {'error': KEY})
@@ -147,6 +151,11 @@ class Fixture:
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=5)
+        if (self.directory / 'state/state.sqlite3').exists():
+            lock_key = hashlib.sha256(f'{CHAIN}\n{ADDRESS}'.encode()).hexdigest()
+            lock_root = pathlib.Path(pwd.getpwuid(os.geteuid()).pw_dir) / '.agmi-account-locks'
+            for entry in lock_root.glob(lock_key + '.*'):
+                entry.unlink()
 
     def args(self, confirm=True, extra=()):
         return ['identity', 'create', '--label', 'registration fixture', '--chain', CHAIN,
@@ -158,12 +167,12 @@ class Fixture:
     def command(self, args, json_output=True):
         return [self.binary, *(['--json'] if json_output else []), '--config', str(self.config), *args]
 
-    def run(self, args=None, success=True, json_output=True, cwd=None):
+    def run(self, args=None, success=True, json_output=True, cwd=None, stdin=None):
         process = subprocess.run(self.command(self.args() if args is None else args, json_output),
-                                 env=self.env, cwd=cwd, capture_output=True, text=True, timeout=15)
+                                 env=self.env, cwd=cwd, input=stdin, capture_output=True, text=True, timeout=15)
         combined = process.stdout + process.stderr
-        assert KEY not in combined, 'credential escaped to CLI output'
-        assert (process.returncode == 0) == success, combined.replace(KEY, '[redacted]')
+        assert all(key not in combined for key in (KEY, ROTATED_KEY)), 'credential escaped to CLI output'
+        assert (process.returncode == 0) == success, combined
         if not json_output:
             return combined
         envelope = json.loads(process.stdout if success else process.stderr)
@@ -495,6 +504,26 @@ def separate_init(f):
     assert snapshot(f.root) == before and len(f.posts) == 1
 
 
+def rotated_status(f):
+    separate_init(f)
+    f.run(['pause'])  # Initialize paused local authority without any hosted observations.
+    f.identity_key = ROTATED_KEY
+    rotated = f.run(['credentials', 'rotate', '--key-stdin'], stdin=ROTATED_KEY)
+    assert rotated['identity_verified'] and rotated['state_preserved']
+    before = snapshot(f.root)
+    requests = list(f.requests)
+    status = f.status()
+    assert status['stage'] == 'configured' and status['created']
+    assert status['current_credential_matches_registration'] is False
+    assert status['current_credential_verified'] is False
+    assert status['identity_verified'] is False and not status['next_actions']
+    assert snapshot(f.root) == before and f.requests == requests
+    assert (f.directory / 'credential').read_text() == ROTATED_KEY
+    assert f.run(['identity', 'resume', '--confirm'], success=False)['code'] == 'registration_conflict'
+    assert f.run(success=False)['code'] == 'registration_conflict'
+    assert snapshot(f.root) == before and f.requests == requests and len(f.posts) == 1
+
+
 def mining_cancellation(f):
     f.bits = 256
     words = f.args(extra=['--max-pow-bits', '256', '--max-pow-hashes', '1099511627776'])
@@ -536,7 +565,7 @@ SCENARIOS = {'success': success, 'capture-resume': capture_resume, 'loss-boundar
              'incomplete-capture': partial_capture,
              'concurrent': concurrent, 'concurrent-init': concurrent_init, 'cancellation': cancellation,
              'separate-init': separate_init, 'mining-cancellation': mining_cancellation,
-             'custom-routes': custom_routes}
+             'custom-routes': custom_routes, 'rotated-status': rotated_status}
 SCENARIOS.update({name: ambiguous for name in ['loss', 'truncated', 'malformed', 'oversized', 'server-error', 'redirect', 'hold']})
 SCENARIOS.update({name: rejection for name in ['rate-limit', 'header-floor', 'proof-rejected']})
 SCENARIOS.update({name: preflight for name in ['existing-config', 'existing-key', 'existing-state', 'symlink']})

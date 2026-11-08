@@ -364,8 +364,9 @@ fn evaluate(config: &Config, options: Options, status: &Value, at: i64) -> Value
         "captured_work":status["captured_work"],
         "epoch_observed_age_seconds":epoch_age,"pending_age_seconds":pending_age,
         "admission_blocked":status["admission_blocked"].as_bool().unwrap_or(false),
-        "blocking_operation":status["blocking_operation"],"blocked_since":status["blocked_since"],
-        "blocked_age_seconds":age(&status["blocked_since"],at),
+        "oldest_unresolved_operation":status["oldest_unresolved_operation"],
+        "oldest_unresolved_since":status["oldest_unresolved_since"],
+        "oldest_unresolved_age_seconds":age(&status["oldest_unresolved_since"],at),
         "affected_capabilities":status["affected_capabilities"],
         "progress_age_seconds":age(&status["last_progress_at"],at),
         "desired_capabilities":config.capabilities,"effective_capabilities":effective["capabilities"],
@@ -676,15 +677,23 @@ mod tests {
         assert!(!has(&health, "no_active_capabilities"));
         assert!(!has(&health, "model_work_overdue"));
         status["admission_blocked"] = json!(true);
-        status["blocking_operation"] = json!(17);
-        status["blocked_since"] = json!(9000);
+        status["oldest_unresolved_operation"] = json!(17);
+        status["oldest_unresolved_since"] = json!(9000);
         status["pending"] = json!({"kind":"judge","state":"unknown","created_at":9000});
         status["operations"] = json!([{"kind":"answer","state":"generating","count":1}]);
         let health = evaluate(&config, options, &status, 10000);
         assert_eq!(health["healthy"], false);
         assert_eq!(health["preparing"], true);
         assert_eq!(health["admission_blocked"], true);
-        assert_eq!(health["blocked_age_seconds"], 1000);
+        assert_eq!(health["oldest_unresolved_age_seconds"], 1000);
+        for obsolete in ["blocking_operation", "blocked_since", "blocked_age_seconds"] {
+            assert!(health.get(obsolete).is_none());
+        }
+        status["admission_blocked"] = json!(false);
+        let health = evaluate(&config, options, &status, 10000);
+        assert_eq!(health["admission_blocked"], false);
+        assert_eq!(health["oldest_unresolved_operation"], 17);
+        assert_eq!(health["oldest_unresolved_age_seconds"], 1000);
     }
 
     #[test]
