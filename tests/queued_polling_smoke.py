@@ -110,8 +110,27 @@ def risk_health(f):
     assert disk['operational']['status'] == 'degraded', disk
     assert 'state_disk_space_low' in disk['operational']['issues']
     assert len(f.writes) == 1 and f.operations('judge')[0]['state'] == 'unknown'
+    f.stop()
+    # Isolated journal fixture: a later overdue effect must not disappear behind
+    # the original unknown. The stopped controller cannot race these timestamps.
+    old = f.operations('judge')[0]['id']
+    with sqlite3.connect(f.database) as db:
+        later = db.execute(
+            "INSERT INTO operations(kind,work_key,state,request,generation,revision,created_at,updated_at) "
+            "SELECT kind,work_key||'-later','queued',request,generation,revision,1,1 "
+            "FROM operations WHERE id=?", (old,)).lastrowid
+    for state, issue in [('queued', 'pending_work_overdue'),
+                         ('included_pending', 'pending_work_overdue'),
+                         ('dispatching', 'dispatch_outcome_uncertain')]:
+        with sqlite3.connect(f.database) as db:
+            db.execute("UPDATE operations SET state=? WHERE id=?", (state, later))
+        overdue = json.loads(f.invoke('health', succeeds=False).stdout)['data']
+        assert issue in overdue['issues'], overdue
+        assert 'pending_outcome_uncertain' in overdue['warnings']
+    assert len(f.writes) == 1
     return {'strict_block_visible': True, 'risk_retained_after_admission_opens': True,
             'healthy_with_warnings_exits_zero': True,
+            'later_overdue_work_detected': True,
             'disk_failure_still_operational': True, 'writes': 1}
 
 

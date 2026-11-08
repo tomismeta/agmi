@@ -42,7 +42,7 @@ fn missing_installation_is_nonzero_structured_and_does_not_initialize_state() {
     assert_eq!(value["ok"], false);
     assert_eq!(value["data"]["healthy"], false);
     assert_eq!(value["data"]["thresholds"]["warn_free_mib"], 0);
-    assert_eq!(value["data"]["admission_blocked"], false);
+    assert_eq!(value["data"]["admission_blocked"], Value::Null);
     for field in [
         "oldest_unresolved_operation",
         "oldest_unresolved_since",

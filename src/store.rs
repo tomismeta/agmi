@@ -3094,6 +3094,7 @@ impl Store {
             |r| r.get(0),
         )?;
         let mut captured_work = Vec::new();
+        let mut pending_work = Vec::new();
         let last_safety_observation: Option<i64> = if self.schema_version()? == 2 {
             let mut statement = self.db.prepare("SELECT o.id,o.kind,o.state,o.revision,o.generation,
                 e.model_deadline,e.http_deadline,e.policy,o.created_at FROM operations o
@@ -3115,6 +3116,22 @@ impl Store {
                 }
                 captured_work.push(work);
             }
+            let mut statement = self.db.prepare(
+                "SELECT o.id,o.state,o.created_at,o.updated_at,e.http_deadline,e.model_deadline
+                 FROM operations o LEFT JOIN operation_evidence e ON e.operation_id=o.id
+                 WHERE o.state IN ('generating','generated','prepared','retry','dispatching','queued','unknown','included_pending')
+                 ORDER BY o.id",
+            )?;
+            pending_work = statement
+                .query_map([], |r| {
+                    Ok(json!({
+                        "operation_id":r.get::<_,i64>(0)?,"state":r.get::<_,String>(1)?,
+                        "created_at":r.get::<_,i64>(2)?,"updated_at":r.get::<_,i64>(3)?,
+                        "http_deadline":r.get::<_,Option<i64>>(4)?,
+                        "model_deadline":r.get::<_,Option<i64>>(5)?
+                    }))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
             self.db.query_row(
                 "SELECT MAX(safety_observed_at) FROM operation_evidence",
                 [],
@@ -3150,6 +3167,7 @@ impl Store {
             "last_progress_at":last_progress,"last_reported_build":effective.as_ref().map(|e| &e["policy"]["build"]),
             "process_identity":"unverified",
             "captured_work":captured_work,"last_safety_observation_at":last_safety_observation,
+            "pending_work":pending_work,
             "finality":"node_reported_only","paid":"not_verified"});
         snapshot.commit()?;
         Ok(status)

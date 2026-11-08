@@ -231,28 +231,48 @@ fn evaluate(config: &Config, options: Options, status: &Value, at: i64) -> Value
             issues.push("no_active_capabilities");
         }
     }
-    match pending["state"].as_str() {
-        Some("unknown") => warnings.push("pending_outcome_uncertain"),
-        Some("generating") => match model_overdue(pending, at, poll, model_limit) {
-            Some(true) => issues.push("model_work_overdue"),
-            None => warnings.push("model_deadline_unavailable"),
-            _ => {}
-        },
-        Some("dispatching")
-            if pending["http_deadline"].as_i64().map_or(
-                age(&pending["updated_at"], at).is_some_and(|seconds| {
-                    seconds > http.saturating_add(shutdown).saturating_add(1)
-                }),
-                |deadline| at > deadline.saturating_add(shutdown as i64),
-            ) =>
+    // The representative oldest pending row must not hide later overdue work.
+    for work in
+        std::iter::once(pending).chain(status["pending_work"].as_array().into_iter().flatten())
+    {
+        let issue = match work["state"].as_str() {
+            Some("unknown") => {
+                if !warnings.contains(&"pending_outcome_uncertain") {
+                    warnings.push("pending_outcome_uncertain");
+                }
+                None
+            }
+            Some("generating") => match model_overdue(work, at, poll, model_limit) {
+                Some(true) => Some("model_work_overdue"),
+                None => {
+                    if !warnings.contains(&"model_deadline_unavailable") {
+                        warnings.push("model_deadline_unavailable");
+                    }
+                    None
+                }
+                _ => None,
+            },
+            Some("dispatching")
+                if work["http_deadline"].as_i64().map_or(
+                    age(&work["updated_at"], at).is_some_and(|seconds| {
+                        seconds > http.saturating_add(shutdown).saturating_add(1)
+                    }),
+                    |deadline| at > deadline.saturating_add(shutdown as i64),
+                ) =>
+            {
+                Some("dispatch_outcome_uncertain")
+            }
+            Some(_) if age(&work["created_at"], at).is_some_and(|seconds| seconds > work_limit) => {
+                // created_at survives repeated queue polls and Retry-After.
+                Some("pending_work_overdue")
+            }
+            _ => None,
+        };
+        if let Some(issue) = issue
+            && !issues.contains(&issue)
         {
-            issues.push("dispatch_outcome_uncertain");
+            issues.push(issue);
         }
-        Some(_) if pending_age.is_some_and(|seconds| seconds > work_limit) => {
-            // created_at deliberately survives repeated queue polls and Retry-After.
-            issues.push("pending_work_overdue");
-        }
-        _ => {}
     }
     let answer_expected = options.expect_participation && effective_mode(WorkKind::Answer);
     if answer_expected {
@@ -356,8 +376,9 @@ fn evaluate(config: &Config, options: Options, status: &Value, at: i64) -> Value
         "last_safety_observation_at":status["last_safety_observation_at"],
         "work":status["work"],
         "captured_work":status["captured_work"],
+        "pending_work":status["pending_work"],
         "epoch_observed_age_seconds":epoch_age,"pending_age_seconds":pending_age,
-        "admission_blocked":status["admission_blocked"].as_bool().unwrap_or(false),
+        "admission_blocked":admission,
         "oldest_unresolved_operation":status["oldest_unresolved_operation"],
         "oldest_unresolved_since":status["oldest_unresolved_since"],
         "oldest_unresolved_age_seconds":age(&status["oldest_unresolved_since"],at),
@@ -804,12 +825,32 @@ mod tests {
     }
 
     #[test]
+    fn old_unknown_does_not_hide_later_overdue_work() {
+        let (config, options, mut status) = fixture();
+        status["pending"] = json!({"state":"unknown","created_at":1});
+        for (state, issue) in [
+            ("queued", "pending_work_overdue"),
+            ("included_pending", "pending_work_overdue"),
+            ("dispatching", "dispatch_outcome_uncertain"),
+            ("generating", "model_work_overdue"),
+        ] {
+            status["pending_work"] = json!([{"state":state,"created_at":1,
+                "updated_at":1,"http_deadline":1,"model_deadline":1}]);
+            let health = evaluate(&config, options, &status, 10000);
+            assert_eq!(health["healthy"], false, "{state}");
+            assert!(has(&health, issue), "{state}");
+            assert_eq!(health["warnings"][0], "pending_outcome_uncertain");
+        }
+    }
+
+    #[test]
     fn absent_admission_evidence_is_not_operational_clear() {
         let (config, options, mut status) = fixture();
         status.as_object_mut().unwrap().remove("admission_blocked");
         let health = evaluate(&config, options, &status, 10000);
         assert_eq!(health["operational"]["status"], "unknown");
         assert_eq!(health["healthy"], false);
+        assert_eq!(health["admission_blocked"], Value::Null);
         assert!(has(&health, "admission_unobserved"));
         assert_eq!(health["risk"]["unresolved_effects"], Value::Null);
     }
