@@ -72,6 +72,29 @@ Optional `schedule.challenge_retry_seconds` and `challenge_backoff_max_seconds` 
 Optional `schedule.assignments_retry_seconds` and `assignments_backoff_max_seconds` similarly override assignment-read retry/backoff only. Both default to null/inherit in the configuration schema; omit them in TOML, which has no null literal. Neither these settings nor challenge overrides change write retry authority or shorten retained server minima.
 `reads` labels unattributed legacy deadlines as `retained_conservative_floor`, not server evidence. `server_not_before` retains observed server delays plus retry staggering. Operation blockers use `retained_retry_minimum` because older operation timing may also have unknown provenance.
 
+`reads` and operation evidence expose bounded error categories, never raw provider
+messages or credentials. HTTP status and transport/body failure remain separate
+evidence: an interrupted 503 body may be labeled `timeout`, not a proven halt.
+
+| Category | Next action |
+| --- | --- |
+| `endpoint_halted`, `service_unavailable`, `bad_gateway`, `gateway_timeout`, `upstream_error` | Let scheduled read recovery proceed; inspect freshness and work deadlines. |
+| `rate_limited`, `answer_global_ceiling`, `grade_queue_full` | Honor the retained retry floor; do not restart to bypass it. |
+| `authentication_rejected`, `permission_denied` | Inspect credential configuration and endpoint permissions with `doctor`; do not move credentials into a URL or register a replacement identity. A 403 alone does not prove an invalid key. |
+| `redirect_refused`, `not_found`, `gone`, `request_rejected`, `upstream_rejected` | Inspect the configured network profile and operation evidence. A missing job or receipt is not proof a write failed. |
+| `invalid_json`, `body_interrupted`, `response_too_large`, `timeout`, `connect` | Preserve uncertainty and let endpoint-scoped read backoff run; escalate if evidence becomes stale or work overdue. |
+
+The longest parseable `Retry-After` header (seconds or HTTP-date) and JSON
+`retry_after_seconds` wins. Displayed deadlines mean **retry no earlier than**,
+not “the service will be restored at this time.” Free-form outage prose is not
+parsed into a recovery timestamp. Unknown error bodies retain a safe HTTP or
+transport category; they never silently become success.
+
+These categories are diagnostic, not write-retry authority. A generic 429, halt,
+503 or timeout on submission can still leave the operation unknown. Existing
+bound-job reconciliation and configured participation policy decide subsequent
+work; neither maintenance wording nor a deadline proves the earlier write missed.
+
 Accepted bound jobs can opt into a separate polling policy:
 
 ```toml

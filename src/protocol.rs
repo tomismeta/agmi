@@ -403,9 +403,10 @@ impl Protocol {
         let status = response.status().as_u16();
         let header_delay = response
             .headers()
-            .get(RETRY_AFTER)
-            .and_then(|value| value.to_str().ok())
-            .and_then(parse_retry_after);
+            .get_all(RETRY_AFTER)
+            .iter()
+            .filter_map(|value| value.to_str().ok().and_then(parse_retry_after))
+            .max();
         // Retain status/backoff even when an upstream error page is empty, broken,
         // oversized or interrupted. A null body cannot establish a write outcome.
         let unavailable = |failure| Response {
@@ -929,6 +930,45 @@ pub fn classify_source(kind: WorkKind, response: &Response, source: ResponseSour
         .unwrap_or_else(|| unknown("route_transaction_missing"))
 }
 
+/// Sanitized diagnostics, not retry authority or a promise of recovery.
+pub(crate) fn failure_category(response: &Response) -> Option<&'static str> {
+    if let Some(failure) = response.read_failure {
+        return Some(failure.as_str());
+    }
+    match response.status {
+        401 => return Some("authentication_rejected"),
+        403 => return Some("permission_denied"),
+        _ => {}
+    }
+    let code = error_code(&response.body);
+    if response.body.get("halted").and_then(Value::as_bool) == Some(true)
+        || matches!(
+            response.body.get("status").and_then(Value::as_str),
+            Some("halted" | "paused")
+        )
+        || code.is_some_and(|value| {
+            value == "halted"
+                || value.starts_with("endpoint temporarily halted — API hardening in progress")
+        })
+    {
+        return Some("endpoint_halted");
+    }
+    match response.status {
+        300..=399 => Some("redirect_refused"),
+        404 => Some("not_found"),
+        408 => Some("request_timeout"),
+        410 => Some("gone"),
+        429 => Some("rate_limited"),
+        400..=499 => Some("request_rejected"),
+        502 => Some("bad_gateway"),
+        503 => Some("service_unavailable"),
+        504 => Some("gateway_timeout"),
+        500..=599 => Some("upstream_error"),
+        _ if failed(&response.body) => Some("upstream_rejected"),
+        _ => None,
+    }
+}
+
 fn response_error_category(kind: WorkKind, response: &Response) -> Option<&'static str> {
     let code = error_code(&response.body)?;
     match (kind, code) {
@@ -987,7 +1027,9 @@ pub fn response_evidence(
         retry_after_seconds: response.and_then(|r| r.retry_after_seconds),
         shape: shape.into(),
         error_category: response
-            .and_then(|value| response_error_category(kind, value))
+            .and_then(|value| {
+                response_error_category(kind, value).or_else(|| failure_category(value))
+            })
             .map(str::to_owned),
     }
 }
@@ -1728,7 +1770,7 @@ mod tests {
                     received += count;
                 }
                 let reply = format!(
-                    "HTTP/1.1 {status} Unavailable\r\nRetry-After: 300\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status} Unavailable\r\nRetry-After: 1\r\nRetry-After: 300\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     length,
                 );
                 stream.write_all(reply.as_bytes()).await.unwrap();
@@ -1912,6 +1954,50 @@ mod tests {
     }
 
     #[test]
+    fn outage_diagnostics_do_not_turn_unknown_writes_into_retries() {
+        // Current journals retain 503 + 3600 seconds, but not the original body.
+        // The other forms cover legacy halt fixtures and HTTP status fallbacks;
+        // they are not claims that every synthetic body was captured on the wire.
+        for (status, body, category) in [
+            (503, json!({}), "service_unavailable"),
+            (503, json!({"error":"halted"}), "endpoint_halted"),
+            (503, json!({"halted":true}), "endpoint_halted"),
+            (503, json!({"status":"paused"}), "endpoint_halted"),
+            (
+                503,
+                json!({"error":"endpoint temporarily halted — API hardening in progress; check later"}),
+                "endpoint_halted",
+            ),
+            (
+                401,
+                json!({"error":"private-canary"}),
+                "authentication_rejected",
+            ),
+            (403, json!({}), "permission_denied"),
+            (429, json!({"error":"private-canary"}), "rate_limited"),
+            (502, json!({}), "bad_gateway"),
+            (504, json!({}), "gateway_timeout"),
+            (500, json!({}), "upstream_error"),
+        ] {
+            let mut result = response(status, body);
+            result.retry_after_seconds = Some(3600);
+            let evidence =
+                response_evidence(WorkKind::Answer, ResponseSource::Submit, Some(&result));
+            assert_eq!(evidence.error_category.as_deref(), Some(category));
+            assert_eq!(evidence.retry_after_seconds, Some(3600));
+            assert!(
+                !serde_json::to_string(&evidence)
+                    .unwrap()
+                    .contains("private-canary")
+            );
+            assert!(matches!(
+                classify_source(WorkKind::Answer, &result, ResponseSource::Submit),
+                Outcome::Unknown { .. }
+            ));
+        }
+    }
+
+    #[test]
     fn diagnostics_never_echo_untrusted_values() {
         let result = response(
             500,
@@ -1966,7 +2052,7 @@ mod tests {
         );
         let diagnostic =
             response_evidence(WorkKind::Answer, ResponseSource::Submit, Some(&injected));
-        assert!(diagnostic.error_category.is_none());
+        assert_eq!(diagnostic.error_category.as_deref(), Some("rate_limited"));
         assert!(
             !serde_json::to_string(&diagnostic)
                 .unwrap()

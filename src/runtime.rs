@@ -1,10 +1,9 @@
 use crate::config::{Config, Mode, Participation, ParticipationMode, WorkKind};
 use crate::endpoints::Endpoint;
 use crate::protocol::{
-    Assignment, Challenge, Outcome, Protocol, ReadFailure, Response, ResponseSource,
-    assignment_ids, assignment_needs_hydration, classify_source, has_required_words,
-    parse_challenge, parse_selected_assignment, response_evidence, transport_failure,
-    valid_grade_reasoning,
+    Assignment, Challenge, Outcome, Protocol, Response, ResponseSource, assignment_ids,
+    assignment_needs_hydration, classify_source, has_required_words, parse_challenge,
+    parse_selected_assignment, response_evidence, transport_failure, valid_grade_reasoning,
 };
 use crate::solver::{
     SolverRequest, SolverResult, completed_artifact_invalid, execution_may_have_started,
@@ -679,7 +678,7 @@ impl Runtime {
                 self.store.read_finished(
                     scope,
                     Some(response.status),
-                    response.read_failure.map(ReadFailure::as_str),
+                    crate::protocol::failure_category(&response),
                 )?;
                 // The documented 408 job-expired result is authoritative, not
                 // a transport timeout. Preserve its existing bound-job retry rule.
@@ -697,12 +696,7 @@ impl Runtime {
                     self.store.read_finished(
                         scope,
                         Some(response.status),
-                        Some(
-                            response
-                                .read_failure
-                                .map(ReadFailure::as_str)
-                                .unwrap_or("http_status"),
-                        ),
+                        Some(crate::protocol::failure_category(&response).unwrap_or("http_status")),
                     )?;
                     self.read_failed(scope, response.retry_after_seconds)?;
                     if let Some(minimum) = response.retry_after_seconds {
@@ -3080,6 +3074,51 @@ mod tests {
         assert_eq!(status["observation"]["epoch"], 77);
         assert_eq!(status["reads"][2]["state"], "idle");
         assert!(status["reads"][2]["last_success_at"].is_i64());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_challenge_reads_expose_safe_categories_and_preserve_server_delay() {
+        use tokio::io::AsyncWriteExt;
+        for (status, body, category) in [
+            (503, json!({"halted":true}), "endpoint_halted"),
+            (503, json!({}), "service_unavailable"),
+            (429, json!({"error":"private-canary"}), "rate_limited"),
+            (
+                401,
+                json!({"error":"private-canary"}),
+                "authentication_rejected",
+            ),
+        ] {
+            let credentials = tempfile::tempdir().unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut config = active_judge_config(credentials.path());
+            config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
+            config.capabilities.answer = Mode::ReadOnly;
+            let (_temp, mut runtime, _sender) = fixture_with(config);
+            let path = format!(
+                "GET /chain/{}/api/hosted/challenge",
+                runtime.config.network.chain
+            );
+            let server = tokio::spawn(async move {
+                let mut stream = accept_api_request(&listener, &path).await;
+                let body = body.to_string();
+                stream.write_all(format!(
+                    "HTTP/1.1 {status} Unavailable\r\nRetry-After: 1\r\nRetry-After: 90\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                ).as_bytes()).await.unwrap();
+            });
+            let before = now();
+            assert!(runtime.challenge(WorkKind::Answer).await.unwrap().is_none());
+            let reads = runtime.store.reads().unwrap();
+            assert_eq!(reads[0]["failure_category"], category);
+            assert_eq!(reads[0]["status"], status);
+            assert_eq!(reads[0]["failures"], 1);
+            assert!(reads[0]["last_success_at"].is_null());
+            assert!(reads[0]["server_not_before"].as_i64().unwrap() >= before + 90);
+            assert!(!reads.to_string().contains("private-canary"));
+            server.await.unwrap();
+        }
     }
 
     #[cfg(unix)]
