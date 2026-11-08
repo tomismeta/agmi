@@ -1,0 +1,25 @@
+# Network policy, not credentials. Adding a trusted origin authorizes sending keys there.
+base_url = "https://minepoa.com"
+chain = "poa-mainnet-1"
+trusted_origins = ["https://minepoa.com"]
+
+[api]
+chain_path = "/chain/{chain}"
+status = "/api/status"
+networks = "/api/networks"
+network_facts = "/api/network-facts"
+epochs = "/api/epochs"
+identity = "/api/hosted/me"
+challenge = "/api/hosted/challenge"
+assignments = "/api/hosted/assignments"
+address_assignments = "/api/assignments/{address}"
+explorer_address = "/api/explorer/address/{address}"
+established = "/api/established/{address}"
+job = "/api/job/{id}"
+receipt = "/api/receipt/{id}"
+explorer_tx = "/api/explorer/tx/{id}"
+answer = "/api/hosted/answer"
+grade = "/api/hosted/grade"
+mine = "/api/hosted/mine"
+join_pow = "/api/join-pow"
+register = "/api/hosted/register"

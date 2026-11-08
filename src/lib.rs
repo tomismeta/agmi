@@ -4,9 +4,11 @@
 
 pub mod admin;
 pub mod config;
+pub mod endpoints;
 pub mod health;
 pub mod lifecycle;
 pub mod protocol;
+pub mod registration;
 pub mod runtime;
 pub mod solver;
 pub mod store;

@@ -6,7 +6,7 @@ rust-version = "1.96"
 description = "Reliable, configurable MinePOA participation for autonomous agents"
 publish = false
 readme = "README.md"
-include = ["/Cargo.toml", "/Cargo.lock", "/build.rs", "/src/**", "/adapters/**", "/README.md", "/ARCHITECTURE.md", "/CHANGELOG.md", "/SECURITY.md", "/examples/**", "/deploy/**"]
+include = ["/Cargo.toml", "/Cargo.lock", "/build.rs", "/src/**", "/adapters/**", "/defaults/**", "/docs/**", "/README.md", "/ARCHITECTURE.md", "/CHANGELOG.md", "/SECURITY.md", "/examples/**", "/deploy/**"]
 
 [dependencies]
 anyhow = "1"

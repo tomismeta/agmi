@@ -32,8 +32,18 @@ impl Default for Options {
 /// This command opens existing state read-only, never recovers it, and performs
 /// neither network nor model calls. Errors are deliberately replaced at this boundary.
 pub fn check(config: &Config, options: Options) -> Result<Value> {
-    let status =
-        runtime::status(config).map_err(|_| anyhow!("local health evidence unavailable"))?;
+    let status = match runtime::status(config) {
+        Ok(status) => status,
+        Err(_) => {
+            return Ok(json!({
+                "healthy":false,"attention_required":true,
+                "issues":["local_evidence_unavailable"],"warnings":[],
+                "operational":{"status":"unknown","issues":["local_evidence_unavailable"]},
+                "risk":{"status":"unknown","attention_required":null,"unresolved_effects":null,"unresolved_model_attempts":null},
+                "evidence":"local_only","mutations":false
+            }));
+        }
+    };
     let mut result = evaluate(config, options, &status, now());
     if options.min_free_mib != 0 {
         let available = available_mib(&config.state_dir).ok();
@@ -169,6 +179,9 @@ fn evaluate(config: &Config, options: Options, status: &Value, at: i64) -> Value
             .map(|mode| mode == "active")
             .unwrap_or(config.mode(kind) == Mode::Active)
     };
+    let active = [WorkKind::Answer, WorkKind::Judge, WorkKind::Mine]
+        .iter()
+        .any(|kind| effective_mode(*kind));
     let heartbeat_age = age(&effective["observed_at"], at);
     let observation_age = age(&status["observation"]["observed_at"], at);
     let epoch_age = age(&status["epoch_evidence"]["first_observed_at"], at);
@@ -182,8 +195,13 @@ fn evaluate(config: &Config, options: Options, status: &Value, at: i64) -> Value
     if status["identity_matches_config"].as_bool() == Some(false) {
         issues.push("identity_mismatch");
     }
+    if status["network_routing"]["matches_config"].as_bool() == Some(false) {
+        issues.push("api_routing_mismatch");
+    }
     if status["hosted_identity_verified"].as_bool() == Some(false) {
         issues.push("hosted_identity_unverified");
+    } else if status["hosted_identity_verified"].as_bool().is_none() && !paused && active {
+        issues.push("hosted_identity_unobserved");
     }
     if status["controller_stopped"].as_bool() == Some(true) {
         issues.push("controller_stopped");
@@ -209,10 +227,7 @@ fn evaluate(config: &Config, options: Options, status: &Value, at: i64) -> Value
         if effective["reload_blocked"].as_bool() == Some(true) {
             issues.push("reload_blocked");
         }
-        if ![WorkKind::Answer, WorkKind::Judge, WorkKind::Mine]
-            .iter()
-            .any(|kind| effective_mode(*kind))
-        {
+        if !active {
             issues.push("no_active_capabilities");
         }
     }
@@ -343,13 +358,9 @@ fn evaluate(config: &Config, options: Options, status: &Value, at: i64) -> Value
         "hosted_identity_verified":status["hosted_identity_verified"].as_bool(),
         "heartbeat_age_seconds":heartbeat_age,"observation_age_seconds":observation_age,
         "heartbeat_recent":heartbeat_age.is_some_and(|age|age<=stale),
-        "current_epoch":{"epoch":status["observation"]["epoch"].as_u64(),
-            "answered":status["epoch_evidence"]["answered"].as_bool(),
-            "evidence_fresh":observation_age.is_some_and(|age|age<=stale)
-                && status["observation"]["observed_at"].as_i64().is_some_and(|time| time<=at),
-            "evidence":"last_local_observation_not_a_live_remote_check"},
         "observing":observation_age.is_some_and(|age|age<=stale),"preparing":preparing,
         "last_safety_observation_at":status["last_safety_observation_at"],
+        "work":status["work"],
         "captured_work":status["captured_work"],
         "epoch_observed_age_seconds":epoch_age,"pending_age_seconds":pending_age,
         "admission_blocked":status["admission_blocked"].as_bool().unwrap_or(false),
@@ -360,14 +371,21 @@ fn evaluate(config: &Config, options: Options, status: &Value, at: i64) -> Value
         "desired_capabilities":config.capabilities,"effective_capabilities":effective["capabilities"],
         "participation":status["participation"],"desired_participation":config.participation,
         "last_reported_build":status["last_reported_build"],"process_identity":"unverified",
-        "thresholds":{"stale_seconds":stale,"work_seconds":work_limit,
-            "answer_grace_seconds":grace,"model_seconds":model_limit,"cycle_floor_seconds":cycle_floor,
-            "read_http_seconds":read_http,"write_http_seconds":http},
         "evidence":"local_only","notifications":"local_exit_status_and_journal"});
+    result["current_epoch"] = json!({"epoch":status["observation"]["epoch"].as_u64(),
+        "answered":status["epoch_evidence"]["answered"].as_bool(),
+        "evidence_fresh":observation_age.is_some_and(|age|age<=stale)
+            && status["observation"]["observed_at"].as_i64().is_some_and(|time| time<=at),
+        "evidence":"last_local_observation_not_a_live_remote_check"});
+    result["thresholds"] = json!({"stale_seconds":stale,"work_seconds":work_limit,
+        "answer_grace_seconds":grace,"model_seconds":model_limit,"cycle_floor_seconds":cycle_floor,
+        "read_http_seconds":read_http,"write_http_seconds":http});
     result["operational"] = json!({"status":operational_status,"issues":operational_issues,
         "evidence":"local_only_not_a_submission_guarantee"});
     result["risk"] = json!({"attention_required":risk_attention,
         "unresolved_effects":status["participation"]["unresolved_count"].as_u64(),
+        "active_unresolved_effects":status["participation"]["active_unresolved_count"].as_u64(),
+        "historical_unknown_answers":status["participation"]["historical_unknown_answer_count"].as_u64(),
         "unresolved_model_attempts":unresolved_models});
     result
 }
@@ -380,6 +398,7 @@ mod tests {
         let mut config = Config::default();
         config.capabilities.answer = Mode::Active;
         let status = json!({"initialized":true,"paused":false,"identity_matches_config":true,
+            "hosted_identity_verified":true,
             "effective_runtime":{"observed_at":10000,"reload_blocked":false},
             "observation":{"observed_at":10000},
             "epoch_evidence":{"first_observed_at":10000,"answered":true},"pending":null});
@@ -397,12 +416,10 @@ mod tests {
     #[test]
     fn hosted_identity_failure_overrides_local_match_and_fresh_challenge() {
         let (config, options, mut status) = fixture();
-        for evidence in [Value::Null, json!(true)] {
-            status["hosted_identity_verified"] = evidence.clone();
-            let health = evaluate(&config, options, &status, 10000);
-            assert_eq!(health["healthy"], true);
-            assert_eq!(health["hosted_identity_verified"], evidence);
-        }
+        status["hosted_identity_verified"] = json!(true);
+        let health = evaluate(&config, options, &status, 10000);
+        assert_eq!(health["healthy"], true);
+        assert_eq!(health["hosted_identity_verified"], true);
         status["hosted_identity_verified"] = json!(false);
         let health = evaluate(&config, options, &status, 10000);
         assert_eq!(health["healthy"], false);
@@ -423,6 +440,59 @@ mod tests {
         ));
         status["hosted_identity_verified"] = json!(true);
         assert_eq!(evaluate(&config, options, &status, 10000)["healthy"], true);
+    }
+
+    #[test]
+    fn mine_only_requires_identity_evidence_without_inventing_failure_or_risk() {
+        let (mut config, _, mut status) = fixture();
+        config.capabilities.answer = Mode::Off;
+        config.capabilities.judge = Mode::Off;
+        config.capabilities.mine = Mode::Active;
+        status["observation"] = Value::Null;
+        status["hosted_identity_verified"] = Value::Null;
+        status["admission_blocked"] = json!(false);
+        for expect_participation in [false, true] {
+            let options = Options {
+                expect_participation,
+                ..Options::default()
+            };
+            let health = evaluate(&config, options, &status, 10000);
+            assert_eq!(health["healthy"], false);
+            assert_eq!(health["issues"], json!(["hosted_identity_unobserved"]));
+            assert_eq!(health["operational"]["status"], "degraded");
+            assert_eq!(health["operational"]["issues"], health["issues"]);
+            assert!(health["hosted_identity_verified"].is_null());
+            assert_eq!(health["risk"]["attention_required"], false);
+            assert_eq!(health["evidence"], "local_only");
+            status["hosted_identity_verified"] = json!(true);
+            let verified = evaluate(&config, options, &status, 10000);
+            assert_eq!(verified["healthy"], true);
+            assert_eq!(verified["operational"]["status"], "clear");
+            status["hosted_identity_verified"] = Value::Null;
+        }
+    }
+
+    #[test]
+    fn paused_or_nonactive_modes_do_not_require_new_upstream_identity_evidence() {
+        let (config, _, mut status) = fixture();
+        let options = Options {
+            expect_participation: false,
+            ..Options::default()
+        };
+        status["hosted_identity_verified"] = Value::Null;
+        status["paused"] = json!(true);
+        let health = evaluate(&config, options, &status, 10000);
+        assert_eq!(health["healthy"], true);
+        assert!(health["hosted_identity_verified"].is_null());
+        status["paused"] = json!(false);
+        for mode in ["read_only", "off"] {
+            // Effective modes, not a newly edited desired configuration, govern readiness.
+            status["effective_runtime"]["capabilities"] =
+                json!({"answer":mode,"judge":mode,"mine":mode});
+            let health = evaluate(&config, options, &status, 10000);
+            assert_eq!(health["healthy"], true);
+            assert!(health["hosted_identity_verified"].is_null());
+        }
     }
 
     #[test]
@@ -752,5 +822,24 @@ mod tests {
         let future = evaluate(&config, options, &status, stale_at);
         assert_eq!(future["current_epoch"]["evidence_fresh"], false);
         assert!(has(&future, "clock_regressed"));
+    }
+    #[test]
+    fn historical_allowance_preserves_risk_without_inventing_an_operational_block() {
+        let (config, options, mut status) = fixture();
+        status["pending"] = json!({"state":"unknown","created_at":9000});
+        status["participation"] = json!({"unresolved_count":4,"active_unresolved_count":1,
+            "historical_unknown_answer_count":3,"risk_admissions":1});
+        status["admission_blocked"] = json!(false);
+        status["work"] = json!({"answer":{"phase":"answered","reason":"hosted_answer_observed",
+            "next_at":null,"next_action":"observe_challenge"}});
+        let health = evaluate(&config, options, &status, 10000);
+        assert_eq!(health["healthy"], false);
+        assert_eq!(health["operational"]["status"], "clear");
+        assert_eq!(health["risk"]["unresolved_effects"], 4);
+        assert_eq!(health["risk"]["active_unresolved_effects"], 1);
+        assert_eq!(health["risk"]["historical_unknown_answers"], 3);
+        assert!(has(&health, "pending_outcome_uncertain"));
+        assert_eq!(health["work"]["answer"]["next_at"], Value::Null);
+        assert_eq!(health["work"]["answer"]["phase"], "answered");
     }
 }

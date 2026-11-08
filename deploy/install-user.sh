@@ -5,6 +5,19 @@ LC_ALL=C
 export LC_ALL
 umask 077
 
+# Machine evidence uses only fixed labels. Unknown means inspect, not retry/rollback.
+phase=preflight
+stage_state=not_started
+activation_state=not_started
+service_state=unknown
+report_result() {
+    result=$1
+    if [ "$result" -eq 0 ]; then outcome=success; else outcome=failed; fi
+    printf '{"schema":"agmi.installer.v1","outcome":"%s","stage":"%s","staging":"%s","activation":"%s","service":"%s","evidence":"this_invocation_only","next_actions":[{"kind":"command","argv":["agmi","service","status"],"authorization_required":false}]}\n' \
+        "$outcome" "$phase" "$stage_state" "$activation_state" "$service_state"
+}
+trap 'result=$?; trap - 0; report_result "$result"; exit "$result"' 0
+
 usage() {
     printf '%s\n' \
         'Usage: sh deploy/install-user.sh stage /absolute/path/to/agmi --sha256 TRUSTED_SHA256 [--dry-run]' \
@@ -146,7 +159,7 @@ status() {
     esac
     printf '%s\n' 'identity_evidence=checksums_and_build_labels_not_signed_source_provenance'
 }
-if [ "$action" = status ]; then status; exit 0; fi
+if [ "$action" = status ]; then phase=status; status; exit 0; fi
 if [ "$action" = stage ] || [ "$action" = install ] || [ "$action" = update ]; then
     case $target in /*) ;; *) fail 'Binary path must be absolute.' ;; esac
     [ "${#expected_hash}" -eq 64 ] || fail 'Stage requires an independently trusted SHA256 digest.'
@@ -188,7 +201,7 @@ validate_loaded() {
     stop_timeout=$(systemctl --user show agmi.service --property=TimeoutStopUSec --value)
     [ "$stop_timeout" = infinity ] || fail 'Loaded stop deadline would truncate configured shutdown policy.'
 }
-if [ "$action" = service ] && [ "$target" = status ]; then status; exit 0; fi
+if [ "$action" = service ] && [ "$target" = status ]; then phase=status; status; exit 0; fi
 mkdir -p -- "$root" "$bin_dir" "$unit_dir"
 [ ! -L "$root" ] || fail 'The releases directory must not be a symlink.'
 lock=$root/.install-lock
@@ -202,12 +215,15 @@ cleanup() {
     trap - 0 HUP INT TERM
     if [ "$activation" -eq 1 ] && [ "$result" -ne 0 ]; then
         printf '%s\n' 'Activation failed: stopping agmi units; current is NOT reverted and the journal is NOT restored.' >&2
-        stop_units || printf '%s\n' 'STOP FAILED: operator must stop the runtime before any repair or activation.' >&2
+        service_state=unknown
+        if stop_units; then service_state=stopped
+        else printf '%s\n' 'STOP FAILED: operator must stop the runtime before any repair or activation.' >&2; fi
     fi
     if [ -n "$staging" ]; then rm -rf -- "$staging"; fi
     if [ -n "$link_temp" ]; then rm -f -- "$link_temp"; fi
     rm -f -- "$lock/owner"
     rmdir -- "$lock" || :
+    report_result "$result"
     exit "$result"
 }
 trap cleanup 0
@@ -223,6 +239,7 @@ if [ "$action" = install ]; then
     stopped=1
 fi
 if [ "$action" = service ]; then
+    phase=service
     case $target in
         stop) stop_units ;;
         disable) systemctl --user disable agmi.service agmi-health.timer ;;
@@ -236,6 +253,7 @@ if [ "$action" = service ]; then
                 systemctl --user is-active --quiet agmi.service agmi-health.timer
             fi ;;
     esac
+    service_state=command_completed
     exit 0
 fi
 
@@ -298,6 +316,8 @@ space_checks() {
 }
 
 stage_release() {
+    phase=staging
+    stage_state=in_progress
     binary=$target
     [ -f "$binary" ] && [ -x "$binary" ] && [ ! -L "$binary" ] || fail 'Supply a regular executable binary, not a symlink.'
     binary=$(readlink -f -- "$binary")
@@ -308,6 +328,7 @@ stage_release() {
     if [ -e "$release" ]; then
         validate_release "$release" "$release_id"
         systemd-analyze --user verify "$release/agmi.service" "$release/agmi-health.service" "$release/agmi-health.timer"
+        stage_state=complete
         printf 'staged_release=%s\n' "$release_id"
         return 0
     fi
@@ -342,12 +363,15 @@ stage_release() {
     release_checksums "$staging" > "$staging/SHA256SUMS"
     validate_release "$staging" "$release_id"
     sync -f "$staging"
+    stage_state=unknown
     mv -T -- "$staging" "$release"
+    stage_state=published
     staging=
     sync -f "$root"
     # ExecStart is release-pinned, so verification happens after the complete
     # directory is in its final location, but before it is current/activatable.
     systemd-analyze --user verify "$release/agmi.service" "$release/agmi-health.service" "$release/agmi-health.timer"
+    stage_state=complete
     printf 'staged_release=%s\n' "$release_id"
     printf '%s\n' 'No pointer, loaded unit, running process, state, credential or pause setting changed.'
 }
@@ -357,6 +381,7 @@ if [ "$action" = stage ] || [ "$action" = install ] || [ "$action" = update ]; t
     target=r-$expected_hash
 fi
 
+phase=activation_preflight
 release_id=$target
 valid_id "$release_id" || fail 'Invalid release ID.'
 release=$root/$release_id
@@ -381,11 +406,16 @@ runtime_active=0
 timer_active=0
 systemctl --user is-active --quiet agmi.service && runtime_active=1
 systemctl --user is-active --quiet agmi-health.timer && timer_active=1
+phase=stopping
+activation_state=in_progress
+service_state=unknown
 activation=1
 stop_units
 pid=$(systemctl --user show agmi.service --property=MainPID --value)
 pid=${pid:-0}
 [ "$pid" = 0 ] || fail 'The previous runtime did not stop; activation is blocked.'
+service_state=stopped
+phase=switching
 
 # Keep the unversioned pilot artifacts for inspection only. They are not a
 # compatible rollback release and are never offered as an activation target.
@@ -418,21 +448,28 @@ sync -f "$unit_dir"
 # until daemon-reload; the old executable cannot silently become the new one.
 link_temp=$root/.current.$$
 ln -s -- "$release_id" "$link_temp"
+activation_state=unknown
 mv -Tf -- "$link_temp" "$root/current"
+activation_state=selected
 link_temp=
 sync -f "$root"
+phase=reloading
 systemctl --user daemon-reload
 validate_loaded
+activation_state=loaded_verified
 if [ "$stopped" -eq 1 ]; then
     if [ "$action" = install ]; then
         systemctl --user enable agmi.service agmi-health.timer
     fi
     activation=0
+    phase=complete
     status
     printf '%s\n' 'Activated and daemon-reloaded, remaining stopped for explicit journal migration.' \
         'No journal or pause state was changed; use service start explicitly afterward.'
     exit 0
 fi
+phase=starting
+service_state=unknown
 if [ "$runtime_active" -eq 1 ]; then
     systemctl --user start agmi.service
     systemctl --user is-active --quiet agmi.service
@@ -445,6 +482,8 @@ if [ "$timer_active" -eq 1 ]; then
     systemctl --user is-active --quiet agmi-health.timer
 fi
 activation=0
+phase=complete
+service_state=previous_intent_restored
 status
 printf '%s\n' 'Activated without changing pause/admission, credentials, native harnesses, or journal history.' \
     'Units were not enabled; retain the existing enablement policy.' \

@@ -1,4 +1,5 @@
 use crate::config::{Config, Mode, Participation, ParticipationMode, WorkKind};
+use crate::endpoints::Endpoint;
 use crate::protocol::{
     Assignment, Challenge, Outcome, Protocol, ReadFailure, Response, ResponseSource,
     assignment_ids, assignment_needs_hydration, classify_source, has_required_words,
@@ -18,7 +19,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{Notify, oneshot, watch};
 
 pub fn build_info() -> Value {
@@ -92,6 +93,9 @@ pub async fn recovery_resolve(
         controller: false,
         model_wake: Arc::new(Notify::new()),
         urgent_context: false,
+        identity_read: None,
+        identity_ready: None,
+        identity_nonblocking: false,
     };
     if !runtime.identity_matches(op.kind).await? {
         bail!("recovery identity unverified");
@@ -188,6 +192,7 @@ pub fn recover_model(config: &Config) -> Result<usize> {
 
 fn same_identity(a: &Config, b: &Config) -> bool {
     a.network.base_url == b.network.base_url
+        && a.network.api == b.network.api
         && a.network.chain == b.network.chain
         && a.network.address == b.network.address
         && a.network.credential_file == b.network.credential_file
@@ -264,6 +269,21 @@ struct Inventory {
     pages_usable: bool,
 }
 
+struct IdentityRead {
+    protocol: Arc<Protocol>,
+    control: Control,
+    kind: WorkKind,
+    task: tokio::task::JoinHandle<()>,
+    completion: oneshot::Receiver<(Instant, Result<Response>)>,
+    _guard: ReadTaskGuard,
+}
+
+struct IdentityReady {
+    protocol: Arc<Protocol>,
+    control: Control,
+    completed_at: Instant,
+}
+
 struct Runtime {
     config_path: PathBuf,
     config: Config,
@@ -275,6 +295,9 @@ struct Runtime {
     model_wake: Arc<Notify>,
     urgent_context: bool,
     preparations: Vec<Preparation>,
+    identity_read: Option<IdentityRead>,
+    identity_ready: Option<IdentityReady>,
+    identity_nonblocking: bool,
 }
 
 /// A single runtime owns the account lock even when paused or read-only. The
@@ -319,6 +342,9 @@ pub async fn run(config_path: &Path, once: bool) -> Result<()> {
         controller: true,
         model_wake: Arc::new(Notify::new()),
         urgent_context: false,
+        identity_read: None,
+        identity_ready: None,
+        identity_nonblocking: false,
     };
     let result = runtime.run_loop(once).await;
     signal.abort();
@@ -383,13 +409,7 @@ impl Runtime {
         if changed || was_blocked != self.reload_blocked {
             self.store
                 .runtime_state(&self.config, self.reload_blocked)?;
-            let (base, cap) = self.read_policy(ReadScope::Challenge);
-            self.store.reschedule_read(
-                ReadScope::Challenge,
-                base,
-                cap,
-                stagger(&self.config, "retry"),
-            )?;
+            self.reschedule_reads()?;
         }
         Ok(())
     }
@@ -441,18 +461,30 @@ impl Runtime {
 
     fn read_policy(&self, scope: ReadScope) -> (u64, u64) {
         let schedule = &self.config.schedule;
-        if scope == ReadScope::Challenge {
-            (
-                schedule
-                    .challenge_retry_seconds
-                    .unwrap_or(schedule.retry_seconds),
-                schedule
-                    .challenge_backoff_max_seconds
-                    .unwrap_or(schedule.backoff_max_seconds),
-            )
-        } else {
-            (schedule.retry_seconds, schedule.backoff_max_seconds)
+        let (base, cap) = match scope {
+            ReadScope::Challenge => (
+                schedule.challenge_retry_seconds,
+                schedule.challenge_backoff_max_seconds,
+            ),
+            ReadScope::Assignments => (
+                schedule.assignments_retry_seconds,
+                schedule.assignments_backoff_max_seconds,
+            ),
+            _ => (None, None),
+        };
+        (
+            base.unwrap_or(schedule.retry_seconds),
+            cap.unwrap_or(schedule.backoff_max_seconds),
+        )
+    }
+
+    fn reschedule_reads(&self) -> Result<()> {
+        for scope in [ReadScope::Challenge, ReadScope::Assignments] {
+            let (base, cap) = self.read_policy(scope);
+            self.store
+                .reschedule_read(scope, base, cap, stagger(&self.config, "retry"))?;
         }
+        Ok(())
     }
 
     fn urgent_delay(&self) -> Result<Duration> {
@@ -480,13 +512,8 @@ impl Runtime {
     }
 
     async fn run_loop(&mut self, once: bool) -> Result<()> {
-        let (base, cap) = self.read_policy(ReadScope::Challenge);
-        self.store.reschedule_read(
-            ReadScope::Challenge,
-            base,
-            cap,
-            stagger(&self.config, "retry"),
-        )?;
+        self.identity_nonblocking = self.controller && !once;
+        self.reschedule_reads()?;
         if !once {
             self.wait_delay(stagger(&self.config, "startup")).await;
         }
@@ -525,6 +552,7 @@ impl Runtime {
                 self.wait_delay(delay).await;
             }
         }
+        self.cancel_identity().await?;
         // Give already-ready solver results priority over cancellation, then
         // retain their artifacts without granting permission to dispatch.
         let shutdown =
@@ -557,16 +585,18 @@ impl Runtime {
         &mut self,
         kind: WorkKind,
         scope: ReadScope,
-        path: &str,
+        endpoint: Endpoint,
+        parameter: Option<&str>,
     ) -> Result<Option<Response>> {
-        self.get_page(kind, scope, path, None).await
+        self.get_page(kind, scope, endpoint, parameter, None).await
     }
 
     async fn get_page(
         &mut self,
         kind: WorkKind,
         scope: ReadScope,
-        path: &str,
+        endpoint: Endpoint,
+        parameter: Option<&str>,
         offset: Option<u64>,
     ) -> Result<Option<Response>> {
         self.reload()?;
@@ -588,12 +618,12 @@ impl Runtime {
         let protocol = Arc::clone(&self.protocol);
         // Reqwest bounds the complete read, including its body. An equal outer
         // timeout would race that result and lose already-received Retry-After.
-        let path = path.to_owned();
+        let parameter = parameter.map(str::to_owned);
         let mut request = tokio::spawn(async move {
             if let Some(offset) = offset {
                 protocol.assignment_page(offset, 100).await
             } else {
-                protocol.get(&path).await
+                protocol.get(endpoint, parameter.as_deref()).await
             }
         });
         let _request_guard = ReadTaskGuard(request.abort_handle());
@@ -621,6 +651,7 @@ impl Runtime {
                     return Ok(None);
                 },
                 _ = wake.notified() => {
+                    self.collect_identity().await?;
                     self.collect_models().await?;
                     if background { Box::pin(self.service_urgent(true)).await?; }
                 },
@@ -629,8 +660,21 @@ impl Runtime {
                 },
             }
         };
+        self.finish_read(
+            kind,
+            scope,
+            result.unwrap_or_else(|_| Err(anyhow::anyhow!("read task ended"))),
+        )
+    }
+
+    fn finish_read(
+        &mut self,
+        kind: WorkKind,
+        scope: ReadScope,
+        result: Result<Response>,
+    ) -> Result<Option<Response>> {
         match result {
-            Ok(Ok(response)) => {
+            Ok(response) => {
                 self.store.read_finished(
                     scope,
                     Some(response.status),
@@ -668,12 +712,8 @@ impl Runtime {
                 }
                 Ok(Some(response))
             }
-            failure => {
-                let category = match failure {
-                    Ok(Err(error)) => transport_failure(&error),
-                    Err(_) => ReadFailure::Request,
-                    Ok(Ok(_)) => unreachable!(),
-                };
+            Err(error) => {
+                let category = transport_failure(&error);
                 self.store
                     .read_finished(scope, None, Some(category.as_str()))?;
                 self.read_failed(scope, None)?;
@@ -692,9 +732,14 @@ impl Runtime {
             stagger(&self.config, "retry"),
             server_minimum,
         )?;
-        if scope == ReadScope::Challenge {
-            let deadline = self.store.read_backoff(scope)?.next_at;
-            self.store.defer_until(WorkKind::Answer, deadline)?;
+        let work = match scope {
+            ReadScope::Challenge => Some(WorkKind::Answer),
+            ReadScope::Assignments => Some(WorkKind::Judge),
+            _ => None,
+        };
+        if let Some(kind) = work {
+            self.store
+                .defer_until(kind, self.store.read_backoff(scope)?.next_at)?;
         }
         Ok(())
     }
@@ -709,7 +754,7 @@ impl Runtime {
 
     async fn challenge(&mut self, kind: WorkKind) -> Result<Option<Challenge>> {
         let Some(response) = self
-            .get(kind, ReadScope::Challenge, "/api/hosted/challenge")
+            .get(kind, ReadScope::Challenge, Endpoint::Challenge, None)
             .await?
         else {
             return Ok(None);
@@ -728,12 +773,13 @@ impl Runtime {
         }
     }
 
-    async fn assignment_inventory(&mut self) -> Result<Option<Inventory>> {
+    async fn assignment_inventory(&mut self, target: Option<&str>) -> Result<Option<Inventory>> {
         let Some(mut response) = self
             .get(
                 WorkKind::Judge,
                 ReadScope::Assignments,
-                "/api/hosted/assignments",
+                Endpoint::Assignments,
+                None,
             )
             .await?
         else {
@@ -744,10 +790,6 @@ impl Runtime {
             self.read_evaluated(ReadScope::Assignments, false, response.retry_after_seconds)?;
             self.store
                 .event("assignments_unavailable", Some(WorkKind::Judge))?;
-            self.store.defer(
-                WorkKind::Judge,
-                self.retry_delay(response.retry_after_seconds),
-            )?;
             return Ok(None);
         }
         let mut seen: std::collections::HashSet<String> =
@@ -762,14 +804,21 @@ impl Runtime {
         // Offset inventories can move between pages: bounded deduplication is
         // useful selection evidence, never proof that an absent sent request failed.
         for _ in 1..4 {
-            if response.body["has_more"].as_bool() != Some(true) || offset == 0 {
+            // A fresh positive membership observation is sufficient for targeted
+            // revalidation; selection still scans the bounded inventory for expiry.
+            // Absence remains inconclusive unless the inventory is complete.
+            if target.is_some_and(|id| seen.contains(id))
+                || response.body["has_more"].as_bool() != Some(true)
+                || offset == 0
+            {
                 break;
             }
             let Some(page) = self
                 .get_page(
                     WorkKind::Judge,
                     ReadScope::Assignments,
-                    "/api/hosted/assignments",
+                    Endpoint::Assignments,
+                    None,
                     Some(offset),
                 )
                 .await?
@@ -860,7 +909,8 @@ impl Runtime {
                     .get(
                         WorkKind::Judge,
                         ReadScope::AssignmentEvidence,
-                        &format!("/api/explorer/tx/{id}"),
+                        Endpoint::ExplorerTx,
+                        Some(id),
                     )
                     .await?
                 else {
@@ -879,10 +929,6 @@ impl Runtime {
                 }
                 self.store
                     .event("assignment_evidence_unavailable", Some(WorkKind::Judge))?;
-                self.store.defer(
-                    WorkKind::Judge,
-                    self.retry_delay(inventory.retry_after_seconds),
-                )?;
                 return Ok(None);
             }
         };
@@ -912,7 +958,7 @@ impl Runtime {
                 self.store
                     .event("assignment_evidence_unavailable", Some(WorkKind::Judge))?;
                 self.store
-                    .defer(WorkKind::Judge, self.retry_delay(minimum))?;
+                    .defer_until(WorkKind::Judge, self.store.read_backoff(scope)?.next_at)?;
                 if self.active(WorkKind::Judge)?
                     && self.store.preparation(WorkKind::Judge)?.is_none()
                     && !self.store.attempted(WorkKind::Judge, id)?
@@ -933,11 +979,135 @@ impl Runtime {
         }
     }
 
+    async fn cancel_identity(&mut self) -> Result<()> {
+        self.identity_ready = None;
+        if let Some(read) = self.identity_read.take() {
+            read.task.abort();
+            let _ = read.task.await;
+            self.store.read_finished(ReadScope::Identity, None, None)?;
+        }
+        Ok(())
+    }
+
+    async fn collect_identity(&mut self) -> Result<()> {
+        let control = self.store.control()?;
+        let stale_read = self.identity_read.as_ref().is_some_and(|read| {
+            read.control != control || !Arc::ptr_eq(&read.protocol, &self.protocol)
+        });
+        let stale_ready = self.identity_ready.as_ref().is_some_and(|ready| {
+            ready.control != control
+                || !Arc::ptr_eq(&ready.protocol, &self.protocol)
+                || ready.completed_at.elapsed()
+                    > Duration::from_secs(self.config.timeouts.effective_read_http_seconds())
+        });
+        if self.reload_blocked || stale_read || stale_ready {
+            self.cancel_identity().await?;
+        }
+        let Some(mut read) = self.identity_read.take() else {
+            return Ok(());
+        };
+        let (completed_at, result) = match read.completion.try_recv() {
+            Ok(result) => result,
+            Err(oneshot::error::TryRecvError::Empty) => {
+                self.identity_read = Some(read);
+                return Ok(());
+            }
+            Err(oneshot::error::TryRecvError::Closed) => (
+                Instant::now(),
+                Err(anyhow::anyhow!("identity read task ended")),
+            ),
+        };
+        let _ = read.task.await;
+        if completed_at.elapsed()
+            > Duration::from_secs(self.config.timeouts.effective_read_http_seconds())
+        {
+            self.store.read_finished(ReadScope::Identity, None, None)?;
+            return Ok(());
+        }
+        let response = self.finish_read(read.kind, ReadScope::Identity, result)?;
+        if self.validate_identity(read.kind, response)? {
+            self.identity_ready = Some(IdentityReady {
+                protocol: read.protocol,
+                control: read.control,
+                completed_at,
+            });
+            // A due mine waiting to prepare must wake before this permit expires.
+            // Once captured, its operation deadline drives dispatch; keep mining cadence.
+            if read.kind != WorkKind::Mine || self.store.preparation(WorkKind::Mine)?.is_none() {
+                self.store.defer_until(read.kind, now())?;
+            }
+        }
+        Ok(())
+    }
+
     async fn identity_matches(&mut self, kind: WorkKind) -> Result<bool> {
-        let Some(response) = self
-            .get(kind, ReadScope::Identity, "/api/hosted/me")
-            .await?
-        else {
+        if !self.identity_nonblocking {
+            let response = self
+                .get(kind, ReadScope::Identity, Endpoint::Identity, None)
+                .await?;
+            return self.validate_identity(kind, response);
+        }
+        loop {
+            self.collect_identity().await?;
+            if self.stopping() || self.reload_blocked {
+                return Ok(false);
+            }
+            if self.identity_ready.take().is_some() {
+                return Ok(true);
+            }
+            self.start_identity(kind)?;
+            // Keep a selected judgment across this wait: a later inventory-page
+            // failure may forbid re-reading the usable earlier page for a while.
+            // Answers remain independently serviced; no admission guard is held.
+            if kind != WorkKind::Judge || self.urgent_context || self.identity_read.is_none() {
+                return Ok(false);
+            }
+            let wake = Arc::clone(&self.model_wake);
+            let delay = self.urgent_delay()?;
+            tokio::select! {
+                _ = self.stop.changed() => return Ok(false),
+                _ = wake.notified() => {},
+                _ = tokio::time::sleep(delay) => {},
+            }
+            Box::pin(self.service_urgent(true)).await?;
+            if !self.active(kind)? {
+                return Ok(false);
+            }
+        }
+    }
+
+    fn start_identity(&mut self, kind: WorkKind) -> Result<()> {
+        if self.identity_ready.is_none()
+            && self.identity_read.is_none()
+            && !self.stopping()
+            && !self.reload_blocked
+            && self.store.read_backoff(ReadScope::Identity)?.next_at <= now()
+        {
+            let control = self.store.control()?;
+            let protocol = Arc::clone(&self.protocol);
+            let client = Arc::clone(&protocol);
+            let wake = Arc::clone(&self.model_wake);
+            let (sender, completion) = oneshot::channel();
+            self.store.read_started(ReadScope::Identity)?;
+            let task = tokio::spawn(async move {
+                let result = client.get(Endpoint::Identity, None).await;
+                let _ = sender.send((Instant::now(), result));
+                wake.notify_one();
+            });
+            self.identity_read = Some(IdentityRead {
+                protocol,
+                control,
+                kind,
+                completion,
+                _guard: ReadTaskGuard(task.abort_handle()),
+                task,
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_identity(&mut self, kind: WorkKind, response: Option<Response>) -> Result<bool> {
+        let Some(response) = response else {
             self.store.record_hosted_identity(false)?;
             return Ok(false);
         };
@@ -1003,6 +1173,7 @@ impl Runtime {
     }
 
     async fn service_urgent(&mut self, admission_available: bool) -> Result<()> {
+        self.collect_identity().await?;
         let previous = self.urgent_context;
         self.urgent_context = true;
         let result = self.answer_work(admission_available).await;
@@ -1085,6 +1256,7 @@ impl Runtime {
     }
 
     async fn cycle(&mut self) -> Result<()> {
+        self.collect_identity().await?;
         self.collect_models().await?;
         self.store.retry_models(&self.config)?;
         let before_answer = self.store.work_revision()?;
@@ -1128,14 +1300,14 @@ impl Runtime {
                 && (kind != WorkKind::Answer || !self.config.preparation.answer_while_blocked)
             {
                 if kind == WorkKind::Judge {
-                    let _ = self.assignment_inventory().await?;
+                    let _ = self.assignment_inventory(None).await?;
                 }
                 continue;
             }
             match kind {
                 WorkKind::Answer => unreachable!("answer uses the urgent lane"),
                 WorkKind::Judge => {
-                    let Some(inventory) = self.assignment_inventory().await? else {
+                    let Some(inventory) = self.assignment_inventory(None).await? else {
                         continue;
                     };
                     if !self.active(kind)? {
@@ -1232,7 +1404,7 @@ impl Runtime {
             self.store.defer(kind, self.poll_delay())?;
             match kind {
                 WorkKind::Judge => {
-                    let _ = self.assignment_inventory().await?;
+                    let _ = self.assignment_inventory(None).await?;
                 }
                 _ => {
                     let _ = self.challenge(kind).await?;
@@ -1490,7 +1662,7 @@ impl Runtime {
                 ))
             }
             WorkKind::Judge => {
-                let Some(inventory) = self.assignment_inventory().await? else {
+                let Some(inventory) = self.assignment_inventory(Some(&op.key)).await? else {
                     return Ok(None);
                 };
                 let ids = assignment_ids(&inventory.response)?;
@@ -1544,6 +1716,13 @@ impl Runtime {
         let expected_control = self.store.control()?;
         let input: Input =
             serde_json::from_value(op.request.clone()).context("invalid durable request")?;
+        if self.identity_nonblocking {
+            self.collect_identity().await?;
+            // Fetch identity alongside freshness, but consume it only afterward.
+            // A slow inventory must not force another inventory round trip merely
+            // because identity verification had not yet been started.
+            self.start_identity(op.kind)?;
+        }
         match self.fresh(op, &input).await? {
             Some(true) => {}
             Some(false) => {
@@ -1767,7 +1946,7 @@ impl Runtime {
     async fn reconcile(&mut self, op: &mut Operation) -> Result<()> {
         if let Some(txid) = op.txid.clone() {
             let Some(response) = self
-                .get(op.kind, ReadScope::Receipt, &format!("/api/receipt/{txid}"))
+                .get(op.kind, ReadScope::Receipt, Endpoint::Receipt, Some(&txid))
                 .await?
             else {
                 return Ok(());
@@ -1814,7 +1993,7 @@ impl Runtime {
                 return Ok(());
             }
             let Some(response) = self
-                .get(op.kind, ReadScope::Job, &format!("/api/job/{job}"))
+                .get(op.kind, ReadScope::Job, Endpoint::Job, Some(&job))
                 .await?
             else {
                 return Ok(());
@@ -2056,6 +2235,9 @@ mod tests {
             controller: true,
             model_wake: Arc::new(Notify::new()),
             urgent_context: false,
+            identity_read: None,
+            identity_ready: None,
+            identity_nonblocking: false,
         };
         (temp, runtime, sender)
     }
@@ -2395,7 +2577,7 @@ mod tests {
                 .await
                 .unwrap();
         });
-        assert!(runtime.assignment_inventory().await.unwrap().is_some());
+        assert!(runtime.assignment_inventory(None).await.unwrap().is_some());
         server.await.unwrap();
         assert_eq!(runtime.config.timeouts.http_seconds, 1);
         assert_eq!(
@@ -2449,7 +2631,7 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let inventory = runtime.assignment_inventory().await.unwrap().unwrap();
+        let inventory = runtime.assignment_inventory(None).await.unwrap().unwrap();
         server.await.unwrap();
         assert_eq!(inventory.response.body["has_more"], false);
         let status = runtime.store.status(&runtime.config).unwrap();
@@ -2675,11 +2857,11 @@ mod tests {
                 drop(stream);
                 listener
             });
-            assert!(runtime.assignment_inventory().await.unwrap().is_none());
+            assert!(runtime.assignment_inventory(None).await.unwrap().is_none());
             let state = runtime.store.read_backoff(ReadScope::Assignments).unwrap();
             assert_eq!(state.failures, 1);
             runtime.store = Store::open(&runtime.config).unwrap();
-            assert!(runtime.assignment_inventory().await.unwrap().is_none());
+            assert!(runtime.assignment_inventory(None).await.unwrap().is_none());
             assert_eq!(
                 runtime.store.read_backoff(ReadScope::Assignments).unwrap(),
                 state

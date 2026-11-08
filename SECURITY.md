@@ -1,6 +1,6 @@
 # Security
 
-agmi participates using an existing MinePOA identity. A hosted API key can authorize more than the participation operations agmi exposes: protect it as an account credential.
+agmi participates using a local MinePOA identity. It can attach an existing credential or explicitly create a new hosted identity through the CLI. A hosted API key can authorize more than participation: protect it as an account credential.
 
 ## Secrets and private state
 
@@ -16,7 +16,11 @@ Model failure diagnostics are typed, allowlisted codes, not raw native stderr or
 
 ## Network and outcomes
 
-Production credentials are pinned to `https://minepoa.com` on its default HTTPS port. Explicit HTTP loopback remains available for local fixtures; use dummy fixture credentials. Redirects, arbitrary origins and arbitrary polling destinations are not authorized. Authentication belongs in headers, not query strings. Job identifiers may act as bearer capabilities and remain private.
+The default production credential origin is MinePOA, declared in `defaults/network.toml`. `network.base_url` must match the separately configured `network.trusted_origins`; adding an origin explicitly authorizes credential delivery there. Production origins require HTTPS. Explicit HTTP loopback remains available for isolated fixtures with dummy credentials. Existing journals bind their origin immutably. Redirects, proxies and response-provided polling URLs are never followed. Authentication belongs in headers; job identifiers may be bearer capabilities and remain private.
+
+API paths are configurable trusted policy, not arbitrary URL input. Typed endpoint permissions retain authentication and mutation semantics independently of path spelling or GET. Unsafe templates and overlapping same-method paths are rejected, but agmi cannot prove the semantics of a custom server. A durable routing profile prevents pending work from being reinterpreted after route changes, restart or recovery. Changes require a stopped, drained account; never discard uncertainty to bypass this gate.
+
+Registration requires explicit confirmation and finite proof-of-work budgets. The durable pre-POST intent prevents cooperating replay; it cannot eliminate the remote-created/lost-key crash window. Complete responses, intents, credentials and network metadata are private, create-only artifacts. An incomplete or ambiguous capture remains unknown and cannot authorize another POST. Retained success can be recovered locally; only a documented rejection permits a separately confirmed new attempt after its retained retry floor. Status, logs and errors never expose the credential or raw response.
 
 Read-only means no new model calls or MinePOA mutations, not no local journal writes. Off prevents new participation and ordinary polling; safe account/job/receipt reconciliation continues for possibly-sent work even while paused. Stop the runtime to stop agmi network activity. Local pause cannot retract requests or disable server-side auto-mining.
 

@@ -39,6 +39,8 @@ fn main() {
         "deploy",
         "tests",
         "examples",
+        "defaults",
+        "docs",
         ".github",
     ] {
         println!("cargo:rerun-if-changed={path}");

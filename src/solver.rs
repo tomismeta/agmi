@@ -244,6 +244,7 @@ where
                 );
                 let input = serde_json::to_vec(
                     &json!({"model": model.model, "reasoning": model.reasoning,
+                    "hermes_api_url": model.hermes_api_url,
                     "timeout_seconds": timeout_seconds, "policy": SECURITY_AND_OUTPUT, "prompt": prompt}),
                 )?;
                 started = true;
@@ -511,12 +512,23 @@ fn validate_request(request: &SolverRequest) -> Result<()> {
 fn validate_artifact(output: &str, request: &SolverRequest, digest: &str) -> Result<Artifact> {
     let artifact: Artifact =
         serde_json::from_str(output).map_err(|_| NativeFailure("artifact_json_invalid"))?;
+    // Diagnose only the failed field, never the model-supplied binding value.
+    // Unbound artifacts remain uncertain rather than eligible for regeneration.
     ensure!(
-        artifact.version == 1
-            && artifact.request_id == request.id
-            && artifact.request_digest == digest
-            && artifact.kind == request.kind,
-        NativeFailure("artifact_binding_mismatch")
+        artifact.version == 1,
+        NativeFailure("artifact_version_mismatch")
+    );
+    ensure!(
+        artifact.request_id == request.id,
+        NativeFailure("artifact_request_id_mismatch")
+    );
+    ensure!(
+        artifact.request_digest == digest,
+        NativeFailure("artifact_request_digest_mismatch")
+    );
+    ensure!(
+        artifact.kind == request.kind,
+        NativeFailure("artifact_kind_mismatch")
     );
     match request.kind {
         WorkKind::Answer => {
@@ -901,7 +913,7 @@ mod tests {
                 artifact(&request)
                     .to_string()
                     .replace("request-1", "secret-canary"),
-                "artifact_binding_mismatch",
+                "artifact_request_id_mismatch",
             ),
             (
                 artifact(&request).to_string().replace(
@@ -916,6 +928,42 @@ mod tests {
                 .unwrap();
             assert_safe_failure(&error, code, true);
         }
+    }
+
+    #[test]
+    fn binding_failures_are_field_specific_and_never_completed_invalid() {
+        let request = request();
+        for (field, value, code) in [
+            ("version", json!(2), "artifact_version_mismatch"),
+            (
+                "request_id",
+                json!("secret-canary"),
+                "artifact_request_id_mismatch",
+            ),
+            (
+                "request_digest",
+                json!("secret-canary"),
+                "artifact_request_digest_mismatch",
+            ),
+            ("kind", json!("judge"), "artifact_kind_mismatch"),
+        ] {
+            let mut output = artifact(&request);
+            output[field] = value;
+            // A payload failure must not mask the binding failure or permit retry.
+            output["answer"] = json!("secret-canary");
+            let error = validate_artifact(&output.to_string(), &request, "digest")
+                .err()
+                .unwrap();
+            assert_safe_failure(&error, code, true);
+            assert!(!completed_artifact_invalid(&error));
+        }
+        let mut output = artifact(&request);
+        output["answer"] = json!("secret-canary");
+        let error = validate_artifact(&output.to_string(), &request, "digest")
+            .err()
+            .unwrap();
+        assert_safe_failure(&error, "protocol_output_invalid", true);
+        assert!(completed_artifact_invalid(&error));
     }
 
     #[cfg(unix)]
@@ -970,6 +1018,33 @@ mod tests {
         ] {
             scripts.push((format!("printf '%s' '{value}'"), code, true));
         }
+        let request = request();
+        let digest = format!("{:x}", Sha256::digest(encode_request(&request).unwrap()));
+        for (field, value, code) in [
+            ("version", json!(2), "artifact_version_mismatch"),
+            (
+                "request_id",
+                json!("secret-canary"),
+                "artifact_request_id_mismatch",
+            ),
+            (
+                "request_digest",
+                json!("secret-canary"),
+                "artifact_request_digest_mismatch",
+            ),
+            ("kind", json!("judge"), "artifact_kind_mismatch"),
+            ("answer", json!("secret-canary"), "protocol_output_invalid"),
+        ] {
+            let mut output = artifact(&request);
+            output["request_digest"] = json!(digest);
+            output[field] = value;
+            let envelope = json!({
+                "provider":"openai-codex", "model":model.model,
+                "reasoning_effort":model.reasoning, "run_id":"run",
+                "output":output.to_string()
+            });
+            scripts.push((format!("printf '%s' '{envelope}'"), code, true));
+        }
         for (kind, code) in [
             ("timeout", "hermes_timeout"),
             ("cancelled", "hermes_cancelled"),
@@ -994,10 +1069,14 @@ mod tests {
             } else {
                 10
             };
-            let error = solve(&model, &request(), budget, || Ok(()))
+            let error = solve(&model, &request, budget, || Ok(()))
                 .await
                 .unwrap_err();
             assert_safe_failure(&error, code, ambiguous);
+            assert_eq!(
+                completed_artifact_invalid(&error),
+                code == "protocol_output_invalid"
+            );
         }
         for (script, code) in [
             ("sleep 3", "model_deadline_exceeded"),
@@ -1016,7 +1095,7 @@ mod tests {
             } else {
                 10
             };
-            let error = solve(&model, &request(), budget, || Ok(()))
+            let error = solve(&model, &request, budget, || Ok(()))
                 .await
                 .unwrap_err();
             assert_safe_failure(&error, code, false);
@@ -1178,6 +1257,7 @@ mod tests {
             executable: scratch.0.join("does-not-exist"),
             model: "gpt-6.1-sol".into(),
             reasoning: "high".into(),
+            hermes_api_url: crate::config::default_hermes_api_url(),
             guidance_file: None,
             core_guidance_file: None,
             core_guidance: "".into(),
@@ -1352,6 +1432,7 @@ mod tests {
             executable,
             model: "openai/gpt-6.1-sol".into(),
             reasoning: "high".into(),
+            hermes_api_url: crate::config::default_hermes_api_url(),
             guidance_file: None,
             core_guidance_file: None,
             core_guidance: "".into(),

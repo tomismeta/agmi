@@ -58,7 +58,7 @@ def main():
         PRELAUNCH_CODE = 79
         runtime = resolve_runtime_provider(requested="openai-codex", target_model=payload["model"])
         PRELAUNCH_CODE = 80
-        expected = ("openai-codex", "codex_responses", "https://chatgpt.com/backend-api/codex")
+        expected = ("openai-codex", "codex_responses", payload["hermes_api_url"])
         if tuple(runtime.get(k) for k in ("provider", "api_mode", "base_url")) != expected:
             raise RuntimeError("native OAuth route mismatch")
         if runtime.get("source") not in ("hermes-auth-store", "manual:device_code", "device_code"):

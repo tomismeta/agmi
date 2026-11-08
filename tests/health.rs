@@ -82,3 +82,70 @@ fn disk_guard_checks_existing_parent_and_never_creates_state() {
     );
     assert!(!dir.path().join("not-created").exists());
 }
+
+#[test]
+fn health_before_onboarding_is_structured_read_only_and_preserves_config_selection() {
+    for invalid in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let private = "private-invalid-config-value";
+        if invalid {
+            fs::write(&path, format!("invalid = \"{private}\n")).unwrap();
+        }
+        let before = fs::read_dir(dir.path()).unwrap().count();
+        let output = Command::new(env!("CARGO_BIN_EXE_agmi"))
+            .env("HOME", dir.path())
+            .env("XDG_CONFIG_HOME", dir.path().join("xdg"))
+            .arg("--config")
+            .arg(&path)
+            .args(["--json", "health"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stderr.is_empty());
+        let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let code = if invalid {
+            "config_invalid"
+        } else {
+            "config_missing"
+        };
+        assert_eq!(envelope["type"], "health");
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["data"]["issues"], serde_json::json!([code]));
+        assert_eq!(envelope["data"]["operational"]["status"], "unknown");
+        assert!(envelope["data"]["risk"]["unresolved_effects"].is_null());
+        assert_eq!(envelope["data"]["mutations"], false);
+        let action = &envelope["data"]["diagnostics"][0]["next_actions"][0];
+        assert_eq!(action["kind"], "command");
+        assert_eq!(action["authorization_required"], false);
+        assert_eq!(action["argv"][1], "--config");
+        assert_eq!(action["argv"][2], serde_json::json!(path));
+        assert_eq!(before, fs::read_dir(dir.path()).unwrap().count());
+        assert!(!String::from_utf8_lossy(&output.stdout).contains(private));
+        if invalid {
+            assert_eq!(
+                fs::read_to_string(&path).unwrap(),
+                format!("invalid = \"{private}\n")
+            );
+        }
+    }
+}
+
+#[test]
+fn health_with_default_missing_config_never_creates_onboarding_directories() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_agmi"))
+        .env("HOME", dir.path())
+        .env("XDG_CONFIG_HOME", dir.path().join("xdg"))
+        .args(["--json", "health"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        envelope["data"]["issues"],
+        serde_json::json!(["config_missing"])
+    );
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+}

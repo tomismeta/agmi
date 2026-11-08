@@ -1,6 +1,6 @@
 //! Local, private administration. No journal initialization, provider or network calls.
 use crate::config::{Config, resolve_path, validate_guidance_bytes};
-use crate::store::{AdmissionGuard, admin_identity_initialized};
+use crate::store::{AccountLock, AdmissionGuard, Store, admin_identity_initialized};
 use anyhow::Result;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -211,9 +211,17 @@ fn encode(value: Value) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 fn immutable_changed(old: &Config, new: &Config) -> bool {
-    old.network != new.network || old.state_dir != new.state_dir
+    old.network.base_url != new.network.base_url
+        || old.network.chain != new.network.chain
+        || old.network.address != new.network.address
+        || old.network.credential_file != new.network.credential_file
+        || old.state_dir != new.state_dir
 }
-fn identity_guard(old: &Config, new: &Config, dry_run: bool) -> Result<Vec<AdmissionGuard>> {
+fn identity_guard(
+    old: &Config,
+    new: &Config,
+    dry_run: bool,
+) -> Result<(Vec<AdmissionGuard>, Option<AccountLock>)> {
     let mut guards = Vec::new();
     if !dry_run {
         let key = |config: &Config| {
@@ -240,8 +248,20 @@ fn identity_guard(old: &Config, new: &Config, dry_run: bool) -> Result<Vec<Admis
             })?);
         }
     }
+    let mut writer = None;
+    if old.network.api != new.network.api && admin_identity_initialized(old)? {
+        writer = Some(AccountLock::stopped(old).map_err(|_| {
+            error(
+                "admin_routing_runtime_active",
+                "Stop the controller before changing API routing.",
+            )
+        })?);
+        if let Some(store) = Store::read_only(old)? {
+            store.routing_change_allowed(new)?;
+        }
+    }
     if !immutable_changed(old, new) {
-        return Ok(guards);
+        return Ok((guards, writer));
     }
     if admin_identity_initialized(old).map_err(|_| {
         error(
@@ -259,7 +279,7 @@ fn identity_guard(old: &Config, new: &Config, dry_run: bool) -> Result<Vec<Admis
             "Initialized account, origin, chain, credential reference and state directory cannot be changed.",
         ));
     }
-    Ok(guards)
+    Ok((guards, writer))
 }
 fn guidance_target(config_path: &Path, config: &Config, target: &Path) -> Result<PathBuf> {
     let target = absolute_target(target)?;
@@ -361,6 +381,8 @@ fn defaults() -> Value {
     value["timeouts"]["read_http_seconds"] = Value::Null;
     value["schedule"]["challenge_retry_seconds"] = Value::Null;
     value["schedule"]["challenge_backoff_max_seconds"] = Value::Null;
+    value["schedule"]["assignments_retry_seconds"] = Value::Null;
+    value["schedule"]["assignments_backoff_max_seconds"] = Value::Null;
     value["schedule"]["queued_job_polling"] = Value::Null;
     value["solver"]["answer"]["guidance_file"] = Value::Null;
     value["solver"]["judge"]["guidance_file"] = Value::Null;
@@ -399,6 +421,8 @@ fn describe(path: &str, value: &Value, settings: &mut Vec<Value>) {
                 "timeouts.read_http_seconds"
                     | "schedule.challenge_retry_seconds"
                     | "schedule.challenge_backoff_max_seconds"
+                    | "schedule.assignments_retry_seconds"
+                    | "schedule.assignments_backoff_max_seconds"
             ) =>
         {
             "integer|null"
@@ -416,7 +440,22 @@ fn describe(path: &str, value: &Value, settings: &mut Vec<Value>) {
         Value::Null
     };
     let mut setting = json!({"path":path,"type":kind,"default":value,"enum":choices,
-            "immutable_when_initialized":path.starts_with("network.") || path == "state_dir"});
+            "immutable_when_initialized":matches!(path,
+                "network.base_url" | "network.chain" | "network.address"
+                | "network.credential_file" | "state_dir")});
+    if path.starts_with("network.api.") {
+        setting["change_conditions"] = json!({
+            "when_initialized": ["controller_stopped", "journal_drained"],
+            "constraint": "Changed routing must pass the journal routing-change guard before saving."
+        });
+    }
+    if path == "network.trusted_origins" {
+        setting["change_conditions"] = json!({
+            "bound_origin_must_remain_authorized": true,
+            "credential_delivery_authorization_required": true,
+            "constraint": "Trust edits authorize credential delivery to the configured origin; the bound origin must remain trusted, except explicit HTTP loopback development origins."
+        });
+    }
     if path == "schedule.queued_job_polling" {
         setting["properties"] = json!({
             "initial_seconds":{"type":"integer","minimum":1},
@@ -658,6 +697,57 @@ pub fn guidance_set(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schema_distinguishes_identity_routing_and_trust_changes() {
+        let schema = schema();
+        let settings = schema["settings"].as_array().unwrap();
+        let immutable: Vec<_> = settings
+            .iter()
+            .filter(|setting| setting["immutable_when_initialized"] == true)
+            .map(|setting| setting["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            immutable,
+            vec![
+                "network.address",
+                "network.base_url",
+                "network.chain",
+                "network.credential_file",
+                "state_dir"
+            ]
+        );
+        let routes: Vec<_> = settings
+            .iter()
+            .filter(|setting| {
+                setting["path"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("network.api.")
+            })
+            .collect();
+        assert!(!routes.is_empty());
+        for route in routes {
+            assert_eq!(route["immutable_when_initialized"], false);
+            assert_eq!(
+                route["change_conditions"]["when_initialized"],
+                json!(["controller_stopped", "journal_drained"])
+            );
+        }
+        let trust = settings
+            .iter()
+            .find(|setting| setting["path"] == "network.trusted_origins")
+            .unwrap();
+        assert_eq!(trust["immutable_when_initialized"], false);
+        assert_eq!(
+            trust["change_conditions"]["bound_origin_must_remain_authorized"],
+            true
+        );
+        assert_eq!(
+            trust["change_conditions"]["credential_delivery_authorization_required"],
+            true
+        );
+    }
 
     #[test]
     fn guidance_layers_are_discoverable_and_updated_independently() {

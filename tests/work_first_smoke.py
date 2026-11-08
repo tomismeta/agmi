@@ -244,7 +244,16 @@ def assert_safe_projection(f, reads, work=None):
             assert {'phase', 'reason', 'next_action', 'next_at', 'epoch', 'operation_id'} <= row.keys(), row
             assert isinstance(row['phase'], str) and row['phase'], row
             assert isinstance(row['next_action'], str) and row['next_action'], row
-    encoded = json.dumps({'reads': reads, 'work': work})
+    public_work = json.loads(json.dumps(work))
+    if public_work is not None:
+        for row in public_work.values():
+            for action in row.get('next_actions', []):
+                argv = action.get('argv', [])
+                # The caller-selected configuration is explicit CLI navigation,
+                # not permission to expose any other private path or model data.
+                if argv[:3] == ['agmi', '--config', str(f.config)]:
+                    argv[2] = '<selected-config>'
+    encoded = json.dumps({'reads': reads, 'work': public_work})
     assert len(encoded) < 16384, 'public diagnostics are not bounded'
     for private in ('pk_test_fixture', PRIVATE_MARKER, 'http://', 'https://',
                     f.chain, f.address, TXID, str(f.root)):

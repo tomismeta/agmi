@@ -7,6 +7,7 @@ Fixtures only; temporary state and fixture account locks are removed on exit.
 import argparse
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
 import pathlib
@@ -76,6 +77,21 @@ class LifecycleFixture(Fixture):
         output = result.stdout + result.stderr
         assert not any(secret in output for secret in SECRETS), 'credential leaked to CLI output'
         assert (result.returncode == 0) == succeeds, safe(output)
+        if not succeeds:
+            envelope = json.loads(result.stderr)
+            assert envelope['schema'] == 'agmi.cli.v1' and not envelope['ok']
+            error = envelope['error']
+            assert error['code'] and isinstance(error['details'], dict)
+            for action in error['next_actions']:
+                if action['kind'] == 'instruction':
+                    assert action['authorization_required'] is True
+                    continue
+                assert action['kind'] == 'command'
+                if config is not None:
+                    assert action['argv'][:3] == ['agmi', '--config', str(config)]
+                words = action['argv'][3:] if action['argv'][1:2] == ['--config'] else action['argv'][1:]
+                requires_authorization = words in (['pause'], ['service', 'stop'])
+                assert action['authorization_required'] is requires_authorization
         return json.loads(result.stdout)['data'] if succeeds else output
 
     def init_args(self, target):
@@ -106,10 +122,21 @@ def init(f):
         count = len(f.identity_reads)
         result = f.cli(config, args + key_args + ['--dry-run'], OLD if mode == 'stdin' else None)
         assert result['dry_run'] and result['identity_verified']
+        assert result['ready_for_participation'] is False
+        assert result['next_actions'][0]['kind'] == 'instruction'
+        assert result['next_actions'][0]['authorization_required']
         assert snapshot(f.root) == before and not target.exists(), 'dry-run wrote files'
         assert len(f.identity_reads) == count + 1
         result = f.cli(config, args + key_args, OLD if mode == 'stdin' else None)
         assert result['identity_verified'] and result['paused'] and not result['journal_initialized']
+        assert result['ready_for_participation'] is False and result['service_state'] == 'not_inspected'
+        actions = result['next_actions']
+        commands = [action for action in actions if action['kind'] == 'command']
+        assert all(action['argv'][:3] == ['agmi', '--config', str(config)] for action in commands)
+        tails = [action['argv'][3:] for action in commands]
+        assert tails.index(['config', 'check']) < tails.index(['run', '--once']) < tails.index(['resume']) < tails.index(['health'])
+        assert all(action['authorization_required'] for action in commands if action['argv'][3:] in (['run', '--once'], ['resume']))
+        assert all(not action['authorization_required'] for action in commands if action['argv'][3:] in (['config', 'check'], ['health']))
         assert not (target / 'state/state.sqlite3').exists()
         text = config.read_text()
         assert 'read_only' in text and not any(secret in text for secret in SECRETS)
@@ -198,7 +225,7 @@ def terminal(f, target, interrupt=None):
             assert '"identity_verified":true' in text.replace(' ', '')
             private_tree(target)
         else:
-            assert 'interrupted' in text and not target.exists(), safe(text)
+            assert not target.exists(), 'interrupted input created onboarding files'
     finally:
         signal.signal(signal.SIGHUP, signal.SIG_IGN)
         os.close(master)
@@ -243,14 +270,12 @@ def rotate(f):
     f.invoke('pause')
     old = f.key.read_bytes()
     count = len(f.identity_reads)
-    error = f.cli(f.config, ['credentials', 'rotate', '--key-stdin'], NEW, succeeds=False)
-    assert 'running' in error or 'writer' in error or 'stop' in error, error
+    f.cli(f.config, ['credentials', 'rotate', '--key-stdin'], NEW, succeeds=False)
     assert f.key.read_bytes() == old and len(f.identity_reads) == count
     f.stop()
     f.invoke('resume')
     count = len(f.identity_reads)
-    error = f.cli(f.config, ['credentials', 'rotate', '--key-stdin'], NEW, succeeds=False)
-    assert 'pause' in error, error
+    f.cli(f.config, ['credentials', 'rotate', '--key-stdin'], NEW, succeeds=False)
     assert f.key.read_bytes() == old and len(f.identity_reads) == count
     f.invoke('pause')
     operations = f.operations()
@@ -295,6 +320,46 @@ def installer(f):
         result = f.cli(None, words + ['--dry-run'])
         assert result['dry_run'] and not result['network_downloads']
         assert result['pause_state'] == 'unchanged' and 'plan only' in result['preview']
+        assert result['stage'] == 'preflight' and result['activation'] == 'not_started'
+        assert result['service'] == 'unknown' and result['authorization']['dry_run']
+        assert result['next_actions'][0] == {'kind': 'command', 'argv': ['agmi', 'service', 'status'],
+                                             'authorization_required': False}
+        assert snapshot(f.root) == before
+    error = json.loads(f.cli(None, ['install', '--binary', '/nonexistent/fixture-binary',
+                                    '--sha256', '0' * 64], succeeds=False))['error']
+    assert error['code'] == 'installer_failed'
+    assert error['details']['stage'] == 'preflight'
+    assert error['details']['activation'] == 'not_started'
+    assert error['details']['service'] == 'unknown'
+    assert snapshot(f.root) == before
+    script = pathlib.Path(__file__).resolve().parents[1] / 'deploy/install-user.sh'
+    failed = subprocess.run(['sh', str(script), 'stage'], text=True, capture_output=True, env=f.env)
+    assert failed.returncode != 0
+    marker = json.loads(failed.stdout.splitlines()[-1])
+    assert marker['schema'] == 'agmi.installer.v1' and marker['outcome'] == 'failed'
+    assert marker['activation'] == 'not_started' and marker['service'] == 'unknown'
+    assert marker['next_actions'][0]['argv'] == ['agmi', 'service', 'status']
+    assert snapshot(f.root) == before
+    if sys.platform.startswith('linux'):
+        planned = subprocess.run(['sh', str(script), 'service', 'start', '--dry-run'],
+                                 text=True, capture_output=True, env=f.env)
+        assert planned.returncode == 0, safe(planned.stderr)
+        marker = json.loads(planned.stdout.splitlines()[-1])
+        assert marker['outcome'] == 'success' and marker['activation'] == 'not_started'
+        candidate = f.root / 'unreporting-incoming-release'
+        candidate.write_text(f"#!/bin/sh\nprintf '%s\\n' '{ECHO}' >&2\nexit 7\n")
+        candidate.chmod(0o700)
+        try:
+            digest = hashlib.sha256(candidate.read_bytes()).hexdigest()
+            error = json.loads(f.cli(None, ['update', '--binary', str(candidate),
+                                            '--sha256', digest], succeeds=False))['error']
+            assert error['code'] == 'installer_failed'
+            assert error['details']['stage'] == 'unknown'
+            assert error['details']['activation'] == 'unknown'
+            assert error['details']['service'] == 'unknown'
+            assert error['next_actions'][0]['argv'] == ['agmi', 'service', 'status']
+        finally:
+            candidate.unlink()
         assert snapshot(f.root) == before
     assert not f.identity_reads and not f.reads and not f.writes
 

@@ -1,7 +1,9 @@
+mod cli_error;
+
 use agmi::{
     admin,
-    config::{Config, WorkKind},
-    health, lifecycle, runtime,
+    config::{Config, NetworkConfig, WorkKind},
+    health, lifecycle, registration, runtime,
 };
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -32,21 +34,50 @@ struct Cli {
     command: Command,
 }
 
+fn network_options(
+    profile: Option<&Path>,
+    chain: Option<&str>,
+    base_url: Option<&str>,
+) -> Result<NetworkConfig> {
+    let mut network = profile
+        .map(NetworkConfig::read_profile)
+        .transpose()?
+        .unwrap_or_default();
+    if let Some(chain) = chain {
+        network.chain = chain.into();
+    }
+    if let Some(origin) = base_url {
+        network.base_url = origin.into();
+    }
+    network.origin()?;
+    network.api.validate()?;
+    Ok(network)
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Inspect the compiled release identity without loading configuration.
     BuildInfo {
+        /// Emit the raw installer manifest even with --json (explicit envelope exception).
         #[arg(long)]
         manifest: bool,
+    },
+    /// Explicitly create a hosted identity, or inspect local registration evidence.
+    Identity {
+        #[command(subcommand)]
+        command: IdentityCommand,
     },
     /// Verify an existing hosted credential and create read-only, paused configuration.
     Init {
         #[arg(long)]
         account: String,
-        #[arg(long, default_value = "poa-mainnet-1")]
-        chain: String,
-        #[arg(long, default_value = "https://minepoa.com")]
-        base_url: String,
+        #[arg(long)]
+        chain: Option<String>,
+        #[arg(long)]
+        base_url: Option<String>,
+        /// Network defaults, trust and API route templates; contains no credential value.
+        #[arg(long)]
+        network_config: Option<PathBuf>,
         /// Reference an existing private credential; never copy or replace it.
         #[arg(long, conflicts_with_all = ["key_stdin", "key_prompt"], required_unless_present_any = ["key_stdin", "key_prompt"])]
         api_key_file: Option<PathBuf>,
@@ -159,6 +190,55 @@ enum Command {
     Agents,
     /// Discover commands and their effects.
     Commands,
+}
+
+#[derive(Subcommand)]
+enum IdentityCommand {
+    /// Plan without effects; --confirm authorizes bounded proof of work and registration.
+    ///
+    /// The API key is returned only once. A crash after remote creation but before
+    /// durable private response capture can permanently lose it. An uncertain
+    /// attempt is never automatically submitted again.
+    Create {
+        #[arg(long)]
+        label: String,
+        #[arg(long)]
+        chain: Option<String>,
+        /// Explicitly trusted HTTPS origin, or an isolated loopback fixture.
+        #[arg(long)]
+        base_url: Option<String>,
+        #[arg(long)]
+        network_config: Option<PathBuf>,
+        #[arg(long)]
+        invited_by: Option<String>,
+        /// Maximum accepted challenge difficulty; never lowers server difficulty.
+        #[arg(long, default_value_t = 24, value_parser = clap::value_parser!(u32).range(0..=256))]
+        max_pow_bits: u32,
+        /// Maximum number of nonce hashes for one attempt.
+        #[arg(long, default_value_t = 67_108_864, value_parser = clap::value_parser!(u64).range(1..))]
+        max_pow_hashes: u64,
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
+        pow_seconds: u64,
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
+        http_seconds: u64,
+        /// Explicitly accept this exact server algorithm identifier.
+        #[arg(long)]
+        expected_pow_algo: Option<String>,
+        /// Authorize remote creation and acknowledge the irreversible lost-key crash window.
+        #[arg(long)]
+        confirm: bool,
+        /// Explicit new attempt only after a definitive rejection and its retry floor.
+        #[arg(long, requires = "confirm")]
+        retry_rejected: bool,
+    },
+    /// Inspect sanitized local registration evidence without network or file writes.
+    Status,
+    /// Recover retained registration files locally; never contacts the network.
+    Resume {
+        /// Authorize local credential/configuration publication from the captured response.
+        #[arg(long)]
+        confirm: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -296,11 +376,23 @@ fn administration_input() -> Result<Vec<u8>> {
 
 fn config_path(cli: &Cli) -> Result<PathBuf> {
     if let Some(path) = &cli.config {
-        return Ok(path.clone());
+        return Ok(std::path::absolute(path)?);
     }
-    Ok(dirs::config_dir()
-        .context("cannot locate configuration directory; use --config")?
-        .join("agmi/config.toml"))
+    Ok(std::path::absolute(
+        dirs::home_dir()
+            .context("cannot locate home directory; use --config")?
+            .join(".config/agmi/config.toml"),
+    )?)
+}
+
+fn health_prerequisite(code: &'static str) -> Value {
+    json!({
+        "healthy":false,"attention_required":true,"issues":[code],"warnings":[],
+        "readiness":"prerequisites_missing","evidence":"local_only",
+        "operational":{"status":"unknown","issues":[code]},
+        "risk":{"status":"unknown","attention_required":null,"unresolved_effects":null,"unresolved_model_attempts":null},
+        "initialized":null,"paused":null,"mutations":false
+    })
 }
 
 fn initialize(path: &Path) -> Result<Value> {
@@ -327,7 +419,10 @@ fn initialize(path: &Path) -> Result<Value> {
 }
 
 fn discovery() -> Value {
-    json!({"commands":[
+    let mut value = json!({"commands":[
+        {"name":"identity create","network_reads":"only with --confirm","network_writes":"only with --confirm; at most one registration POST per durable attempt","model_calls":false,"local_writes":"only with --confirm","confirmation_flag":"--confirm","purpose":"without --confirm: nonmutating plan; explicit bounded hosted identity creation; never starts, initializes or resumes participation"},
+        {"name":"identity status","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":false,"purpose":"local sanitized registration evidence and safe next actions; never retries registration"},
+        {"name":"identity resume","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":"only with --confirm","confirmation_flag":"--confirm","purpose":"nonmutating plan or explicit local-only publication from retained successful registration evidence; never repeats proof work or registration"},
         {"name":"init","network_reads":true,"network_writes":false,"local_writes":"unless --dry-run","purpose":"existing identity only; --account and --api-key-file, --key-stdin or --key-prompt; never registers or resumes"},
         {"name":"credentials rotate","network_reads":true,"network_writes":false,"local_writes":"credential only unless --dry-run","purpose":"requires initialized, paused, stopped account; verifies replacement identity; file/stdin/hidden prompt"},
         {"name":"install","network_reads":false,"network_writes":false,"local_writes":"unless --dry-run","purpose":"fresh install --binary local-path --sha256 trusted-digest; stage, activate stopped, enable; never starts/resumes"},
@@ -361,7 +456,18 @@ fn discovery() -> Value {
         {"name":"commands","network_writes":false,"local_writes":false}
     ],"capabilities":["answer","judge","mine"],"modes":["active","read_only","off"],
         "participation_modes":["strict","participation_first","manual"],
-        "limits":["Local pause cannot retract dispatched requests or stop server-side auto-mining.","A timeout does not prove a submission failed."]})
+        "limits":["Local pause cannot retract dispatched requests or stop server-side auto-mining.","A timeout does not prove a submission failed.","Hosted registration returns its API key once. Remote creation followed by a crash before durable private response capture can permanently lose the key; uncertain attempts are never automatically resubmitted."],
+        "output_contract":{"json_schema":SCHEMA,"next_actions":"typed_actions_with_argv_not_shell",
+            "raw_exception":"build-info --manifest is raw manifest text even with --json",
+            "state_path":"config state-path is plain text only without --json"}});
+    for command in value["commands"]
+        .as_array_mut()
+        .expect("discovery commands")
+    {
+        command["authorization_required"] =
+            json!(command["local_writes"] == true || command["local_writes"].is_string());
+    }
+    value
 }
 
 async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
@@ -379,18 +485,89 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
     ) {
         return Ok(("config_schema", admin::schema()));
     }
-    let path = config_path(cli)?;
+    let path = match config_path(cli) {
+        Ok(path) => path,
+        Err(_) if matches!(cli.command, Command::Health { .. }) => {
+            return Ok(("health", health_prerequisite("config_location_unavailable")));
+        }
+        Err(_) => {
+            return Err(cli_error::BoundaryError(
+                "config_location_unavailable",
+                "Cannot locate configuration; select its path explicitly with --config.",
+            )
+            .into());
+        }
+    };
     match &cli.command {
+        Command::Identity { command } => {
+            return match command {
+                IdentityCommand::Create {
+                    label,
+                    chain,
+                    base_url,
+                    network_config,
+                    invited_by,
+                    max_pow_bits,
+                    max_pow_hashes,
+                    pow_seconds,
+                    http_seconds,
+                    expected_pow_algo,
+                    confirm,
+                    retry_rejected,
+                } => {
+                    let network = network_options(
+                        network_config.as_deref(),
+                        chain.as_deref(),
+                        base_url.as_deref(),
+                    ).map_err(|_| cli_error::BoundaryError(
+                        "registration_configuration_invalid",
+                        "Invalid network profile, origin or API route configuration; no registration was attempted.",
+                    ))?;
+                    Ok((
+                        "identity_create",
+                        registration::create(
+                            &path,
+                            registration::CreateOptions {
+                                label: label.clone(),
+                                chain: network.chain,
+                                base_url: network.base_url,
+                                api: network.api,
+                                trusted_origins: network.trusted_origins,
+                                invited_by: invited_by.clone(),
+                                max_pow_bits: *max_pow_bits,
+                                max_pow_hashes: *max_pow_hashes,
+                                pow_seconds: *pow_seconds,
+                                http_seconds: *http_seconds,
+                                expected_pow_algo: expected_pow_algo.clone(),
+                                retry_rejected: *retry_rejected,
+                            },
+                            *confirm,
+                        )
+                        .await?,
+                    ))
+                }
+                IdentityCommand::Status => Ok(("identity_status", registration::status(&path)?)),
+                IdentityCommand::Resume { confirm } => {
+                    Ok(("identity_resume", registration::resume(&path, *confirm)?))
+                }
+            };
+        }
         Command::Init {
             account,
             chain,
             base_url,
+            network_config,
             api_key_file,
             key_stdin,
             state_dir,
             dry_run,
             ..
         } => {
+            let network = network_options(
+                network_config.as_deref(),
+                chain.as_deref(),
+                base_url.as_deref(),
+            )?;
             let bytes = lifecycle::credential_input(api_key_file.as_deref(), *key_stdin)?;
             return Ok((
                 "init",
@@ -398,8 +575,7 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
                     &path,
                     lifecycle::InitOptions {
                         account,
-                        chain,
-                        base_url,
+                        network,
                         credential_file: api_key_file.as_deref(),
                         state_dir: state_dir.as_deref(),
                         dry_run: *dry_run,
@@ -434,12 +610,18 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
                     && sha256
                         .bytes()
                         .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
-                "expected SHA256 must be 64 lowercase hex digits"
+                cli_error::BoundaryError(
+                    "invalid_release_digest",
+                    "Expected SHA256 must be 64 lowercase hex digits; no installer was started."
+                )
             );
             let binary = std::path::absolute(binary).context("cannot resolve local binary path")?;
             anyhow::ensure!(
                 cli.config.is_none(),
-                "installer uses ~/.config/agmi/config.toml; --config is unsupported"
+                cli_error::BoundaryError(
+                    "service_config_unsupported",
+                    "Installer uses only ~/.config/agmi/config.toml; --config is unsupported. No installer was started."
+                )
             );
             return Ok((
                 "install",
@@ -463,7 +645,10 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
         } => {
             anyhow::ensure!(
                 cli.config.is_none(),
-                "installer uses ~/.config/agmi/config.toml; --config is unsupported"
+                cli_error::BoundaryError(
+                    "service_config_unsupported",
+                    "Installer uses only ~/.config/agmi/config.toml; --config is unsupported. No installer was started."
+                )
             );
             let mut arguments = if let Some(release) = release {
                 anyhow::ensure!(
@@ -473,7 +658,10 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
                             && hash
                                 .bytes()
                                 .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())),
-                    "release must be an explicit r-SHA256 identity"
+                    cli_error::BoundaryError(
+                        "invalid_release_identity",
+                        "Release must be an explicit r-SHA256 identity; no installer was started."
+                    )
                 );
                 vec!["activate".into(), release.clone()]
             } else {
@@ -489,7 +677,10 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
                         && hash
                             .bytes()
                             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
-                    "expected SHA256 must be 64 lowercase hex digits"
+                    cli_error::BoundaryError(
+                        "invalid_release_digest",
+                        "Expected SHA256 must be 64 lowercase hex digits; no installer was started."
+                    )
                 );
                 vec![
                     "update".into(),
@@ -506,7 +697,10 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
         Command::Service { action, dry_run } => {
             anyhow::ensure!(
                 cli.config.is_none(),
-                "service uses ~/.config/agmi/config.toml; --config is unsupported"
+                cli_error::BoundaryError(
+                    "service_config_unsupported",
+                    "Service uses only ~/.config/agmi/config.toml; --config is unsupported. No installer was started."
+                )
             );
             return Ok((
                 "service",
@@ -596,11 +790,29 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
                 command: ConfigCommand::Check
             }
     ) {
-        Config::load(&path)?
+        Config::load(&path)
     } else {
-        Config::load_metadata(&path)?
+        Config::load_metadata(&path)
+    };
+    let config = match config {
+        Ok(config) => config,
+        Err(_) => {
+            let code = if path.try_exists().ok() == Some(false) {
+                "config_missing"
+            } else {
+                "config_invalid"
+            };
+            if matches!(cli.command, Command::Health { .. }) {
+                return Ok(("health", health_prerequisite(code)));
+            }
+            return Err(cli_error::BoundaryError(code,
+                "Configuration is missing, unreadable or invalid; private contents are not displayed.").into());
+        }
     };
     match &cli.command {
+        Command::Config {
+            command: ConfigCommand::StatePath,
+        } => Ok(("config_state_path", json!({"path":config.state_dir}))),
         Command::Operations {
             command:
                 OperationsCommand::List {
@@ -709,14 +921,12 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
         }
         Command::BuildInfo { .. }
         | Command::Init { .. }
+        | Command::Identity { .. }
         | Command::Credentials { .. }
         | Command::Install { .. }
         | Command::Update { .. }
         | Command::Service { .. }
         | Command::Run { .. }
-        | Command::Config {
-            command: ConfigCommand::StatePath,
-        }
         | Command::Commands
         | Command::Guidance { .. }
         | Command::Config {
@@ -732,71 +942,132 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
 async fn main() {
     let arguments: Vec<_> = std::env::args_os().collect();
     let json_requested = arguments.iter().any(|argument| argument == "--json");
+    let parser_config = arguments
+        .windows(2)
+        .find(|pair| pair[0] == "--config" && !pair[1].to_string_lossy().starts_with('-'))
+        .map(|pair| PathBuf::from(&pair[1]))
+        .or_else(|| {
+            arguments.iter().find_map(|argument| {
+                argument
+                    .to_str()
+                    .and_then(|value| value.strip_prefix("--config="))
+                    .map(PathBuf::from)
+            })
+        });
     let cli = match Cli::try_parse_from(arguments) {
         Ok(cli) => cli,
         Err(error)
-            if json_requested
-                && !matches!(
-                    error.kind(),
-                    clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
-                ) =>
+            if matches!(
+                error.kind(),
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+            ) =>
         {
-            eprintln!(
-                "{}",
-                json!({"schema":SCHEMA,"ok":false,"type":"error","error":{
-                "code":"invalid_arguments","message":"Invalid command arguments; use agmi commands or --help."}})
-            );
+            error.exit()
+        }
+        Err(error) => {
+            let error = cli_error::parser(&error, parser_config.as_deref());
+            if json_requested {
+                eprintln!(
+                    "{}",
+                    json!({"schema":SCHEMA,"ok":false,"type":"error","error":error})
+                );
+            } else {
+                eprintln!(
+                    "agmi: {} [{}] {}",
+                    error["message"].as_str().unwrap_or("Invalid arguments"),
+                    error["code"].as_str().unwrap_or("invalid_arguments"),
+                    error["details"]
+                );
+                eprintln!("Next: {}", error["next_actions"]);
+            }
             std::process::exit(2);
         }
-        Err(error) => error.exit(),
     };
     if matches!(cli.command, Command::BuildInfo { manifest: true }) {
         print!("{}", include_str!(env!("AGMI_BUILD_MANIFEST_PATH")));
         return;
     }
-    if matches!(
-        cli.command,
-        Command::Config {
-            command: ConfigCommand::StatePath
-        }
-    ) {
-        match config_path(&cli).and_then(|path| Config::load_metadata(&path)) {
-            Ok(config) => println!("{}", config.state_dir.display()),
-            Err(_) => {
-                eprintln!("agmi: cannot read configuration metadata");
-                std::process::exit(1);
-            }
-        }
-        return;
-    }
+    let action_config = config_path(&cli).ok();
     match execute(&cli).await {
-        Ok((kind, data)) => {
+        Ok((kind, mut data)) => {
+            if kind == "config_state_path" && !cli.json {
+                println!("{}", data["path"].as_str().expect("state path is UTF-8"));
+                return;
+            }
+            if kind == "init" {
+                cli_error::onboarding(&mut data, action_config.as_deref());
+            }
+            if matches!(kind, "health" | "status") {
+                cli_error::diagnostics(&mut data, action_config.as_deref());
+            }
+            if matches!(kind, "install" | "update" | "service") {
+                data["next_actions"] =
+                    json!([cli_error::action(None, &["service", "status"], false)]);
+            }
+            if let Command::Identity {
+                command:
+                    IdentityCommand::Create { confirm, .. } | IdentityCommand::Resume { confirm },
+            } = &cli.command
+            {
+                data["authorization"] = json!({
+                    "required":true,
+                    "source":if *confirm { "explicit_confirmation" } else { "not_confirmed" },
+                    "confirmed":confirm,
+                    "dry_run":!confirm
+                });
+            }
+            if matches!(
+                cli.command,
+                Command::Pause
+                    | Command::Resume
+                    | Command::Run { .. }
+                    | Command::Init { .. }
+                    | Command::Install { .. }
+                    | Command::Update { .. }
+                    | Command::Credentials { .. }
+                    | Command::RecoverModel
+                    | Command::Recover {
+                        command: RecoveryCommand::Adopt
+                            | RecoveryCommand::Authorize { .. }
+                            | RecoveryCommand::Revoke { .. }
+                            | RecoveryCommand::Resolve { .. }
+                    }
+                    | Command::Config {
+                        command: ConfigCommand::Init | ConfigCommand::Apply { .. }
+                    }
+                    | Command::Guidance {
+                        command: GuidanceCommand::Set { .. }
+                    }
+            ) || matches!(&cli.command, Command::Service { action, .. } if action != "status")
+            {
+                data["authorization"] = json!({"required":true,"source":"explicit_command",
+                    "dry_run":data["dry_run"].as_bool().or_else(|| data["plan"]["dry_run"].as_bool()).unwrap_or(false)});
+            }
             let ok = kind != "health" || data["healthy"].as_bool() == Some(true);
             let value = json!({"schema":SCHEMA,"ok":ok,"type":kind,"data":data});
             if cli.json {
                 println!("{value}");
             } else {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&value).expect("JSON value serializes")
-                );
+                cli_error::human(kind, &value["data"]);
             }
             if !ok {
                 std::process::exit(1);
             }
         }
         Err(error) => {
-            // Errors must be constructed at safe boundaries; never print Debug chains
-            // containing HTTP requests, credentials, provider output or answer text.
+            let error = cli_error::execution(&error, action_config.as_deref());
             if cli.json {
                 eprintln!(
                     "{}",
-                    json!({"schema":SCHEMA,"ok":false,"type":"error","error":{
-                        "code":admin::error_code(&error).unwrap_or("operation_failed"),
-                        "message":error.to_string()}})
+                    json!({"schema":SCHEMA,"ok":false,"type":"error","error":error})
                 );
             } else {
-                eprintln!("agmi: {error}");
+                eprintln!(
+                    "agmi: {} [{}]",
+                    error["message"].as_str().unwrap_or("Operation failed"),
+                    error["code"].as_str().unwrap_or("operation_failed")
+                );
+                eprintln!("Next: {}", error["next_actions"]);
             }
             std::process::exit(1);
         }

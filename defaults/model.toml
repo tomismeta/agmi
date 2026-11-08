@@ -1,0 +1,2 @@
+# Expected authenticated Hermes endpoint. It must also match Hermes' native auth route.
+hermes_api_url = "https://chatgpt.com/backend-api/codex"

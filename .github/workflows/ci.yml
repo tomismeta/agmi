@@ -59,6 +59,12 @@ jobs:
         run: python3 tests/lifecycle_smoke.py target/debug/agmi
       - name: Installer candidate replacement fence
         run: python3 tests/installer_smoke.py target/debug/agmi
+      - name: Identity-read and historical-answer continuity
+        run: python3 tests/continuity_smoke.py target/debug/agmi
+      - name: Explicit registration durability and confidentiality
+        run: python3 tests/registration_smoke.py target/debug/agmi
+      - name: Configurable endpoint trust and durable routing
+        run: python3 tests/endpoints_smoke.py target/debug/agmi
       - name: Build identity
         run: ./target/debug/agmi build-info --manifest
       - name: Inspect distributable contents

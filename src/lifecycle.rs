@@ -24,7 +24,37 @@ fn absolute(path: &Path) -> Result<PathBuf> {
     })
 }
 
+/// Public errors carry static diagnostic text, not credentials or provider output.
+#[derive(Debug)]
+pub struct LifecycleError {
+    pub code: &'static str,
+    pub message: &'static str,
+}
+impl std::fmt::Display for LifecycleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message)
+    }
+}
+impl std::error::Error for LifecycleError {}
+
+fn safe_lifecycle_error(
+    error: anyhow::Error,
+    code: &'static str,
+    message: &'static str,
+) -> anyhow::Error {
+    if error.downcast_ref::<LifecycleError>().is_some() || admin::error_code(&error).is_some() {
+        error
+    } else {
+        LifecycleError { code, message }.into()
+    }
+}
+
 pub fn credential_input(path: Option<&Path>, stdin: bool) -> Result<Vec<u8>> {
+    credential_input_inner(path, stdin).map_err(|error| safe_lifecycle_error(error,
+        "credential_input_unavailable", "Cannot read a bounded private credential. Use a private file, stdin or a controlling terminal; never put a key in arguments."))
+}
+
+fn credential_input_inner(path: Option<&Path>, stdin: bool) -> Result<Vec<u8>> {
     if let Some(path) = path {
         let bytes = admin::read_optional(path, true)?.context("credential file is missing")?;
         ensure!(bytes.len() <= 4096, "credential exceeds 4096 bytes");
@@ -122,10 +152,13 @@ fn prompt_credential() -> Result<Vec<u8>> {
     terminal.file.flush()?;
     let mut bytes = Vec::new();
     loop {
-        ensure!(
-            !INTERRUPTED.load(Ordering::Relaxed),
-            "credential input interrupted"
-        );
+        if INTERRUPTED.load(Ordering::Relaxed) {
+            return Err(LifecycleError {
+                code: "credential_input_interrupted",
+                message: "Credential entry was interrupted; no credential was saved.",
+            }
+            .into());
+        }
         // macOS can reject polling the /dev/tty alias even while its underlying
         // controlling terminal is connected. select supports this descriptor on
         // both supported Unix platforms and still bounds signal-flag latency.
@@ -188,32 +221,43 @@ fn prompt_credential() -> Result<Vec<u8>> {
 }
 
 async fn verify(config: &Config, bytes: &[u8]) -> Result<()> {
-    let protocol = Protocol::with_credential(config, bytes)?;
-    let response = protocol.get("/api/hosted/me").await.map_err(|_| {
-        anyhow::anyhow!("credential identity verification failed; no credential was changed")
+    let protocol = Protocol::with_credential(config, bytes).map_err(|_| LifecycleError {
+        code: "identity_verification_prerequisite",
+        message: "Cannot prepare identity verification; inspect the network configuration and private credential input.",
     })?;
-    ensure!(
-        (200..300).contains(&response.status)
-            && response.read_failure.is_none()
-            && ["ok", "success"].iter().all(|field| response
+    let response = protocol
+        .get(crate::endpoints::Endpoint::Identity, None)
+        .await
+        .map_err(|_| LifecycleError {
+            code: "identity_verification_unavailable",
+            message: "Identity verification is unavailable; no credential was changed.",
+        })?;
+    if !((200..300).contains(&response.status)
+        && response.read_failure.is_none()
+        && ["ok", "success"].iter().all(|field| {
+            response
                 .body
                 .get(field)
-                .is_none_or(|v| v.as_bool() == Some(true)))
-            && response.body.get("address").and_then(Value::as_str)
-                == Some(config.network.address.as_str())
-            && response
-                .body
-                .get("chain_id")
-                .is_none_or(|v| v.as_str() == Some(config.network.chain.as_str())),
-        "credential does not verify the configured chain/account; no credential was changed"
-    );
+                .is_none_or(|v| v.as_bool() == Some(true))
+        })
+        && response.body.get("address").and_then(Value::as_str)
+            == Some(config.network.address.as_str())
+        && response
+            .body
+            .get("chain_id")
+            .is_none_or(|v| v.as_str() == Some(config.network.chain.as_str())))
+    {
+        return Err(LifecycleError {
+            code: "credential_identity_unverified",
+            message: "Credential did not verify the configured chain/account; no credential was changed.",
+        }.into());
+    }
     Ok(())
 }
 
 pub struct InitOptions<'a> {
     pub account: &'a str,
-    pub chain: &'a str,
-    pub base_url: &'a str,
+    pub network: crate::config::NetworkConfig,
     pub credential_file: Option<&'a Path>,
     pub state_dir: Option<&'a Path>,
     pub dry_run: bool,
@@ -221,16 +265,24 @@ pub struct InitOptions<'a> {
 
 /// Creates private configuration/guidance only; never registers or initializes a journal.
 pub async fn init(path: &Path, options: InitOptions<'_>, bytes: &[u8]) -> Result<Value> {
+    init_inner(path, options, bytes).await.map_err(|error| safe_lifecycle_error(error,
+        "initialization_failed", "Initialization did not complete. Private files may already exist; inspect configuration before retrying."))
+}
+
+async fn init_inner(path: &Path, options: InitOptions<'_>, bytes: &[u8]) -> Result<Value> {
     let path = absolute(path)?;
-    ensure!(
-        fs::symlink_metadata(&path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
-        "configuration already exists or cannot be inspected; it is never overwritten"
-    );
+    if !fs::symlink_metadata(&path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
+        return Err(LifecycleError {
+            code: "configuration_exists",
+            message: "Configuration exists or cannot be inspected; initialization never overwrites it.",
+        }.into());
+    }
     let parent = path.parent().context("configuration parent missing")?;
-    let mut config = Config::default();
+    let mut config = Config {
+        network: options.network,
+        ..Config::default()
+    };
     config.network.address = options.account.into();
-    config.network.chain = options.chain.into();
-    config.network.base_url = options.base_url.into();
     config.network.credential_file = match options.credential_file {
         Some(file) => absolute(file)?,
         None => parent.join("credential"),
@@ -365,11 +417,17 @@ pub async fn init(path: &Path, options: InitOptions<'_>, bytes: &[u8]) -> Result
     Ok(
         json!({"path":path,"dry_run":options.dry_run,"identity_verified":true,"paused":true,
         "journal_initialized":false,"credential_referenced":options.credential_file.is_some(),
-        "note":"Read-only capabilities; configure guidance and modes, then explicitly resume. No account was registered."}),
+        "ready_for_participation":false,"capabilities":config.capabilities,"service_state":"not_inspected",
+        "note":"No account was registered. Configuration alone does not initialize the journal, configure native model authentication, start a controller or authorize participation."}),
     )
 }
 
 pub async fn rotate(path: &Path, bytes: &[u8], dry_run: bool) -> Result<Value> {
+    rotate_inner(path, bytes, dry_run).await.map_err(|error| safe_lifecycle_error(error,
+        "credential_rotation_failed", "Credential rotation did not complete. Inspect current configuration and credential state before retrying; keep the controller stopped."))
+}
+
+async fn rotate_inner(path: &Path, bytes: &[u8], dry_run: bool) -> Result<Value> {
     // Runtime reload never takes the directory lock. Admission blocks dispatch;
     // stopped() fails fast if a writer still holds its permanent inode.
     let _directory = admin::lock_config_directory(path)?;
@@ -380,13 +438,24 @@ pub async fn rotate(path: &Path, bytes: &[u8], dry_run: bool) -> Result<Value> {
     );
     let _credential_directory = _directory.additional(&config.network.credential_file)?;
     let _admission = AccountLock::rotation_admission(&config)?;
-    let _writer = AccountLock::stopped(&config)?;
+    let _writer = AccountLock::stopped(&config).map_err(|error| {
+        if error.downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock)
+        {
+            LifecycleError {
+                code: "credential_rotation_requires_stop",
+                message: "Stop the controller before rotating this credential; no replacement was saved.",
+            }.into()
+        } else { error }
+    })?;
     let store = Store::read_only(&config)?
         .context("initialize and pause the account before credential rotation")?;
-    ensure!(
-        store.control()?.paused,
-        "pause participation, then stop the runtime before credential rotation"
-    );
+    if !store.control()?.paused {
+        return Err(LifecycleError {
+            code: "credential_rotation_requires_pause",
+            message: "Pause participation before rotating this credential; no replacement was saved.",
+        }.into());
+    }
     let old = admin::read_optional(&config.network.credential_file, true)?
         .context("existing credential is missing")?;
     // Reject paths that could overwrite configuration or durable state.
@@ -445,6 +514,77 @@ fn binary_digest(mut file: fs::File) -> Result<String> {
     Ok(format!("{:x}", digest.finalize()))
 }
 
+/// Safe, bounded evidence from the canonical installer, never child output text.
+#[derive(Debug)]
+pub struct InstallerError {
+    pub evidence: Value,
+}
+impl std::fmt::Display for InstallerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("installer did not complete; inspect installation before retrying")
+    }
+}
+impl std::error::Error for InstallerError {}
+
+fn installer_evidence(value: Option<&Value>) -> Value {
+    let mut result = json!({"stage":"unknown","staging":"unknown","activation":"unknown","service":"unknown",
+        "evidence":"this_invocation_only","installation_state":"not_inspected"});
+    for (key, allowed) in [
+        (
+            "stage",
+            &[
+                "preflight",
+                "staging",
+                "activation_preflight",
+                "stopping",
+                "switching",
+                "reloading",
+                "starting",
+                "service",
+                "status",
+                "complete",
+            ][..],
+        ),
+        (
+            "staging",
+            &[
+                "not_started",
+                "in_progress",
+                "published",
+                "complete",
+                "unknown",
+            ][..],
+        ),
+        (
+            "activation",
+            &[
+                "not_started",
+                "in_progress",
+                "selected",
+                "loaded_verified",
+                "unknown",
+            ][..],
+        ),
+        (
+            "service",
+            &[
+                "unknown",
+                "stopped",
+                "command_completed",
+                "previous_intent_restored",
+            ][..],
+        ),
+    ] {
+        if let Some(text) = value
+            .and_then(|value| value[key].as_str())
+            .filter(|text| allowed.contains(text))
+        {
+            result[key] = json!(text);
+        }
+    }
+    result
+}
+
 /// Let a verified incoming release supply its own embedded installer and units.
 /// The child sees its own digest, so delegation ends after exactly one hop.
 fn incoming_installer(binary: &Path, action: &str, digest: &str, stopped: bool) -> Result<Value> {
@@ -459,51 +599,61 @@ fn incoming_installer(binary: &Path, action: &str, digest: &str, stopped: bool) 
     let result = command
         .stdin(Stdio::null())
         .output()
-        .context("cannot execute the verified incoming release installer")?;
-    // Forward human diagnostics, but consume the child's machine error envelope
-    // so the calling CLI emits exactly one final envelope.
-    let mut child_error = None;
-    for line in result
-        .stderr
-        .split(|byte| *byte == b'\n')
-        .filter(|line| !line.is_empty())
-    {
-        if let Ok(value) = serde_json::from_slice::<Value>(line)
-            && value["schema"] == "agmi.cli.v1"
-            && value["ok"] == false
-        {
-            child_error = value["error"]["message"].as_str().map(str::to_owned);
-            continue;
-        }
-        std::io::stderr().lock().write_all(line)?;
-        std::io::stderr().lock().write_all(b"\n")?;
-    }
+        .map_err(|_| InstallerError {
+            evidence: installer_evidence(None),
+        })?;
     if !result.status.success() {
-        anyhow::bail!(
-            "{}",
-            child_error.unwrap_or_else(|| {
-                "verified incoming installer failed; activation may already have changed".into()
+        let evidence = result
+            .stderr
+            .split(|byte| *byte == b'\n')
+            .filter_map(|line| serde_json::from_slice::<Value>(line).ok())
+            .find(|value| {
+                value["schema"] == "agmi.cli.v1" && value["error"]["code"] == "installer_failed"
             })
-        );
+            .map(|value| installer_evidence(Some(&value["error"]["details"])))
+            .unwrap_or_else(|| installer_evidence(None));
+        return Err(InstallerError { evidence }.into());
     }
-    let mut envelope: Value = serde_json::from_slice(&result.stdout)
-        .context("verified incoming installer returned an invalid CLI envelope; inspect installation before retrying")?;
-    ensure!(
-        envelope["schema"] == "agmi.cli.v1"
-            && envelope["ok"] == true
-            && envelope["type"] == action
-            && envelope.get("data").is_some(),
-        "verified incoming installer returned an incompatible CLI envelope; inspect installation before retrying"
-    );
+    let mut envelope: Value =
+        serde_json::from_slice(&result.stdout).map_err(|_| InstallerError {
+            evidence: installer_evidence(None),
+        })?;
+    if !(envelope["schema"] == "agmi.cli.v1"
+        && envelope["ok"] == true
+        && envelope["type"] == action
+        && envelope.get("data").is_some())
+    {
+        return Err(InstallerError {
+            evidence: installer_evidence(None),
+        }
+        .into());
+    }
     Ok(envelope["data"].take())
 }
 
 /// The embedded script is the canonical installer, not a second cutover implementation.
 pub fn installer(arguments: &[String], dry_run: bool) -> Result<Value> {
-    let plan = json!({"arguments":arguments,"dry_run":dry_run,"network_downloads":false,
+    installer_inner(arguments, dry_run).map_err(|error| {
+        if error.downcast_ref::<InstallerError>().is_some() {
+            error
+        } else {
+            InstallerError {
+                evidence: json!({"stage":"preflight","staging":"not_started",
+            "activation":"not_started","service":"unknown","evidence":"this_invocation_only",
+            "installation_state":"not_inspected"}),
+            }
+            .into()
+        }
+    })
+}
+
+fn installer_inner(arguments: &[String], dry_run: bool) -> Result<Value> {
+    let mut plan = json!({"arguments":arguments,"dry_run":dry_run,"network_downloads":false,
         "trust":"Local operator-trusted binary and expected SHA256 only; hashes/build labels are not signed publisher or source provenance.",
-        "pause_state":"unchanged","journal":"never copied, restored or migrated by installer","preview":"plan only; operational preconditions are checked on execution"});
+        "pause_state":"unchanged","journal":"never copied, restored or migrated by installer","preview":"plan only; operational preconditions are checked on execution",
+        "stage":"preflight","staging":"not_started","activation":"not_started","service":"unknown"});
     if dry_run {
+        plan["installation"] = installer_evidence(Some(&plan));
         return Ok(plan);
     }
     ensure!(
@@ -624,17 +774,26 @@ pub fn installer(arguments: &[String], dry_run: bool) -> Result<Value> {
     ] {
         fs::write(directory.0.join(name), contents).context("cannot prepare installer artifact")?;
     }
-    // Inherit stderr for operational details, capture stdout to retain the CLI envelope.
+    // Capture child streams: neither raw systemd output nor subprocess errors are
+    // part of the machine error contract. The script remains the only cutover owner.
     let result = Command::new("sh")
         .arg(directory.0.join("install-user.sh"))
         .args(canonical_arguments.as_ref())
         .stdin(Stdio::null())
-        .stderr(Stdio::inherit())
         .output()
-        .context("cannot run canonical installer")?;
-    ensure!(
-        result.status.success(),
-        "canonical installer failed; inspect diagnostics before retrying; activation may already have changed"
-    );
-    Ok(json!({"plan":plan,"output":String::from_utf8_lossy(&result.stdout)}))
+        .map_err(|_| InstallerError {
+            evidence: installer_evidence(None),
+        })?;
+    let marker = result
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| serde_json::from_slice::<Value>(line).ok())
+        .rfind(|value| value["schema"] == "agmi.installer.v1");
+    let evidence = installer_evidence(marker.as_ref());
+    if !result.status.success() {
+        return Err(InstallerError { evidence }.into());
+    }
+    Ok(
+        json!({"plan":plan,"installation":evidence,"output":String::from_utf8_lossy(&result.stdout)}),
+    )
 }

@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+"""Actual-CLI continuity and targeted-read scenarios; loopback/synthetic identity only."""
+import argparse
+import json
+import pathlib
+import tempfile
+import time
+import urllib.parse
+
+from work_first_smoke import WorkFixture, STALL_SECONDS
+
+
+class ContinuityFixture(WorkFixture):
+    def __init__(self, *args):
+        self.unneeded_pages = 0
+        self.judge_dispatches = []
+        self.targeted_inventory = False
+        super().__init__(*args)
+
+    def handler(self):
+        base = super().handler()
+        f = self
+
+        class Upstream(base):
+            def do_POST(self):
+                if self.path.split('?')[0].endswith('/hosted/grade'):
+                    f.judge_dispatches.append((time.monotonic(), f.unneeded_pages))
+                super().do_POST()
+
+            def do_GET(self):
+                route = self.path.split('?')[0]
+                if f.targeted_inventory and route.endswith('/hosted/assignments'):
+                    offset = int(urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                                 .get('offset', ['0'])[0])
+                    if offset:
+                        f.unneeded_pages += 1
+                        f.closing.wait(STALL_SECONDS)
+                        self.reply(503, {'error': 'unrelated page unavailable'}, 30)
+                        return
+                    self.reply(200, {'assignments': [{
+                        'answer_txid': 'a' * 64, 'answer_epoch': 9,
+                        'answer': 'A clock on the bridge enforces a delay before each claim.',
+                        'words': ['clock', 'bridge'], 'author_prior': [],
+                        'pending_meta': {'expires_at_epoch': 1000},
+                    }], 'has_more': f.model_calls('judge') > 0})
+                    return
+                super().do_GET()
+        return Upstream
+
+
+def targeted_judgment(f):
+    f.capabilities.update(answer='off', judge='active', mine='off')
+    f.targeted_inventory = True
+    f.configure(mode='participation_first', allow_judge=True)
+    f.start(resume=True)
+    f.wait(lambda: f.model_calls('judge') == 1, 'judge model did not start')
+    captured = next(json.loads(line)['started_at'] for line in
+                    (f.root / 'calls').read_text().splitlines()
+                    if json.loads(line)['kind'] == 'judge')
+    f.wait(lambda: bool(f.judge_dispatches), 'prepared grade stalled on unrelated inventory',
+           seconds=STALL_SECONDS - 1)
+    assert f.judge_dispatches[0][1] == 0, 'targeted freshness fetched unrelated pages before dispatch'
+    assert f.model_calls('judge') == 1
+    return dict(model_start_to_dispatch_seconds=round(f.judge_dispatches[0][0] - captured, 3),
+                unrelated_pages=0, single_inference=True)
+
+
+def identity_rollover(f):
+    f.read_http_seconds = 15
+    f.stall_scope = 'identity'
+    f.answer_response, f.receipt_state = 'bound', 'final'
+    f.configure(mode='participation_first')
+    f.start(resume=True)
+    assert f.stall_entered.wait(5), 'identity request did not start'
+    started = time.monotonic()
+    f.rollover(11)
+    f.wait(lambda: (f.status().get('observation') or {}).get('epoch') == 11,
+           'identity read blocked epoch observation', seconds=3)
+    elapsed = time.monotonic() - started
+    assert not f.dispatched(), 'write occurred before identity verification'
+    with f.lock:
+        f.stall_scope = None
+    f.wait(lambda: any(row['state'] == 'final' for row in f.operations('answer')),
+           'answer did not progress after identity recovery', seconds=25)
+    assert all(json.loads(row['request'])['solver']['epoch'] == 11 for row in f.dispatched('answer'))
+    return dict(epoch_observation_seconds=round(elapsed, 3), identity_required=True,
+                current_epoch_answer_final=True)
+
+
+def historical_continuity(f):
+    f.configure(mode='participation_first')
+    f.start(resume=True)
+    f.unknown('answer')
+    original = f.dispatched('answer')[0]
+    f.answer_response, f.receipt_state = 'bound', 'final'
+    f.apply_config({'participation': {'retry_uncertain_answers': True}})
+    f.wait(lambda: any(row['state'] == 'final' for row in f.operations('answer')),
+           'linked retry never reached inclusion')
+    f.apply_config({'participation': {
+        'max_unresolved_operations': 1, 'max_historical_unknown_answers': 1}})
+    f.stop(crash=True)
+    f.challenge_fault = 'timeout'
+    with f.lock:
+        f.epoch, f.answered = 11, False
+    f.start()
+    f.wait(lambda: (f.read_record('challenge') or {}).get('failures', 0) > 0,
+           'outage was not observed')
+    assert len(f.dispatched('answer')) == 2, 'stale observations admitted a new answer'
+    f.preserved(original)
+    f.challenge_fault = None
+    f.wait(lambda: any(row['state'] == 'final' and
+                       json.loads(row['request'])['solver']['epoch'] == 11
+                       for row in f.operations('answer')),
+           'next epoch blocked by qualifying historical uncertainty', seconds=30)
+    next_answer = f.dispatched('answer')[-1]
+    # Inspect the immutable journal through the fixture's read-only connection.
+    historical = f.rows('SELECT operation_id,accepted_answer_id FROM risk_historical_answers '
+                        'WHERE dispatch_sequence=?', (next_answer['dispatch_sequence'],))
+    assert historical[0]['operation_id'] == original['id'], historical
+    assert f.status()['participation']['historical_unknown_answer_count'] == 1
+    f.preserved(original)
+    return dict(lost_reply=True, linked_retry_included=True, cold_restart=True,
+                outage_recovered=True, next_epoch_included=True,
+                original_still_unknown=True, risk_witness_retained=bool(historical))
+
+
+SCENARIOS = {'targeted_judgment': targeted_judgment, 'identity_rollover': identity_rollover,
+             'historical_continuity': historical_continuity}
+
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('binary', type=pathlib.Path)
+    parser.add_argument('--scenario', choices=['all', *SCENARIOS], default='all')
+    args = parser.parse_args()
+    scenarios = SCENARIOS if args.scenario == 'all' else {args.scenario: SCENARIOS[args.scenario]}
+    for name, scenario in scenarios.items():
+        with tempfile.TemporaryDirectory(prefix='agmi-continuity-') as directory:
+            fixture = ContinuityFixture(args.binary.resolve(), pathlib.Path(directory))
+            try:
+                print(json.dumps(dict(scenario=name, status='passed', **scenario(fixture))), flush=True)
+            finally:
+                fixture.close()
+
+
+if __name__ == '__main__':
+    main()

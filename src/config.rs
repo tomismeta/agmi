@@ -1,9 +1,23 @@
-use anyhow::{Context, Result, bail, ensure};
+use crate::endpoints::{ApiEndpoints, network_defaults};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+
+pub(crate) fn default_hermes_api_url() -> String {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Defaults {
+        hermes_api_url: String,
+    }
+    static DEFAULTS: std::sync::LazyLock<Defaults> = std::sync::LazyLock::new(|| {
+        toml::from_str(include_str!("../defaults/model.toml"))
+            .expect("valid bundled model defaults")
+    });
+    DEFAULTS.hermes_api_url.clone()
+}
 
 pub(crate) const MAX_GUIDANCE_BYTES: usize = 64 * 1024;
 
@@ -46,6 +60,8 @@ pub struct ModelConfig {
     pub executable: PathBuf,
     pub model: String,
     pub reasoning: String,
+    #[serde(default = "default_hermes_api_url")]
+    pub hermes_api_url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guidance_file: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -68,12 +84,55 @@ impl std::fmt::Debug for ModelConfig {
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub struct NetworkConfig {
     pub base_url: String,
     pub chain: String,
     pub address: String,
     pub credential_file: PathBuf,
+    pub trusted_origins: Vec<String>,
+    pub api: ApiEndpoints,
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        let defaults = network_defaults();
+        Self {
+            base_url: defaults.base_url.clone(),
+            chain: defaults.chain.clone(),
+            address: String::new(),
+            credential_file: PathBuf::new(),
+            trusted_origins: defaults.trusted_origins.clone(),
+            api: defaults.api.clone(),
+        }
+    }
+}
+impl NetworkConfig {
+    pub fn origin(&self) -> Result<reqwest::Url> {
+        validate_origin_with_trust(&self.base_url, &self.trusted_origins)
+    }
+    /// A reusable network-only profile, or the network table from full configuration.
+    pub fn read_profile(path: &Path) -> Result<Self> {
+        let file = std::fs::File::open(path)
+            .map_err(|_| anyhow::anyhow!("cannot read network configuration"))?;
+        let mut text = String::new();
+        file.take(65537)
+            .read_to_string(&mut text)
+            .map_err(|_| anyhow::anyhow!("cannot read network configuration"))?;
+        ensure!(text.len() <= 65536, "network configuration exceeds 64 KiB");
+        let value: toml::Value =
+            toml::from_str(&text).map_err(|_| anyhow::anyhow!("invalid network configuration"))?;
+        let network: Self = value
+            .get("network")
+            .cloned()
+            .unwrap_or(value)
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("invalid network configuration"))?;
+        network.origin()?;
+        network.api.validate()?;
+        ensure!(safe_segment(&network.chain, 64), "invalid network chain");
+        Ok(network)
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -116,6 +175,10 @@ pub struct Schedule {
     pub challenge_retry_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub challenge_backoff_max_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignments_retry_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignments_backoff_max_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queued_job_polling: Option<QueuedJobPolling>,
     #[serde(default = "default_jitter_seconds")]
@@ -166,6 +229,8 @@ pub struct Participation {
     pub mode: ParticipationMode,
     pub uncertainty_grace_seconds: u64,
     pub max_unresolved_operations: u32,
+    /// Additional bounded capacity for directly linked, still-unknown answers.
+    pub max_historical_unknown_answers: u32,
     pub answer_reserved_slots: u32,
     pub allow_answer: bool,
     pub allow_mine: bool,
@@ -180,6 +245,7 @@ impl Default for Participation {
             mode: ParticipationMode::Strict,
             uncertainty_grace_seconds: 300,
             max_unresolved_operations: 4,
+            max_historical_unknown_answers: 0,
             answer_reserved_slots: 0,
             allow_answer: true,
             allow_mine: true,
@@ -232,6 +298,7 @@ impl Default for Config {
             executable: PathBuf::from("hermes"),
             model: "gpt-6.1-sol".into(),
             reasoning: "high".into(),
+            hermes_api_url: default_hermes_api_url(),
             guidance_file: None,
             core_guidance_file: None,
             core_guidance: Arc::from(""),
@@ -242,12 +309,7 @@ impl Default for Config {
             preparation: Preparation::default(),
             participation: Participation::default(),
             excluded_judging_assignments: Vec::new(),
-            network: NetworkConfig {
-                base_url: "https://minepoa.com".into(),
-                chain: "poa-mainnet-1".into(),
-                address: String::new(),
-                credential_file: PathBuf::new(),
-            },
+            network: NetworkConfig::default(),
             state_dir: dirs::data_local_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join("agmi"),
@@ -274,6 +336,8 @@ impl Default for Config {
                 backoff_max_seconds: default_backoff_max_seconds(),
                 challenge_retry_seconds: None,
                 challenge_backoff_max_seconds: None,
+                assignments_retry_seconds: None,
+                assignments_backoff_max_seconds: None,
                 queued_job_polling: None,
                 jitter_seconds: default_jitter_seconds(),
             },
@@ -383,7 +447,8 @@ impl Config {
                 .all(|id| id.len() == 64 && id.bytes().all(|byte| byte.is_ascii_hexdigit())),
             "excluded_judging_assignments must contain 64-character hexadecimal transaction IDs"
         );
-        validate_origin(&self.network.base_url)?;
+        self.network.origin()?;
+        self.network.api.validate()?;
         ensure!(
             safe_segment(&self.network.chain, 64),
             "invalid network chain"
@@ -416,6 +481,22 @@ impl Config {
             );
         }
         for model in [&self.solver.answer, &self.solver.judge] {
+            let api_url = reqwest::Url::parse(&model.hermes_api_url)
+                .map_err(|_| anyhow::anyhow!("invalid Hermes API URL"))?;
+            ensure!(
+                model.hermes_api_url.len() <= 2048
+                    && !model
+                        .hermes_api_url
+                        .chars()
+                        .any(|c| c.is_whitespace() || c.is_control())
+                    && !model.hermes_api_url.contains('\\')
+                    && api_url.scheme() == "https"
+                    && api_url.username().is_empty()
+                    && api_url.password().is_none()
+                    && api_url.query().is_none()
+                    && api_url.fragment().is_none(),
+                "Hermes API URL requires HTTPS without credentials, query or fragment"
+            );
             if check_guidance_paths {
                 for path in [&model.guidance_file, &model.core_guidance_file]
                     .into_iter()
@@ -477,6 +558,18 @@ impl Config {
             ),
             (
                 self.schedule
+                    .assignments_retry_seconds
+                    .unwrap_or(self.schedule.retry_seconds),
+                false,
+            ),
+            (
+                self.schedule
+                    .assignments_backoff_max_seconds
+                    .unwrap_or(self.schedule.backoff_max_seconds),
+                false,
+            ),
+            (
+                self.schedule
                     .queued_job_polling
                     .as_ref()
                     .map_or(1, |policy| policy.initial_seconds),
@@ -510,6 +603,18 @@ impl Config {
                     .max(
                         self.schedule
                             .challenge_retry_seconds
+                            .unwrap_or(self.schedule.retry_seconds),
+                    )
+                    .saturating_add(self.schedule.jitter_seconds),
+                false,
+            ),
+            (
+                self.schedule
+                    .assignments_backoff_max_seconds
+                    .unwrap_or(self.schedule.backoff_max_seconds)
+                    .max(
+                        self.schedule
+                            .assignments_retry_seconds
                             .unwrap_or(self.schedule.retry_seconds),
                     )
                     .saturating_add(self.schedule.jitter_seconds),
@@ -674,7 +779,41 @@ pub(crate) fn valid_address(value: &str) -> bool {
     let significant = bytes.iter().position(|&b| b != 0).map_or(0, |i| 32 - i);
     leading + significant == 32
 }
+#[cfg(test)]
 pub(crate) fn validate_origin(value: &str) -> Result<reqwest::Url> {
+    validate_origin_with_trust(value, &network_defaults().trusted_origins)
+}
+
+pub fn validate_origin_with_trust(value: &str, trusted_origins: &[String]) -> Result<reqwest::Url> {
+    ensure!(
+        !trusted_origins.is_empty() && trusted_origins.len() <= 16,
+        "configure between one and sixteen trusted origins"
+    );
+    let url = parse_origin(value)?;
+    let mut trusted = false;
+    for origin in trusted_origins {
+        trusted |= parse_origin(origin)?.origin() == url.origin();
+    }
+    // Explicit loopback URLs remain the isolated development/fixture boundary.
+    let loopback = url.scheme() == "http" && is_loopback(&url);
+    ensure!(
+        trusted || loopback,
+        "network origin is not explicitly trusted"
+    );
+    Ok(url)
+}
+
+fn is_loopback(url: &reqwest::Url) -> bool {
+    url.host_str().is_some_and(|host| {
+        host == "localhost"
+            || host
+                .trim_matches(['[', ']'])
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    })
+}
+
+fn parse_origin(value: &str) -> Result<reqwest::Url> {
     let url = reqwest::Url::parse(value).map_err(|_| anyhow::anyhow!("invalid network origin"))?;
     let authority = value.split_once("://").map(|(_, rest)| rest).unwrap_or("");
     ensure!(
@@ -700,21 +839,10 @@ pub(crate) fn validate_origin(value: &str) -> Result<reqwest::Url> {
                 .any(|ch| ch.is_whitespace() || ch.is_control()),
         "base_url must be an origin without a path"
     );
-    let loopback = url.host_str().is_some_and(|host| {
-        host == "localhost"
-            || host
-                .trim_matches(['[', ']'])
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|ip| ip.is_loopback())
-    });
-    let production = url.scheme() == "https"
-        && url.host_str() == Some("minepoa.com")
-        && url.port_or_known_default() == Some(443);
-    if !(production || (url.scheme() == "http" && loopback)) {
-        bail!(
-            "trusted origin must be https://minepoa.com or explicit loopback HTTP development origin"
-        );
-    }
+    ensure!(
+        url.scheme() == "https" || (url.scheme() == "http" && is_loopback(&url)),
+        "network origin requires HTTPS or an explicit loopback HTTP development origin"
+    );
     Ok(url)
 }
 

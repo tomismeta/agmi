@@ -7,8 +7,34 @@ excluded_judging_assignments = []
 [network]
 base_url = "https://minepoa.com"
 chain = "poa-mainnet-1"
+# Adding trust explicitly authorizes credential delivery to that origin.
+trusted_origins = ["https://minepoa.com"]
 address = ""
 credential_file = ""
+
+# Shipped defaults live in defaults/network.toml. Overrides are typed relative
+# paths; methods/auth/effect permissions cannot be changed by route configuration.
+# Changing a profile requires stopped/drained state (no prepared/unresolved work).
+[network.api]
+chain_path = "/chain/{chain}"
+status = "/api/status"
+networks = "/api/networks"
+network_facts = "/api/network-facts"
+epochs = "/api/epochs"
+identity = "/api/hosted/me"
+challenge = "/api/hosted/challenge"
+assignments = "/api/hosted/assignments"
+address_assignments = "/api/assignments/{address}"
+explorer_address = "/api/explorer/address/{address}"
+established = "/api/established/{address}"
+job = "/api/job/{id}"
+receipt = "/api/receipt/{id}"
+explorer_tx = "/api/explorer/tx/{id}"
+answer = "/api/hosted/answer"
+grade = "/api/hosted/grade"
+mine = "/api/hosted/mine"
+join_pow = "/api/join-pow"
+register = "/api/hosted/register"
 
 [capabilities]
 answer = "read_only"
@@ -28,6 +54,9 @@ max_attempts_per_work = 1
 mode = "strict" # strict | participation_first | manual
 uncertainty_grace_seconds = 300
 max_unresolved_operations = 4
+# Participation-first capacity only; retains the original unknown plus witness.
+# Requires a linked later accepted same-epoch answer; never claims settlement.
+max_historical_unknown_answers = 0
 # Reserve unresolved capacity for answers even after this epoch's answer completes.
 # Must be smaller than max_unresolved_operations; zero preserves existing policy.
 answer_reserved_slots = 0
@@ -81,6 +110,9 @@ backoff_max_seconds = 900
 # Hot changes never shorten retained server minima.
 # challenge_retry_seconds = 30
 # challenge_backoff_max_seconds = 120
+# Optional assignment-only overrides; null/inherit in JSON, omitted in TOML.
+# assignments_retry_seconds = 180
+# assignments_backoff_max_seconds = 900
 # Deterministic per-identity startup/poll/retry staggering; 0 disables staggering.
 jitter_seconds = 30
 

@@ -1,10 +1,11 @@
 //! Hosted API compatibility is based on https://minepoa.com/go.md,
 //! https://minepoa.com/openapi.yaml and https://minepoa.com/client/poa.mjs.
 //! HTTP success is not ledger finality. Unknown write outcomes never authorize replay.
-use crate::config::{Config, Mode, WorkKind, safe_segment, validate_origin};
+use crate::config::{Config, Mode, WorkKind, safe_segment};
+use crate::endpoints::{ApiEndpoints, Endpoint};
 use anyhow::{Result, ensure};
 use reqwest::{
-    Client, Method, Url,
+    Client, Url,
     header::{HeaderValue, RETRY_AFTER},
 };
 use serde::{Deserialize, Serialize};
@@ -71,11 +72,83 @@ fn request_failure(error: &reqwest::Error) -> ReadFailure {
     }
 }
 
+/// Shared transport policy for hosted and explicitly unauthenticated onboarding.
+/// Callers must still validate and pin the origin and endpoint before use.
+pub(crate) fn private_http_client(timeout: Duration, connect_timeout: Duration) -> Result<Client> {
+    Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .no_proxy()
+        .timeout(timeout)
+        .connect_timeout(connect_timeout)
+        .user_agent(concat!("agmi/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|_| anyhow::anyhow!("HTTP client initialization failed"))
+}
+
+// Never Debug or serialize this into public diagnostics: registration contains a key.
+pub(crate) struct RawResponse {
+    pub status: u16,
+    pub retry_after_seconds: Option<u64>,
+    pub retry_after_invalid: bool,
+    pub bytes: Vec<u8>,
+}
+
+/// Consume a complete bounded body without interpreting it. Registration persists
+/// these bytes privately before JSON parsing; interrupted bodies establish nothing.
+pub(crate) async fn complete_raw_response(request: reqwest::RequestBuilder) -> Result<RawResponse> {
+    let mut response = request
+        .send()
+        .await
+        .map_err(|error| anyhow::Error::new(request_failure(&error)))?;
+    let status = response.status().as_u16();
+    let mut retry_after_seconds = None;
+    let mut retry_after_invalid = false;
+    for value in response.headers().get_all(RETRY_AFTER) {
+        if let Some(delay) = value.to_str().ok().and_then(parse_retry_after) {
+            retry_after_seconds = max_delay(retry_after_seconds, Some(delay));
+        } else {
+            retry_after_invalid = true;
+        }
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
+    {
+        return Err(ReadFailure::ResponseTooLarge.into());
+    }
+    let mut bytes = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) if chunk.len() <= MAX_RESPONSE_BYTES - bytes.len() => {
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Ok(Some(_)) => return Err(ReadFailure::ResponseTooLarge.into()),
+            Err(error) => {
+                return Err(if error.is_timeout() {
+                    ReadFailure::Timeout
+                } else {
+                    ReadFailure::BodyInterrupted
+                }
+                .into());
+            }
+        }
+    }
+    Ok(RawResponse {
+        status,
+        retry_after_seconds,
+        retry_after_invalid,
+        bytes,
+    })
+}
+
 // Deliberately no Debug: authentication and queued-job identifiers must not enter logs.
 pub struct Protocol {
     client: Client,
     read_timeout: Duration,
     origin: Url,
+    api: ApiEndpoints,
     chain: String,
     address: String,
     key: Option<HeaderValue>,
@@ -212,21 +285,17 @@ impl Protocol {
 
     fn with_key(config: &Config, key: Option<HeaderValue>) -> Result<Self> {
         let timeout = Duration::from_secs(config.timeouts.http_seconds);
-        let client = Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .no_proxy()
-            .timeout(timeout)
-            .connect_timeout(timeout.max(Duration::from_secs(
+        let client = private_http_client(
+            timeout,
+            timeout.max(Duration::from_secs(
                 config.timeouts.effective_read_http_seconds(),
-            )))
-            .user_agent(concat!("agmi/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .map_err(|_| anyhow::anyhow!("HTTP client initialization failed"))?;
+            )),
+        )?;
         Ok(Self {
             client,
             read_timeout: Duration::from_secs(config.timeouts.effective_read_http_seconds()),
-            origin: validate_origin(&config.network.base_url)?,
+            origin: config.network.origin()?,
+            api: config.network.api.clone(),
             chain: config.network.chain.clone(),
             address: config.network.address.clone(),
             key,
@@ -237,24 +306,31 @@ impl Protocol {
             ],
         })
     }
-    pub async fn get(&self, path: &str) -> Result<Response> {
-        ensure!(self.allowed_read(path), "read endpoint is not allowlisted");
-        self.request(Method::GET, path, None).await
+    pub async fn get(&self, endpoint: Endpoint, parameter: Option<&str>) -> Result<Response> {
+        ensure!(
+            !endpoint.is_effect(),
+            "effect endpoint is not a read permission"
+        );
+        if matches!(
+            endpoint,
+            Endpoint::AddressAssignments | Endpoint::ExplorerAddress | Endpoint::Established
+        ) {
+            ensure!(
+                !self.address.is_empty() && parameter == Some(self.address.as_str()),
+                "read endpoint belongs to a different account"
+            );
+        }
+        self.request_query(endpoint, parameter, None, None).await
     }
-    /// Query values never enter the path allowlist. Offset inventories are
+    /// Pagination is a typed read permission, independent of configured paths.
     /// moving views, not snapshots; aggregation and coverage belong to the owner.
     pub async fn assignment_page(&self, offset: u64, limit: u64) -> Result<Response> {
         ensure!(
             offset <= 10_000 && (1..=100).contains(&limit),
             "invalid inventory page bounds"
         );
-        self.request_query(
-            Method::GET,
-            "/api/hosted/assignments",
-            None,
-            Some((offset, limit)),
-        )
-        .await
+        self.request_query(Endpoint::Assignments, None, None, Some((offset, limit)))
+            .await
     }
     /// Validate synchronously before the caller journals a possible network effect.
     pub fn prepare_submission<'a>(
@@ -276,84 +352,40 @@ impl Protocol {
             "submission requires configured identity"
         );
         validate_payload(kind, payload)?;
-        Ok(async move {
-            match kind {
-                WorkKind::Answer => {
-                    self.request(Method::POST, "/api/hosted/answer", Some(payload))
-                        .await
-                }
-                WorkKind::Judge => {
-                    self.request(Method::POST, "/api/hosted/grade", Some(payload))
-                        .await
-                }
-                // GET here is an effect, never a read permission.
-                WorkKind::Mine => self.request(Method::GET, "/api/hosted/mine", None).await,
-            }
-        })
-    }
-    fn allowed_read(&self, path: &str) -> bool {
-        if matches!(
-            path,
-            "/api/status"
-                | "/api/networks"
-                | "/api/network-facts"
-                | "/api/epochs"
-                | "/api/hosted/me"
-                | "/api/hosted/challenge"
-                | "/api/hosted/assignments"
-        ) {
-            return true;
-        }
-        if let Some(id) = path.strip_prefix("/api/job/") {
-            return safe_segment(id, 128);
-        }
-        for prefix in ["/api/receipt/", "/api/explorer/tx/"] {
-            if let Some(id) = path.strip_prefix(prefix) {
-                return valid_txid(id);
-            }
-        }
-        if !self.address.is_empty() {
-            for prefix in [
-                "/api/assignments/",
-                "/api/explorer/address/",
-                "/api/established/",
-            ] {
-                if path.strip_prefix(prefix) == Some(self.address.as_str()) {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-    async fn request(
-        &self,
-        method: Method,
-        path: &str,
-        payload: Option<&Value>,
-    ) -> Result<Response> {
-        self.request_query(method, path, payload, None).await
+        let endpoint = match kind {
+            WorkKind::Answer => Endpoint::Answer,
+            WorkKind::Judge => Endpoint::Grade,
+            WorkKind::Mine => Endpoint::Mine,
+        };
+        let body = if kind == WorkKind::Mine {
+            None
+        } else {
+            Some(payload)
+        };
+        Ok(self.request_query(endpoint, None, body, None))
     }
     async fn request_query(
         &self,
-        method: Method,
-        path: &str,
+        endpoint: Endpoint,
+        parameter: Option<&str>,
         payload: Option<&Value>,
         page: Option<(u64, u64)>,
     ) -> Result<Response> {
-        let mut url = self.origin.clone();
-        url.set_path(&format!("/chain/{}{}", self.chain, path));
+        let mut url = self
+            .api
+            .url(&self.origin, &self.chain, endpoint, parameter)?;
         if let Some((offset, limit)) = page {
             url.query_pairs_mut()
                 .append_pair("offset", &offset.to_string())
                 .append_pair("limit", &limit.to_string());
         }
         // Hosted mining is effectful despite using GET; it retains the write timeout.
-        let is_read = method == Method::GET && path != "/api/hosted/mine";
-        let mut request = self.client.request(method, url);
+        let is_read = !endpoint.is_effect();
+        let mut request = self.client.request(endpoint.method(), url);
         if is_read {
             request = request.timeout(self.read_timeout);
         }
-        if path.starts_with("/api/hosted/") {
+        if endpoint.authenticated() {
             let key = self
                 .key
                 .as_ref()
@@ -1585,7 +1617,7 @@ mod tests {
         let protocol = Protocol::new(&config).unwrap();
         assert!(assignment_needs_hydration(&page, &txid()).unwrap());
         let tx = protocol
-            .get(&format!("/api/explorer/tx/{}", txid()))
+            .get(Endpoint::ExplorerTx, Some(&txid()))
             .await
             .unwrap();
         let assignment = parse_selected_assignment(&page, &txid(), Some(&tx)).unwrap();
@@ -1594,31 +1626,26 @@ mod tests {
         assert!(assignment.words.is_empty());
         server.await.unwrap();
     }
-    #[test]
-    fn read_allowlist_excludes_effects_and_url_injection() {
+    #[tokio::test]
+    async fn typed_reads_exclude_effects_and_identifier_injection() {
         let protocol = Protocol::new(&Config::default()).unwrap();
-        for path in [
-            "/api/hosted/mine",
-            "/api/hosted/answer",
-            "/api/hosted/register",
-            "/api/hosted/send",
-            "/api/hosted/export",
-            "/api/hosted/me?key=x",
-            "https://other.example/api/hosted/me",
-            "/api/job/../hosted/mine",
-            "/api/job/a%2fb",
-            "/chain/other/api/status",
+        for endpoint in [
+            Endpoint::Mine,
+            Endpoint::Answer,
+            Endpoint::Grade,
+            Endpoint::Register,
         ] {
-            assert!(!protocol.allowed_read(path), "{path}");
+            assert!(protocol.get(endpoint, None).await.is_err());
         }
-        for path in [
-            "/api/status",
-            "/api/hosted/me",
-            "/api/job/safe-id",
-            &format!("/api/receipt/{}", txid()),
-        ] {
-            assert!(protocol.allowed_read(path), "{path}");
+        for id in ["../mine", "a%2fb", "safe?key=x", "https://other.example/x"] {
+            assert!(protocol.get(Endpoint::Job, Some(id)).await.is_err());
         }
+        assert!(
+            protocol
+                .get(Endpoint::ExplorerAddress, Some("another-account"))
+                .await
+                .is_err()
+        );
     }
     #[test]
     fn payload_allowlist_excludes_secret_and_extra_fields() {
@@ -1708,7 +1735,7 @@ mod tests {
             });
             let mut protocol = Protocol::new(&config).unwrap();
             protocol.key = Some(HeaderValue::from_static("private-test-credential"));
-            let response = protocol.get("/api/status").await.unwrap();
+            let response = protocol.get(Endpoint::Status, None).await.unwrap();
             assert_eq!(response.status, status);
             assert_eq!(response.retry_after_seconds, Some(300));
             assert_eq!(response.read_failure, Some(failure));
@@ -2036,7 +2063,7 @@ mod tests {
         assert!(protocol.assignment_page(0, 0).await.is_err());
         assert!(
             protocol
-                .get("/api/hosted/assignments?offset=10&limit=10")
+                .get(Endpoint::Job, Some("job?offset=10&limit=10"))
                 .await
                 .is_err()
         );

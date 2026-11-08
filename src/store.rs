@@ -9,6 +9,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[derive(Debug)]
+pub struct RoutingProfileError;
+impl std::fmt::Display for RoutingProfileError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("API routing differs while unresolved or reusable work remains; restore the prior network.api profile before continuing")
+    }
+}
+impl std::error::Error for RoutingProfileError {}
+
 // SQLite may see a new inode only after its raw creation descriptor is closed.
 static DATABASE_OPEN: Mutex<()> = Mutex::new(());
 
@@ -362,6 +371,7 @@ impl AccountLock {
             }
         }
         let mut store = Store::open(config)?;
+        store.bind_routing(config)?;
         let location = fs::canonicalize(&config.state_dir)?
             .to_string_lossy()
             .into_owned();
@@ -583,8 +593,15 @@ pub(crate) struct Store {
     database_file: Option<(PathBuf, fs::Metadata)>,
 }
 
+#[derive(serde::Serialize)]
+struct HistoricalAnswer {
+    operation_id: i64,
+    accepted_answer_id: i64,
+}
+
 struct RiskDecision {
     blockers: Vec<i64>,
+    historical: Vec<HistoricalAnswer>,
     retry_of: Option<i64>,
     grant: Option<i64>,
 }
@@ -832,6 +849,8 @@ impl Store {
                 candidates TEXT NOT NULL, truncated INTEGER NOT NULL DEFAULT 0);
              CREATE TABLE IF NOT EXISTS runtime_policy (
                 singleton INTEGER PRIMARY KEY CHECK(singleton=1), policy TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS routing_profile (
+                singleton INTEGER PRIMARY KEY CHECK(singleton=1), profile TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS operation_links (
                 operation_id INTEGER PRIMARY KEY REFERENCES operations(id),
                 retry_of INTEGER NOT NULL REFERENCES operations(id), payload_reused INTEGER NOT NULL);
@@ -850,6 +869,11 @@ impl Store {
                 policy TEXT NOT NULL, revision TEXT NOT NULL, blocker_ids TEXT NOT NULL,
                 retry_of INTEGER REFERENCES operations(id), manual_grant_id INTEGER REFERENCES manual_grants(id),
                 admitted_at INTEGER NOT NULL);
+             CREATE TABLE IF NOT EXISTS risk_historical_answers (
+                dispatch_sequence INTEGER NOT NULL REFERENCES risk_admissions(dispatch_sequence),
+                operation_id INTEGER NOT NULL REFERENCES operations(id),
+                accepted_answer_id INTEGER NOT NULL REFERENCES operations(id),
+                PRIMARY KEY(dispatch_sequence,operation_id));
              UPDATE operations SET work_key=lower(work_key) WHERE kind='judge' AND length(work_key)=64;
              UPDATE operations SET txid=lower(txid) WHERE length(txid)=64;
              UPDATE control SET version=2 WHERE singleton=1;"
@@ -863,6 +887,101 @@ impl Store {
             writer_path: None,
             database_file: Some((database_path, database_metadata)),
         })
+    }
+
+    fn routing_profile(&self) -> Result<Option<String>> {
+        let exists: bool = self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='routing_profile')",
+            [], |row| row.get(0))?;
+        if !exists {
+            return Ok(None);
+        }
+        Ok(self
+            .db
+            .query_row(
+                "SELECT profile FROM routing_profile WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    fn routing_busy(&self, config: &Config) -> Result<bool> {
+        // Read-only inspection of an older schema cannot prove its retry lane drained.
+        if !self.has_table("operation_links")? {
+            return Ok(true);
+        }
+        // Keep this retry predicate aligned with retry_models and model_budget_used.
+        Ok(self.db.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE state IN
+            ('generating','model_unknown','generated','prepared','retry','dispatching','queued','unknown','included_pending','confirmed')
+            OR (state IN ('rejected','retry_model','superseded_model_unknown')
+                AND payload IS NULL AND job_id IS NULL AND txid IS NULL
+                AND (SELECT COUNT(*) FROM operations b WHERE b.kind=operations.kind
+                    AND b.work_key=operations.work_key COLLATE NOCASE
+                    AND b.state NOT IN ('prelaunch_failed','abandoned_model')
+                    AND NOT EXISTS(SELECT 1 FROM operation_links l WHERE l.operation_id=b.id AND l.payload_reused=1)) < ?1))",
+            [config.preparation.max_attempts_per_work], |row| row.get(0))?)
+    }
+
+    pub(crate) fn routing_change_allowed(&self, config: &Config) -> Result<()> {
+        let profile = serde_json::to_string(&config.network.api)?;
+        let previous = self.routing_profile()?;
+        let matches = previous.as_deref().map_or(
+            digest(&profile) == crate::endpoints::LEGACY_API_FINGERPRINT,
+            |previous| previous == profile,
+        );
+        if !matches && self.routing_busy(config)? {
+            return Err(RoutingProfileError.into());
+        }
+        Ok(())
+    }
+
+    /// Called only under the account writer and admission guards, before any HTTP.
+    fn bind_routing(&mut self, config: &Config) -> Result<()> {
+        self.routing_change_allowed(config)?;
+        let profile = serde_json::to_string(&config.network.api)?;
+        let previous = self.routing_profile()?;
+        if previous.as_deref() == Some(profile.as_str()) {
+            return Ok(());
+        }
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if previous.is_some() || digest(&profile) != crate::endpoints::LEGACY_API_FINGERPRINT {
+            tx.execute_batch("DELETE FROM observation;
+                UPDATE control SET generation=generation+1 WHERE singleton=1;
+                UPDATE health_evidence SET hosted_identity_verified=NULL,epoch=NULL,first_observed_at=NULL,answered=NULL;
+                UPDATE read_observations SET in_flight=0,started_at=NULL,last_success_at=NULL,last_http_success_at=NULL;")?;
+        }
+        tx.execute(
+            "INSERT INTO routing_profile VALUES(1,?1)
+            ON CONFLICT(singleton) DO UPDATE SET profile=excluded.profile",
+            [&profile],
+        )?;
+        tx.execute(
+            "INSERT INTO events(at,code) VALUES(?1,'routing_profile_bound')",
+            [now()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn routing_status(&self, config: &Config) -> Result<Value> {
+        let profile = self.routing_profile()?;
+        let configured = serde_json::to_string(&config.network.api)?;
+        let matches = profile.as_deref().map_or(
+            digest(&configured) == crate::endpoints::LEGACY_API_FINGERPRINT,
+            |profile| profile == configured,
+        );
+        Ok(json!({
+            "matches_config":matches,
+            "change_allowed_when_stopped":matches || !self.routing_busy(config)?,
+            "bound":profile.is_some(),
+            "configured_fingerprint":config.network.api.fingerprint()?,
+            "bound_fingerprint":profile.as_ref().map(digest),
+            "bound_api":profile.as_deref().map(serde_json::from_str::<Value>).transpose()?,
+            "changes_require":"stopped_and_drained"
+        }))
     }
 
     pub(crate) fn control(&self) -> Result<Control> {
@@ -1129,6 +1248,13 @@ impl Store {
                         params![op.id,serde_json::to_string(&config.participation)?,config.revision()?,
                             serde_json::to_string(&decision.blockers)?,decision.retry_of,decision.grant,now()],
                     )?;
+                    for historical in &decision.historical {
+                        tx.execute(
+                            "INSERT INTO risk_historical_answers VALUES
+                            ((SELECT dispatch_sequence FROM authority WHERE singleton=1),?1,?2)",
+                            params![historical.operation_id, historical.accepted_answer_id],
+                        )?;
+                    }
                     if let Some(grant) = decision.grant {
                         let consumed = tx.execute(
                             "UPDATE manual_grants SET consumed_by=?1 WHERE id=?2 AND consumed_by IS NULL
@@ -1336,6 +1462,48 @@ impl Store {
         Ok(())
     }
 
+    /// This is bounded risk accounting, not a transition or proof of settlement.
+    fn historical_answers_in(
+        db: &Connection,
+        config: &Config,
+        excluding: Option<i64>,
+    ) -> Result<Vec<HistoricalAnswer>> {
+        let policy = &config.participation;
+        if policy.mode != ParticipationMode::ParticipationFirst
+            || policy.max_historical_unknown_answers == 0
+        {
+            return Ok(Vec::new());
+        }
+        let mut query = db.prepare(
+            "SELECT original.id,MIN(accepted.id) FROM operations original
+            JOIN operation_evidence evidence ON evidence.operation_id=original.id
+            JOIN operation_links link ON link.retry_of=original.id
+            JOIN operations accepted ON accepted.id=link.operation_id
+            WHERE original.kind='answer' AND original.state='unknown'
+            AND original.job_id IS NULL AND original.txid IS NULL
+            AND evidence.dispatch_sequence IS NOT NULL AND original.id!=?1
+            AND accepted.id>original.id AND accepted.kind='answer' AND accepted.txid IS NOT NULL
+            AND accepted.state IN ('included_pending','confirmed','final')
+            AND json_extract(original.request,'$.solver.epoch')=
+                json_extract(accepted.request,'$.solver.epoch')
+            GROUP BY original.id ORDER BY original.id LIMIT ?2",
+        )?;
+        Ok(query
+            .query_map(
+                params![
+                    excluding.unwrap_or(-1),
+                    policy.max_historical_unknown_answers
+                ],
+                |row| {
+                    Ok(HistoricalAnswer {
+                        operation_id: row.get(0)?,
+                        accepted_answer_id: row.get(1)?,
+                    })
+                },
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     fn risk_decision(
         db: &Connection,
         config: &Config,
@@ -1375,7 +1543,9 @@ impl Store {
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        if effects.len() as u64 + 1 > u64::from(policy.unresolved_limit(op.kind))
+        let historical = Self::historical_answers_in(db, config, Some(op.id))?;
+        if effects.len().saturating_sub(historical.len()) as u64 + 1
+            > u64::from(policy.unresolved_limit(op.kind))
             || effects.iter().any(|e| e.1 == "dispatching" || e.3 > now())
         {
             return Ok(None);
@@ -1416,6 +1586,7 @@ impl Store {
         }
         let mut decision = RiskDecision {
             blockers: effects.iter().map(|e| e.0).collect(),
+            historical,
             retry_of,
             grant: None,
         };
@@ -1614,9 +1785,11 @@ impl Store {
         if effects.is_empty() {
             return Ok(true);
         }
+        let historical = Self::historical_answers_in(&self.db, config, None)?;
         if policy.mode == ParticipationMode::Strict
             || !policy.allows(kind)
-            || effects.len() as u64 + 1 > u64::from(policy.unresolved_limit(kind))
+            || effects.len().saturating_sub(historical.len()) as u64 + 1
+                > u64::from(policy.unresolved_limit(kind))
             || effects.iter().any(|e| e.1 == "dispatching" || e.3 > now())
         {
             return Ok(false);
@@ -1832,6 +2005,15 @@ impl Store {
             params![kind.as_str(),key], |r| r.get(0))?)
     }
 
+    fn answer_epoch_accepted(&self, epoch: u64) -> Result<bool> {
+        Ok(self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM operations WHERE kind='answer' AND work_key LIKE ?1
+            AND txid IS NOT NULL AND state IN ('included_pending','confirmed','final'))",
+            [format!("{epoch}:%")],
+            |row| row.get(0),
+        )?)
+    }
+
     pub(crate) fn answer_epoch_attempted(&self, epoch: u64) -> Result<bool> {
         Ok(self.db.query_row(
             "SELECT EXISTS(SELECT 1 FROM operations WHERE kind='answer' AND work_key LIKE ?1
@@ -1977,6 +2159,11 @@ impl Store {
         if scope == ReadScope::Challenge {
             tx.execute(
                 "UPDATE schedule SET next_at=?2 WHERE kind IN ('answer','mine') AND next_at=?1",
+                params![old.next_at, next],
+            )?;
+        } else if scope == ReadScope::Assignments {
+            tx.execute(
+                "UPDATE schedule SET next_at=?2 WHERE kind='judge' AND next_at=?1",
                 params![old.next_at, next],
             )?;
         }
@@ -2310,7 +2497,12 @@ impl Store {
             let unresolved: u64 = self.db.query_row(
                 "SELECT COUNT(*) FROM operations WHERE id!=?1 AND state IN ('dispatching','queued','unknown','included_pending')",
                 [op.map_or(-1,|op| op.id)],|r| r.get(0))?;
-            let capacity = unresolved.saturating_add(1)
+            let historical = if self.has_table("operation_links")? {
+                Self::historical_answers_in(&self.db, config, op.map(|op| op.id))?.len() as u64
+            } else {
+                0
+            };
+            let capacity = unresolved.saturating_sub(historical).saturating_add(1)
                 > u64::from(config.participation.unresolved_limit(kind));
             if read.is_some_and(|row| row["state"] == "in_flight") {
                 phase = "observing";
@@ -2334,7 +2526,8 @@ impl Store {
                 phase = "blocked";
                 reason = if kind != WorkKind::Answer
                     && config.participation.answer_reserved_slots > 0
-                    && unresolved < u64::from(config.participation.max_unresolved_operations)
+                    && unresolved.saturating_sub(historical)
+                        < u64::from(config.participation.max_unresolved_operations)
                 {
                     "answer_capacity_reserved"
                 } else {
@@ -2766,6 +2959,7 @@ impl Store {
                 && kind == WorkKind::Answer
                 && let Some(epoch) = epoch
                 && self.answer_epoch_attempted(epoch)?
+                && !self.answer_epoch_accepted(epoch)?
             {
                 blocked = match self.uncertain_answer(epoch)? {
                     Some(original) => !self.answer_retry_allowed(&policy_config, &original)?,
@@ -2779,8 +2973,16 @@ impl Store {
             }
         }
         let blocked = !affected.is_empty();
+        let historical = if self.has_table("operation_links")? {
+            Self::historical_answers_in(&self.db, &policy_config, None)?
+        } else {
+            Vec::new()
+        };
         let participation = json!({"policy":policy_config.participation,"policy_source":policy_source,
             "unresolved_count":unresolved_count,"risk_admissions":risk_admissions,
+            "active_unresolved_count":unresolved_count.saturating_sub(historical.len() as u64),
+            "historical_unknown_answer_count":historical.len(),
+            "historical_unknown_answers":historical,
             "observation_epoch":epoch,"uncertainty_blocks":uncertainty_blocks});
         let blocking_operation = effect.as_ref().map(|op| op.id);
         let blocked_since = if self.schema_version()? == 2 {
@@ -2841,6 +3043,7 @@ impl Store {
             "identity_fingerprint":digest(format!("{}\n{}",stored["chain"].as_str().unwrap_or_default(),stored["address"].as_str().unwrap_or_default())),
             "chain":stored["chain"],"capabilities":config.capabilities,"observation":observed,
             "configured_revision":config.optional_revision()?,"effective_runtime":effective,
+            "network_routing":self.routing_status(config)?,
             "controller_stopped":controller_stopped,"epoch_evidence":epoch_evidence,
             "identity_matches_config":stored_identity==identity(config)?,"last_event":last_event,
             "hosted_identity_verified":hosted_identity_verified,
@@ -2891,7 +3094,7 @@ impl Store {
                     r.get(0)
                 })?;
         let identity: Value = serde_json::from_str(&identity_text)?;
-        let admissions = if self.has_table("risk_admissions")? {
+        let mut admissions = if self.has_table("risk_admissions")? {
             let mut statement = self.db.prepare(
                 "SELECT dispatch_sequence,policy,revision,blocker_ids,retry_of,manual_grant_id,admitted_at
                 FROM risk_admissions WHERE operation_id=?1 ORDER BY dispatch_sequence",
@@ -2905,6 +3108,28 @@ impl Store {
         } else {
             Vec::new()
         };
+        if self.has_table("risk_historical_answers")? {
+            let mut query = self.db.prepare(
+                "SELECT operation_id,accepted_answer_id FROM risk_historical_answers
+                WHERE dispatch_sequence=?1 ORDER BY operation_id",
+            )?;
+            for admission in &mut admissions {
+                let links = query
+                    .query_map(
+                        [admission["dispatch_sequence"]
+                            .as_i64()
+                            .context("risk sequence missing")?],
+                        |row| {
+                            Ok(HistoricalAnswer {
+                                operation_id: row.get(0)?,
+                                accepted_answer_id: row.get(1)?,
+                            })
+                        },
+                    )?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                admission["historical_unknown_answers"] = serde_json::to_value(links)?;
+            }
+        }
         let linkage: Option<(i64, bool)> = if self.has_table("operation_links")? {
             self.db
                 .query_row(
@@ -3198,6 +3423,248 @@ mod tests {
         op.state = "unknown".into();
         store.save(&op, "dispatch_outcome_unknown").unwrap();
         op
+    }
+
+    fn accepted_linked_answer(
+        store: &mut Store,
+        config: &Config,
+        original: &Operation,
+    ) -> Operation {
+        let mut accepted = store
+            .begin_linked(
+                WorkKind::Answer,
+                &original.key,
+                ("prepared", &original.request),
+                store.control().unwrap(),
+                "linked_revision",
+                Some((original, true)),
+            )
+            .unwrap();
+        assert!(store.dispatch_intent(&mut accepted, config).unwrap());
+        accepted.txid = Some("b".repeat(64));
+        accepted.state = "confirmed".into();
+        store.save(&accepted, "receipt_included").unwrap();
+        accepted
+    }
+
+    #[test]
+    fn pending_routes_bind_only_legacy_defaults_and_survive_restart() {
+        for state in ["generating", "prepared", "unknown"] {
+            let (_temp, config, mut store) = participation_fixture();
+            let op = begin(&mut store, WorkKind::Answer, "7:pending", state);
+            let mut changed = config.clone();
+            changed.network.api.routes.insert(
+                crate::endpoints::Endpoint::Challenge,
+                "/new-challenge".into(),
+            );
+            assert!(
+                store
+                    .bind_routing(&changed)
+                    .unwrap_err()
+                    .is::<RoutingProfileError>()
+            );
+            assert!(store.routing_profile().unwrap().is_none());
+            store.bind_routing(&config).unwrap();
+            drop(store);
+            let mut store = Store::open(&config).unwrap();
+            assert!(
+                store
+                    .bind_routing(&changed)
+                    .unwrap_err()
+                    .is::<RoutingProfileError>()
+            );
+            assert_eq!(store.operation(op.id).unwrap().unwrap().state, state);
+            assert!(
+                !store.routing_status(&changed).unwrap()["matches_config"]
+                    .as_bool()
+                    .unwrap()
+            );
+            store.bind_routing(&config).unwrap();
+        }
+    }
+
+    #[test]
+    fn confirmed_receipts_keep_the_original_routing_profile_until_final() {
+        let (_temp, config, mut store) = participation_fixture();
+        store.bind_routing(&config).unwrap();
+        let mut op = begin(&mut store, WorkKind::Answer, "7:included", "confirmed");
+        op.txid = Some("a".repeat(64));
+        store.save(&op, "receipt_included").unwrap();
+        let mut changed = config.clone();
+        changed.network.api.routes.insert(
+            crate::endpoints::Endpoint::Receipt,
+            "/different-receipts/{id}".into(),
+        );
+        drop(store);
+        let mut store = Store::open(&config).unwrap();
+        assert!(
+            store
+                .bind_routing(&changed)
+                .unwrap_err()
+                .is::<RoutingProfileError>()
+        );
+        assert_eq!(
+            store
+                .awaiting_finality(WorkKind::Answer)
+                .unwrap()
+                .unwrap()
+                .id,
+            op.id
+        );
+        op.state = "final".into();
+        store.save(&op, "node_reported_final").unwrap();
+        store.bind_routing(&changed).unwrap();
+        assert_eq!(store.operation(op.id).unwrap().unwrap().state, "final");
+    }
+
+    #[test]
+    fn first_custom_binding_revokes_legacy_grants_and_observations() {
+        let (_temp, mut config, mut store) = participation_fixture();
+        config.participation.mode = ParticipationMode::Manual;
+        config.participation.allow_answer = true;
+        store.observe(9, false).unwrap();
+        store.record_hosted_identity(true).unwrap();
+        let grant = store.authorize(&config, 9, WorkKind::Answer).unwrap();
+        config.network.api.routes.insert(
+            crate::endpoints::Endpoint::Challenge,
+            "/different-challenge".into(),
+        );
+        store.bind_routing(&config).unwrap();
+        assert!(store.control().unwrap().generation > grant["generation"].as_i64().unwrap());
+        let observations: i64 = store
+            .db
+            .query_row("SELECT COUNT(*) FROM observation", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(observations, 0);
+        let identity: Option<bool> = store
+            .db
+            .query_row(
+                "SELECT hosted_identity_verified FROM health_evidence WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(identity, None);
+        dispatched_unknown(&mut store, &config, WorkKind::Judge, 8);
+        let mut answer = prepared_epoch(&mut store, WorkKind::Answer, 9, "fresh");
+        assert!(!store.dispatch_intent(&mut answer, &config).unwrap());
+    }
+
+    #[test]
+    fn reusable_model_attempts_hold_routing_until_their_budget_is_exhausted() {
+        for initial in ["rejected", "model_unknown"] {
+            for convert in [false, true] {
+                let (_temp, mut config, mut store) = participation_fixture();
+                config.preparation.max_attempts_per_work = 2;
+                config.preparation.retry_uncertain = true;
+                store.bind_routing(&config).unwrap();
+                let op = begin(&mut store, WorkKind::Answer, "7:retry", initial);
+                if convert {
+                    store.retry_models(&config).unwrap();
+                }
+                let mut changed = config.clone();
+                changed.network.api.routes.insert(
+                    crate::endpoints::Endpoint::Challenge,
+                    "/different-challenge".into(),
+                );
+                assert!(
+                    store
+                        .bind_routing(&changed)
+                        .unwrap_err()
+                        .is::<RoutingProfileError>()
+                );
+                // A still-unknown model invocation is never a drained lane.
+                if initial == "model_unknown" && !convert {
+                    continue;
+                }
+                changed.preparation.max_attempts_per_work = 1;
+                store.bind_routing(&changed).unwrap();
+                assert_eq!(
+                    store.model_budget_used(WorkKind::Answer, &op.key).unwrap(),
+                    1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn historical_allowance_preserves_unknowns_and_records_dispatch_witnesses() {
+        let (_temp, mut config, mut store) = participation_fixture();
+        config.participation.retry_uncertain_answers = true;
+        let original = dispatched_unknown(&mut store, &config, WorkKind::Answer, 7);
+        let accepted = accepted_linked_answer(&mut store, &config, &original);
+        store.observe(7, true).unwrap();
+        store.runtime_state(&config, false).unwrap();
+        assert_eq!(
+            store.status(&config).unwrap()["participation"]["uncertainty_blocks"]["answer"],
+            false
+        );
+        config.participation.max_unresolved_operations = 1;
+        let mut next = prepared_epoch(&mut store, WorkKind::Answer, 8, "next");
+        assert!(!store.dispatch_intent(&mut next, &config).unwrap());
+        config.participation.max_historical_unknown_answers = 1;
+        assert!(store.dispatch_intent(&mut next, &config).unwrap());
+        next.state = "unknown".into();
+        store.save(&next, "dispatch_outcome_unknown").unwrap();
+        let risk = store.inspect(next.id).unwrap();
+        assert_eq!(
+            risk["risk_admissions"][0]["historical_unknown_answers"],
+            json!([{"operation_id":original.id,"accepted_answer_id":accepted.id}])
+        );
+        let blockers: Vec<i64> =
+            serde_json::from_str(risk["risk_admissions"][0]["blocker_ids"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(blockers, vec![original.id]);
+        drop(store);
+        let mut store = Store::open(&config).unwrap();
+        store.runtime_state(&config, false).unwrap();
+        let status = store.status(&config).unwrap();
+        assert_eq!(status["participation"]["unresolved_count"], 2);
+        assert_eq!(status["participation"]["active_unresolved_count"], 1);
+        assert_eq!(
+            store.operation(original.id).unwrap().unwrap().state,
+            "unknown"
+        );
+        let mut third = prepared_epoch(&mut store, WorkKind::Answer, 9, "third");
+        assert!(!store.dispatch_intent(&mut third, &config).unwrap());
+    }
+
+    #[test]
+    fn historical_allowance_never_weakens_policy_floors_or_binding_evidence() {
+        let (_temp, mut config, mut store) = participation_fixture();
+        config.participation.retry_uncertain_answers = true;
+        let original = dispatched_unknown(&mut store, &config, WorkKind::Answer, 7);
+        let mut accepted = accepted_linked_answer(&mut store, &config, &original);
+        config.participation.max_unresolved_operations = 1;
+        config.participation.max_historical_unknown_answers = 1;
+        let next = prepared_epoch(&mut store, WorkKind::Answer, 8, "next");
+        assert!(store.admission_allowed(&config, &next).unwrap());
+        for mode in [ParticipationMode::Strict, ParticipationMode::Manual] {
+            config.participation.mode = mode;
+            assert!(!store.admission_allowed(&config, &next).unwrap());
+        }
+        config.participation.mode = ParticipationMode::ParticipationFirst;
+        config.participation.max_historical_unknown_answers = 0;
+        assert!(!store.admission_allowed(&config, &next).unwrap());
+        config.participation.max_historical_unknown_answers = 1;
+        accepted.state = "rejected".into();
+        store.save(&accepted, "receipt_rejected").unwrap();
+        assert!(!store.admission_allowed(&config, &next).unwrap());
+        accepted.state = "confirmed".into();
+        store.save(&accepted, "receipt_included").unwrap();
+        let mut bound = store.operation(original.id).unwrap().unwrap();
+        bound.job_id = Some("a".repeat(32));
+        store.save(&bound, "job_bound").unwrap();
+        assert!(!store.admission_allowed(&config, &next).unwrap());
+        bound.job_id = None;
+        store.save(&bound, "fixture_unbound").unwrap();
+        assert!(store.admission_allowed(&config, &next).unwrap());
+        store.record_retry_minimum(original.id, 3600).unwrap();
+        assert!(!store.admission_allowed(&config, &next).unwrap());
+        assert_eq!(
+            store.operation(original.id).unwrap().unwrap().state,
+            "unknown"
+        );
     }
 
     #[test]
@@ -4716,6 +5183,7 @@ mod tests {
         let mut store = Store::open(&config).unwrap();
         store.set_paused(false).unwrap();
         store.runtime_state(&config, false).unwrap();
+        store.record_hosted_identity(true).unwrap();
         store.observe(54, true).unwrap();
         store.event("runtime_stopped", None).unwrap();
         assert_eq!(store.status(&config).unwrap()["controller_stopped"], true);
