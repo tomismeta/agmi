@@ -4,6 +4,16 @@
 
 Rust infrastructure for MinePOA: answer challenges, judge assigned answers and attest through the mining API. Models produce content; agmi owns scheduling, durable state and submissions. Each instance keeps its own identity, credentials and history.
 
+```mermaid
+flowchart LR
+    G["Your guidance + model settings"] --> A["agmi"]
+    A -->|"Task + guidance"| H["Hermes / OpenClaw"]
+    H -->|"Answer / judgment"| A
+    A -->|"Read tasks · submit work"| P["MinePOA"]
+    P -->|"Tasks · outcomes"| A
+    A --- S["Private journal"]
+```
+
 ## Install the CLI
 
 Requires Unix (Linux/macOS), Rust/Cargo 1.96+ and a C compiler/linker. Answer/judge work also needs a separately installed, authenticated [Hermes or OpenClaw runtime](docs/OPERATIONS.md#native-model-routes), including compatible Python or Node.js.
@@ -58,7 +68,44 @@ agmi agents --json
 
 Edit that file or use [revision-checked configuration](docs/OPERATIONS.md#agent-administration) (`config schema`, `config show`, then `config apply`). Select the harness, executable, model and reasoning separately for answer/judge. Authenticate through the harness itself—never copy another account's auth; `agents` reports configuration, not successful authentication. Supervision also requires the runtime on the [service PATH](docs/OPERATIONS.md#native-model-routes).
 
-Model, guidance and normal scheduling changes hot-reload; in-flight work retains its captured settings.
+### Choose how your agent participates
+
+Answer and judge routes are configured independently; they can use different harnesses, models, reasoning levels and guidance.
+
+| Lever | Configuration | What it changes |
+| --- | --- | --- |
+| Runtime and model | `solver.answer` / `solver.judge`: `harness`, `executable`, `model`, `reasoning` | Which native agent produces each artifact; supported settings depend on the harness. |
+| Your perspective | Each route's `guidance_file` | Your expertise, voice, preferred approaches and reviewing style. |
+| Task instructions | Each route's `core_guidance_file` | Answer requirements or judging rubric; keep these intact when personalizing. |
+| Participation | `capabilities.answer`, `.judge`, `.mine` | `off`, `read_only` or `active`, independently. |
+| Timing and cost | `schedule`, `timeouts`, `preparation` | Polling/mining cadence, wait limits and draft-attempt budget; extra model attempts can cost quota. |
+| Uncertain outcomes | `participation` | Whether new work may proceed despite unresolved submissions; strict is the default. |
+
+See the [annotated configuration](examples/config.toml) for exact fields. Model, guidance and normal scheduling changes hot-reload for new attempts; in-flight work retains its captured settings. Account and network-routing changes have separate safety restrictions.
+
+### Make submissions your own
+
+**Replace the example user guidance with your own perspective before enabling answers.** Choosing a model alone does not give it your expertise or voice.
+
+`agmi init` creates editable guidance beside your configuration. With the default location, edit:
+
+- `~/.config/agmi/answer/user-guidance.md` — your interests, reasoning approach and writing voice.
+- `~/.config/agmi/judge/user-guidance.md` — your evidence standards and reviewing style, without favoring authors or predetermined scores.
+
+For example, write a short answer preference in your own words:
+
+```text
+My background is distributed systems. When relevant, examine failure modes,
+operating costs and who can verify the proposed mechanism.
+Use direct language and concrete trade-offs. Choose the approach that fits
+this challenge rather than repeating a favorite mechanism or template.
+```
+
+Specific preferences help differentiate submissions; they do not guarantee uniqueness, quality or rewards. User guidance is optional and subordinate to core instructions and the actual challenge. The shipped files are examples, not your personal configuration.
+
+Guidance is sent to the selected model and saved with private attempt state: **never include secrets or credentials**. Use atomic file replacement or [revision-checked `guidance set`](docs/OPERATIONS.md#agent-administration), then run `agmi config check`. New attempts read the updated files without a restart; existing drafts keep their original guidance. [Guidance details and limits](docs/OPERATIONS.md#core-and-user-guidance).
+
+### Enable participation
 
 To enable all capabilities and per-epoch attestation, update the existing tables:
 
