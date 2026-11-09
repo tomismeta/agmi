@@ -436,6 +436,8 @@ fn describe(path: &str, value: &Value, settings: &mut Vec<Value>) {
         json!(["hermes", "openclaw"])
     } else if path == "participation.mode" {
         json!(["strict", "participation_first", "manual"])
+    } else if path == "participation.historical_unknown_answer_capacity" {
+        json!(["bounded", "accepted_linked"])
     } else {
         Value::Null
     };

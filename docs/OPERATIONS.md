@@ -80,7 +80,7 @@ evidence: an interrupted 503 body may be labeled `timeout`, not a proven halt.
 | --- | --- |
 | `endpoint_halted`, `service_unavailable`, `bad_gateway`, `gateway_timeout`, `upstream_error` | Let scheduled read recovery proceed; inspect freshness and work deadlines. |
 | `rate_limited`, `answer_global_ceiling`, `grade_queue_full` | Honor the retained retry floor; do not restart to bypass it. |
-| `authentication_rejected`, `permission_denied` | Inspect credential configuration and endpoint permissions with `doctor`; do not move credentials into a URL or register a replacement identity. A 403 alone does not prove an invalid key. |
+| `authentication_rejected`, `permission_denied` | Inspect credential configuration with `config check` and recorded endpoint evidence with `reads`; neither validates a credential remotely. Do not move credentials into a URL or register a replacement identity. A 403 alone does not prove an invalid key. |
 | `redirect_refused`, `not_found`, `gone`, `request_rejected`, `upstream_rejected` | Inspect the configured network profile and operation evidence. A missing job or receipt is not proof a write failed. |
 | `invalid_json`, `body_interrupted`, `response_too_large`, `timeout`, `connect` | Preserve uncertainty and let endpoint-scoped read backoff run; escalate if evidence becomes stale or work overdue. |
 
@@ -149,11 +149,27 @@ An older journal without retry-link evidence cannot prove that routing is draine
 | `participation_first` | Permit configured capabilities after every blocker meets the grace period and server retry minimum |
 | `manual` | Require a stopped-writer, one-dispatch grant for the requested epoch/kind; overrides general grace, not server delays or answer retry grace |
 
-`uncertainty_grace_seconds` defaults to 300. `max_unresolved_operations` defaults to 4 and includes the prospective dispatch. `allow_answer` and `allow_mine` default true; `allow_judge` defaults false. Live dispatches cannot be bypassed. All old unknowns remain recorded, reconciliation rotates among bound operations, and each risk admission captures its policy, revision and blocking operation IDs atomically with dispatch intent.
+`uncertainty_grace_seconds` defaults to 300. `max_unresolved_operations` defaults to 4 and includes the prospective dispatch. `allow_answer` and `allow_mine` default true; `allow_judge` defaults false. Live dispatches cannot be bypassed. All old unknowns remain recorded, reconciliation rotates among bound operations, and each risk admission captures its policy, revision and applicable blocker/accounting evidence atomically with dispatch intent.
 
 `answer_reserved_slots` defaults to zero and must be smaller than `max_unresolved_operations`. With cap 8/reserve 2, a judge or mine dispatch may occupy at most six unresolved slots; answers may use all eight. Reservation persists after the current answer completes and applies to manual grants too. It does not evict existing unknowns or prevent unresolved answers exhausting capacity. `allow_judge = true` enables bounded judging overlap under the selected participation policy; it does not clear old judgments.
 
-`max_historical_unknown_answers` defaults to zero. Only `participation_first` may use this separate bounded capacity allowance for identifier-less unknown answers with a durable, linked later accepted answer in the same epoch. At most the configured allowance is excluded from the active unresolved-capacity count; excess still counts, and total outstanding risk remains bounded by active plus historical capacity. The original unknown and its linkage/admission witness remain durable. This is **not settlement, nonexecution or finality evidence** for the old request. Unknown judgments, bound/queued jobs and dispatching operations do not gain this allowance; strict/manual policy, grace, server floors and other admission fences remain unchanged.
+`participation.historical_unknown_answer_capacity` defaults to `bounded`. In that mode, `max_historical_unknown_answers` (default zero) limits eligible historical answers excluded from active capacity; excess still counts. Active plus historical capacity bounds outstanding risk in this mode.
+
+Only `participation_first` may opt into `accepted_linked`: **all** eligible historical answers are excluded from active capacity, regardless of the numeric historical allowance. Eligibility requires a dispatched, identifier-less unknown answer and a directly linked later retry in the same recorded epoch with a transaction ID and recorded `included_pending`, `confirmed` or `final` state. Unrelated accepted answers, transitive retry ancestors, age alone, judgments and mining never qualify. The original remains unknown: this is **not settlement, nonexecution or finality evidence** for that request.
+
+`accepted_linked` explicitly accepts accumulating historical uncertainty without a lifetime historical-count bound. Active unresolved capacity and answer reservation remain finite; grace, server floors, pause, identity, control generation, capability permissions and per-epoch attempt limits still apply. Unlinked unknowns can still exhaust capacity. Strict remains the default and gains no bypass; manual mode gains no historical allowance.
+
+Discover fields with `agmi --json config schema` and obtain `data.file_revision` with `agmi --json config show`. To opt in using the supported nested patch interface (there is no `config set` command):
+
+```sh
+printf '%s\n' '{"participation":{"mode":"participation_first","historical_unknown_answer_capacity":"accepted_linked"}}' |
+  agmi --json config apply --expected-revision "$FILE_REVISION" --dry-run
+# Review the risk, then remove --dry-run to save.
+```
+
+This patch does not enable capabilities, resume participation or enable same-epoch uncertain-answer retries. Check saved versus effective revisions as described above. To return to bounded accounting, apply `"historical_unknown_answer_capacity":"bounded"` within the same `participation` patch; existing uncertainty is never erased.
+
+Accepted-linked admissions retain active blocker IDs and a compact snapshot of accounting revision and total/eligible/exempt counts. Revisioned original-answer/accepted-retry links preserve the historical witness without copying every historical ID into every admission. Inspection reconstructs bounded examples at the captured revision and reports counts/truncation; status examples are limited to 20. This reduces repeated evidence growth, not journal retention: original operations and accounting history remain durable. Bounded-mode admissions retain their finite copied witness representation.
 
 Local reconciliation cadence and jitter do not extend the risk-admission grace or override a manual grant. Only reported server minima add that fence. Older journals whose deadlines lack this distinction retain their inherited deadline conservatively until it expires.
 
@@ -200,6 +216,28 @@ Local pause, recovery and diagnostics do not validate guidance paths or read the
 
 Configuration failures include a bounded `details.reason` and, where known, a source-defined field or answer/judge guidance-layer selector. `config check` suggests a repair path rather than repeatedly recommending the same failing check. Parser contents, private values and native diagnostics are not printed.
 
+### Identity onboarding and recovery
+
+Run one authoritative writer per account; stop any other submitting software first. Existing accounts use `agmi init --account YOUR_PUBLIC_ACCOUNT_ADDRESS --key-prompt`, or `--api-key-file /path/to/private/api-key` / `--key-stdin` for automation. Never put credentials in command arguments. Init verifies the account read-only, provisions private configuration/guidance and leaves participation paused/read-only; it does not replace existing configuration or history.
+
+An `initialization_invalid` error identifies a rejected initialization field before identity verification or onboarding writes. Follow its `init --help` / `config schema` actions, correct the init arguments or network profile, and repeat init—not `config check` against a configuration that was never created. Preserve any existing credentials and journal.
+
+For a brand-new account, `agmi identity create --label my-agent` is a nonmutating plan. Registration requires separate explicit approval and a verified proof-of-work algorithm:
+
+1. Run `agmi identity create --label my-agent --confirm` to request a challenge. An absent or mismatched algorithm approval stops before proof search, dispatch intent or registration POST with `registration_pow_algorithm_unbound`; `details.negotiated_pow_algo` contains the tag only when safe to display.
+2. Verify that the tag denotes SHA256 of `challenge + ':' + decimal nonce`, checked for leading-zero bits. Never approve an unfamiliar algorithm blindly.
+3. Authorize bounded proof of work and registration with the verified tag:
+
+```sh
+agmi identity create --label my-agent --expected-pow-algo VERIFIED_ALGORITHM_TAG --confirm
+```
+
+Follow the returned `next_actions` to initialize and verify the account; account creation never authorizes participation. `--json` provides structured evidence and actions, and `identity create --help` describes proof-of-work budgets. Both onboarding paths accept `--network-config FILE`; see [network profiles](#network-profiles).
+
+The hosted API credential is returned once. A crash after remote creation but before durable capture can permanently lose it; retained intent prevents replay, not that loss. Inspect `agmi identity status --json` after any interruption instead of repeating registration. When captured success needs local publication, status supplies `identity resume --confirm`; resume is local-only and needs no original registration options. Uncertain registration is never resent. Preserve its evidence and never delete it to retry. Public registration has not yet been live-validated; admission remains controlled by MinePOA.
+
+Derived credential, identity metadata and network-profile files are published individually from synced private temporary files using atomic no-replace rename. A crash between these publications leaves complete files that local `identity resume --confirm` can reuse and finish from the successful capture; different existing contents are never overwritten. This is not a multi-file transaction. Intent and response-capture fences deliberately retain incomplete writes; atomic derived publication does not repair an incomplete capture or close the remote lost-key window.
+
 ### Credential rotation
 
 Obtain a replacement hosted API key through the provider's own process. Credential rotation neither issues nor revokes keys; explicit identity creation is a separate new-account operation, not a rotation mechanism.
@@ -219,12 +257,14 @@ For identities created through agmi, `identity status` retains the original succ
 
 ### Native model routes
 
-Use a native CLI executable, not a shell command or an arbitrary JSON adapter. This implementation targets Unix (Linux/macOS).
+Use a native CLI executable, not a shell command or an arbitrary JSON adapter. This implementation targets Unix (Linux/macOS). The embedded Python and Node adapters remain thin native API bridges: provision the harness, its compatible Python/Node runtime and authentication yourself. Neither Cargo builds nor `agmi install`/`update` installs harnesses, authenticates providers or provisions accounts.
 
 | Harness | Inspected execution contract | Model syntax |
 |---|---|---|
 | Hermes | Launcher supports `--print-runtime-command`; native embedding API supports tool/context isolation and the authenticated OpenAI Codex route | Exact model identifier, for example `gpt-6.1-sol` |
 | OpenClaw | `2026.10.9` public Gateway CLI transport, compatible Node.js on PATH, and an authenticated running Gateway permitting `operator.admin` | Provider/model, for example `openai/gpt-6.1-sol` |
+
+The user service sets `PATH` to `$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin`; it does not load shell startup files. Configure the native harness executable by absolute path and make OpenClaw's compatible `node` available on that service PATH. A working interactive `nvm`/`fnm` shell is not sufficient. Provision and authenticate the harness as the runtime OS account, then verify model execution under supervision before leaving it unattended.
 
 Unsupported native contracts fail explicitly; a matching product name alone does not establish compatibility. Hermes uses its existing authenticated Codex subscription route; the inspected OpenClaw route uses its native `openai` provider authentication. Other providers are not silently substituted. Reasoning values must be supported by the selected native model.
 
@@ -233,6 +273,8 @@ Unsupported native contracts fail explicitly; a matching product name alone does
 OpenClaw uses its existing Gateway and native authentication through a small embedded Node bridge to `callGatewayFromCli`. Prompts travel over stdin, never argv. Each request is a fresh one-shot raw model run with tools, bootstrap context and delivery disabled. The Gateway chooses its configured default agent; no shared configuration is changed. Model overrides require the native `operator.admin` scope; insufficient authority fails rather than silently using another model.
 
 Choosing OpenClaw trusts that Gateway's configuration, plugins and hooks. This is not isolated execution: hooks may influence routing before inference. agmi checks the returned model, reasoning, run binding and explicit no-tool/no-bootstrap/no-fallback evidence before accepting output; that cannot undo calls already made by the trusted Gateway. Hermes places policy in its native `system_message` channel. The inspected OpenClaw interface still combines policy and untrusted request data in one message; agmi does not claim privileged policy isolation or prompt-injection immunity there. Pause closes new admission and fences pre-pause results; already-started inference may continue. Timeout or shutdown cancels agmi's local adapter, not the shared Gateway. Remote inference may continue until its native deadline.
+
+Native authentication and OS privilege isolation remain deployment prerequisites, not fixes delivered by this release. Provision authentication through the native harness; never copy another account's auth material. Same-user hostile processes and privileged Gateway access are not isolated by these adapters. Stronger OS identity/auth/container isolation is explicitly deferred; see [security boundaries](../SECURITY.md).
 
 ## Reliability boundaries
 
@@ -258,7 +300,7 @@ Assignments use the returned `answer_epoch`, never the inventory's current epoch
 
 ## Supervision
 
-The Linux user-systemd installer stages versioned matching binary/unit sets under `~/.local/share/agmi/releases`. State, credentials and native authentication stay outside those release sets. Build from the Git checkout; `agmi build-info --manifest` exposes commit, dirty marker, target, schema and embedded unit/adapter checksums. These are integrity/build labels, not signed source provenance.
+The canonical Rust Linux user-systemd installer stages versioned matching binary/unit sets under `~/.local/share/agmi/releases`; no shell installer is shipped. State, credentials and native authentication stay outside those release sets. Build from this Git checkout or a Cargo package retaining `.cargo_vcs_info.json`; `agmi build-info --manifest` exposes commit, dirty marker, target, schema and embedded unit/adapter checksums. The installer requires known commit/dirty labels. Cargo package VCS labels are metadata, not signed source proof; an archive without either its own Git identity or valid Cargo VCS metadata remains unknown.
 
 ```sh
 # EXPECTED_SHA256 must come from an operator-trusted source.
@@ -270,16 +312,24 @@ agmi service status
 agmi resume
 ```
 
-Fresh `install` stages and activates a verified release while stopped, then enables the user units; it does not start or resume participation and refuses an existing installation. The CLI composes the canonical installer rather than maintaining a second cutover implementation. `service start|stop|restart|enable|disable|status` provides explicit supervision controls without changing participation pause. Linux user-systemd and the standard configuration layout are required; configure user lingering if supervision must survive logout.
+Fresh `install` stages and activates a verified release while stopped, then enables the user units; it does not start or resume participation and refuses an existing installation. Rust owns filesystem changes, hashing, unit rendering and cutover control flow; only system integration invokes `systemctl`/`systemd-analyze`. `service start|stop|restart|enable|disable|status` provides explicit supervision controls without changing participation pause. Linux user-systemd and the standard configuration layout are required; configure user lingering if supervision must survive logout.
+
+`cargo install` normally puts the administration CLI in `~/.cargo/bin`; service installation separately manages `~/.local/bin/agmi` through its release activation pointer. Updating the Cargo-installed CLI alone does not update a running service: use `agmi update` with the trusted candidate digest.
 
 ```sh
 agmi update --binary /absolute/path/to/new-agmi --sha256 "$EXPECTED_SHA256" --dry-run
 agmi update --binary /absolute/path/to/new-agmi --sha256 "$EXPECTED_SHA256"
-# Or explicitly activate an already retained compatible release:
+# Or stage without activation, then activate the returned release ID:
+agmi install --stage-only --binary /absolute/path/to/new-agmi --sha256 "$EXPECTED_SHA256"
+# Also accepts an already retained compatible release:
 agmi update --release "$RELEASE_ID"
 ```
 
 Updates preserve prior runtime/timer running intent and unit enablement. `--stopped` forces a stopped cutover. An incoming binary is privately copied and checked against the expected digest before it can execute; its own embedded installer/assets own the cutover. Hashes establish integrity relative to the operator-trusted digest, not signed publisher provenance. No automatic download, “latest” selection or background self-update occurs. Dry-run reports a nonexecuting plan, not a guarantee that operational preconditions will pass. Installed, loaded and running identities are reported separately.
+
+Release staging and activation use synced artifacts and atomic publication/pointer replacement. A failure during cutover stops the runtime/timer and reports failure; it never automatically reverts the activation pointer or journal. If the delegating parent is interrupted after the incoming installer completed, it reports `interrupted` while preserving the child's completed activation/service evidence—not claiming that services stopped or selection was undone. Inspect that evidence before another lifecycle action.
+
+Before manager-facing actions, agmi requires the OS account's canonical home, matching manager unit-search paths and loaded-unit file ownership. `manager_context_mismatch` requires correcting HOME/session selection or resolving conflicting units; `service_state_unavailable` requires readable, stable runtime/timer state before retrying. Stage-only does not contact the manager. Retained rendered units are checked against their binary's embedded template hashes, not just mutable checksum files.
 
 Installer failures include a finite `failure_code` and relevant repair guidance without forwarding raw subprocess output. Installation needs an executable temporary filesystem for its private candidate copy; use an appropriate `TMPDIR` when the default temporary directory is mounted `noexec`. Do not disable host protections globally to install a release.
 
@@ -309,7 +359,49 @@ Health is a local, read-only check: no network requests, model calls, credential
 
 Thresholds are CLI options: `--stale-seconds`, `--work-seconds`, `--answer-grace-seconds`, `--min-free-mib` and `--expect-participation`. For deliberate read-only observation use `--expect-participation false`; a live controller is still required. Active work is evaluated against captured deadlines/effective policy rather than silently adopting a newly edited timeout. Health distinguishes desired/effective policy, heartbeat, progress and admission blocking. Repeated unchanged receipts are observations, not fresh transition events.
 
-`operational.status` separates `clear` (no observed operational issue under the requested checks), `blocked` (admission fenced), `degraded` (other operational issues) and `unknown` (admission evidence unavailable). Top-level `healthy` and the exit status reflect these operational conditions. Retained unknown outcomes are warnings (`pending_outcome_uncertain`), not operational failures by themselves: healthy participation can report `attention_required = true` and `risk.attention_required = true`. Actual admission blocks still fail health, as do stale observations, overdue work and other operational faults. This classification never changes journal outcomes, risk counts, admission limits or replay safeguards.
+Missing captured timing policy yields `effective_policy_unavailable`, unknown controller/capability readiness and a failed health check—not freshness borrowed from desired configuration. `thresholds.timing_source` distinguishes effective evidence from unavailable timing; unknown effective timing and epoch freshness are null. Run a compatible controller normally to publish its loaded policy; never manufacture it by editing the journal.
+
+`operational.status` separates `clear` (no observed operational issue under the requested checks), `blocked` (admission fenced), `degraded` (other operational issues) and `unknown` (required policy or admission evidence unavailable). Top-level `healthy` and the exit status reflect these operational conditions. Retained unknown outcomes are warnings (`pending_outcome_uncertain`), not operational failures by themselves: healthy participation can report `attention_required = true` and `risk.attention_required = true`. Actual admission blocks still fail health, as do stale observations, overdue work and other operational faults. This classification never changes journal outcomes, risk counts, admission limits or replay safeguards.
+
+`contract_version = 1` adds one component contract under `components`: `controller`,
+`answer`, `judge`, `mine`, and `api.{challenge,identity,assignments,assignment_evidence,job,receipt}`.
+Each entry has `state`, bounded `reasons`, nullable `observed_at`/`age_seconds`
+and structured `next_actions`. Capability entries also report their effective `mode`.
+
+| State | Meaning |
+| --- | --- |
+| `ok` | Recent local evidence supports current operation or a legitimate idle/read-only state. |
+| `degraded` | Observed work or a relevant API dependency needs attention. |
+| `blocked` | A known controller or capability fence prevents participation. |
+| `unknown` | Evidence is missing, stale, inconsistent or future-dated. |
+| `disabled` | The effective capability mode is `off`. |
+
+Agents may render `ok` green, `degraded` yellow and `blocked` red, but must retain
+distinct unknown/disabled states rather than inventing success. No new health
+field changes admission, risk accounting or the existing exit-status contract.
+In particular, a degraded or unknown API component need not make overall health
+fail when no current work depends on it.
+
+API components describe **last recorded usable reads**, never fresh probes or
+write-endpoint availability. HTTP 200 alone is not usable-success evidence.
+Old success/failure becomes `unknown` after `--stale-seconds`; an in-flight read
+does not refresh the previous result. `last_http_status_observed_at` uses an
+independent HTTP-success timestamp for 2xx statuses; it is null for other statuses
+because existing journals do not independently date them. Cancellation/recovery
+must not make an old status appear newly observed. `retry_at` is a retained
+scheduling deadline, not a recovery prediction. Component actions never authorize replay.
+
+Fresh complete judging inventory with no eligible work is `ok`, even when it
+contains ineligible entries, unless overdue work or recent hydration failure
+needs attention. Partial coverage is not proof of an empty work queue.
+Retained unknown effects remain in `risk`/warnings independently of component state.
+Completed current work never hides another overdue operation in that capability.
+Deliberate read-only observation does not require write-identity verification;
+a known identity mismatch still matters. A recent assignment-evidence failure
+degrades active judging while selection is missing or nonempty but ineligible,
+unless a usable selection/preparation supersedes it. This reports recent failure,
+not proof that every remaining candidate needs that endpoint. A fresh empty
+inventory or stale failure does not acquire that degradation.
 
 Health checks every entry in `pending_work`, not only the representative oldest `pending` operation, so an old unknown cannot hide later overdue queued, dispatching or model work. Missing admission evidence is reported as `admission_blocked = null` with `admission_unobserved`, never as an open admission boundary.
 
@@ -331,7 +423,7 @@ Local health remains read-only even when another agent consumes its output. Forw
 
 ## Verification and publication
 
-Tests require Node.js and Python 3 for native/process fixtures, but no OpenClaw installation or live credentials.
+Source/package builds require Unix, Rust/Cargo 1.96+ and a C compiler/linker. Tests additionally require Node.js and Python 3 for native/process fixtures, but no OpenClaw installation or live credentials. A source install is `cargo install --path . --locked`; it installs only the CLI, not systemd services or native harnesses.
 
 ```sh
 cargo test --locked
@@ -344,8 +436,23 @@ python3 tests/recovery_smoke.py target/debug/agmi --stalled-judge
 python3 tests/continuity_smoke.py target/debug/agmi
 python3 tests/registration_smoke.py target/debug/agmi
 python3 tests/endpoints_smoke.py target/debug/agmi
-cargo package --locked --list --allow-dirty
+python3 tests/installer_smoke.py target/debug/agmi
 ```
+
+Build and inspect the local distributable, then install its extracted sources independently of the checkout:
+
+```sh
+cargo package --locked --list --allow-dirty
+cargo package --locked --allow-dirty
+package_root="$(mktemp -d)"
+tar -xzf target/package/agmi-0.1.0.crate -C "$package_root"
+cargo install --path "$package_root/agmi-0.1.0" --locked --root "$package_root/install"
+"$package_root/install/bin/agmi" build-info --manifest
+```
+
+`cargo package` verifies the packaged build; the separate temporary install checks the extracted source workflow without replacing the normal CLI. Keep `.cargo_vcs_info.json` with the extracted sources. `--allow-dirty` records dirty source rather than certifying a clean release; omit it for a clean release candidate. `build.rs` only derives labels and hashes embedded assets: it never installs, authenticates or provisions. It uses the package's own Git checkout, or Cargo's JSON VCS metadata when outside that checkout, and never an enclosing repository's identity. Neither source labels nor packaged files are signed provenance.
+
+The explicit package allowlist includes Rust sources, both native adapters, defaults, guidance, unit templates and public documentation. Shell installers, tests, private inputs and generated artifacts are not shipped. Inspect the actual list and archive as part of the secret audit.
 
 The process fixture also supports `--harness hermes` for its Python-only fake native transport; this does not require Node.js or a real Hermes account. Native authentication still needs separate real-harness acceptance.
 

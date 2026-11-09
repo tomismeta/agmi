@@ -369,6 +369,38 @@ fn installer_preflight_failure_reports_known_nonactivation_without_raw_values() 
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn staging_preview_never_executes_candidate_or_creates_installation_state() {
+    use sha2::Digest;
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let candidate = root.path().join("candidate");
+    let contents = b"#!/bin/sh\n: > \"$AGMI_PREVIEW_MARKER\"\nexit 1\n";
+    fs::write(&candidate, contents).unwrap();
+    fs::set_permissions(&candidate, fs::Permissions::from_mode(0o700)).unwrap();
+    let marker = root.path().join("executed");
+    let digest = format!("{:x}", sha2::Sha256::digest(contents));
+    let output = binary()
+        .env("HOME", &home)
+        .env("PATH", root.path())
+        .env("AGMI_PREVIEW_MARKER", &marker)
+        .args(["--json", "install", "--stage-only", "--binary"])
+        .arg(&candidate)
+        .args(["--sha256", &digest, "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert!(!marker.exists(), "preview executed the supplied candidate");
+    assert_eq!(fs::read_dir(&home).unwrap().count(), 0);
+    assert_eq!(fs::read(&candidate).unwrap(), contents);
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["data"]["installation"]["activation"], "not_started");
+}
+
 #[test]
 fn discovery_labels_mutation_authorization_and_raw_output_contract() {
     let output = binary().args(["--json", "commands"]).output().unwrap();

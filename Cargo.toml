@@ -4,9 +4,32 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.96"
 description = "Reliable, configurable MinePOA participation for autonomous agents"
+repository = "https://github.com/tomismeta/agmi"
 publish = false
 readme = "README.md"
-include = ["/Cargo.toml", "/Cargo.lock", "/build.rs", "/src/**", "/adapters/**", "/defaults/**", "/docs/**", "/README.md", "/ARCHITECTURE.md", "/CHANGELOG.md", "/SECURITY.md", "/examples/**", "/deploy/**"]
+include = [
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/build.rs",
+    "/src/**/*.rs",
+    "/adapters/hermes.py",
+    "/adapters/openclaw.mjs",
+    "/defaults/model.toml",
+    "/defaults/network.toml",
+    "/deploy/agmi.service",
+    "/deploy/agmi-health.service",
+    "/deploy/agmi-health.timer",
+    "/examples/config.toml",
+    "/examples/answer/core-guidance.md",
+    "/examples/answer/user-guidance.md",
+    "/examples/judge/core-guidance.md",
+    "/examples/judge/user-guidance.md",
+    "/docs/OPERATIONS.md",
+    "/README.md",
+    "/ARCHITECTURE.md",
+    "/CHANGELOG.md",
+    "/SECURITY.md",
+]
 
 [dependencies]
 anyhow = "1"
@@ -23,6 +46,7 @@ tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-
 toml = "0.9"
 
 [build-dependencies]
+serde_json = "1"
 sha2 = "0.10"
 
 [dev-dependencies]

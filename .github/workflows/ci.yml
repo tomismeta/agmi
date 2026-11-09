@@ -23,8 +23,6 @@ jobs:
         run: node --check adapters/openclaw.mjs
       - name: Native bridge contracts
         run: python3 tests/native_bridge_smoke.py
-      - name: Installer syntax
-        run: sh -n deploy/install-user.sh
       - name: Behavior tests
         run: cargo +1.96.0 test --locked
       - name: Lints
@@ -61,7 +59,7 @@ jobs:
         run: python3 tests/stale_seed_smoke.py target/debug/agmi
       - name: Credential onboarding rotation and terminal confidentiality
         run: python3 tests/lifecycle_smoke.py target/debug/agmi
-      - name: Installer candidate replacement fence
+      - name: Rust installer lifecycle and candidate integrity
         run: python3 tests/installer_smoke.py target/debug/agmi
       - name: Identity-read and historical-answer continuity
         run: python3 tests/continuity_smoke.py target/debug/agmi
@@ -83,8 +81,21 @@ jobs:
           docker exec "$name" runuser -u agmi-systemd-fixture -- env \
             HOME=/home/agmi-systemd-fixture XDG_RUNTIME_DIR=/run/user/17321 \
             DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/17321/bus \
+            python3 /src/tests/installer_smoke.py /input/agmi --isolated-home
+          docker exec "$name" runuser -u agmi-systemd-fixture -- env \
+            HOME=/home/agmi-systemd-fixture XDG_RUNTIME_DIR=/run/user/17321 \
+            DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/17321/bus \
             python3 /src/tests/systemd_smoke.py /input/agmi
       - name: Build identity
         run: ./target/debug/agmi build-info --manifest
       - name: Inspect distributable contents
         run: cargo +1.96.0 package --locked --list --allow-dirty
+      - name: Install and exercise extracted package
+        run: |
+          cargo +1.96.0 package --locked --allow-dirty
+          package_root="$RUNNER_TEMP/agmi-package"
+          mkdir -p "$package_root"
+          tar -xzf target/package/agmi-0.1.0.crate -C "$package_root"
+          cargo +1.96.0 install --path "$package_root/agmi-0.1.0" --locked --root "$package_root/install"
+          "$package_root/install/bin/agmi" build-info --manifest
+          python3 tests/lifecycle_smoke.py "$package_root/install/bin/agmi" --scenario init

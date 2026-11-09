@@ -6,6 +6,7 @@ pub mod admin;
 pub mod config;
 pub mod endpoints;
 pub mod health;
+mod installer;
 pub mod lifecycle;
 pub mod protocol;
 pub mod registration;

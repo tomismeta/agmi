@@ -123,6 +123,15 @@ fn health_before_onboarding_is_structured_read_only_and_preserves_config_selecti
         assert_eq!(envelope["ok"], false);
         assert_eq!(envelope["data"]["issues"], serde_json::json!([code]));
         assert_eq!(envelope["data"]["operational"]["status"], "unknown");
+        assert_eq!(
+            envelope["data"]["components"]["controller"]["state"],
+            "unknown"
+        );
+        assert_eq!(envelope["data"]["components"]["answer"]["state"], "unknown");
+        assert_eq!(
+            envelope["data"]["components"]["api"]["challenge"]["state"],
+            "unknown"
+        );
         assert!(envelope["data"]["risk"]["unresolved_effects"].is_null());
         assert_eq!(envelope["data"]["mutations"], false);
         let action = &envelope["data"]["diagnostics"][0]["next_actions"][0];

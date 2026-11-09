@@ -1,0 +1,39 @@
+name: RustSec
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**/Cargo.lock'
+      - '**/Cargo.toml'
+      - '.github/workflows/rustsec.yml'
+  pull_request:
+    paths:
+      - '**/Cargo.lock'
+      - '**/Cargo.toml'
+      - '.github/workflows/rustsec.yml'
+  schedule:
+    - cron: '41 5 * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: Cargo.lock advisories
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Install audit tooling
+        working-directory: ${{ runner.temp }}
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal
+          cargo +1.96.0 install cargo-audit --version 0.22.2 --locked
+      - name: Check RustSec advisories
+        # Stay outside the checkout so PR-controlled Cargo/audit configuration
+        # cannot alter installation or suppress advisories. Never generate a lockfile.
+        working-directory: ${{ runner.temp }}
+        run: cargo +1.96.0 audit --file "$GITHUB_WORKSPACE/Cargo.lock" --deny warnings

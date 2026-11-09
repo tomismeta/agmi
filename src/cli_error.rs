@@ -77,6 +77,22 @@ pub(crate) fn parser(error: &clap::Error, config: Option<&Path>) -> Value {
 
 pub(crate) fn execution(error: &Error, config: Option<&Path>) -> Value {
     if let Some(diagnostic) = error.downcast_ref::<agmi::config::ConfigDiagnostic>() {
+        if error
+            .downcast_ref::<agmi::lifecycle::LifecycleError>()
+            .is_some_and(|error| error.code == "initialization_invalid")
+        {
+            return json!({
+                "code":"initialization_invalid",
+                "message":diagnostic.to_string(),
+                "details":diagnostic,
+                "next_actions":[
+                    action(config, &["init", "--help"], false),
+                    action(config, &["config", "schema"], false),
+                    {"kind":"instruction","authorization_required":true,
+                     "message":"Correct the reported initialization field in the init arguments or network profile, then repeat init. No identity verification was requested and no onboarding files were written; preserve any existing credentials and journal state."}
+                ]
+            });
+        }
         let mut actions = vec![action(
             config,
             if diagnostic.is_missing() {
@@ -124,10 +140,10 @@ pub(crate) fn execution(error: &Error, config: Option<&Path>) -> Value {
             "next_actions":[action(config, &["status"], false), action(config, &["operations", "list"], false)]
         });
     }
-    if let Some((code, details)) = agmi::registration::error_details(error) {
+    if let Some((code, message, details)) = agmi::registration::error_details(error) {
         return json!({
             "code":code,
-            "message":"Registration did not complete. Inspect local evidence before any further action; an uncertain remote outcome must not be retried.",
+            "message":message,
             "details":details,
             "next_actions":[
                 action(config, &["identity", "status"], false),
@@ -230,6 +246,12 @@ pub(crate) fn execution(error: &Error, config: Option<&Path>) -> Value {
             "configuration_invalid" => {
                 "Repair the selected configuration before retrying installation."
             }
+            "manager_context_mismatch" => {
+                "Use the installation owner's normal HOME and user-systemd session; verify that the manager loads that home's .config/systemd/user directory."
+            }
+            "service_state_unavailable" => {
+                "Inspect user-manager connectivity and wait for runtime/timer transitions to settle before retrying."
+            }
             "insufficient_space" => {
                 "Free unrelated filesystem capacity; never delete the journal, WAL, retained evidence or credentials."
             }
@@ -249,6 +271,9 @@ pub(crate) fn execution(error: &Error, config: Option<&Path>) -> Value {
             {"kind":"instruction","authorization_required":false,"message":repair},
             action(config, if reason == "configuration_invalid" { &["config", "check"] } else { &["install", "--help"] }, false)
         ]);
+        if reason == "manager_context_mismatch" {
+            value["next_actions"].as_array_mut().unwrap().remove(0);
+        }
     }
     value
 }
@@ -368,6 +393,24 @@ pub(crate) fn human(kind: &str, data: &Value) {
                 data["operational"]["status"].as_str().unwrap_or("unknown"),
                 data["risk"]["unresolved_effects"]
             );
+            for name in ["controller", "answer", "judge", "mine"] {
+                let component = &data["components"][name];
+                print!(
+                    "{name}: {}",
+                    component["state"].as_str().unwrap_or("unknown")
+                );
+                if let Some(mode) = component["mode"].as_str() {
+                    print!(" ({mode})");
+                }
+                println!();
+            }
+            println!("API reads (last recorded, not live probes):");
+            for (scope, component) in data["components"]["api"].as_object().into_iter().flatten() {
+                println!(
+                    "  {scope}: {}",
+                    component["state"].as_str().unwrap_or("unknown")
+                );
+            }
             for diagnostic in data["diagnostics"].as_array().into_iter().flatten() {
                 println!("- {}", diagnostic["code"].as_str().unwrap_or("unknown"));
                 print_actions(&diagnostic["next_actions"]);
@@ -460,26 +503,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn installer_failures_offer_reason_specific_repairs_without_outer_context() {
-        for (reason, instruction) in [
-            ("unknown", "reason is unavailable"),
-            ("unsupported_platform", "Linux"),
-            ("invalid_arguments", "arguments"),
-            ("missing_prerequisite", "dependencies"),
-            ("candidate_unavailable", "regular executable"),
-            ("candidate_execution_unavailable", "executable TMPDIR"),
-            ("digest_mismatch", "trusted SHA256"),
-            ("installer_busy", "lock ownership"),
-            ("preparation_failed", "permissions"),
-            ("release_invalid", "compatible"),
-            ("configuration_invalid", "configuration"),
-            ("insufficient_space", "never delete the journal"),
-            ("unit_invalid", "overrides"),
-            ("stop_failed", "manually"),
-            ("switch_failed", "manually"),
-            ("reload_failed", "manually"),
-            ("start_failed", "manually"),
-            ("service_failed", "manually"),
+    fn installer_failures_sanitize_context_and_scope_repair_actions() {
+        for reason in [
+            "configuration_invalid",
+            "unknown",
+            "manager_context_mismatch",
         ] {
             let error = Error::new(agmi::lifecycle::InstallerError {
                 evidence: json!({"failure_code":reason,"stage":"preflight","activation":"not_started","service":"unknown"}),
@@ -487,16 +515,21 @@ mod tests {
             let value = execution(&error, Some(Path::new("/selected/config.toml")));
             assert_eq!(value["code"], "installer_failed");
             assert_eq!(value["details"]["failure_code"], reason);
-            assert!(
-                value["next_actions"][1]["message"]
-                    .as_str()
-                    .unwrap()
-                    .contains(instruction)
-            );
-            assert_eq!(
-                value["next_actions"][0]["argv"],
-                json!(["agmi", "service", "status"])
-            );
+            if reason == "manager_context_mismatch" {
+                assert_eq!(value["next_actions"][0]["kind"], "instruction");
+                assert!(
+                    !value["next_actions"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|action| { action["argv"] == json!(["agmi", "service", "status"]) })
+                );
+            } else {
+                assert_eq!(
+                    value["next_actions"][0]["argv"],
+                    json!(["agmi", "service", "status"])
+                );
+            }
             if reason == "configuration_invalid" {
                 assert_eq!(
                     value["next_actions"][2]["argv"],

@@ -1,4 +1,6 @@
-use crate::config::{Config, Mode, Participation, ParticipationMode, WorkKind};
+use crate::config::{
+    Config, HistoricalAnswerCapacity, Mode, Participation, ParticipationMode, WorkKind,
+};
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, json};
@@ -125,7 +127,7 @@ fn prepare_database(path: &Path) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn account_home() -> Result<PathBuf> {
+pub(crate) fn account_home() -> Result<PathBuf> {
     use std::ffi::CStr;
     use std::os::unix::ffi::OsStrExt;
     let mut record = std::mem::MaybeUninit::<libc::passwd>::uninit();
@@ -572,7 +574,7 @@ fn read_delay(failures: u32, base: u64, cap: u64, jitter: u64) -> u64 {
     .saturating_add(jitter)
 }
 
-fn safe_read_category(category: &str) -> &'static str {
+pub(crate) fn safe_read_category(category: &str) -> &'static str {
     match category {
         "timeout" => "timeout",
         "connect" => "connect",
@@ -614,10 +616,46 @@ struct HistoricalAnswer {
 }
 
 struct RiskDecision {
-    blockers: Vec<i64>,
-    historical: Vec<HistoricalAnswer>,
+    accounting: UncertaintyAccounting,
     retry_of: Option<i64>,
     grant: Option<i64>,
+}
+
+const HISTORICAL_EXAMPLE_LIMIT: usize = 20;
+
+// Operations and direct retry linkage remain authoritative; this query never
+// resolves an original or treats age/same-epoch similarity as acceptance.
+const HISTORICAL_ANSWERS: &str = "
+    SELECT original.id AS operation_id,MIN(accepted.id) AS accepted_answer_id
+    FROM operations original
+    JOIN operation_evidence evidence ON evidence.operation_id=original.id
+    JOIN operation_links link ON link.retry_of=original.id
+    JOIN operations accepted ON accepted.id=link.operation_id
+    WHERE original.kind='answer' AND original.state='unknown'
+    AND original.job_id IS NULL AND original.txid IS NULL
+    AND evidence.dispatch_sequence IS NOT NULL
+    AND accepted.id>original.id AND accepted.kind='answer' AND accepted.txid IS NOT NULL
+    AND accepted.state IN ('included_pending','confirmed','final')
+    AND json_extract(original.request,'$.solver.epoch')=
+        json_extract(accepted.request,'$.solver.epoch')
+    GROUP BY original.id";
+
+#[derive(Default)]
+struct UncertaintyAccounting {
+    total: u64,
+    eligible: u64,
+    exempt: u64,
+    historical: Vec<HistoricalAnswer>,
+    blockers: Vec<i64>,
+    live_or_floor: bool,
+    grace_closed: bool,
+    retry_grace_closed: bool,
+}
+
+impl UncertaintyAccounting {
+    fn active(&self) -> u64 {
+        self.total - self.exempt
+    }
 }
 
 fn identity(config: &Config) -> Result<String> {
@@ -797,6 +835,7 @@ impl Store {
                 next_at INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL);
              CREATE INDEX IF NOT EXISTS operations_key ON operations(kind,work_key);
+             CREATE INDEX IF NOT EXISTS operations_state ON operations(state,kind,updated_at);
              CREATE TABLE IF NOT EXISTS events (
                 id INTEGER PRIMARY KEY, at INTEGER NOT NULL, code TEXT NOT NULL,
                 kind TEXT, operation_id INTEGER);
@@ -893,8 +932,19 @@ impl Store {
                 operation_id INTEGER NOT NULL REFERENCES operations(id),
                 accepted_answer_id INTEGER NOT NULL REFERENCES operations(id),
                 PRIMARY KEY(dispatch_sequence,operation_id));
-             UPDATE operations SET work_key=lower(work_key) WHERE kind='judge' AND length(work_key)=64;
-             UPDATE operations SET txid=lower(txid) WHERE length(txid)=64;
+             CREATE INDEX IF NOT EXISTS operation_links_retry_of ON operation_links(retry_of);
+             CREATE TABLE IF NOT EXISTS historical_answer_accounting_events (
+                revision INTEGER PRIMARY KEY, original_id INTEGER NOT NULL REFERENCES operations(id),
+                accepted_answer_id INTEGER REFERENCES operations(id), observed_at INTEGER NOT NULL);
+             CREATE INDEX IF NOT EXISTS historical_answer_accounting_original
+                ON historical_answer_accounting_events(original_id,revision DESC);
+             CREATE TABLE IF NOT EXISTS risk_accounting_snapshots (
+                dispatch_sequence INTEGER PRIMARY KEY REFERENCES risk_admissions(dispatch_sequence),
+                witness_revision INTEGER NOT NULL, unresolved_count INTEGER NOT NULL,
+                eligible_count INTEGER NOT NULL, exempt_count INTEGER NOT NULL);
+             UPDATE operations SET work_key=lower(work_key)
+                WHERE kind='judge' AND length(work_key)=64 AND work_key<>lower(work_key);
+             UPDATE operations SET txid=lower(txid) WHERE length(txid)=64 AND txid<>lower(txid);
              UPDATE control SET version=2 WHERE singleton=1;"
         )?;
         tx.commit()?;
@@ -1260,18 +1310,33 @@ impl Store {
                 [op.id],
             )?;
             if let (Some(config), Some(decision)) = (config, decision) {
-                if !decision.blockers.is_empty() || decision.retry_of.is_some() {
+                if decision.accounting.total > 0 || decision.retry_of.is_some() {
                     tx.execute(
                         "INSERT INTO risk_admissions
                         VALUES ((SELECT dispatch_sequence FROM authority WHERE singleton=1),?1,?2,?3,?4,?5,?6,?7)",
                         params![op.id,serde_json::to_string(&config.participation)?,config.revision()?,
-                            serde_json::to_string(&decision.blockers)?,decision.retry_of,decision.grant,now()],
+                            serde_json::to_string(&decision.accounting.blockers)?,decision.retry_of,decision.grant,now()],
                     )?;
-                    for historical in &decision.historical {
+                    if config.participation.historical_unknown_answer_capacity
+                        == HistoricalAnswerCapacity::AcceptedLinked
+                    {
+                        let revision = Self::capture_historical_revision(&tx)?;
                         tx.execute(
-                            "INSERT INTO risk_historical_answers VALUES
-                            ((SELECT dispatch_sequence FROM authority WHERE singleton=1),?1,?2)",
-                            params![historical.operation_id, historical.accepted_answer_id],
+                            "INSERT INTO risk_accounting_snapshots VALUES
+                             ((SELECT dispatch_sequence FROM authority WHERE singleton=1),?1,?2,?3,?4)",
+                            params![revision,decision.accounting.total,
+                                decision.accounting.eligible,decision.accounting.exempt],
+                        )?;
+                    } else if decision.accounting.exempt > 0 {
+                        // Legacy bounded admissions retain their original representation.
+                        tx.execute(
+                            &format!(
+                                "INSERT INTO risk_historical_answers
+                             SELECT (SELECT dispatch_sequence FROM authority WHERE singleton=1),
+                                operation_id,accepted_answer_id FROM ({HISTORICAL_ANSWERS})
+                             WHERE operation_id!=?1 ORDER BY operation_id LIMIT ?2"
+                            ),
+                            params![op.id, decision.accounting.exempt],
                         )?;
                     }
                     if let Some(grant) = decision.grant {
@@ -1481,46 +1546,133 @@ impl Store {
         Ok(())
     }
 
-    /// This is bounded risk accounting, not a transition or proof of settlement.
-    fn historical_answers_in(
+    /// Shared by preparation, transactional admission, and read-only status.
+    /// Stream narrow evidence columns; never load historical operation payloads.
+    fn uncertainty_accounting(
         db: &Connection,
         config: &Config,
         excluding: Option<i64>,
-    ) -> Result<Vec<HistoricalAnswer>> {
+        retry_of: Option<i64>,
+        capture_blockers: bool,
+    ) -> Result<UncertaintyAccounting> {
         let policy = &config.participation;
-        if policy.mode != ParticipationMode::ParticipationFirst
-            || policy.max_historical_unknown_answers == 0
-        {
-            return Ok(Vec::new());
+        let has_table = |name: &str| -> Result<bool> {
+            Ok(db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1)",
+                [name],
+                |r| r.get(0),
+            )?)
+        };
+        let has_evidence = has_table("operation_evidence")?;
+        let eligible = if has_evidence && has_table("operation_links")? {
+            HISTORICAL_ANSWERS
+        } else {
+            "SELECT NULL AS operation_id,NULL AS accepted_answer_id WHERE 0"
+        };
+        let (evidence, blocked_since) = if has_evidence {
+            (
+                "LEFT JOIN operation_evidence e ON e.operation_id=o.id",
+                "COALESCE(e.blocked_since,o.created_at)",
+            )
+        } else {
+            ("", "o.created_at")
+        };
+        let (timing, floor) = if has_table("operation_timing")? {
+            (
+                "LEFT JOIN operation_timing t ON t.operation_id=o.id",
+                "COALESCE(t.retry_not_before,o.next_at)",
+            )
+        } else {
+            ("", "o.next_at")
+        };
+        let mut statement = db.prepare(&format!(
+            "WITH historical AS ({eligible})
+             SELECT o.id,o.state='dispatching',{blocked_since},{floor},h.accepted_answer_id
+             FROM operations o {evidence} {timing}
+             LEFT JOIN historical h ON h.operation_id=o.id
+             WHERE o.id!=?1 AND o.state IN ('dispatching','queued','unknown','included_pending')
+             ORDER BY o.id"
+        ))?;
+        let mut rows = statement.query([excluding.unwrap_or(-1)])?;
+        let mut result = UncertaintyAccounting::default();
+        let current = now();
+        let accepted_linked =
+            policy.historical_unknown_answer_capacity == HistoricalAnswerCapacity::AcceptedLinked;
+        let blocker_limit = u64::from(policy.max_unresolved_operations)
+            + if accepted_linked {
+                0
+            } else {
+                u64::from(policy.max_historical_unknown_answers)
+            };
+        while let Some(row) = rows.next()? {
+            let id: i64 = row.get(0)?;
+            let dispatched: bool = row.get(1)?;
+            let since: i64 = row.get(2)?;
+            let floor: i64 = row.get(3)?;
+            let witness: Option<i64> = row.get(4)?;
+            result.total += 1;
+            result.eligible += u64::from(witness.is_some());
+            let exempt = witness.is_some()
+                && policy.mode == ParticipationMode::ParticipationFirst
+                && (accepted_linked
+                    || result.exempt < u64::from(policy.max_historical_unknown_answers));
+            if exempt {
+                result.exempt += 1;
+                if result.historical.len() < HISTORICAL_EXAMPLE_LIMIT {
+                    result.historical.push(HistoricalAnswer {
+                        operation_id: id,
+                        accepted_answer_id: witness.context("historical witness missing")?,
+                    });
+                }
+            }
+            if capture_blockers
+                && (!accepted_linked || !exempt)
+                && (result.blockers.len() as u64) < blocker_limit
+            {
+                result.blockers.push(id);
+            }
+            // Exemption affects capacity only, never floors or grace.
+            result.live_or_floor |= dispatched || floor > current;
+            let retry = Some(id) == retry_of;
+            let retry_grace =
+                i64::try_from(policy.uncertain_answer_retry_seconds).unwrap_or(i64::MAX);
+            result.retry_grace_closed |= retry && since.saturating_add(retry_grace) > current;
+            let grace = if retry {
+                policy
+                    .uncertainty_grace_seconds
+                    .max(policy.uncertain_answer_retry_seconds)
+            } else {
+                policy.uncertainty_grace_seconds
+            };
+            result.grace_closed |=
+                since.saturating_add(i64::try_from(grace).unwrap_or(i64::MAX)) > current;
         }
-        let mut query = db.prepare(
-            "SELECT original.id,MIN(accepted.id) FROM operations original
-            JOIN operation_evidence evidence ON evidence.operation_id=original.id
-            JOIN operation_links link ON link.retry_of=original.id
-            JOIN operations accepted ON accepted.id=link.operation_id
-            WHERE original.kind='answer' AND original.state='unknown'
-            AND original.job_id IS NULL AND original.txid IS NULL
-            AND evidence.dispatch_sequence IS NOT NULL AND original.id!=?1
-            AND accepted.id>original.id AND accepted.kind='answer' AND accepted.txid IS NOT NULL
-            AND accepted.state IN ('included_pending','confirmed','final')
-            AND json_extract(original.request,'$.solver.epoch')=
-                json_extract(accepted.request,'$.solver.epoch')
-            GROUP BY original.id ORDER BY original.id LIMIT ?2",
-        )?;
-        Ok(query
-            .query_map(
-                params![
-                    excluding.unwrap_or(-1),
-                    policy.max_historical_unknown_answers
-                ],
-                |row| {
-                    Ok(HistoricalAnswer {
-                        operation_id: row.get(0)?,
-                        accepted_answer_id: row.get(1)?,
-                    })
-                },
-            )?
-            .collect::<std::result::Result<Vec<_>, _>>()?)
+        Ok(result)
+    }
+
+    /// Append only changed direct witnesses. A NULL witness revokes eligibility.
+    /// Called inside the dispatch transaction; captured revisions are immutable.
+    fn capture_historical_revision(db: &Connection) -> Result<i64> {
+        db.execute(&format!(
+            "WITH eligible AS MATERIALIZED ({HISTORICAL_ANSWERS}),
+             latest AS MATERIALIZED (
+                SELECT e.* FROM historical_answer_accounting_events e
+                WHERE NOT EXISTS(SELECT 1 FROM historical_answer_accounting_events newer
+                    WHERE newer.original_id=e.original_id AND newer.revision>e.revision))
+             INSERT INTO historical_answer_accounting_events(original_id,accepted_answer_id,observed_at)
+             SELECT h.operation_id,h.accepted_answer_id,?1 FROM eligible h
+             LEFT JOIN latest l ON l.original_id=h.operation_id
+             WHERE l.accepted_answer_id IS NOT h.accepted_answer_id
+             UNION ALL
+             SELECT l.original_id,NULL,?1 FROM latest l
+             WHERE l.accepted_answer_id IS NOT NULL
+             AND NOT EXISTS(SELECT 1 FROM eligible h WHERE h.operation_id=l.original_id)"
+        ), [now()])?;
+        Ok(db.query_row(
+            "SELECT COALESCE(MAX(revision),0) FROM historical_answer_accounting_events",
+            [],
+            |r| r.get(0),
+        )?)
     }
 
     fn risk_decision(
@@ -1545,27 +1697,9 @@ impl Store {
                 |r| r.get(0),
             )
             .optional()?;
-        let mut statement = db.prepare(
-            "SELECT o.id,o.state,COALESCE(e.blocked_since,o.created_at),
-                COALESCE(t.retry_not_before,o.next_at)
-            FROM operations o LEFT JOIN operation_evidence e ON e.operation_id=o.id
-            LEFT JOIN operation_timing t ON t.operation_id=o.id
-            WHERE o.id!=?1 AND o.state IN ('dispatching','queued','unknown','included_pending') ORDER BY o.id",
-        )?;
-        let effects = statement
-            .query_map([op.id], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, i64>(2)?,
-                    r.get::<_, i64>(3)?,
-                ))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        let historical = Self::historical_answers_in(db, config, Some(op.id))?;
-        if effects.len().saturating_sub(historical.len()) as u64 + 1
-            > u64::from(policy.unresolved_limit(op.kind))
-            || effects.iter().any(|e| e.1 == "dispatching" || e.3 > now())
+        let accounting = Self::uncertainty_accounting(db, config, Some(op.id), retry_of, true)?;
+        if accounting.active() + 1 > u64::from(policy.unresolved_limit(op.kind))
+            || accounting.live_or_floor
         {
             return Ok(None);
         }
@@ -1604,23 +1738,17 @@ impl Store {
             }
         }
         let mut decision = RiskDecision {
-            blockers: effects.iter().map(|e| e.0).collect(),
-            historical,
+            accounting,
             retry_of,
             grant: None,
         };
-        if effects.is_empty() && retry_of.is_none() {
+        if decision.accounting.total == 0 && retry_of.is_none() {
             return Ok(Some(decision));
         }
         if policy.mode == ParticipationMode::Strict || !policy.allows(op.kind) {
             return Ok(None);
         }
-        if effects.iter().any(|e| {
-            Some(e.0) == retry_of
-                && e.2.saturating_add(
-                    i64::try_from(policy.uncertain_answer_retry_seconds).unwrap_or(i64::MAX),
-                ) > now()
-        }) {
+        if decision.accounting.retry_grace_closed {
             return Ok(None);
         }
         if policy.mode == ParticipationMode::Manual {
@@ -1633,16 +1761,7 @@ impl Store {
             if decision.grant.is_none() {
                 return Ok(None);
             }
-        } else if effects.iter().any(|e| {
-            let grace = if Some(e.0) == retry_of {
-                policy
-                    .uncertainty_grace_seconds
-                    .max(policy.uncertain_answer_retry_seconds)
-            } else {
-                policy.uncertainty_grace_seconds
-            };
-            e.2.saturating_add(i64::try_from(grace).unwrap_or(i64::MAX)) > now()
-        }) {
+        } else if decision.accounting.grace_closed {
             return Ok(None);
         }
         Ok(Some(decision))
@@ -1783,42 +1902,29 @@ impl Store {
         epoch: Option<u64>,
         retry_of: Option<i64>,
     ) -> Result<bool> {
+        let accounting = Self::uncertainty_accounting(&self.db, config, None, retry_of, false)?;
+        self.uncertainty_open_with(config, kind, epoch, &accounting)
+    }
+
+    fn uncertainty_open_with(
+        &self,
+        config: &Config,
+        kind: WorkKind,
+        epoch: Option<u64>,
+        accounting: &UncertaintyAccounting,
+    ) -> Result<bool> {
         let policy = &config.participation;
-        let mut statement = self.db.prepare(
-            "SELECT o.id,o.state,COALESCE(e.blocked_since,o.created_at),
-            COALESCE(t.retry_not_before,o.next_at) FROM operations o
-            LEFT JOIN operation_evidence e ON e.operation_id=o.id
-            LEFT JOIN operation_timing t ON t.operation_id=o.id
-            WHERE o.state IN ('dispatching','queued','unknown','included_pending')",
-        )?;
-        let effects = statement
-            .query_map([], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, i64>(2)?,
-                    r.get::<_, i64>(3)?,
-                ))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        if effects.is_empty() {
+        if accounting.total == 0 {
             return Ok(true);
         }
-        let historical = Self::historical_answers_in(&self.db, config, None)?;
         if policy.mode == ParticipationMode::Strict
             || !policy.allows(kind)
-            || effects.len().saturating_sub(historical.len()) as u64 + 1
-                > u64::from(policy.unresolved_limit(kind))
-            || effects.iter().any(|e| e.1 == "dispatching" || e.3 > now())
+            || accounting.active() + 1 > u64::from(policy.unresolved_limit(kind))
+            || accounting.live_or_floor
         {
             return Ok(false);
         }
-        if effects.iter().any(|e| {
-            Some(e.0) == retry_of
-                && e.2.saturating_add(
-                    i64::try_from(policy.uncertain_answer_retry_seconds).unwrap_or(i64::MAX),
-                ) > now()
-        }) {
+        if accounting.retry_grace_closed {
             return Ok(false);
         }
         if policy.mode == ParticipationMode::Manual {
@@ -1829,16 +1935,7 @@ impl Store {
                 params![i64::try_from(epoch)?,kind.as_str(),self.control()?.generation], |r| r.get(0),
             )?);
         }
-        Ok(effects.iter().all(|e| {
-            let grace = if retry_of == Some(e.0) {
-                policy
-                    .uncertainty_grace_seconds
-                    .max(policy.uncertain_answer_retry_seconds)
-            } else {
-                policy.uncertainty_grace_seconds
-            };
-            e.2.saturating_add(i64::try_from(grace).unwrap_or(i64::MAX)) <= now()
-        }))
+        Ok(!accounting.grace_closed)
     }
 
     pub(crate) fn mine_epoch_attempted(&self, epoch: u64) -> Result<bool> {
@@ -2581,15 +2678,9 @@ impl Store {
             } else {
                 "observe_challenge"
             };
-            let unresolved: u64 = self.db.query_row(
-                "SELECT COUNT(*) FROM operations WHERE id!=?1 AND state IN ('dispatching','queued','unknown','included_pending')",
-                [op.map_or(-1,|op| op.id)],|r| r.get(0))?;
-            let historical = if self.has_table("operation_links")? {
-                Self::historical_answers_in(&self.db, config, op.map(|op| op.id))?.len() as u64
-            } else {
-                0
-            };
-            let capacity = unresolved.saturating_sub(historical).saturating_add(1)
+            let accounting =
+                Self::uncertainty_accounting(&self.db, config, op.map(|op| op.id), None, false)?;
+            let capacity = accounting.active().saturating_add(1)
                 > u64::from(config.participation.unresolved_limit(kind));
             if read.is_some_and(|row| row["state"] == "in_flight") {
                 phase = "observing";
@@ -2623,7 +2714,7 @@ impl Store {
                 phase = "blocked";
                 reason = if kind != WorkKind::Answer
                     && config.participation.answer_reserved_slots > 0
-                    && unresolved.saturating_sub(historical)
+                    && accounting.active()
                         < u64::from(config.participation.max_unresolved_operations)
                 {
                     "answer_capacity_reserved"
@@ -2686,7 +2777,7 @@ impl Store {
                                 } else if floor > current {
                                     reason = "retained_retry_minimum";
                                     next_at = Some(floor);
-                                } else if unresolved == 0 {
+                                } else if accounting.total == 0 {
                                     reason = "request_eligibility";
                                     action = "revalidate_request";
                                     next_at = Some(current);
@@ -3008,10 +3099,6 @@ impl Store {
         };
         let epoch_evidence = json!({"first_observed_at":first_observed_at,"answered":answered});
         let effect = self.effect()?;
-        let unresolved_count: u64 = self.db.query_row(
-            "SELECT COUNT(*) FROM operations WHERE state IN ('dispatching','queued','unknown','included_pending')",
-            [], |r| r.get(0),
-        )?;
         let stored_policy = effective.as_ref().and_then(|e| {
             serde_json::from_value::<Participation>(e["policy"]["participation"].clone()).ok()
         });
@@ -3043,6 +3130,8 @@ impl Store {
             0
         };
         let epoch = observed.as_ref().and_then(|o| o["epoch"].as_u64());
+        let accounting = Self::uncertainty_accounting(&self.db, &policy_config, None, None, false)?;
+        let unresolved_count = accounting.total;
         let mut uncertainty_blocks = json!({});
         let mut affected = Vec::new();
         for kind in [WorkKind::Answer, WorkKind::Judge, WorkKind::Mine] {
@@ -3050,7 +3139,7 @@ impl Store {
                 && self.has_table("manual_grants")?
                 && self.has_table("manual_grant_revocations")?
             {
-                !self.uncertainty_open(&policy_config, kind, epoch, None)?
+                !self.uncertainty_open_with(&policy_config, kind, epoch, &accounting)?
             } else {
                 unresolved_count > 0
             };
@@ -3073,16 +3162,14 @@ impl Store {
             }
         }
         let blocked = !affected.is_empty();
-        let historical = if self.has_table("operation_links")? {
-            Self::historical_answers_in(&self.db, &policy_config, None)?
-        } else {
-            Vec::new()
-        };
         let participation = json!({"policy":policy_config.participation,"policy_source":policy_source,
             "unresolved_count":unresolved_count,"risk_admissions":risk_admissions,
-            "active_unresolved_count":unresolved_count.saturating_sub(historical.len() as u64),
-            "historical_unknown_answer_count":historical.len(),
-            "historical_unknown_answers":historical,
+            "active_unresolved_count":accounting.active(),
+            "historical_eligible_count":accounting.eligible,
+            "capacity_exempt_count":accounting.exempt,
+            "historical_unknown_answer_count":accounting.exempt,
+            "historical_unknown_answers":accounting.historical,
+            "historical_unknown_answers_truncated":accounting.exempt > accounting.historical.len() as u64,
             "observation_epoch":epoch,"uncertainty_blocks":uncertainty_blocks});
         let oldest_unresolved_operation = effect.as_ref().map(|op| op.id);
         let oldest_unresolved_since = if self.schema_version()? == 2 {
@@ -3138,12 +3225,12 @@ impl Store {
             None
         };
         let mut statement = self.db.prepare(if self.schema_version()? == 2 {
-            "SELECT o.id,o.state,o.created_at,o.updated_at,e.http_deadline,e.model_deadline
+            "SELECT o.id,o.state,o.created_at,o.updated_at,e.http_deadline,e.model_deadline,o.kind
              FROM operations o LEFT JOIN operation_evidence e ON e.operation_id=o.id
              WHERE o.state IN ('generating','generated','prepared','retry','dispatching','queued','unknown','included_pending')
              ORDER BY o.id"
         } else {
-            "SELECT id,state,created_at,updated_at,NULL,NULL FROM operations
+            "SELECT id,state,created_at,updated_at,NULL,NULL,kind FROM operations
              WHERE state IN ('generating','generated','prepared','retry','dispatching','queued','unknown','included_pending')
              ORDER BY id"
         })?;
@@ -3153,7 +3240,8 @@ impl Store {
                     "operation_id":r.get::<_,i64>(0)?,"state":r.get::<_,String>(1)?,
                     "created_at":r.get::<_,i64>(2)?,"updated_at":r.get::<_,i64>(3)?,
                     "http_deadline":r.get::<_,Option<i64>>(4)?,
-                    "model_deadline":r.get::<_,Option<i64>>(5)?
+                    "model_deadline":r.get::<_,Option<i64>>(5)?,
+                    "kind":r.get::<_,String>(6)?
                 }))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -3259,6 +3347,53 @@ impl Store {
                     )?
                     .collect::<std::result::Result<Vec<_>, _>>()?;
                 admission["historical_unknown_answers"] = serde_json::to_value(links)?;
+            }
+        }
+        if self.has_table("risk_accounting_snapshots")? {
+            for admission in &mut admissions {
+                let sequence = admission["dispatch_sequence"]
+                    .as_i64()
+                    .context("risk sequence missing")?;
+                let snapshot: Option<(i64, u64, u64, u64)> = self
+                    .db
+                    .query_row(
+                        "SELECT witness_revision,unresolved_count,eligible_count,exempt_count
+                     FROM risk_accounting_snapshots WHERE dispatch_sequence=?1",
+                        [sequence],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                    )
+                    .optional()?;
+                if let Some((revision, total, eligible, exempt)) = snapshot {
+                    let mut query = self.db.prepare(
+                        "SELECT e.original_id,e.accepted_answer_id
+                         FROM historical_answer_accounting_events e
+                         WHERE e.revision<=?1 AND e.accepted_answer_id IS NOT NULL AND ?2>0
+                         AND NOT EXISTS(SELECT 1 FROM historical_answer_accounting_events newer
+                            WHERE newer.original_id=e.original_id
+                            AND newer.revision>e.revision AND newer.revision<=?1)
+                         ORDER BY e.original_id LIMIT ?3",
+                    )?;
+                    let examples = query
+                        .query_map(
+                            params![revision, exempt, HISTORICAL_EXAMPLE_LIMIT as i64],
+                            |r| {
+                                Ok(HistoricalAnswer {
+                                    operation_id: r.get(0)?,
+                                    accepted_answer_id: r.get(1)?,
+                                })
+                            },
+                        )?
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    admission["accounting"] = json!({
+                        "witness_revision":revision,"unresolved_count":total,
+                        "historical_eligible_count":eligible,"capacity_exempt_count":exempt,
+                        "active_unresolved_count":total-exempt,"blocker_ids_scope":"active",
+                    });
+                    admission["historical_unknown_answers_truncated"] =
+                        json!(exempt > examples.len() as u64);
+                    admission["historical_unknown_answer_count"] = json!(exempt);
+                    admission["historical_unknown_answers"] = serde_json::to_value(examples)?;
+                }
             }
         }
         let linkage: Option<(i64, bool)> = if self.has_table("operation_links")? {
@@ -3576,6 +3711,309 @@ mod tests {
         accepted.state = "confirmed".into();
         store.save(&accepted, "receipt_included").unwrap();
         accepted
+    }
+
+    #[test]
+    fn accepted_linked_capacity_and_witness_growth_survive_restart_and_tightening() {
+        let (_temp, mut config, mut store) = participation_fixture();
+        config.participation.historical_unknown_answer_capacity =
+            HistoricalAnswerCapacity::AcceptedLinked;
+        config.participation.max_unresolved_operations = 2;
+        config.participation.retry_uncertain_answers = true;
+        let mut originals = Vec::new();
+        let mut accepted = Vec::new();
+        for epoch in 1..=24 {
+            let original = dispatched_unknown(&mut store, &config, WorkKind::Answer, epoch);
+            assert!(store.answer_retry_allowed(&config, &original).unwrap());
+            accepted.push(accepted_linked_answer(&mut store, &config, &original));
+            originals.push(original);
+            drop(store);
+            store = Store::open(&config).unwrap();
+            let accounting =
+                Store::uncertainty_accounting(&store.db, &config, None, None, false).unwrap();
+            assert_eq!(
+                (
+                    accounting.total,
+                    accounting.eligible,
+                    accounting.exempt,
+                    accounting.active()
+                ),
+                (epoch, epoch, epoch, 0)
+            );
+        }
+        let mut next = prepared_epoch(&mut store, WorkKind::Answer, 25, "next");
+        config.participation.max_unresolved_operations = 1;
+        assert!(store.admission_allowed(&config, &next).unwrap());
+        for mode in [ParticipationMode::Strict, ParticipationMode::Manual] {
+            config.participation.mode = mode;
+            assert!(!store.admission_allowed(&config, &next).unwrap());
+            let accounting =
+                Store::uncertainty_accounting(&store.db, &config, None, None, false).unwrap();
+            assert_eq!(
+                (accounting.eligible, accounting.exempt, accounting.active()),
+                (24, 0, 24)
+            );
+        }
+        config.participation.mode = ParticipationMode::ParticipationFirst;
+        config.participation.historical_unknown_answer_capacity = HistoricalAnswerCapacity::Bounded;
+        config.participation.max_historical_unknown_answers = 2;
+        assert!(!store.admission_allowed(&config, &next).unwrap());
+        config.participation.historical_unknown_answer_capacity =
+            HistoricalAnswerCapacity::AcceptedLinked;
+        store.record_retry_minimum(originals[0].id, 3600).unwrap();
+        drop(store);
+        store = Store::open(&config).unwrap();
+        assert!(!store.admission_allowed(&config, &next).unwrap());
+        assert!(
+            !store
+                .uncertainty_open(&config, WorkKind::Answer, Some(25), None)
+                .unwrap()
+        );
+        // Expire only the fixture's wall-clock floor; no operation is retired.
+        store
+            .db
+            .execute("UPDATE operation_timing SET retry_not_before=0", [])
+            .unwrap();
+        assert!(store.dispatch_intent(&mut next, &config).unwrap());
+        next.state = "unknown".into();
+        store.save(&next, "dispatch_outcome_unknown").unwrap();
+        store.runtime_state(&config, false).unwrap();
+        let status = store.status(&config).unwrap();
+        assert_eq!(status["participation"]["unresolved_count"], 25);
+        assert_eq!(status["participation"]["historical_eligible_count"], 24);
+        assert_eq!(status["participation"]["capacity_exempt_count"], 24);
+        assert_eq!(status["participation"]["active_unresolved_count"], 1);
+        assert_eq!(
+            status["participation"]["historical_unknown_answers"]
+                .as_array()
+                .unwrap()
+                .len(),
+            20
+        );
+        assert_eq!(
+            status["participation"]["historical_unknown_answers_truncated"],
+            true
+        );
+        let inspection = store.inspect(next.id).unwrap();
+        let risk = &inspection["risk_admissions"][0];
+        assert_eq!(risk["accounting"]["capacity_exempt_count"], 24);
+        assert_eq!(risk["blocker_ids"], "[]");
+        assert_eq!(risk["historical_unknown_answers_truncated"], true);
+        let counts: (u64, u64, u64) = store
+            .db
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM historical_answer_accounting_events),
+                (SELECT COUNT(*) FROM risk_accounting_snapshots),
+                (SELECT COUNT(*) FROM risk_historical_answers)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (24, 48, 0));
+        let blocker_count: u64 = store
+            .db
+            .query_row(
+                "SELECT SUM(json_array_length(blocker_ids)) FROM risk_admissions",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(blocker_count, 24);
+        for original in &originals {
+            assert_eq!(
+                store.operation(original.id).unwrap().unwrap().state,
+                "unknown"
+            );
+        }
+        assert!(
+            !store
+                .uncertainty_open(&config, WorkKind::Answer, Some(26), None)
+                .unwrap()
+        );
+        config.participation.max_unresolved_operations = 3;
+        accepted[0].state = "rejected".into();
+        store.save(&accepted[0], "receipt_rejected").unwrap();
+        let accounting =
+            Store::uncertainty_accounting(&store.db, &config, None, None, false).unwrap();
+        assert_eq!((accounting.exempt, accounting.active()), (23, 2));
+        let mut later = prepared_epoch(&mut store, WorkKind::Answer, 26, "later");
+        assert!(store.dispatch_intent(&mut later, &config).unwrap());
+        let revoked: u64 = store.db.query_row(
+            "SELECT COUNT(*) FROM historical_answer_accounting_events WHERE accepted_answer_id IS NULL",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(revoked, 1);
+        // A historical snapshot remains reconstructable after its witness is revoked.
+        assert_eq!(
+            store.inspect(next.id).unwrap()["risk_admissions"][0]["accounting"]["capacity_exempt_count"],
+            24
+        );
+    }
+
+    #[test]
+    fn accepted_linked_requires_direct_same_epoch_dispatched_identifierless_unknown() {
+        let (_temp, mut config, mut store) = participation_fixture();
+        config.participation.historical_unknown_answer_capacity =
+            HistoricalAnswerCapacity::AcceptedLinked;
+        config.participation.retry_uncertain_answers = true;
+        let original = dispatched_unknown(&mut store, &config, WorkKind::Answer, 7);
+        let accepted = accepted_linked_answer(&mut store, &config, &original);
+        for (change, restore) in [
+            (
+                "UPDATE operations SET job_id='job' WHERE id=?1",
+                "UPDATE operations SET job_id=NULL WHERE id=?1",
+            ),
+            (
+                "UPDATE operations SET txid='tx' WHERE id=?1",
+                "UPDATE operations SET txid=NULL WHERE id=?1",
+            ),
+            (
+                "UPDATE operations SET state='queued' WHERE id=?1",
+                "UPDATE operations SET state='unknown' WHERE id=?1",
+            ),
+            (
+                "UPDATE operations SET kind='judge' WHERE id=?1",
+                "UPDATE operations SET kind='answer' WHERE id=?1",
+            ),
+            (
+                "UPDATE operations SET kind='mine' WHERE id=?1",
+                "UPDATE operations SET kind='answer' WHERE id=?1",
+            ),
+            (
+                "UPDATE operations SET request=json_set(request,'$.solver.epoch',8) WHERE id=?1",
+                "UPDATE operations SET request=json_set(request,'$.solver.epoch',7) WHERE id=?1",
+            ),
+            (
+                "UPDATE operation_evidence SET dispatch_sequence=NULL WHERE operation_id=?1",
+                "UPDATE operation_evidence SET dispatch_sequence=1 WHERE operation_id=?1",
+            ),
+        ] {
+            store.db.execute(change, [original.id]).unwrap();
+            let accounting =
+                Store::uncertainty_accounting(&store.db, &config, None, None, false).unwrap();
+            assert_eq!(
+                (accounting.eligible, accounting.exempt, accounting.active()),
+                (0, 0, 1),
+                "{change}"
+            );
+            store.db.execute(restore, [original.id]).unwrap();
+        }
+        for (state, active, eligible) in [
+            ("included_pending", 1, 1),
+            ("confirmed", 0, 1),
+            ("final", 0, 1),
+            ("unknown", 2, 0),
+            ("queued", 2, 0),
+            ("rejected", 1, 0),
+        ] {
+            store
+                .db
+                .execute(
+                    "UPDATE operations SET state=?1 WHERE id=?2",
+                    params![state, accepted.id],
+                )
+                .unwrap();
+            let accounting =
+                Store::uncertainty_accounting(&store.db, &config, None, None, false).unwrap();
+            assert_eq!(
+                (accounting.active(), accounting.eligible),
+                (active, eligible),
+                "{state}"
+            );
+        }
+        store
+            .db
+            .execute(
+                "UPDATE operations SET state='confirmed',txid=NULL WHERE id=?1",
+                [accepted.id],
+            )
+            .unwrap();
+        assert_eq!(
+            Store::uncertainty_accounting(&store.db, &config, None, None, false)
+                .unwrap()
+                .eligible,
+            0
+        );
+        store
+            .db
+            .execute(
+                "UPDATE operations SET txid=?1 WHERE id=?2",
+                params!["b".repeat(64), accepted.id],
+            )
+            .unwrap();
+        store
+            .db
+            .execute(
+                "DELETE FROM operation_links WHERE operation_id=?1",
+                [accepted.id],
+            )
+            .unwrap();
+        assert_eq!(
+            Store::uncertainty_accounting(&store.db, &config, None, None, false)
+                .unwrap()
+                .eligible,
+            0
+        );
+        // An accepted grandchild does not qualify an ancestor without a direct accepted retry.
+        let mut retry = store
+            .begin_linked(
+                WorkKind::Answer,
+                &original.key,
+                ("prepared", &original.request),
+                store.control().unwrap(),
+                "retry",
+                Some((&original, true)),
+            )
+            .unwrap();
+        config.participation.max_answer_attempts_per_epoch = 4;
+        store
+            .db
+            .execute(
+                "UPDATE operations SET state='rejected',txid=NULL WHERE id=?1",
+                [accepted.id],
+            )
+            .unwrap();
+        assert!(store.dispatch_intent(&mut retry, &config).unwrap());
+        retry.state = "unknown".into();
+        store.save(&retry, "dispatch_outcome_unknown").unwrap();
+        accepted_linked_answer(&mut store, &config, &retry);
+        let accounting =
+            Store::uncertainty_accounting(&store.db, &config, None, None, false).unwrap();
+        assert_eq!(
+            (
+                accounting.total,
+                accounting.eligible,
+                accounting.exempt,
+                accounting.active()
+            ),
+            (2, 1, 1, 1)
+        );
+        assert_eq!(accounting.historical[0].operation_id, retry.id);
+    }
+
+    #[test]
+    fn historical_accounting_reads_old_journals_without_migration() {
+        let (_temp, config, mut store) = participation_fixture();
+        dispatched_unknown(&mut store, &config, WorkKind::Answer, 7);
+        store
+            .db
+            .execute_batch(
+                "DROP TABLE risk_accounting_snapshots;
+             DROP TABLE historical_answer_accounting_events;
+             DROP TABLE operation_links; DROP TABLE operation_timing;",
+            )
+            .unwrap();
+        drop(store);
+        let store = Store::read_only(&config).unwrap().unwrap();
+        let status = store.status(&config).unwrap();
+        assert_eq!(status["participation"]["unresolved_count"], 1);
+        assert_eq!(status["participation"]["historical_eligible_count"], 0);
+        assert_eq!(status["participation"]["active_unresolved_count"], 1);
+        assert!(
+            !store
+                .has_table("historical_answer_accounting_events")
+                .unwrap()
+        );
     }
 
     #[test]

@@ -8,12 +8,10 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::{
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
 };
 
 fn absolute(path: &Path) -> Result<PathBuf> {
@@ -42,7 +40,12 @@ fn safe_lifecycle_error(
     code: &'static str,
     message: &'static str,
 ) -> anyhow::Error {
-    if error.downcast_ref::<LifecycleError>().is_some() || admin::error_code(&error).is_some() {
+    if error.downcast_ref::<LifecycleError>().is_some()
+        || error
+            .downcast_ref::<crate::config::ConfigDiagnostic>()
+            .is_some()
+        || admin::error_code(&error).is_some()
+    {
         error
     } else {
         LifecycleError { code, message }.into()
@@ -332,7 +335,10 @@ async fn init_inner(path: &Path, options: InitOptions<'_>, bytes: &[u8]) -> Resu
             );
         }
     }
-    config.validate()?;
+    config.validate().context(LifecycleError {
+        code: "initialization_invalid",
+        message: "Initialization inputs are invalid; no identity verification was requested and no onboarding files were written.",
+    })?;
     ensure!(
         !admin_identity_initialized(&config)?,
         "existing account state requires its existing configuration; onboarding never replaces identity/history"
@@ -492,28 +498,6 @@ async fn rotate_inner(path: &Path, bytes: &[u8], dry_run: bool) -> Result<Value>
     )
 }
 
-struct InstallerDirectory(PathBuf);
-impl Drop for InstallerDirectory {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-fn binary_digest(mut file: fs::File) -> Result<String> {
-    let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 65536];
-    loop {
-        let count = file
-            .read(&mut buffer)
-            .context("cannot hash local executable")?;
-        if count == 0 {
-            break;
-        }
-        digest.update(&buffer[..count]);
-    }
-    Ok(format!("{:x}", digest.finalize()))
-}
-
 /// Safe, bounded evidence from the canonical installer, never child output text.
 #[derive(Debug)]
 pub struct InstallerError {
@@ -526,7 +510,7 @@ impl std::fmt::Display for InstallerError {
 }
 impl std::error::Error for InstallerError {}
 
-fn installer_preflight_error(code: &'static str) -> anyhow::Error {
+pub(crate) fn installer_preflight_error(code: &'static str) -> anyhow::Error {
     InstallerError {
         evidence: installer_evidence(Some(&json!({
             "stage":"preflight","staging":"not_started","activation":"not_started",
@@ -536,7 +520,7 @@ fn installer_preflight_error(code: &'static str) -> anyhow::Error {
     .into()
 }
 
-fn installer_evidence(value: Option<&Value>) -> Value {
+pub(crate) fn installer_evidence(value: Option<&Value>) -> Value {
     let mut result = json!({"stage":"unknown","staging":"unknown","activation":"unknown","service":"unknown",
         "failure_code":"unknown","evidence":"this_invocation_only","installation_state":"not_inspected"});
     for (key, allowed) in [
@@ -545,6 +529,7 @@ fn installer_evidence(value: Option<&Value>) -> Value {
             &[
                 "unknown",
                 "none",
+                "interrupted",
                 "unsupported_platform",
                 "invalid_arguments",
                 "missing_prerequisite",
@@ -555,6 +540,8 @@ fn installer_evidence(value: Option<&Value>) -> Value {
                 "preparation_failed",
                 "release_invalid",
                 "configuration_invalid",
+                "manager_context_mismatch",
+                "service_state_unavailable",
                 "insufficient_space",
                 "unit_invalid",
                 "stop_failed",
@@ -619,209 +606,13 @@ fn installer_evidence(value: Option<&Value>) -> Value {
     result
 }
 
-/// Let a verified incoming release supply its own embedded installer and units.
-/// The child sees its own digest, so delegation ends after exactly one hop.
-fn incoming_installer(binary: &Path, action: &str, digest: &str, stopped: bool) -> Result<Value> {
-    let mut command = Command::new(binary);
-    command
-        .args(["--json", action, "--binary"])
-        .arg(binary)
-        .args(["--sha256", digest]);
-    if stopped {
-        command.arg("--stopped");
-    }
-    let result = command.stdin(Stdio::null()).output().map_err(|error| {
-        if error.kind() == std::io::ErrorKind::PermissionDenied {
-            installer_preflight_error("candidate_execution_unavailable")
-        } else {
-            InstallerError {
-                evidence: installer_evidence(None),
-            }
-            .into()
-        }
-    })?;
-    if !result.status.success() {
-        let evidence = result
-            .stderr
-            .split(|byte| *byte == b'\n')
-            .filter_map(|line| serde_json::from_slice::<Value>(line).ok())
-            .find(|value| {
-                value["schema"] == "agmi.cli.v1" && value["error"]["code"] == "installer_failed"
-            })
-            .map(|value| installer_evidence(Some(&value["error"]["details"])))
-            .unwrap_or_else(|| installer_evidence(None));
-        return Err(InstallerError { evidence }.into());
-    }
-    let mut envelope: Value =
-        serde_json::from_slice(&result.stdout).map_err(|_| InstallerError {
-            evidence: installer_evidence(None),
-        })?;
-    if !(envelope["schema"] == "agmi.cli.v1"
-        && envelope["ok"] == true
-        && envelope["type"] == action
-        && envelope.get("data").is_some())
-    {
-        return Err(InstallerError {
-            evidence: installer_evidence(None),
-        }
-        .into());
-    }
-    Ok(envelope["data"].take())
-}
-
-/// The embedded script is the canonical installer, not a second cutover implementation.
+/// Execute the incoming-release-owned native Rust installer.
 pub fn installer(arguments: &[String], dry_run: bool) -> Result<Value> {
-    installer_inner(arguments, dry_run).map_err(|error| {
+    crate::installer::run(arguments, dry_run).map_err(|error| {
         if error.downcast_ref::<InstallerError>().is_some() {
             error
         } else {
             installer_preflight_error("preparation_failed")
         }
     })
-}
-
-fn installer_inner(arguments: &[String], dry_run: bool) -> Result<Value> {
-    let mut plan = json!({"arguments":arguments,"dry_run":dry_run,"network_downloads":false,
-        "trust":"Local operator-trusted binary and expected SHA256 only; hashes/build labels are not signed publisher or source provenance.",
-        "pause_state":"unchanged","journal":"never copied, restored or migrated by installer","preview":"plan only; operational preconditions are checked on execution",
-        "stage":"preflight","staging":"not_started","activation":"not_started","service":"unknown","failure_code":"none"});
-    if dry_run {
-        plan["installation"] = installer_evidence(Some(&plan));
-        return Ok(plan);
-    }
-    if !cfg!(target_os = "linux") {
-        return Err(installer_preflight_error("unsupported_platform"));
-    }
-    let root = std::env::temp_dir();
-    let directory = (0..1000)
-        .find_map(|n| {
-            let path = root.join(format!("agmi-installer-{}-{n}", std::process::id()));
-            let mut builder = fs::DirBuilder::new();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt;
-                builder.mode(0o700);
-            }
-            match builder.create(&path) {
-                Ok(()) => Some(Ok(InstallerDirectory(path))),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => None,
-                Err(_) => Some(Err(anyhow::anyhow!(
-                    "cannot prepare private installer directory"
-                ))),
-            }
-        })
-        .context("cannot allocate private installer directory")??;
-    let mut canonical_arguments = std::borrow::Cow::Borrowed(arguments);
-    if arguments
-        .first()
-        .is_some_and(|action| matches!(action.as_str(), "install" | "update"))
-    {
-        let action = &arguments[0];
-        let source = Path::new(
-            arguments
-                .get(1)
-                .ok_or_else(|| installer_preflight_error("invalid_arguments"))?,
-        );
-        if arguments.get(2).map(String::as_str) != Some("--sha256") {
-            return Err(installer_preflight_error("invalid_arguments"));
-        }
-        let expected = arguments
-            .get(3)
-            .ok_or_else(|| installer_preflight_error("invalid_arguments"))?;
-        let mut options = fs::OpenOptions::new();
-        options.read(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
-        }
-        let mut source = options
-            .open(source)
-            .map_err(|_| installer_preflight_error("candidate_unavailable"))?;
-        let metadata = source
-            .metadata()
-            .map_err(|_| installer_preflight_error("candidate_unavailable"))?;
-        if !metadata.is_file() {
-            return Err(installer_preflight_error("candidate_unavailable"));
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if metadata.permissions().mode() & 0o111 == 0 {
-                return Err(installer_preflight_error("candidate_execution_unavailable"));
-            }
-        }
-        let candidate = directory.0.join("incoming-agmi");
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o700);
-        }
-        let mut copied = options
-            .open(&candidate)
-            .context("cannot stage private incoming executable")?;
-        std::io::copy(&mut source, &mut copied).context("cannot copy incoming executable")?;
-        copied
-            .sync_all()
-            .context("cannot sync incoming executable")?;
-        drop(copied); // Close the writable descriptor before exec (ETXTBSY).
-        let actual = binary_digest(
-            fs::File::open(&candidate).context("cannot inspect copied incoming executable")?,
-        )?;
-        if &actual != expected {
-            return Err(installer_preflight_error("digest_mismatch"));
-        }
-        // Linux /proc pins the running image even if its installation path changed.
-        let running = binary_digest(
-            fs::File::open("/proc/self/exe")
-                .context("cannot inspect running executable identity")?,
-        )?;
-        if actual != running {
-            return incoming_installer(
-                &candidate,
-                action,
-                expected,
-                arguments.iter().any(|argument| argument == "--stopped"),
-            );
-        }
-        canonical_arguments.to_mut()[1] = candidate.to_string_lossy().into_owned();
-    }
-    for (name, contents) in [
-        ("install-user.sh", include_str!("../deploy/install-user.sh")),
-        ("agmi.service", include_str!("../deploy/agmi.service")),
-        (
-            "agmi-health.service",
-            include_str!("../deploy/agmi-health.service"),
-        ),
-        (
-            "agmi-health.timer",
-            include_str!("../deploy/agmi-health.timer"),
-        ),
-    ] {
-        fs::write(directory.0.join(name), contents).context("cannot prepare installer artifact")?;
-    }
-    // Capture child streams: neither raw systemd output nor subprocess errors are
-    // part of the machine error contract. The script remains the only cutover owner.
-    let result = Command::new("sh")
-        .arg(directory.0.join("install-user.sh"))
-        .args(canonical_arguments.as_ref())
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|_| InstallerError {
-            evidence: installer_evidence(None),
-        })?;
-    let marker = result
-        .stdout
-        .split(|byte| *byte == b'\n')
-        .filter_map(|line| serde_json::from_slice::<Value>(line).ok())
-        .rfind(|value| value["schema"] == "agmi.installer.v1");
-    let evidence = installer_evidence(marker.as_ref());
-    if !result.status.success() {
-        return Err(InstallerError { evidence }.into());
-    }
-    Ok(
-        json!({"plan":plan,"installation":evidence,"output":String::from_utf8_lossy(&result.stdout)}),
-    )
 }

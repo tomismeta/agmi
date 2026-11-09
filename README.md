@@ -4,9 +4,9 @@
 
 Rust infrastructure for MinePOA: answer challenges, judge assigned answers and attest through the mining API. Models produce content; agmi owns scheduling, durable state and submissions. Each instance keeps its own identity, credentials and history.
 
-## Install
+## Install the CLI
 
-Requires Rust 1.96+. Active answer/judge work also needs an authenticated, supported Hermes or OpenClaw installation.
+Requires Unix (Linux/macOS), Rust/Cargo 1.96+ and a C compiler/linker. Answer/judge work also needs a separately installed, authenticated [Hermes or OpenClaw runtime](docs/OPERATIONS.md#native-model-routes), including compatible Python or Node.js.
 
 ```sh
 git clone https://github.com/tomismeta/agmi.git
@@ -15,77 +15,52 @@ cargo install --path . --locked
 agmi --help
 ```
 
+Put Cargo's binary directory (normally `~/.cargo/bin`) on `PATH`. This installs only the CLI—not services, native harnesses or authentication. Linux [service installation and updates](docs/OPERATIONS.md#supervision) are separate explicit commands; a fresh service install stays stopped and never resumes participation.
+
+Version **0.1.0** is not published to crates.io; `publish = false` remains intentional. Use this source workflow or the [local package workflow](docs/OPERATIONS.md#verification-and-publication), not `cargo install agmi`.
+
 ## Set up an identity
 
-Choose one path: connect an existing MinePOA account or create a new one.
-Neither path starts mining, answering or judging automatically.
+Choose one path. Stop any other software submitting work for this account first. Neither path starts participation.
 
 ### Existing account
-
-Stop any other software submitting work for this account, then run:
 
 ```sh
 agmi init --account YOUR_PUBLIC_ACCOUNT_ADDRESS --key-prompt
 ```
 
-Replace `YOUR_PUBLIC_ACCOUNT_ADDRESS` with your public MinePOA address.
-agmi securely prompts for the hosted API key; never put the key in command arguments.
-
-**For agents and scripts:** supply an existing private credential file instead of an interactive prompt:
+Replace the address with your public MinePOA address. The prompt reads the hosted API key privately. For agents and scripts, use a private credential file:
 
 ```sh
 agmi init --account YOUR_PUBLIC_ACCOUNT_ADDRESS --api-key-file /path/to/private/api-key --json
 ```
 
-Alternatively, use `--key-stdin` to read the key from standard input.
-`--json` is optional: it provides structured results, errors and next actions for automation.
-Init verifies the account, creates private configuration and guidance, and leaves participation paused/read-only. It never replaces existing configuration or journal history.
+Alternatively, use `--key-stdin`; never put credentials in command arguments.
 
-The default path is `~/.config/agmi/config.toml`, matching the installed service even when `XDG_CONFIG_HOME` differs. Keep `HOME` at the service user's account home; an overridden `HOME` selects a separate CLI/installer root, not a different systemd account home. Use `--config FILE` for a separately supervised foreground instance.
-
-### New account
-
-No MinePOA identity yet? Start by inspecting the registration plan. This command makes no network requests and creates no account:
+### Brand-new account
 
 ```sh
 agmi identity create --label my-agent
 ```
 
-Registration requires explicit authorization and a verified proof-of-work algorithm:
+This is a nonmutating plan. Follow [registration approval and onboarding](docs/OPERATIONS.md#identity-onboarding-and-recovery) to verify the proof-of-work algorithm, explicitly confirm creation and initialize the returned account. Public registration has not yet been live-validated.
 
-1. Run `agmi identity create --label my-agent --confirm` to request the challenge. Without an accepted algorithm tag, it stops before registration and reports `negotiated_pow_algo`.
-2. Verify that the tag denotes SHA256 of `challenge + ':' + decimal nonce`, checked for leading-zero bits. Do not accept an unfamiliar algorithm blindly.
-3. Supply the verified tag to authorize bounded proof of work and registration:
-
-```sh
-agmi identity create --label my-agent --expected-pow-algo VERIFIED_ALGORITHM_TAG --confirm
-```
-
-Replace `VERIFIED_ALGORITHM_TAG` with the verified value. On success, follow the returned `next_actions` to initialize and verify the new account. Then continue to [Configure and run](#configure-and-run).
-
-**For agents and scripts:** add `--json` to receive structured results and next actions. Inspect local registration progress with:
-
-```sh
-agmi identity status --json
-```
-
-Account creation and participation are separate approvals. Do not automatically repeat a failed registration; inspect its recorded status and suggested next action first. See `agmi identity create --help` for proof-of-work budgets and other options.
-
-**The hosted API credential is returned once. A crash after remote creation but before durable local capture can permanently lose it.** Retained intent prevents replay, not that loss window. `identity status` supplies `identity resume --confirm` when captured success needs local publication; resume never sends HTTP or needs the original registration options. An uncertain registration is never resent. Do not delete its evidence. Public registration has not yet been live-validated; admission availability is controlled by MinePOA.
-
-Both onboarding commands accept `--network-config FILE`. See [network profiles](docs/OPERATIONS.md#network-profiles) and [security](SECURITY.md).
+**The API key is returned once.** A crash before durable capture can lose it. After interruption, inspect `agmi identity status --json`; never repeat an uncertain registration or delete its evidence. [Recovery details](docs/OPERATIONS.md#identity-onboarding-and-recovery).
 
 ## Configure and run
 
+Init leaves private configuration at `~/.config/agmi/config.toml`, with participation paused/read-only. Inspect it:
+
 ```sh
 agmi config show --json
-agmi config schema --json
 agmi agents --json
 ```
 
-Edit the private file reported by init, or use revision-checked [`config apply`](docs/OPERATIONS.md#agent-administration). Select the native harness, executable, model and reasoning separately for answer and judge. Authenticate through the harness itself; `agents` reports configuration, not successful authentication.
+Edit that file or use [revision-checked configuration](docs/OPERATIONS.md#agent-administration) (`config schema`, `config show`, then `config apply`). Select the harness, executable, model and reasoning separately for answer/judge. Authenticate through the harness itself—never copy another account's auth; `agents` reports configuration, not successful authentication. Supervision also requires the runtime on the [service PATH](docs/OPERATIONS.md#native-model-routes).
 
-Choose the desired modes in the existing configuration tables. For all participation capabilities and per-epoch attestation:
+Model, guidance and normal scheduling changes hot-reload; in-flight work retains its captured settings.
+
+To enable all capabilities and per-epoch attestation, update the existing tables:
 
 ```toml
 [capabilities]
@@ -97,7 +72,7 @@ mine = "active"
 mine_each_epoch = true
 ```
 
-Other schedule fields retain their defaults. Review the [uncertainty policy](docs/OPERATIONS.md#configurable-uncertainty-policy) deliberately: strict is the default; participation-first permits bounded additional risk without pretending uncertain writes failed.
+Other settings retain their defaults. Review [participation risk policy](docs/OPERATIONS.md#configurable-uncertainty-policy) deliberately; strict is the default. Optional `accepted_linked` accounting retains original unknowns and accepts accumulating historical risk, not proof that old requests failed.
 
 ```sh
 agmi config check
@@ -108,7 +83,7 @@ agmi resume
 agmi run
 ```
 
-The first bounded run initializes paused state; it is not a live-readiness guarantee. Resume does not change capability modes. A resumed foreground run performs the configured work. For unattended Linux operation, use [install/service/update](docs/OPERATIONS.md#supervision) instead of a foreground process.
+The first bounded run initializes paused state, not live readiness. Resume does not change capability modes. For unattended Linux operation, use [install/service/update](docs/OPERATIONS.md#supervision) instead of the foreground process.
 
 ## Inspect and administer
 
@@ -116,26 +91,17 @@ The first bounded run initializes paused state; it is not a live-readiness guara
 agmi status --json
 agmi health --json
 agmi reads --json
-agmi operations list --state unknown --limit 20 --json
-agmi logs --json
 ```
-
-These are local observations, not fresh remote confirmations. Errors include stable codes and structured `next_actions` with authorization requirements. A healthy process, an accepted answer and a verified reward are different claims; agmi does not verify earnings or independent ledger finality.
 
 `healthy` and the health command's exit status describe operational readiness. Unresolved outcomes remain visible through `warnings`, `attention_required` and `risk`; a progressing, unblocked agent can be healthy with warnings. Blocked admission, stale evidence and overdue work still fail health.
 
-- **Models and prompts:** edit answer/judge `core-guidance.md` and `user-guidance.md`, or use the [guidance CLI](docs/OPERATIONS.md#core-and-user-guidance). Model, guidance and normal scheduling-policy changes reload without redeployment; in-flight work retains its captured inputs.
-- **APIs and URLs:** shipped defaults live in [`defaults/network.toml`](defaults/network.toml) and [`defaults/model.toml`](defaults/model.toml). Runtime overrides are exposed through full configuration. Credential trust is separate from endpoint routing; pending work fences route changes. Native OpenClaw endpoints remain owned by its existing configuration.
-- **Pause:** `agmi pause` closes new admission. It cannot retract requests or disable server-side auto-mining. Stop the runtime to stop all its network activity.
-- **Update:** `agmi update --help` describes verified local-binary and retained-release activation. Ordinary updates preserve journal history and pause/running intent; no reset or pause/resume cycle is required.
-- **Alerts:** agents may forward sanitized health/events through their own channels. agmi contains no notification transport, lifecycle hooks or model-driven recovery handler.
+Run one authoritative writer per account. Preserve the journal, account binding and credentials across updates; never erase uncertainty to regain availability. `agmi pause` closes new admission but cannot retract requests or disable server-side auto-mining. Local observations are not fresh remote confirmations or proof of rewards.
 
-## Reliability boundaries
-
-Intent is persisted before effects. Unknown is not failed; time alone never proves nonexecution. Participation-first admissions retain their risk evidence, and historical-answer capacity allowances remain finite. No client can guarantee every epoch during upstream outages, exhausted admission capacity or unavailable model authentication.
-
-Run one authoritative writer per wallet. Preserve the journal, account binding, registration artifacts and credentials across updates. Never erase uncertainty to regain availability.
+- [Configuration, guidance and network profiles](docs/OPERATIONS.md#configuration-and-reload)
+- [Identity recovery and credentials](docs/OPERATIONS.md#identity-onboarding-and-recovery)
+- [Services, release activation and updates](docs/OPERATIONS.md#supervision)
+- [Health and agent-owned forwarding](docs/OPERATIONS.md#local-health-checks)
 
 [Operations reference](docs/OPERATIONS.md) · [Architecture](ARCHITECTURE.md) · [Security](SECURITY.md) · [Changelog](CHANGELOG.md)
 
-Version **0.1.0**. Experimental protocol; no earnings guarantees.
+Experimental protocol; no earnings guarantees.

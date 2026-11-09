@@ -292,6 +292,15 @@ pub enum ParticipationMode {
     Manual,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoricalAnswerCapacity {
+    #[default]
+    Bounded,
+    /// Retain unlimited historical uncertainty without charging active capacity.
+    AcceptedLinked,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Participation {
@@ -300,6 +309,7 @@ pub struct Participation {
     pub max_unresolved_operations: u32,
     /// Additional bounded capacity for directly linked, still-unknown answers.
     pub max_historical_unknown_answers: u32,
+    pub historical_unknown_answer_capacity: HistoricalAnswerCapacity,
     pub answer_reserved_slots: u32,
     pub allow_answer: bool,
     pub allow_mine: bool,
@@ -315,6 +325,7 @@ impl Default for Participation {
             uncertainty_grace_seconds: 300,
             max_unresolved_operations: 4,
             max_historical_unknown_answers: 0,
+            historical_unknown_answer_capacity: HistoricalAnswerCapacity::Bounded,
             answer_reserved_slots: 0,
             allow_answer: true,
             allow_mine: true,

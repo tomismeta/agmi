@@ -1,5 +1,6 @@
-//! Read-only, local health evidence. Output contains only bounded diagnostic codes,
-//! booleans and ages; never copy raw status, event text or operation identifiers.
+//! Read-only, local health evidence with a versioned, bounded component contract.
+//! Component readiness is separate from retained effect risk and never authorizes
+//! replay. Effective modes and fresh local evidence are not live remote probes.
 use crate::{
     config::{Config, Mode, WorkKind},
     runtime,
@@ -7,6 +8,8 @@ use crate::{
 };
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
+
+mod api;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Options {
@@ -36,6 +39,7 @@ pub fn check(config: &Config, options: Options) -> Result<Value> {
         Ok(status) => status,
         Err(_) => {
             return Ok(json!({
+                "contract_version":1,"components":unknown_components(),
                 "healthy":false,"attention_required":true,
                 "issues":["local_evidence_unavailable"],"warnings":[],
                 "operational":{"status":"unknown","issues":["local_evidence_unavailable"]},
@@ -60,16 +64,7 @@ pub fn check(config: &Config, options: Options) -> Result<Value> {
                 .push(json!("state_disk_headroom_low"));
         }
         if let Some(code) = issue {
-            result["issues"]
-                .as_array_mut()
-                .expect("health issues array")
-                .push(json!(code));
-            result["healthy"] = json!(false);
-            result["operational"]["status"] = json!("degraded");
-            result["operational"]["issues"]
-                .as_array_mut()
-                .expect("operational health issues array")
-                .push(json!(code));
+            apply_disk_issue(&mut result, code);
         }
     }
     result["thresholds"]["min_free_mib"] = json!(options.min_free_mib);
@@ -127,31 +122,68 @@ fn model_overdue(work: &Value, at: i64, poll: u64, fallback: Option<u64>) -> Opt
     Some(age(&work["created_at"], at)? > fallback?)
 }
 
+struct WorkTiming {
+    http: u64,
+    shutdown: u64,
+    poll: u64,
+    model: Option<u64>,
+    pending: u64,
+}
+
+impl WorkTiming {
+    fn issue(&self, work: &Value, at: i64) -> Option<&'static str> {
+        match work["state"].as_str() {
+            Some("unknown") => None,
+            Some("generating") => (model_overdue(work, at, self.poll, self.model) == Some(true))
+                .then_some("model_work_overdue"),
+            Some("dispatching")
+                if work["http_deadline"].as_i64().map_or(
+                    age(&work["updated_at"], at).is_some_and(|seconds| {
+                        seconds > self.http.saturating_add(self.shutdown).saturating_add(1)
+                    }),
+                    |deadline| at > deadline.saturating_add(self.shutdown as i64),
+                ) =>
+            {
+                Some("dispatch_outcome_uncertain")
+            }
+            Some(_)
+                if age(&work["created_at"], at).is_some_and(|seconds| seconds > self.pending) =>
+            {
+                Some("pending_work_overdue")
+            }
+            _ => None,
+        }
+    }
+}
+
 fn evaluate(config: &Config, options: Options, status: &Value, at: i64) -> Value {
     // Use the running controller's policy, not a newly edited desired config.
     // Native inference is independent and no longer expands heartbeat grace.
     let policy = &status["effective_runtime"]["policy"];
-    let http = policy["timeouts"]["http_seconds"]
-        .as_u64()
-        .unwrap_or(config.timeouts.http_seconds);
+    let timing_known = [
+        &policy["timeouts"]["http_seconds"],
+        &policy["timeouts"]["shutdown_seconds"],
+        &policy["schedule"]["poll_seconds"],
+        &policy["schedule"]["jitter_seconds"],
+    ]
+    .iter()
+    .all(|value| value.as_u64().is_some());
+    let http = policy["timeouts"]["http_seconds"].as_u64().unwrap_or(0);
     let read_http = policy["timeouts"]["read_http_seconds"]
         .as_u64()
         .unwrap_or(http);
-    let poll = policy["schedule"]["poll_seconds"]
-        .as_u64()
-        .unwrap_or(config.schedule.poll_seconds);
-    let jitter = policy["schedule"]["jitter_seconds"]
-        .as_u64()
-        .unwrap_or(config.schedule.jitter_seconds);
-    let shutdown = policy["timeouts"]["shutdown_seconds"]
-        .as_u64()
-        .unwrap_or(config.timeouts.shutdown_seconds);
-    let cycle_floor = http
-        .max(read_http)
-        .saturating_add(poll)
-        .saturating_add(jitter)
-        .saturating_add(shutdown)
-        .saturating_add(1);
+    let poll = policy["schedule"]["poll_seconds"].as_u64().unwrap_or(0);
+    let jitter = policy["schedule"]["jitter_seconds"].as_u64().unwrap_or(0);
+    let shutdown = policy["timeouts"]["shutdown_seconds"].as_u64().unwrap_or(0);
+    let cycle_floor = if timing_known {
+        http.max(read_http)
+            .saturating_add(poll)
+            .saturating_add(jitter)
+            .saturating_add(shutdown)
+            .saturating_add(1)
+    } else {
+        0
+    };
     let stale = options.stale_seconds.max(cycle_floor);
     let work_limit = options.work_seconds.max(cycle_floor);
     let grace = options.answer_grace_seconds.max(cycle_floor);
@@ -192,6 +224,9 @@ fn evaluate(config: &Config, options: Options, status: &Value, at: i64) -> Value
     if !initialized {
         issues.push("not_initialized");
     }
+    if initialized && !timing_known {
+        issues.push("effective_policy_unavailable");
+    }
     if status["identity_matches_config"].as_bool() == Some(false) {
         issues.push("identity_mismatch");
     }
@@ -208,7 +243,7 @@ fn evaluate(config: &Config, options: Options, status: &Value, at: i64) -> Value
     }
     match heartbeat_age {
         None => issues.push("controller_unobserved"),
-        Some(seconds) if seconds > stale => issues.push("controller_stale"),
+        Some(seconds) if timing_known && seconds > stale => issues.push("controller_stale"),
         _ => {}
     }
     if effective["observed_at"]
@@ -231,44 +266,27 @@ fn evaluate(config: &Config, options: Options, status: &Value, at: i64) -> Value
             issues.push("no_active_capabilities");
         }
     }
+    let timing = WorkTiming {
+        http,
+        shutdown,
+        poll,
+        model: model_limit,
+        pending: work_limit,
+    };
     // The representative oldest pending row must not hide later overdue work.
     for work in
         std::iter::once(pending).chain(status["pending_work"].as_array().into_iter().flatten())
     {
-        let issue = match work["state"].as_str() {
-            Some("unknown") => {
-                if !warnings.contains(&"pending_outcome_uncertain") {
-                    warnings.push("pending_outcome_uncertain");
-                }
-                None
-            }
-            Some("generating") => match model_overdue(work, at, poll, model_limit) {
-                Some(true) => Some("model_work_overdue"),
-                None => {
-                    if !warnings.contains(&"model_deadline_unavailable") {
-                        warnings.push("model_deadline_unavailable");
-                    }
-                    None
-                }
-                _ => None,
-            },
-            Some("dispatching")
-                if work["http_deadline"].as_i64().map_or(
-                    age(&work["updated_at"], at).is_some_and(|seconds| {
-                        seconds > http.saturating_add(shutdown).saturating_add(1)
-                    }),
-                    |deadline| at > deadline.saturating_add(shutdown as i64),
-                ) =>
-            {
-                Some("dispatch_outcome_uncertain")
-            }
-            Some(_) if age(&work["created_at"], at).is_some_and(|seconds| seconds > work_limit) => {
-                // created_at survives repeated queue polls and Retry-After.
-                Some("pending_work_overdue")
-            }
-            _ => None,
-        };
-        if let Some(issue) = issue
+        if work["state"] == "unknown" && !warnings.contains(&"pending_outcome_uncertain") {
+            warnings.push("pending_outcome_uncertain");
+        } else if work["state"] == "generating"
+            && model_overdue(work, at, poll, model_limit).is_none()
+            && !warnings.contains(&"model_deadline_unavailable")
+        {
+            warnings.push("model_deadline_unavailable");
+        }
+        if timing_known
+            && let Some(issue) = timing.issue(work, at)
             && !issues.contains(&issue)
         {
             issues.push(issue);
@@ -278,10 +296,13 @@ fn evaluate(config: &Config, options: Options, status: &Value, at: i64) -> Value
     if answer_expected {
         match observation_age {
             None => issues.push("challenge_unobserved"),
-            Some(seconds) if seconds > stale => issues.push("challenge_observation_stale"),
+            Some(seconds) if timing_known && seconds > stale => {
+                issues.push("challenge_observation_stale")
+            }
             _ => {}
         }
-        if status["epoch_evidence"]["answered"].as_bool() == Some(false)
+        if timing_known
+            && status["epoch_evidence"]["answered"].as_bool() == Some(false)
             && epoch_age.is_some_and(|seconds| seconds > grace)
             && observation_age.is_some_and(|seconds| seconds <= stale)
         {
@@ -324,7 +345,7 @@ fn evaluate(config: &Config, options: Options, status: &Value, at: i64) -> Value
         .flatten()
         .any(|row| row["state"] == "generating" && row["count"].as_u64().unwrap_or(0) > 0);
     for work in status["captured_work"].as_array().into_iter().flatten() {
-        if work["state"] != "generating" {
+        if !timing_known || work["state"] != "generating" {
             continue;
         }
         match model_overdue(work, at, poll, model_limit) {
@@ -340,7 +361,9 @@ fn evaluate(config: &Config, options: Options, status: &Value, at: i64) -> Value
     // Health measures operational readiness; uncertainty remains explicit risk.
     // "clear" is not a guarantee of remote availability or successful submission.
     let admission = status["admission_blocked"].as_bool();
-    let operational_status = if !issues.is_empty() {
+    let operational_status = if issues == ["effective_policy_unavailable"] {
+        "unknown"
+    } else if !issues.is_empty() {
         "degraded"
     } else if admission == Some(true) {
         "blocked"
@@ -390,20 +413,300 @@ fn evaluate(config: &Config, options: Options, status: &Value, at: i64) -> Value
         "evidence":"local_only","notifications":"local_exit_status_and_journal"});
     result["current_epoch"] = json!({"epoch":status["observation"]["epoch"].as_u64(),
         "answered":status["epoch_evidence"]["answered"].as_bool(),
-        "evidence_fresh":observation_age.is_some_and(|age|age<=stale)
-            && status["observation"]["observed_at"].as_i64().is_some_and(|time| time<=at),
+        "evidence_fresh":timing_known.then(|| observation_age.is_some_and(|age|age<=stale)
+            && status["observation"]["observed_at"].as_i64().is_some_and(|time| time<=at)),
         "evidence":"last_local_observation_not_a_live_remote_check"});
     result["thresholds"] = json!({"stale_seconds":stale,"work_seconds":work_limit,
-        "answer_grace_seconds":grace,"model_seconds":model_limit,"cycle_floor_seconds":cycle_floor,
-        "read_http_seconds":read_http,"write_http_seconds":http});
+        "answer_grace_seconds":grace,"model_seconds":model_limit,
+        "cycle_floor_seconds":timing_known.then_some(cycle_floor),
+        "read_http_seconds":timing_known.then_some(read_http),
+        "write_http_seconds":timing_known.then_some(http),
+        "timing_source":if timing_known {"effective"} else {"unavailable"}});
     result["operational"] = json!({"status":operational_status,"issues":issues,
         "evidence":"local_only_not_a_submission_guarantee"});
     result["risk"] = json!({"attention_required":risk_attention,
         "unresolved_effects":status["participation"]["unresolved_count"].as_u64(),
         "active_unresolved_effects":status["participation"]["active_unresolved_count"].as_u64(),
         "historical_unknown_answers":status["participation"]["historical_unknown_answer_count"].as_u64(),
+        "historical_eligible_answers":status["participation"]["historical_eligible_count"].as_u64(),
+        "capacity_exempt_answers":status["participation"]["capacity_exempt_count"].as_u64(),
         "unresolved_model_attempts":unresolved_models});
+    result["contract_version"] = json!(1);
+    result["components"] = components(status, &result, at, stale, &timing);
     result
+}
+
+fn apply_disk_issue(result: &mut Value, code: &str) {
+    result["issues"]
+        .as_array_mut()
+        .expect("health issues array")
+        .push(json!(code));
+    result["healthy"] = json!(false);
+    result["operational"]["status"] = json!("degraded");
+    result["operational"]["issues"]
+        .as_array_mut()
+        .expect("operational health issues array")
+        .push(json!(code));
+    for name in ["controller", "answer", "judge", "mine"] {
+        let row = &mut result["components"][name];
+        if row["state"] == "ok" {
+            row["state"] = json!("degraded");
+            row["next_actions"] = inspection_actions();
+        }
+        if row["state"] != "disabled" {
+            row["reasons"]
+                .as_array_mut()
+                .expect("component reasons")
+                .push(json!(code));
+        }
+    }
+}
+
+fn component(state: &str, reason: &str, observed: Option<i64>, at: i64) -> Value {
+    json!({
+        "state":state,"reasons":[reason],"observed_at":observed,
+        "age_seconds":observed.filter(|time| *time <= at).map(|time| at.saturating_sub(time) as u64),
+        "next_actions":if state == "ok" || state == "disabled" {
+            json!([])
+        } else {
+            inspection_actions()
+        }
+    })
+}
+
+fn inspection_actions() -> Value {
+    json!([{"kind":"instruction","authorization_required":false,
+        "message":"Inspect agmi status and agmi health using the same selected configuration; these commands read local evidence only."}])
+}
+
+/// A stable shape for unavailable local evidence; this grants no replay authority.
+pub fn unknown_components() -> Value {
+    let mut value = json!({"api":api::unknown()});
+    for name in ["controller", "answer", "judge", "mine"] {
+        value[name] = component("unknown", "local_evidence_unavailable", None, 0);
+        if name != "controller" {
+            value[name]["mode"] = Value::Null;
+        }
+    }
+    value
+}
+
+fn fresh(timestamp: Option<i64>, at: i64, stale: u64) -> bool {
+    timestamp.is_some_and(|time| time <= at && at.saturating_sub(time) as u64 <= stale)
+}
+
+fn components(status: &Value, health: &Value, at: i64, stale: u64, timing: &WorkTiming) -> Value {
+    let effective = &status["effective_runtime"];
+    let observed = effective["observed_at"].as_i64();
+    let active = ["answer", "judge", "mine"]
+        .iter()
+        .any(|name| effective["capabilities"][name] == "active");
+    let controller_issue = if status["initialized"] != true {
+        Some(("unknown", "not_initialized"))
+    } else if status["identity_matches_config"] == false {
+        Some(("blocked", "identity_mismatch"))
+    } else if status["network_routing"]["matches_config"] == false {
+        Some(("blocked", "api_routing_mismatch"))
+    } else if status["hosted_identity_verified"] == false {
+        Some(("blocked", "hosted_identity_unverified"))
+    } else if status["controller_stopped"] == true {
+        Some(("blocked", "controller_stopped"))
+    } else if status["paused"] == true && active {
+        Some(("blocked", "participation_paused"))
+    } else if effective["reload_blocked"] == true {
+        Some(("blocked", "reload_blocked"))
+    } else if health["thresholds"]["timing_source"] != "effective" {
+        Some(("unknown", "effective_policy_unavailable"))
+    } else if observed.is_some_and(|time| time > at) {
+        Some(("unknown", "clock_regressed"))
+    } else if observed.is_none() {
+        Some(("unknown", "controller_unobserved"))
+    } else if !fresh(observed, at, stale) {
+        Some(("unknown", "controller_stale"))
+    } else if status["hosted_identity_verified"].is_null() && active {
+        Some(("unknown", "hosted_identity_unobserved"))
+    } else if status["paused"].as_bool().is_none()
+        || status["identity_matches_config"].as_bool().is_none()
+    {
+        Some(("unknown", "controller_evidence_unavailable"))
+    } else {
+        None
+    };
+    let (state, reason) = controller_issue.unwrap_or(("ok", "controller_recent"));
+    let controller = component(state, reason, observed, at);
+    let apis = api::evaluate(&status["reads"], at, stale);
+    let mut value = json!({"controller":controller,"api":apis});
+    for name in ["answer", "judge", "mine"] {
+        let mode = effective["capabilities"][name].as_str();
+        let work = &status["work"][name];
+        let scope = if name == "judge" {
+            "assignments"
+        } else {
+            "challenge"
+        };
+        let primary = &value["api"][scope];
+        let observation = if name == "judge" {
+            work["selection"]["observed_at"].as_i64()
+        } else {
+            status["observation"]["observed_at"].as_i64()
+        };
+        let evidence_at = observation.or(primary["observed_at"].as_i64());
+        // Decide with borrowed codes; allocate each JSON component only once.
+        let mut finding = ("unknown", "work_evidence_unavailable", evidence_at);
+        if mode == Some("off") {
+            finding = ("disabled", "capability_off", observed);
+        } else if !matches!(mode, Some("active" | "read_only")) {
+            finding = ("unknown", "effective_mode_unavailable", observed);
+        } else if let Some((state, reason)) = controller_issue.filter(|(_, reason)| {
+            mode != Some("read_only")
+                || !matches!(
+                    *reason,
+                    "participation_paused" | "hosted_identity_unobserved"
+                )
+        }) {
+            finding = (state, reason, observed);
+        } else {
+            let read_only = mode == Some("read_only");
+            let admission = status["participation"]["uncertainty_blocks"][name].as_bool();
+            // Only explicit per-capability admission evidence can fence this row.
+            // Unknown effects remain risk, not a global outage or replay permission.
+            if !read_only && (admission == Some(true) || work["phase"] == "blocked") {
+                finding = (
+                    "blocked",
+                    if admission == Some(true) {
+                        "admission_blocked"
+                    } else {
+                        "work_blocked"
+                    },
+                    evidence_at,
+                );
+            } else {
+                let complete = fresh(observation, at, stale)
+                    && match name {
+                        "answer" => status["epoch_evidence"]["answered"] == true,
+                        "judge" => {
+                            work["selection"]["inventory_complete"] == true
+                                && work["selection"]["eligible"] == false
+                        }
+                        _ => {
+                            work["phase"] == "completed"
+                                && status["observation"]["epoch"].as_u64().is_some()
+                                && work["operation_epoch"] == status["observation"]["epoch"]
+                        }
+                    };
+                if read_only {
+                    if primary["state"] == "ok" {
+                        finding = (
+                            "ok",
+                            "read_only_observation_recent",
+                            primary["observed_at"].as_i64(),
+                        );
+                    }
+                } else if complete {
+                    finding = (
+                        "ok",
+                        match name {
+                            "answer" => "current_epoch_answered",
+                            "judge" => "no_eligible_assignments_observed",
+                            _ => "current_epoch_completed",
+                        },
+                        observation,
+                    );
+                }
+                // Completed current work or idle inventory cannot hide another
+                // overdue operation. Share the overall health deadline authority.
+                for pending in std::iter::once(&status["pending"])
+                    .chain(status["pending_work"].as_array().into_iter().flatten())
+                    .chain(status["captured_work"].as_array().into_iter().flatten())
+                    .filter(|pending| pending["kind"] == name)
+                {
+                    let timestamp = pending["updated_at"]
+                        .as_i64()
+                        .or(pending["created_at"].as_i64());
+                    if timing.issue(pending, at).is_some() {
+                        finding = ("degraded", "work_overdue", timestamp);
+                        break;
+                    }
+                    let timely = match pending["state"].as_str() {
+                        Some("generating") => {
+                            model_overdue(pending, at, timing.poll, timing.model) == Some(false)
+                        }
+                        Some("dispatching") => {
+                            pending["http_deadline"].as_i64().is_some()
+                                || pending["updated_at"].as_i64().is_some()
+                        }
+                        Some(
+                            "generated" | "prepared" | "retry" | "queued" | "included_pending",
+                        ) => pending["created_at"].as_i64().is_some(),
+                        _ => false,
+                    };
+                    if !complete
+                        && !read_only
+                        && timely
+                        && timestamp.is_some_and(|time| time <= at)
+                        && admission == Some(false)
+                    {
+                        finding = ("ok", "work_in_progress", timestamp);
+                    }
+                }
+                // Challenge/assignments are capability-scoped dependencies. Other
+                // APIs matter only when this work is actually waiting for them.
+                let bound_scope = match work["next_action"].as_str() {
+                    Some("read_receipt") => Some("receipt"),
+                    Some("read_job") => Some("job"),
+                    _ if matches!(
+                        work["reason"].as_str(),
+                        Some("identity_backoff" | "identity_in_flight")
+                    ) =>
+                    {
+                        Some("identity")
+                    }
+                    _ if name == "judge"
+                        && !read_only
+                        && work["phase"] == "observing"
+                        && (work["selection"].is_null()
+                            || (work["selection"]["eligible"] == false
+                                && work["selection"]["observed_count"]
+                                    .as_u64()
+                                    .is_some_and(|count| count > 0))) =>
+                    {
+                        // A failed hydration can make a nonempty inventory
+                        // ineligible. Do not mistake that for healthy idle work.
+                        Some("assignment_evidence")
+                    }
+                    _ => None,
+                };
+                for dependency in std::iter::once(scope).chain(bound_scope) {
+                    let api = &value["api"][dependency];
+                    if matches!(api["state"].as_str(), Some("degraded" | "blocked")) {
+                        finding = (
+                            "degraded",
+                            if dependency == "assignment_evidence" {
+                                "recent_assignment_evidence_failure"
+                            } else {
+                                "api_dependency_unavailable"
+                            },
+                            api["observed_at"].as_i64(),
+                        );
+                        break;
+                    }
+                }
+                if name == "answer"
+                    && health["issues"].as_array().is_some_and(|issues| {
+                        issues
+                            .iter()
+                            .any(|issue| issue == "current_epoch_unanswered")
+                    })
+                {
+                    finding = ("degraded", "current_epoch_unanswered", observation);
+                }
+            }
+        }
+        let mut row = component(finding.0, finding.1, finding.2, at);
+        row["mode"] = json!(mode);
+        value[name] = row;
+    }
+    value
 }
 
 #[cfg(test)]
@@ -415,7 +718,10 @@ mod tests {
         config.capabilities.answer = Mode::Active;
         let status = json!({"initialized":true,"paused":false,"identity_matches_config":true,
             "hosted_identity_verified":true,"admission_blocked":false,
-            "effective_runtime":{"observed_at":10000,"reload_blocked":false},
+            "effective_runtime":{"observed_at":10000,"reload_blocked":false,
+                "policy":{"timeouts":{"http_seconds":config.timeouts.http_seconds,
+                    "shutdown_seconds":config.timeouts.shutdown_seconds},
+                    "schedule":config.schedule}},
             "observation":{"observed_at":10000},
             "epoch_evidence":{"first_observed_at":10000,"answered":true},"pending":null});
         (config, Options::default(), status)
@@ -427,6 +733,28 @@ mod tests {
             .unwrap()
             .iter()
             .any(|item| item == code)
+    }
+
+    #[test]
+    fn missing_effective_timing_cannot_be_replaced_by_desired_intervals() {
+        let (mut config, options, mut status) = fixture();
+        config.timeouts.http_seconds = 7200;
+        config.timeouts.shutdown_seconds = 7200;
+        config.schedule.poll_seconds = 7200;
+        status["effective_runtime"]["capabilities"] =
+            json!({"answer":"active","judge":"active","mine":"active"});
+        status["effective_runtime"]["policy"] = Value::Null;
+        let health = evaluate(&config, options, &status, 11000);
+        assert_eq!(health["healthy"], false);
+        assert!(has(&health, "effective_policy_unavailable"));
+        assert_eq!(health["components"]["controller"]["state"], "unknown");
+        assert_eq!(health["current_epoch"]["evidence_fresh"], Value::Null);
+        assert_eq!(health["thresholds"]["timing_source"], "unavailable");
+        config.timeouts.http_seconds = 1;
+        config.timeouts.shutdown_seconds = 1;
+        config.schedule.poll_seconds = 1;
+        let changed = evaluate(&config, options, &status, 11000);
+        assert_eq!(health["thresholds"], changed["thresholds"]);
     }
 
     #[test]
@@ -537,8 +865,9 @@ mod tests {
 
     #[test]
     fn configured_stagger_does_not_trigger_a_false_stall() {
-        let (mut config, options, status) = fixture();
+        let (mut config, options, mut status) = fixture();
         config.schedule.jitter_seconds = 0;
+        status["effective_runtime"]["policy"]["schedule"]["jitter_seconds"] = json!(0);
         let floor = evaluate(&config, options, &status, 10000)["thresholds"]["stale_seconds"]
             .as_i64()
             .unwrap();
@@ -548,6 +877,11 @@ mod tests {
             "controller_stale"
         ));
         config.schedule.jitter_seconds = 30;
+        assert!(has(
+            &evaluate(&config, options, &status, at),
+            "controller_stale"
+        ));
+        status["effective_runtime"]["policy"]["schedule"]["jitter_seconds"] = json!(30);
         assert!(!has(
             &evaluate(&config, options, &status, at),
             "controller_stale"
@@ -891,5 +1225,302 @@ mod tests {
         assert_eq!(health["warnings"][0], "pending_outcome_uncertain");
         assert_eq!(health["work"]["answer"]["next_at"], Value::Null);
         assert_eq!(health["work"]["answer"]["phase"], "answered");
+    }
+
+    fn component_fixture() -> (Config, Options, Value) {
+        let (config, options, mut status) = fixture();
+        status["effective_runtime"]["capabilities"] =
+            json!({"answer":"active","judge":"active","mine":"active"});
+        status["observation"]["epoch"] = json!(56);
+        status["participation"] = json!({"unresolved_count":3,"risk_admissions":1,
+            "uncertainty_blocks":{"answer":false,"judge":false,"mine":false}});
+        status["pending"] = json!({"kind":"answer","state":"unknown","created_at":1});
+        status["work"] = json!({
+            "answer":{"phase":"answered","next_action":"observe_challenge"},
+            "judge":{"phase":"observing","next_action":"observe_assignments",
+                "selection":{"observed_at":10000,"observed_count":0,
+                    "inventory_complete":true,"eligible":false}},
+            "mine":{"phase":"completed","operation_epoch":56}
+        });
+        status["reads"] = json!([
+            {"scope":"challenge","state":"idle","finished_at":10000,"last_success_at":10000,"status":200},
+            {"scope":"assignments","state":"idle","finished_at":10000,"last_success_at":10000,"status":200},
+            {"scope":"identity","state":"idle","finished_at":1,"last_success_at":1,"status":200},
+            {"scope":"job","state":"idle","finished_at":1,"last_failure_at":1,"status":503},
+            {"scope":"receipt","state":"idle","finished_at":1,"last_failure_at":1,"status":500}
+        ]);
+        (config, options, status)
+    }
+
+    #[test]
+    fn no_eligible_judgments_requires_complete_current_inventory() {
+        let (config, options, mut status) = component_fixture();
+        status["work"]["judge"]["selection"]["observed_count"] = json!(12);
+        assert_eq!(
+            evaluate(&config, options, &status, 10000)["components"]["judge"]["state"],
+            "ok"
+        );
+        status["work"]["judge"]["selection"]["inventory_complete"] = json!(false);
+        assert_eq!(
+            evaluate(&config, options, &status, 10000)["components"]["judge"]["state"],
+            "unknown"
+        );
+        status["work"]["judge"]["selection"]["inventory_complete"] = json!(true);
+        status["work"]["judge"]["selection"]["eligible"] = json!(true);
+        assert_eq!(
+            evaluate(&config, options, &status, 10000)["components"]["judge"]["state"],
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn completed_or_idle_work_does_not_hide_later_overdue_work() {
+        let (config, options, mut status) = component_fixture();
+        for kind in ["answer", "judge", "mine"] {
+            for pending in [
+                json!({"kind":kind,"state":"queued","created_at":1,"updated_at":9999}),
+                json!({"kind":kind,"state":"dispatching","created_at":9999,"updated_at":1}),
+                json!({"kind":kind,"state":"generating","created_at":1,"model_deadline":1}),
+            ] {
+                status["pending_work"] = json!([pending]);
+                let result = evaluate(&config, options, &status, 10000);
+                assert_eq!(result["healthy"], false);
+                assert_eq!(result["components"][kind]["state"], "degraded");
+            }
+            status["pending_work"] = json!([{"kind":kind,"state":"unknown","created_at":1}]);
+            assert_eq!(
+                evaluate(&config, options, &status, 10000)["components"][kind]["state"],
+                "ok"
+            );
+        }
+    }
+
+    #[test]
+    fn intentional_observers_do_not_require_write_identity_verification() {
+        let (config, options, mut status) = component_fixture();
+        status["effective_runtime"]["capabilities"] =
+            json!({"answer":"read_only","judge":"read_only","mine":"off"});
+        status["hosted_identity_verified"] = Value::Null;
+        status["paused"] = json!(true);
+        let result = evaluate(&config, options, &status, 10000);
+        for name in ["controller", "answer", "judge"] {
+            assert_eq!(result["components"][name]["state"], "ok");
+        }
+        status["effective_runtime"]["capabilities"]["answer"] = json!("active");
+        assert_eq!(
+            evaluate(&config, options, &status, 10000)["components"]["answer"]["state"],
+            "blocked"
+        );
+        status["paused"] = json!(false);
+        let result = evaluate(&config, options, &status, 10000);
+        assert_eq!(result["components"]["answer"]["state"], "unknown");
+        assert_eq!(result["components"]["judge"]["state"], "ok");
+        status["hosted_identity_verified"] = json!(false);
+        assert_eq!(
+            evaluate(&config, options, &status, 10000)["components"]["judge"]["state"],
+            "blocked"
+        );
+    }
+
+    #[test]
+    fn hydration_failure_affects_only_judging_without_current_usable_selection() {
+        let (config, options, mut status) = component_fixture();
+        status["reads"].as_array_mut().unwrap().push(json!({
+            "scope":"assignment_evidence","last_failure_at":10000,"status":503}));
+        assert_eq!(
+            evaluate(&config, options, &status, 10000)["components"]["judge"]["state"],
+            "ok"
+        );
+        status["work"]["judge"]["selection"]["observed_count"] = json!(1);
+        assert_eq!(
+            evaluate(&config, options, &status, 10000)["components"]["judge"]["state"],
+            "degraded"
+        );
+        status["work"]["judge"]["selection"] = Value::Null;
+        let result = evaluate(&config, options, &status, 10000);
+        assert_eq!(result["components"]["judge"]["state"], "degraded");
+        assert_eq!(result["components"]["answer"]["state"], "ok");
+        status["work"]["judge"]["phase"] = json!("generating");
+        status["captured_work"] = json!([{"kind":"judge","state":"generating",
+            "created_at":9999,"model_deadline":10100}]);
+        assert_eq!(
+            evaluate(&config, options, &status, 10000)["components"]["judge"]["state"],
+            "ok"
+        );
+    }
+
+    #[test]
+    fn canyon_components_separate_current_operations_from_retained_risk() {
+        let (config, options, status) = component_fixture();
+        let result = evaluate(&config, options, &status, 10000);
+        assert_eq!(result["contract_version"], 1);
+        assert_eq!(result["healthy"], true);
+        assert_eq!(result["operational"]["status"], "clear");
+        assert_eq!(result["risk"]["attention_required"], true);
+        for name in ["controller", "answer", "judge", "mine"] {
+            assert_eq!(result["components"][name]["state"], "ok", "{name}");
+            assert_eq!(result["components"][name]["observed_at"], 10000);
+            assert_eq!(result["components"][name]["age_seconds"], 0);
+        }
+        for name in ["identity", "job", "receipt", "assignment_evidence"] {
+            assert_eq!(
+                result["components"]["api"][name]["state"], "unknown",
+                "{name}"
+            );
+        }
+        assert_eq!(result["components"]["api"]["challenge"]["state"], "ok");
+        assert_eq!(result["components"]["api"]["assignments"]["state"], "ok");
+    }
+
+    #[test]
+    fn components_use_applied_modes_and_keep_read_only_distinct() {
+        let (mut config, options, mut status) = component_fixture();
+        config.capabilities.answer = Mode::Off;
+        assert_eq!(
+            evaluate(&config, options, &status, 10000)["components"]["answer"]["state"],
+            "ok"
+        );
+        status["effective_runtime"]["capabilities"] =
+            json!({"answer":"off","judge":"read_only","mine":"off"});
+        status["participation"]["uncertainty_blocks"]["judge"] = json!(true);
+        let result = evaluate(&config, options, &status, 10000);
+        assert_eq!(result["components"]["answer"]["state"], "disabled");
+        assert_eq!(result["components"]["judge"]["state"], "ok");
+        assert_eq!(result["components"]["judge"]["mode"], "read_only");
+        assert_eq!(result["components"]["mine"]["state"], "disabled");
+        status["effective_runtime"]["capabilities"] = Value::Null;
+        let result = evaluate(&config, options, &status, 10000);
+        assert_eq!(result["components"]["answer"]["state"], "unknown");
+        assert_eq!(result["components"]["answer"]["mode"], Value::Null);
+    }
+
+    #[test]
+    fn controller_failures_override_fresh_capability_evidence() {
+        let (config, options, status) = component_fixture();
+        for (field, value, expected) in [
+            ("paused", json!(true), "blocked"),
+            ("controller_stopped", json!(true), "blocked"),
+            ("identity_matches_config", json!(false), "blocked"),
+            ("hosted_identity_verified", json!(false), "blocked"),
+        ] {
+            let mut changed = status.clone();
+            changed[field] = value;
+            let result = evaluate(&config, options, &changed, 10000);
+            for name in ["controller", "answer", "judge", "mine"] {
+                assert_eq!(
+                    result["components"][name]["state"], expected,
+                    "{field}/{name}"
+                );
+            }
+        }
+        for timestamp in [1, 10001] {
+            let mut changed = status.clone();
+            changed["effective_runtime"]["observed_at"] = json!(timestamp);
+            let result = evaluate(&config, options, &changed, 10000);
+            for name in ["controller", "answer", "judge", "mine"] {
+                assert_eq!(result["components"][name]["state"], "unknown", "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn read_failures_and_admission_are_capability_scoped() {
+        let (config, options, mut status) = component_fixture();
+        status["reads"][1] = json!({"scope":"assignments","state":"idle",
+            "finished_at":10000,"last_success_at":9990,"last_failure_at":10000,
+            "failure_category":"http","status":429,"next_at":10100});
+        let result = evaluate(&config, options, &status, 10000);
+        assert_eq!(result["components"]["judge"]["state"], "degraded");
+        assert_eq!(result["components"]["answer"]["state"], "ok");
+        assert_eq!(result["components"]["mine"]["state"], "ok");
+        status["reads"][1] = json!({"scope":"assignments","state":"idle",
+            "finished_at":10000,"last_success_at":10000,"status":200});
+        status["reads"][0] = json!({"scope":"challenge","state":"idle",
+            "finished_at":10000,"last_failure_at":10000,"status":503,"next_at":10100});
+        let result = evaluate(&config, options, &status, 10000);
+        assert_eq!(result["components"]["judge"]["state"], "ok");
+        assert_eq!(result["components"]["answer"]["state"], "degraded");
+        assert_eq!(result["components"]["mine"]["state"], "degraded");
+        status["participation"]["uncertainty_blocks"]["judge"] = json!(true);
+        let result = evaluate(&config, options, &status, 10000);
+        assert_eq!(result["components"]["judge"]["state"], "blocked");
+        assert_eq!(result["components"]["answer"]["state"], "degraded");
+    }
+
+    #[test]
+    fn unused_api_failure_only_affects_work_waiting_for_it() {
+        let (config, options, mut status) = component_fixture();
+        status["reads"][3] = json!({"scope":"job","state":"idle",
+            "finished_at":10000,"last_failure_at":10000,"status":503,"next_at":10100});
+        let result = evaluate(&config, options, &status, 10000);
+        assert_eq!(result["components"]["answer"]["state"], "ok");
+        assert_eq!(result["components"]["judge"]["state"], "ok");
+        status["epoch_evidence"]["answered"] = json!(false);
+        status["work"]["answer"] = json!({"phase":"queued","next_action":"read_job"});
+        let result = evaluate(&config, options, &status, 10000);
+        assert_eq!(result["components"]["answer"]["state"], "degraded");
+        assert_eq!(result["components"]["judge"]["state"], "ok");
+    }
+
+    #[test]
+    fn missing_work_is_unknown_and_normal_model_work_is_not_failure() {
+        let (config, options, mut status) = component_fixture();
+        status["work"] = Value::Null;
+        status["epoch_evidence"]["answered"] = Value::Null;
+        status["pending"] = Value::Null;
+        let result = evaluate(&config, options, &status, 10000);
+        for name in ["answer", "judge", "mine"] {
+            assert_eq!(result["components"][name]["state"], "unknown", "{name}");
+        }
+        status["captured_work"] = json!([{"kind":"answer","state":"generating",
+            "created_at":9990,"model_deadline":10100}]);
+        let result = evaluate(&config, options, &status, 10000);
+        assert_eq!(result["components"]["answer"]["state"], "ok");
+        assert_eq!(result["components"]["judge"]["state"], "unknown");
+        status["participation"]["uncertainty_blocks"] = Value::Null;
+        assert_eq!(
+            evaluate(&config, options, &status, 10000)["components"]["answer"]["state"],
+            "unknown"
+        );
+        let unavailable = unknown_components();
+        for name in ["controller", "answer", "judge", "mine"] {
+            assert_eq!(unavailable[name]["state"], "unknown");
+            assert!(unavailable[name]["observed_at"].is_null());
+            assert!(unavailable[name]["age_seconds"].is_null());
+            assert!(unavailable[name]["reasons"].is_array());
+            assert!(unavailable[name]["next_actions"].is_array());
+        }
+        assert_eq!(unavailable["api"].as_object().unwrap().len(), 6);
+    }
+
+    #[test]
+    fn final_disk_findings_update_components_without_changing_risk() {
+        let (config, options, mut status) = component_fixture();
+        status["effective_runtime"]["capabilities"]["mine"] = json!("off");
+        for code in ["state_disk_space_low", "state_disk_space_unavailable"] {
+            let mut result = evaluate(&config, options, &status, 10000);
+            let risk = result["risk"].clone();
+            apply_disk_issue(&mut result, code);
+            assert_eq!(result["healthy"], false);
+            assert_eq!(result["operational"]["status"], "degraded");
+            assert_eq!(result["risk"], risk);
+            for name in ["controller", "answer", "judge"] {
+                assert_eq!(result["components"][name]["state"], "degraded");
+                assert!(
+                    result["components"][name]["reasons"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|reason| reason == code)
+                );
+                assert!(
+                    !result["components"][name]["next_actions"]
+                        .as_array()
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+            assert_eq!(result["components"]["mine"]["state"], "disabled");
+        }
     }
 }

@@ -15,6 +15,7 @@ import signal
 import socket
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -285,6 +286,52 @@ def capture_resume(f):
     f.private()
 
 
+def publication_interruption(f):
+    f.run()
+    name = {'publish-credential': 'credential', 'publish-metadata': 'registration.json',
+            'publish-network': 'network.toml'}[f.scenario]
+    target = f.directory / name
+    original = target.read_bytes()
+    target.unlink()
+    retained = snapshot(f.directory)
+    inodes = {path.name: path.stat().st_ino for path in f.directory.iterdir() if path.is_file()}
+    # Kill the actual resume process during a derived-file write. The capture is
+    # already complete; RLIMIT_FSIZE applies only to new writes, not reads/fsyncs.
+    worker = (
+        'import os, resource, signal, sys; '
+        'resource.setrlimit(resource.RLIMIT_CORE, (0, 0)); '
+        'signal.signal(signal.SIGXFSZ, signal.SIG_DFL); '
+        'limit = int(sys.argv[1]); '
+        'resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit)); '
+        'os.execv(sys.argv[2], sys.argv[2:])'
+    )
+    process = subprocess.run(
+        [sys.executable, '-c', worker, str(max(1, len(original) // 2)),
+         *f.command(['identity', 'resume', '--confirm'])],
+        env=f.env, capture_output=True, text=True, timeout=15)
+    assert KEY not in process.stdout + process.stderr
+    assert process.returncode == -signal.SIGXFSZ, 'fixture did not interrupt a write'
+    assert not target.exists(), 'interrupted publication exposed a partial final file'
+    interrupted = snapshot(f.directory)
+    assert all(interrupted[path] == contents for path, contents in retained.items())
+    assert f.status()['stage'] == 'response_captured'
+    assert f.run(['identity', 'resume'])['status']['stage'] == 'response_captured'
+    assert snapshot(f.directory) == interrupted, 'inspection changed retained evidence'
+    assert f.run(['identity', 'resume', '--confirm'])['stage'] == 'created'
+    assert target.read_bytes() == original and target.stat().st_nlink == 1
+    after = snapshot(f.directory)
+    assert all(after[path] == contents for path, contents in interrupted.items())
+    assert all((f.directory / path).stat().st_ino == inode for path, inode in inodes.items())
+    assert len(f.requests) == 2 and len(f.posts) == 1
+    f.private()
+    # A partial final left by an older version is conflicting evidence, not a
+    # recoverable temporary: never repair it by overwriting an existing identity.
+    target.write_bytes(original[:max(1, len(original) // 2)])
+    before = snapshot(f.directory)
+    assert f.run(['identity', 'resume', '--confirm'], success=False)['code'] == 'registration_conflict'
+    assert snapshot(f.directory) == before and len(f.requests) == 2
+
+
 def loss_boundaries(f):
     f.run()
     for name in ['credential', 'registration.json', 'network.toml', 'registration-000001.capture.json']:
@@ -330,7 +377,10 @@ def mismatched_capture(f):
 
 def ambiguous(f):
     f.mode = f.scenario
-    assert f.run(success=False)['code'] == 'registration_outcome_unknown'
+    error = f.run(success=False)
+    assert error['code'] == 'registration_outcome_unknown'
+    assert 'Another POST is forbidden' in error['message']
+    assert error['details']['retry_allowed'] is False
     assert len(f.posts) == 1
     before = snapshot(f.root)
     assert f.status()['stage'] == 'outcome_unknown'
@@ -404,8 +454,9 @@ def proof_limits(f):
     extra = []
     if f.scenario == 'expired':
         f.expires = int(time.time()) - 1
-    elif f.scenario == 'algorithm':
-        f.algorithm = 'unrecognized'
+    elif f.scenario in ('algorithm', 'secret-algorithm', 'invalid-algorithm'):
+        f.algorithm = {'algorithm': 'unrecognized', 'secret-algorithm': KEY,
+                       'invalid-algorithm': 'private algorithm / untrusted'}[f.scenario]
     elif f.scenario == 'unbound-algorithm':
         pass
     elif f.scenario == 'difficulty':
@@ -422,8 +473,33 @@ def proof_limits(f):
     if f.scenario == 'unbound-algorithm':
         index = words.index('--expected-pow-algo')
         del words[index:index + 2]
-    f.run(words, success=False)
-    assert not f.posts and len(f.requests) == 1
+    error = f.run(words, success=False)
+    assert 'no registration was sent' in error['message'].lower(), error
+    if f.scenario in ('algorithm', 'unbound-algorithm', 'secret-algorithm', 'invalid-algorithm'):
+        assert error['code'] == 'registration_pow_algorithm_unbound'
+        assert "SHA256(challenge + ':' + decimal nonce)" in error['message']
+        assert 'leading-zero bits' in error['message']
+        assert '--expected-pow-algo' in error['message']
+        assert error['details']['expected_tag_matches'] is False
+        safe_tag = f.algorithm if f.scenario in ('algorithm', 'unbound-algorithm') else None
+        assert error['details']['negotiated_pow_algo'] == safe_tag
+        if safe_tag is None:
+            assert f.algorithm not in json.dumps(error)
+        help_actions = [action for action in error['next_actions']
+                        if action.get('argv', [])[3:] == ['identity', 'create', '--help']]
+        assert len(help_actions) == 1 and not help_actions[0]['authorization_required']
+        help_process = subprocess.run(
+            [f.binary, *help_actions[0]['argv'][1:]], env=f.env,
+            capture_output=True, text=True, timeout=15)
+        assert help_process.returncode == 0 and '--expected-pow-algo' in help_process.stdout
+        assert KEY not in help_process.stdout + help_process.stderr
+        human = f.run(words, success=False, json_output=False)
+        assert "SHA256(challenge + ':' + decimal nonce)" in human
+        assert '--expected-pow-algo' in human and 'No registration was sent.' in human
+        assert len(f.requests) == 2
+    else:
+        assert len(f.requests) == 1
+    assert not f.posts
     assert not list(f.directory.glob('registration-*.intent.json'))
 
 
@@ -566,11 +642,12 @@ SCENARIOS = {'success': success, 'capture-resume': capture_resume, 'loss-boundar
              'concurrent': concurrent, 'concurrent-init': concurrent_init, 'cancellation': cancellation,
              'separate-init': separate_init, 'mining-cancellation': mining_cancellation,
              'custom-routes': custom_routes, 'rotated-status': rotated_status}
+SCENARIOS.update({name: publication_interruption for name in ['publish-credential', 'publish-metadata', 'publish-network']})
 SCENARIOS.update({name: ambiguous for name in ['loss', 'truncated', 'malformed', 'oversized', 'server-error', 'redirect', 'hold']})
 SCENARIOS.update({name: rejection for name in ['rate-limit', 'header-floor', 'proof-rejected']})
 SCENARIOS.update({name: preflight for name in ['existing-config', 'existing-key', 'existing-state', 'symlink']})
 SCENARIOS.update({name: unsafe_evidence for name in ['hardlink', 'public-file', 'public-directory']})
-SCENARIOS.update({name: proof_limits for name in ['expired', 'algorithm', 'unbound-algorithm', 'difficulty', 'hash-budget', 'time-budget', 'challenge-unavailable']})
+SCENARIOS.update({name: proof_limits for name in ['expired', 'algorithm', 'unbound-algorithm', 'secret-algorithm', 'invalid-algorithm', 'difficulty', 'hash-budget', 'time-budget', 'challenge-unavailable']})
 
 
 def main():

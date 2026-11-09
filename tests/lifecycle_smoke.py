@@ -177,6 +177,45 @@ def init(f):
     assert not f.writes and not f.reads, 'onboarding did more than identity GETs'
 
 
+def invalid_init(f):
+    for flag, value, field in [('--account', ECHO, 'network.address'),
+                               ('--chain', ECHO + '/invalid', 'network.chain')]:
+        target = f.root / field
+        config = target / 'config.toml'
+        words = f.init_args(target) + ['--key-stdin']
+        words[words.index(flag) + 1] = value
+        for dry_run in (False, True):
+            before = snapshot(f.root)
+            output = f.cli(config, words + (['--dry-run'] if dry_run else []),
+                           OLD, succeeds=False)
+            error = json.loads(output)['error']
+            assert error['code'] == 'initialization_invalid'
+            assert error['details']['reason'] == 'field_invalid'
+            assert error['details']['field'] == field
+            assert error['message'] == ('Invalid account address.' if flag == '--account'
+                                        else 'Invalid network chain.')
+            actions = error['next_actions']
+            assert actions[0]['argv'] == ['agmi', '--config', str(config), 'init', '--help']
+            assert not actions[0]['authorization_required']
+            assert not any(action.get('argv', [])[3:] in (['config', 'show'], ['config', 'check'])
+                           for action in actions)
+            assert any('No identity verification was requested' in action.get('message', '')
+                       for action in actions)
+            help_process = subprocess.run([f.binary, *actions[0]['argv'][1:]], env=f.env,
+                                          capture_output=True, text=True, timeout=15)
+            assert help_process.returncode == 0 and '--account' in help_process.stdout
+            assert not any(secret in help_process.stdout + help_process.stderr for secret in SECRETS)
+            assert snapshot(f.root) == before and not target.exists()
+            assert not f.identity_reads and not f.reads and not f.writes
+        process = subprocess.run([f.binary, '--config', str(config), *words], input=OLD,
+                                 text=True, capture_output=True, timeout=15, env=f.env)
+        assert process.returncode != 0 and error['message'] in process.stderr
+        assert 'initialization_failed' not in process.stderr and 'init' in process.stderr
+        assert not any(secret in process.stdout + process.stderr for secret in SECRETS)
+        assert snapshot(f.root) == before and not target.exists()
+        assert not f.identity_reads and not f.reads and not f.writes
+
+
 def terminal(f, target, interrupt=None):
     master, slave = pty.openpty()
     original = termios.tcgetattr(slave)
@@ -314,8 +353,10 @@ def rotate(f):
 def installer(f):
     before = snapshot(f.root)
     for words in (['install', '--binary', '/nonexistent/fixture-binary', '--sha256', '0' * 64],
+                  ['install', '--stage-only', '--binary', '/nonexistent/fixture-binary', '--sha256', '0' * 64],
                   ['update', '--binary', '/nonexistent/fixture-binary', '--sha256', '0' * 64],
-                  ['update', '--release', 'r-' + '0' * 64, '--stopped']):
+                  ['update', '--release', 'r-' + '0' * 64, '--stopped'],
+                  ['service', 'start']):
         result = f.cli(None, words + ['--dry-run'])
         assert result['dry_run'] and not result['network_downloads']
         assert result['pause_state'] == 'unchanged' and 'plan only' in result['preview']
@@ -333,26 +374,11 @@ def installer(f):
     assert error['details']['failure_code'] == (
         'candidate_unavailable' if sys.platform.startswith('linux') else 'unsupported_platform')
     assert snapshot(f.root) == before
-    script = pathlib.Path(__file__).resolve().parents[1] / 'deploy/install-user.sh'
-    failed = subprocess.run(['sh', str(script), 'stage'], text=True, capture_output=True, env=f.env)
-    assert failed.returncode != 0
-    marker = json.loads(failed.stdout.splitlines()[-1])
-    assert marker['schema'] == 'agmi.installer.v1' and marker['outcome'] == 'failed'
-    assert marker['activation'] == 'not_started' and marker['service'] == 'unknown'
-    assert marker['failure_code'] == 'invalid_arguments'
-    assert marker['next_actions'][0]['argv'] == ['agmi', 'service', 'status']
-    assert snapshot(f.root) == before
     if sys.platform.startswith('linux'):
-        planned = subprocess.run(['sh', str(script), 'service', 'start', '--dry-run'],
-                                 text=True, capture_output=True, env=f.env)
-        assert planned.returncode == 0, safe(planned.stderr)
-        marker = json.loads(planned.stdout.splitlines()[-1])
-        assert marker['failure_code'] == 'none'
         error = json.loads(f.cli(None, ['update', '--binary', f.binary,
                                         '--sha256', '0' * 64], succeeds=False))['error']
         assert error['details']['failure_code'] == 'digest_mismatch'
         assert error['details']['activation'] == 'not_started'
-        assert marker['outcome'] == 'success' and marker['activation'] == 'not_started'
         candidate = f.root / 'unreporting-incoming-release'
         candidate.write_text(f"#!/bin/sh\nprintf '%s\\n' '{ECHO}' >&2\nexit 7\n")
         candidate.chmod(0o700)
@@ -363,13 +389,10 @@ def installer(f):
                                             '--sha256', digest], succeeds=False))['error']
             assert error['details']['failure_code'] == 'candidate_execution_unavailable'
             assert error['details']['activation'] == 'not_started'
-            denied = subprocess.run(['sh', str(script), 'stage', str(candidate),
-                                     '--sha256', digest], env=f.env, capture_output=True,
-                                    text=True, timeout=15)
-            assert denied.returncode != 0
-            evidence = json.loads(denied.stdout.splitlines()[-1])
-            assert evidence['failure_code'] == 'candidate_execution_unavailable'
-            assert evidence['activation'] == 'not_started'
+            error = json.loads(f.cli(None, ['install', '--stage-only', '--binary', str(candidate),
+                                            '--sha256', digest], succeeds=False))['error']
+            assert error['details']['failure_code'] == 'candidate_execution_unavailable'
+            assert error['details']['activation'] == 'not_started'
             candidate.chmod(0o700)
             error = json.loads(f.cli(None, ['update', '--binary', str(candidate),
                                             '--sha256', digest], succeeds=False))['error']
@@ -396,7 +419,7 @@ def installer(f):
     assert not f.identity_reads and not f.reads and not f.writes
 
 
-SCENARIOS = {'init': init, 'prompt': prompt, 'signals': signals,
+SCENARIOS = {'init': init, 'invalid-init': invalid_init, 'prompt': prompt, 'signals': signals,
              'rotate': rotate, 'installer': installer}
 
 

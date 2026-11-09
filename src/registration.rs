@@ -14,12 +14,14 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const MAX_BODY: usize = 1024 * 1024;
 const MAX_CAPTURE: usize = MAX_BODY * 5 + 65536;
 const MAX_ATTEMPTS: u32 = 10000;
+static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 const RISK: &str = "Remote creation can succeed before its one-time API key is durable locally. A crash or lost response in that interval can permanently lose access. A retained intent prevents another POST, but cannot recover a lost key. This creates a hosted identity, not a self-custody key.";
 
 pub struct CreateOptions {
@@ -49,10 +51,10 @@ impl std::fmt::Display for RegistrationError {
     }
 }
 impl std::error::Error for RegistrationError {}
-pub fn error_details(error: &anyhow::Error) -> Option<(String, Value)> {
+pub fn error_details(error: &anyhow::Error) -> Option<(&'static str, &'static str, Value)> {
     error
         .downcast_ref::<RegistrationError>()
-        .map(|error| (error.code.into(), error.details.clone()))
+        .map(|error| (error.code, error.message, error.details.clone()))
 }
 fn error(code: &'static str, message: &'static str, details: Value) -> anyhow::Error {
     RegistrationError {
@@ -281,11 +283,83 @@ fn sync_private(path: &Path) -> Result<()> {
     file.sync_all().map_err(|_| io_error())?;
     sync_directory(path.parent().ok_or_else(unsafe_file)?)
 }
+struct Temporary(PathBuf);
+impl Drop for Temporary {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+/// Unlike intent/capture fences, derived files must become visible only when complete.
+fn publish_derived(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path.parent().ok_or_else(unsafe_file)?;
+    let (temporary, mut file) = loop {
+        let serial = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+        let name = parent.join(format!(
+            ".agmi-registration-{}-{serial}.tmp",
+            std::process::id()
+        ));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        match options.open(&name) {
+            Ok(file) => break (Temporary(name), file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return Err(io_error()),
+        }
+    };
+    regular(&file.metadata().map_err(|_| io_error())?)?;
+    file.write_all(bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|_| io_error())?;
+    rename_no_replace(&temporary.0, path)?;
+    sync_directory(parent)
+}
+
+fn rename_no_replace(source: &Path, destination: &Path) -> Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+        let source = CString::new(source.as_os_str().as_bytes()).map_err(|_| unsafe_file())?;
+        let destination =
+            CString::new(destination.as_os_str().as_bytes()).map_err(|_| unsafe_file())?;
+        #[cfg(target_os = "linux")]
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                libc::AT_FDCWD,
+                source.as_ptr(),
+                libc::AT_FDCWD,
+                destination.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        #[cfg(target_os = "macos")]
+        let result =
+            unsafe { libc::renamex_np(source.as_ptr(), destination.as_ptr(), libc::RENAME_EXCL) };
+        if result == 0 {
+            return Ok(());
+        }
+        if std::io::Error::last_os_error().kind() == std::io::ErrorKind::AlreadyExists {
+            return Err(conflict());
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let _ = (source, destination);
+    // Never fall back to overwrite or link/unlink (a crash could retain two links).
+    Err(io_error())
+}
 fn publish_matching(path: &Path, bytes: &[u8]) -> Result<()> {
     match read_private(path, MAX_CAPTURE)? {
         Some(existing) if existing == bytes => sync_private(path),
         Some(_) => Err(conflict()),
-        None => publish(path, bytes),
+        None => publish_derived(path, bytes),
     }
 }
 fn ensure_absent(path: &Path) -> Result<()> {

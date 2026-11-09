@@ -97,13 +97,16 @@ enum Command {
         #[command(subcommand)]
         command: CredentialCommand,
     },
-    /// Verify, install and enable a fresh local release without starting or resuming.
+    /// Install a fresh stopped release, or only publish a verified release with --stage-only.
     Install {
         #[arg(long)]
         binary: PathBuf,
         /// Expected digest obtained through an operator-trusted channel.
         #[arg(long)]
         sha256: String,
+        /// Publish a verified release only; never select, enable, stop or start units.
+        #[arg(long)]
+        stage_only: bool,
         #[arg(long)]
         dry_run: bool,
     },
@@ -387,6 +390,7 @@ fn config_path(cli: &Cli) -> Result<PathBuf> {
 
 fn health_prerequisite(code: &'static str) -> Value {
     json!({
+        "contract_version":1,"components":health::unknown_components(),
         "healthy":false,"attention_required":true,"issues":[code],"warnings":[],
         "readiness":"prerequisites_missing","evidence":"local_only",
         "operational":{"status":"unknown","issues":[code]},
@@ -425,7 +429,7 @@ fn discovery() -> Value {
         {"name":"identity resume","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":"only with --confirm","confirmation_flag":"--confirm","purpose":"nonmutating plan or explicit local-only publication from retained successful registration evidence; never repeats proof work or registration"},
         {"name":"init","network_reads":true,"network_writes":false,"local_writes":"unless --dry-run","purpose":"existing identity only; --account and --api-key-file, --key-stdin or --key-prompt; never registers or resumes"},
         {"name":"credentials rotate","network_reads":true,"network_writes":false,"local_writes":"credential only unless --dry-run","purpose":"requires initialized, paused, stopped account; verifies replacement identity; file/stdin/hidden prompt"},
-        {"name":"install","network_reads":false,"network_writes":false,"local_writes":"unless --dry-run","purpose":"fresh install --binary local-path --sha256 trusted-digest; stage, activate stopped, enable; never starts/resumes"},
+        {"name":"install","network_reads":false,"network_writes":false,"local_writes":"unless --dry-run","purpose":"--binary local-path --sha256 trusted-digest; fresh install stages, activates stopped and enables; --stage-only only publishes a verified release and never selects/enables/stops/starts; neither initializes/resumes"},
         {"name":"update","network_reads":false,"network_writes":false,"local_writes":"unless --dry-run","purpose":"--binary local-path --sha256 trusted-digest or retained --release r-SHA256; preserves service intent, --stopped forces stopped"},
         {"name":"service","network_reads":false,"network_writes":false,"local_writes":"unless status or --dry-run","purpose":"status/start/stop/restart/enable/disable; does not resume participation"},
         {"name":"run","network_reads":true,"model_calls":"active capabilities only","network_writes":"active capabilities and resumed state only","local_writes":true},
@@ -603,6 +607,7 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
         Command::Install {
             binary,
             sha256,
+            stage_only,
             dry_run,
         } => {
             anyhow::ensure!(
@@ -627,7 +632,7 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
                 "install",
                 lifecycle::installer(
                     &[
-                        "install".into(),
+                        if *stage_only { "stage" } else { "install" }.into(),
                         binary.to_string_lossy().into_owned(),
                         "--sha256".into(),
                         sha256.clone(),

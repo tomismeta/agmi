@@ -153,6 +153,24 @@ def main():
         return data
 
     try:
+        # Public staging replaces direct installer entrypoints. Both the current
+        # binary and a distinct incoming image must stage without selecting a
+        # release, creating state, installing bindings or contacting live units.
+        private_inputs = {path: path.read_bytes() for path in (fixture.config, fixture.key)}
+        assert not fixture.database.exists()
+        for candidate in (first, second):
+            data = cli('install', '--stage-only', '--binary', str(candidate), '--sha256', hashes[candidate])
+            evidence = data['installation']
+            assert evidence['failure_code'] == 'none' and evidence['staging'] == 'complete'
+            assert evidence['activation'] == 'not_started'
+            assert (releases / ids[candidate] / 'SHA256SUMS').is_file()
+            assert not (releases / 'current').is_symlink()
+            assert not (home / '.local/bin/agmi').is_symlink()
+            assert not fixture.database.exists()
+            assert all(property_value(unit, 'LoadState') == 'not-found' for unit in UNITS)
+            assert all(path.read_bytes() == value for path, value in private_inputs.items())
+        print('PASS public stage-only with incoming-owned staging and no state or activation', flush=True)
+
         fixture.invoke('pause')  # A real initialized, paused journal, no participation.
         journal = digest(fixture.database)
         install('install', first)

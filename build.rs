@@ -16,9 +16,30 @@ fn checksum(path: &str) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+fn valid_commit(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn package_identity() -> Option<(String, &'static str)> {
+    let bytes = fs::read(".cargo_vcs_info.json").ok()?;
+    let metadata: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let git = metadata.get("git")?.as_object()?;
+    let commit = git
+        .get("sha1")?
+        .as_str()
+        .filter(|value| valid_commit(value))?;
+    // Cargo omits `dirty` for clean packages; a present value must be boolean.
+    let dirty = match git.get("dirty") {
+        None | Some(serde_json::Value::Bool(false)) => "clean",
+        Some(serde_json::Value::Bool(true)) => "dirty",
+        Some(_) => return None,
+    };
+    Some((commit.to_owned(), dirty))
+}
+
 fn main() {
-    // A packaged crate inside another checkout must not borrow that checkout's
-    // identity. Source archives without their own Git metadata remain unknown.
+    // Only our own checkout may supply Git identity. Otherwise use Cargo's
+    // packaged VCS metadata, never the enclosing checkout's commit or status.
     let checkout = git(&["rev-parse", "--show-toplevel"])
         .and_then(|path| fs::canonicalize(path).ok())
         .zip(
@@ -34,6 +55,7 @@ fn main() {
         "Cargo.toml",
         "Cargo.lock",
         "build.rs",
+        ".cargo_vcs_info.json",
         "src",
         "adapters",
         "deploy",
@@ -55,13 +77,18 @@ fn main() {
             println!("cargo:rerun-if-changed={path}");
         }
     }
-    let commit = source_git(&["rev-parse", "--verify", "HEAD"])
-        .filter(|value| value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .unwrap_or_else(|| "unknown".into());
-    let dirty = match source_git(&["status", "--porcelain", "--untracked-files=normal"]) {
-        Some(value) if value.is_empty() => "clean",
-        Some(_) => "dirty",
-        None => "unknown",
+    let (commit, dirty) = if checkout {
+        let commit = source_git(&["rev-parse", "--verify", "HEAD"])
+            .filter(|value| valid_commit(value))
+            .unwrap_or_else(|| "unknown".into());
+        let dirty = match source_git(&["status", "--porcelain", "--untracked-files=normal"]) {
+            Some(value) if value.is_empty() => "clean",
+            Some(_) => "dirty",
+            None => "unknown",
+        };
+        (commit, dirty)
+    } else {
+        package_identity().unwrap_or_else(|| ("unknown".into(), "unknown"))
     };
     let target = env::var("TARGET").expect("Cargo supplies TARGET");
     let profile = env::var("PROFILE").expect("Cargo supplies PROFILE");
