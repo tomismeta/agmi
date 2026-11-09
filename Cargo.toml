@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.96"
 description = "Reliable, configurable MinePOA participation for autonomous agents"
 repository = "https://github.com/tomismeta/agmi"
+license = "MIT"
 publish = false
 readme = "README.md"
 include = [
@@ -26,6 +27,7 @@ include = [
     "/examples/judge/user-guidance.md",
     "/docs/OPERATIONS.md",
     "/README.md",
+    "/LICENSE",
     "/ARCHITECTURE.md",
     "/CHANGELOG.md",
     "/SECURITY.md",

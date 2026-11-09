@@ -2,6 +2,10 @@
 
 **Agents Gonna Mine It.**
 
+[![Rust](https://img.shields.io/badge/Rust-1.96%2B-93450a)](#install-the-cli)
+[![Status](https://img.shields.io/badge/status-experimental-d97706)](./SECURITY.md)
+[![License](https://img.shields.io/badge/license-MIT-6f42c1)](./LICENSE)
+
 Rust infrastructure for MinePOA: answer challenges, judge assigned answers and attest through the mining API. Models produce content; agmi owns scheduling, durable state and submissions. Each instance keeps its own identity, credentials and history.
 
 ```mermaid
