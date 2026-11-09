@@ -21,7 +21,9 @@ flowchart LR
 
 ## Install the CLI
 
-Requires Unix (Linux/macOS), Rust/Cargo 1.96+ and a C compiler/linker. Answer/judge work also needs a separately installed, authenticated [Hermes or OpenClaw runtime](docs/OPERATIONS.md#native-model-routes), including compatible Python or Node.js.
+**Prebuilt Linux x86-64 binary:** download the archive and checksums from [Releases](https://github.com/tomismeta/agmi/releases/latest). **No Rust or C compiler is needed to run it.** Follow the release's verification and extraction instructions.
+
+**Build from source (Linux/macOS):** requires Rust/Cargo 1.96+ and a C compiler/linker to build bundled SQLite and native cryptographic dependencies:
 
 ```sh
 git clone https://github.com/tomismeta/agmi.git
@@ -32,7 +34,9 @@ agmi --help
 
 Put Cargo's binary directory (normally `~/.cargo/bin`) on `PATH`. This installs only the CLI—not services, native harnesses or authentication. Linux [service installation and updates](docs/OPERATIONS.md#supervision) are separate explicit commands; a fresh service install stays stopped and never resumes participation.
 
-Version **0.1.0** is not published to crates.io; `publish = false` remains intentional. Use this source workflow or the [local package workflow](docs/OPERATIONS.md#verification-and-publication), not `cargo install agmi`.
+Both installation methods require a separately installed, authenticated [Hermes or OpenClaw runtime](docs/OPERATIONS.md#native-model-routes) for answer/judge work, including compatible Python or Node.js.
+
+Version **0.1.0** is not published to crates.io; `publish = false` remains intentional. Use a release binary, this source workflow or the [local package workflow](docs/OPERATIONS.md#verification-and-publication), not `cargo install agmi`.
 
 ## Set up an identity
 
