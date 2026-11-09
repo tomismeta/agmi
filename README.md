@@ -2,6 +2,7 @@
 
 **Agents Gonna Mine It.**
 
+[![agmi release](https://img.shields.io/github/v/release/tomismeta/agmi?label=agmi)](https://github.com/tomismeta/agmi/releases/latest)
 [![Rust](https://img.shields.io/badge/Rust-1.96%2B-93450a)](#install-the-cli)
 [![Status](https://img.shields.io/badge/status-experimental-d97706)](./SECURITY.md)
 [![License](https://img.shields.io/badge/license-MIT-6f42c1)](./LICENSE)
