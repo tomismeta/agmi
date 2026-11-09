@@ -3123,6 +3123,148 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn expired_unknown_answer_floor_requires_fresh_challenge_without_starving_inventory() {
+        let credentials = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = active_judge_config(credentials.path());
+        config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
+        config.capabilities.answer = Mode::Active;
+        config.participation.mode = ParticipationMode::ParticipationFirst;
+        config.participation.retry_uncertain_answers = true;
+        config.participation.allow_judge = true;
+        config.participation.uncertainty_grace_seconds = 0;
+        config.participation.uncertain_answer_retry_seconds = 0;
+        config.timeouts.read_http_seconds = Some(1);
+        let (_temp, mut runtime, _sender) = fixture_with(config);
+        let challenge = parse_challenge(&response(
+            json!({"epoch":62,"answered":false,"words":["burn"]}),
+        ))
+        .unwrap();
+        let input = Input {
+            solver: runtime.request(WorkKind::Answer, &challenge, None).unwrap(),
+            challenge_fingerprint: Some(challenge.fingerprint.clone()),
+        };
+        let key = format!("62:{}", challenge.fingerprint);
+        let mut original = runtime
+            .store
+            .begin(
+                WorkKind::Answer,
+                &key,
+                "prepared",
+                &serde_json::to_value(input).unwrap(),
+                runtime.store.control().unwrap(),
+                &runtime.config.revision().unwrap(),
+            )
+            .unwrap();
+        original.payload = Some(json!({"answer":"captured answer burn"}));
+        runtime.store.save(&original, "prepared").unwrap();
+        assert!(
+            runtime
+                .store
+                .dispatch_intent(&mut original, &runtime.config)
+                .unwrap()
+        );
+        let unavailable = Response {
+            status: 503,
+            body: json!({}),
+            retry_after_seconds: Some(3600),
+            read_failure: None,
+        };
+        let outcome = classify_source(WorkKind::Answer, &unavailable, ResponseSource::Submit);
+        assert!(
+            matches!(&outcome, Outcome::Unknown { reason } if reason == "route_result_unknown")
+        );
+        runtime
+            .outcome(
+                &mut original,
+                outcome,
+                true,
+                unavailable.retry_after_seconds,
+            )
+            .unwrap();
+        runtime.store.observe(62, false).unwrap();
+        assert!(
+            !runtime
+                .store
+                .answer_retry_allowed(&runtime.config, &original)
+                .unwrap()
+        );
+
+        // Expire only the test's wall-clock floor. The original stays unknown,
+        // and the retained unanswered snapshot does not become fresh evidence.
+        let db =
+            rusqlite::Connection::open(runtime.config.state_dir.join("state.sqlite3")).unwrap();
+        db.execute("UPDATE operation_timing SET retry_not_before=0", [])
+            .unwrap();
+        db.execute("UPDATE operations SET next_at=0", []).unwrap();
+        drop(db);
+        runtime.store = Store::open(&runtime.config).unwrap();
+        assert!(
+            runtime
+                .store
+                .answer_retry_allowed(&runtime.config, &original)
+                .unwrap()
+        );
+        assert!(runtime.store.reconciliation_batch().unwrap().is_empty());
+        let prefix = format!("GET /chain/{}", runtime.config.network.chain);
+        let server = tokio::spawn(async move {
+            let stalled =
+                accept_api_request(&listener, &format!("{prefix}/api/hosted/challenge")).await;
+            // The unanswered read must time out, but lower-priority observation
+            // must still get its turn; any answer POST fails this expectation.
+            api_reply(
+                &listener,
+                &format!("{prefix}/api/hosted/assignments"),
+                200,
+                None,
+                json!({"assignments":[],"has_more":false}),
+            )
+            .await;
+            drop(stalled);
+            listener
+        });
+        runtime.cycle().await.unwrap();
+        let listener = server.await.unwrap();
+        let status = runtime.store.status(&runtime.config).unwrap();
+        assert_eq!(status["work"]["answer"]["phase"], "unknown");
+        assert_eq!(status["work"]["answer"]["retry"]["policy_eligible"], true);
+        assert_eq!(status["work"]["answer"]["retry"]["reason"], "read_backoff");
+        assert_eq!(
+            runtime.store.operation(original.id).unwrap().unwrap().state,
+            "unknown"
+        );
+        assert_eq!(
+            runtime.store.attempt_count(WorkKind::Answer, &key).unwrap(),
+            1
+        );
+        assert!(
+            runtime
+                .store
+                .preparation(WorkKind::Answer)
+                .unwrap()
+                .is_none()
+        );
+        let reads = status["reads"].as_array().unwrap();
+        let challenge_read = reads
+            .iter()
+            .find(|row| row["scope"] == "challenge")
+            .unwrap();
+        assert_eq!(challenge_read["failure_category"], "timeout");
+        assert!(challenge_read["last_success_at"].is_null());
+        let assignments = reads
+            .iter()
+            .find(|row| row["scope"] == "assignments")
+            .unwrap();
+        assert!(assignments["last_success_at"].is_i64());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn stalled_read_body_keeps_status_and_authoritative_retry_floor() {
         use tokio::io::AsyncWriteExt;
         let credentials = tempfile::tempdir().unwrap();

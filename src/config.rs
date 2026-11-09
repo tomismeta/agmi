@@ -278,7 +278,7 @@ impl Default for Preparation {
         Self {
             answer_while_blocked: true,
             retry_uncertain: false,
-            max_attempts_per_work: 1,
+            max_attempts_per_work: 2,
         }
     }
 }
@@ -403,7 +403,7 @@ impl Default for Config {
                 judge: model,
             },
             timeouts: Timeouts {
-                http_seconds: 30,
+                http_seconds: 90,
                 read_http_seconds: None,
                 model_seconds: 300,
                 shutdown_seconds: 30,
@@ -1168,6 +1168,22 @@ mod tests {
         config.participation.answer_reserved_slots = 2;
         config.schedule.challenge_retry_seconds = Some(0);
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn explicit_timeouts_preserve_read_inheritance_and_overrides() {
+        let inherited: Timeouts =
+            toml::from_str("http_seconds = 17\nmodel_seconds = 120\nshutdown_seconds = 5").unwrap();
+        assert_eq!(inherited.http_seconds, 17);
+        assert_eq!(inherited.effective_read_http_seconds(), 17);
+        let mut overridden = inherited.clone();
+        overridden.read_http_seconds = Some(43);
+        overridden.http_seconds = 23;
+        let decoded: Timeouts = toml::from_str(&toml::to_string(&overridden).unwrap()).unwrap();
+        assert_eq!(decoded.http_seconds, 23);
+        assert_eq!(decoded.effective_read_http_seconds(), 43);
+        overridden.read_http_seconds = None;
+        assert_eq!(overridden.effective_read_http_seconds(), 23);
     }
 
     #[test]

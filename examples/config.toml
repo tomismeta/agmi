@@ -46,7 +46,8 @@ mine = "read_only"
 answer_while_blocked = true
 # May repeat remote inference at additional cost; never retries a network write.
 retry_uncertain = false
-max_attempts_per_work = 1
+# Allows one replacement for a known-invalid draft; extra inference costs quota.
+max_attempts_per_work = 2
 
 # Strict is the default. Other modes accept bounded remote conflict risk;
 # elapsed time never proves an uncertain request failed.
@@ -91,8 +92,8 @@ guidance_file = "judge/user-guidance.md"
 # Missing/empty configured core files fail loading; no built-in prose fallback.
 
 [timeouts]
-http_seconds = 30
-# Optional read-only HTTP deadline; absent means http_seconds.
+http_seconds = 90
+# Optional read-only HTTP deadline; absent inherits http_seconds (90 by default).
 # Effectful mine GET requests always use http_seconds.
 # read_http_seconds = 60
 model_seconds = 300

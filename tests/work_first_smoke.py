@@ -375,6 +375,7 @@ def restart_scenario(f):
 
 
 def pause_scenario(f):
+    f.preparation['max_attempts_per_work'] = 1
     old, draft = completed_draft(f)
     generation = f.status()['generation']
     f.invoke('pause')

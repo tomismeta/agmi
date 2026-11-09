@@ -647,9 +647,10 @@ struct UncertaintyAccounting {
     exempt: u64,
     historical: Vec<HistoricalAnswer>,
     blockers: Vec<i64>,
-    live_or_floor: bool,
-    grace_closed: bool,
-    retry_grace_closed: bool,
+    writing: bool,
+    retry_not_before: i64,
+    grace_until: i64,
+    retry_grace_until: i64,
 }
 
 impl UncertaintyAccounting {
@@ -1595,7 +1596,6 @@ impl Store {
         ))?;
         let mut rows = statement.query([excluding.unwrap_or(-1)])?;
         let mut result = UncertaintyAccounting::default();
-        let current = now();
         let accepted_linked =
             policy.historical_unknown_answer_capacity == HistoricalAnswerCapacity::AcceptedLinked;
         let blocker_limit = u64::from(policy.max_unresolved_operations)
@@ -1632,11 +1632,16 @@ impl Store {
                 result.blockers.push(id);
             }
             // Exemption affects capacity only, never floors or grace.
-            result.live_or_floor |= dispatched || floor > current;
+            result.writing |= dispatched;
+            result.retry_not_before = result.retry_not_before.max(floor);
             let retry = Some(id) == retry_of;
             let retry_grace =
                 i64::try_from(policy.uncertain_answer_retry_seconds).unwrap_or(i64::MAX);
-            result.retry_grace_closed |= retry && since.saturating_add(retry_grace) > current;
+            if retry {
+                result.retry_grace_until = result
+                    .retry_grace_until
+                    .max(since.saturating_add(retry_grace));
+            }
             let grace = if retry {
                 policy
                     .uncertainty_grace_seconds
@@ -1644,8 +1649,9 @@ impl Store {
             } else {
                 policy.uncertainty_grace_seconds
             };
-            result.grace_closed |=
-                since.saturating_add(i64::try_from(grace).unwrap_or(i64::MAX)) > current;
+            result.grace_until = result
+                .grace_until
+                .max(since.saturating_add(i64::try_from(grace).unwrap_or(i64::MAX)));
         }
         Ok(result)
     }
@@ -1699,7 +1705,8 @@ impl Store {
             .optional()?;
         let accounting = Self::uncertainty_accounting(db, config, Some(op.id), retry_of, true)?;
         if accounting.active() + 1 > u64::from(policy.unresolved_limit(op.kind))
-            || accounting.live_or_floor
+            || accounting.writing
+            || accounting.retry_not_before > now()
         {
             return Ok(None);
         }
@@ -1748,7 +1755,7 @@ impl Store {
         if policy.mode == ParticipationMode::Strict || !policy.allows(op.kind) {
             return Ok(None);
         }
-        if decision.accounting.retry_grace_closed {
+        if decision.accounting.retry_grace_until > now() {
             return Ok(None);
         }
         if policy.mode == ParticipationMode::Manual {
@@ -1761,7 +1768,7 @@ impl Store {
             if decision.grant.is_none() {
                 return Ok(None);
             }
-        } else if decision.accounting.grace_closed {
+        } else if decision.accounting.grace_until > now() {
             return Ok(None);
         }
         Ok(Some(decision))
@@ -1867,15 +1874,28 @@ impl Store {
         config: &Config,
         original: &Operation,
     ) -> Result<bool> {
-        if config.participation.mode == ParticipationMode::Strict
-            || !config.participation.retry_uncertain_answers
-            || !config.participation.allow_answer
-        {
-            return Ok(false);
+        Ok(self.answer_retry_blocker(config, original)?.is_none())
+    }
+
+    fn answer_retry_blocker(
+        &self,
+        config: &Config,
+        original: &Operation,
+    ) -> Result<Option<(&'static str, Option<i64>)>> {
+        if config.participation.mode == ParticipationMode::Strict {
+            return Ok(Some(("strict_uncertainty", None)));
         }
-        let control = self.control()?;
-        if control.paused || config.mode(WorkKind::Answer) != Mode::Active {
-            return Ok(false);
+        if !config.participation.retry_uncertain_answers {
+            return Ok(Some(("uncertain_retry_disabled", None)));
+        }
+        if !config.participation.allow_answer {
+            return Ok(Some(("participation_disabled", None)));
+        }
+        if self.control()?.paused {
+            return Ok(Some(("admission_paused", None)));
+        }
+        if config.mode(WorkKind::Answer) != Mode::Active {
+            return Ok(Some(("capability_not_active", None)));
         }
         // The regular admission helper reads linkage from durable operations. For
         // preparation, use the existing epoch budget and blocker bounds directly.
@@ -1889,12 +1909,18 @@ impl Store {
             AND (e.dispatch_sequence IS NOT NULL OR o.job_id IS NOT NULL OR o.state IN ('dispatching','queued','unknown','included_pending','confirmed','final'))",
             [format!("{epoch}:%")], |r| Ok((r.get(0)?,r.get(1)?)),
         )?;
-        let eligible = !accepted
-            && attempts < config.participation.max_answer_attempts_per_epoch
-            && self.uncertainty_open(config, WorkKind::Answer, Some(epoch), Some(original.id))?;
-        Ok(eligible)
+        if accepted {
+            return Ok(Some(("answer_already_accepted", None)));
+        }
+        if attempts >= config.participation.max_answer_attempts_per_epoch {
+            return Ok(Some(("answer_attempt_budget_exhausted", None)));
+        }
+        let accounting =
+            Self::uncertainty_accounting(&self.db, config, None, Some(original.id), false)?;
+        self.uncertainty_blocker_with(config, WorkKind::Answer, Some(epoch), &accounting)
     }
 
+    #[cfg(test)]
     fn uncertainty_open(
         &self,
         config: &Config,
@@ -1913,29 +1939,71 @@ impl Store {
         epoch: Option<u64>,
         accounting: &UncertaintyAccounting,
     ) -> Result<bool> {
+        Ok(self
+            .uncertainty_blocker_with(config, kind, epoch, accounting)?
+            .is_none())
+    }
+
+    fn uncertainty_blocker_with(
+        &self,
+        config: &Config,
+        kind: WorkKind,
+        epoch: Option<u64>,
+        accounting: &UncertaintyAccounting,
+    ) -> Result<Option<(&'static str, Option<i64>)>> {
         let policy = &config.participation;
         if accounting.total == 0 {
-            return Ok(true);
+            return Ok(None);
         }
-        if policy.mode == ParticipationMode::Strict
-            || !policy.allows(kind)
-            || accounting.active() + 1 > u64::from(policy.unresolved_limit(kind))
-            || accounting.live_or_floor
-        {
-            return Ok(false);
+        if policy.mode == ParticipationMode::Strict {
+            return Ok(Some(("strict_uncertainty", None)));
         }
-        if accounting.retry_grace_closed {
-            return Ok(false);
+        if !policy.allows(kind) {
+            return Ok(Some(("participation_disabled", None)));
+        }
+        if accounting.active() + 1 > u64::from(policy.unresolved_limit(kind)) {
+            let reason = if kind != WorkKind::Answer
+                && accounting.active() < u64::from(policy.max_unresolved_operations)
+            {
+                "answer_capacity_reserved"
+            } else {
+                "unresolved_capacity"
+            };
+            return Ok(Some((reason, None)));
+        }
+        if accounting.writing {
+            return Ok(Some(("effect_in_flight", None)));
+        }
+        let current = now();
+        if accounting.retry_not_before > current {
+            return Ok(Some((
+                "retained_retry_minimum",
+                Some(accounting.retry_not_before),
+            )));
+        }
+        if accounting.retry_grace_until > current {
+            return Ok(Some((
+                "uncertain_answer_retry_delay",
+                Some(accounting.retry_grace_until),
+            )));
         }
         if policy.mode == ParticipationMode::Manual {
-            let Some(epoch) = epoch else { return Ok(false) };
-            return Ok(self.db.query_row(
-                "SELECT EXISTS(SELECT 1 FROM manual_grants WHERE epoch=?1 AND kind=?2 AND generation=?3 AND consumed_by IS NULL
-                AND NOT EXISTS(SELECT 1 FROM manual_grant_revocations WHERE grant_id=manual_grants.id))",
-                params![i64::try_from(epoch)?,kind.as_str(),self.control()?.generation], |r| r.get(0),
-            )?);
+            let granted = if let Some(epoch) = epoch {
+                self.db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM manual_grants WHERE epoch=?1 AND kind=?2 AND generation=?3 AND consumed_by IS NULL
+                    AND NOT EXISTS(SELECT 1 FROM manual_grant_revocations WHERE grant_id=manual_grants.id))",
+                    params![i64::try_from(epoch)?,kind.as_str(),self.control()?.generation], |r| r.get::<_,bool>(0),
+                )?
+            } else {
+                false
+            };
+            if !granted {
+                return Ok(Some(("manual_authorization_required", None)));
+            }
+        } else if accounting.grace_until > current {
+            return Ok(Some(("uncertainty_grace", Some(accounting.grace_until))));
         }
-        Ok(!accounting.grace_closed)
+        Ok(None)
     }
 
     pub(crate) fn mine_epoch_attempted(&self, epoch: u64) -> Result<bool> {
@@ -2648,6 +2716,14 @@ impl Store {
         let mut work = json!({});
         for kind in [WorkKind::Answer, WorkKind::Judge, WorkKind::Mine] {
             let prepared = self.preparation(kind)?;
+            let retry_original = if kind == WorkKind::Answer && prepared.is_some() {
+                epoch
+                    .map(|epoch| self.uncertain_answer(epoch))
+                    .transpose()?
+                    .flatten()
+            } else {
+                None
+            };
             let operation = if prepared.is_some() {
                 prepared
             } else if kind != WorkKind::Judge {
@@ -2942,6 +3018,69 @@ impl Store {
                 "operation_epoch":op.and_then(|op| op.request["solver"]["epoch"].as_u64())});
             if kind == WorkKind::Judge {
                 work[kind.as_str()]["selection"] = json!(selection);
+            }
+            if kind == WorkKind::Answer
+                && let Some(original) = op
+                    .filter(|op| {
+                        matches!(op.state.as_str(), "queued" | "unknown")
+                            && op.txid.is_none()
+                            && op.payload.is_some()
+                    })
+                    .or(retry_original.as_ref())
+            {
+                // Recovery of the original and admission of a distinct risk-opted
+                // retry are separate. Neither this projection nor elapsed time
+                // supplies fresh challenge evidence or resolves the original.
+                let blocker = if has_evidence
+                    && self.has_table("operation_timing")?
+                    && self.has_table("manual_grants")?
+                    && self.has_table("manual_grant_revocations")?
+                    && original.request["solver"]["epoch"].as_u64().is_some()
+                {
+                    self.answer_retry_blocker(config, original)?
+                } else {
+                    Some(("retry_evidence_unavailable", None))
+                };
+                let (mut retry_reason, mut retry_at) = match blocker {
+                    Some(blocker) => blocker,
+                    None => (
+                        "fresh_evidence_required",
+                        Some(self.next_at(kind)?.max(read_at).max(current)),
+                    ),
+                };
+                let mut retry_action = if blocker.is_none() {
+                    "revalidate_challenge"
+                } else if retry_reason == "manual_authorization_required" {
+                    "authorize"
+                } else {
+                    "await_retry_eligibility"
+                };
+                if blocker.is_none() {
+                    if read.is_some_and(|row| row["state"] == "in_flight") {
+                        retry_reason = "freshness_in_flight";
+                        retry_action = "await_challenge";
+                        retry_at = None;
+                    } else if read_at > current {
+                        retry_reason = "read_backoff";
+                    }
+                }
+                if blocker.is_none() && answered == Some(true) {
+                    retry_reason = "hosted_answer_observed";
+                    retry_action = "observe_challenge";
+                    retry_at = Some(self.next_at(kind)?.max(read_at).max(current));
+                }
+                if stopped || reload_blocked || control.paused || config.mode(kind) != Mode::Active
+                {
+                    retry_reason = reason;
+                    retry_action = action;
+                    retry_at = next_at;
+                }
+                work[kind.as_str()]["retry"] = json!({
+                    "original_operation_id":original.id,
+                    "policy_eligible":blocker.is_none(),
+                    "reason":retry_reason,"next_action":retry_action,"next_at":retry_at,
+                    "requires_fresh_eligibility":true
+                });
             }
             let effect_since = if let Some(op) = op.filter(|op| {
                 has_evidence
@@ -3993,8 +4132,11 @@ mod tests {
 
     #[test]
     fn historical_accounting_reads_old_journals_without_migration() {
-        let (_temp, config, mut store) = participation_fixture();
+        let (_temp, mut config, mut store) = participation_fixture();
+        config.participation.retry_uncertain_answers = true;
         dispatched_unknown(&mut store, &config, WorkKind::Answer, 7);
+        store.observe(7, false).unwrap();
+        store.runtime_state(&config, false).unwrap();
         store
             .db
             .execute_batch(
@@ -4009,6 +4151,11 @@ mod tests {
         assert_eq!(status["participation"]["unresolved_count"], 1);
         assert_eq!(status["participation"]["historical_eligible_count"], 0);
         assert_eq!(status["participation"]["active_unresolved_count"], 1);
+        assert_eq!(
+            status["work"]["answer"]["retry"]["reason"],
+            "retry_evidence_unavailable"
+        );
+        assert_eq!(status["work"]["answer"]["phase"], "unknown");
         assert!(
             !store
                 .has_table("historical_answer_accounting_events")
@@ -4551,6 +4698,202 @@ mod tests {
             )
             .unwrap();
         assert!(!store.dispatch_intent(&mut rotated, &config).unwrap());
+    }
+
+    #[test]
+    fn uncertain_answer_retry_projection_separates_floors_freshness_and_budget() {
+        let (_temp, mut config, mut store) = participation_fixture();
+        config.participation.retry_uncertain_answers = true;
+        config.participation.max_answer_attempts_per_epoch = 2;
+        let original = dispatched_unknown(&mut store, &config, WorkKind::Answer, 62);
+        store.observe(62, false).unwrap();
+        store.runtime_state(&config, false).unwrap();
+        let floor = now() + 3600;
+        store.record_retry_deadline(original.id, floor).unwrap();
+        let status = store.status(&config).unwrap();
+        assert_eq!(status["work"]["answer"]["phase"], "unknown");
+        assert_eq!(
+            status["work"]["answer"]["next_action"],
+            "authoritative_recovery"
+        );
+        assert_eq!(
+            status["work"]["answer"]["retry"]["reason"],
+            "retained_retry_minimum"
+        );
+        assert_eq!(status["work"]["answer"]["retry"]["next_at"], floor);
+        assert_eq!(status["work"]["answer"]["retry"]["policy_eligible"], false);
+        assert!(!store.answer_retry_allowed(&config, &original).unwrap());
+
+        store
+            .db
+            .execute(
+                "UPDATE operation_timing SET retry_not_before=0 WHERE operation_id=?1",
+                [original.id],
+            )
+            .unwrap();
+        let status = store.status(&config).unwrap();
+        assert!(store.answer_retry_allowed(&config, &original).unwrap());
+        assert_eq!(
+            status["work"]["answer"]["retry"]["reason"],
+            "fresh_evidence_required"
+        );
+        assert_eq!(status["work"]["answer"]["retry"]["policy_eligible"], true);
+        assert_eq!(
+            status["work"]["answer"]["retry"]["requires_fresh_eligibility"],
+            true
+        );
+        store
+            .fail_read(ReadScope::Challenge, 90, 300, 0, None)
+            .unwrap();
+        drop(store);
+        let readonly = Store::read_only(&config).unwrap().unwrap();
+        let status = readonly.status(&config).unwrap();
+        assert_eq!(status["work"]["answer"]["retry"]["reason"], "read_backoff");
+        assert_eq!(
+            status["work"]["answer"]["retry"]["next_at"],
+            readonly.read_backoff(ReadScope::Challenge).unwrap().next_at
+        );
+        assert_eq!(
+            readonly.operation(original.id).unwrap().unwrap().state,
+            "unknown"
+        );
+        assert_eq!(
+            readonly
+                .attempt_count(WorkKind::Answer, &original.key)
+                .unwrap(),
+            1
+        );
+        drop(readonly);
+        let mut store = Store::open(&config).unwrap();
+        store.read_started(ReadScope::Challenge).unwrap();
+        let status = store.status(&config).unwrap();
+        assert_eq!(
+            status["work"]["answer"]["retry"]["reason"],
+            "freshness_in_flight"
+        );
+        assert!(status["work"]["answer"]["retry"]["next_at"].is_null());
+        store
+            .read_finished(ReadScope::Challenge, Some(200), None)
+            .unwrap();
+        store.reset_read(ReadScope::Challenge).unwrap();
+
+        store.observe(62, true).unwrap();
+        let status = store.status(&config).unwrap();
+        assert_eq!(
+            status["work"]["answer"]["retry"]["reason"],
+            "hosted_answer_observed"
+        );
+        assert_eq!(
+            store.operation(original.id).unwrap().unwrap().state,
+            "unknown"
+        );
+        store.observe(62, false).unwrap();
+        let mut retry = store
+            .begin_linked(
+                WorkKind::Answer,
+                &original.key,
+                ("prepared", &original.request),
+                store.control().unwrap(),
+                "retry_revision",
+                Some((&original, true)),
+            )
+            .unwrap();
+        // A prepared linked retry must not hide the original's newly retained
+        // server floor or replace its identity with the unsent operation.
+        store.record_retry_deadline(original.id, floor).unwrap();
+        let status = store.status(&config).unwrap();
+        assert_eq!(status["work"]["answer"]["operation_id"], retry.id);
+        assert_eq!(
+            status["work"]["answer"]["retry"]["original_operation_id"],
+            original.id
+        );
+        assert_eq!(
+            status["work"]["answer"]["retry"]["reason"],
+            "retained_retry_minimum"
+        );
+        assert_eq!(status["work"]["answer"]["retry"]["next_at"], floor);
+        assert!(!store.dispatch_intent(&mut retry, &config).unwrap());
+        store
+            .db
+            .execute(
+                "UPDATE operation_timing SET retry_not_before=0 WHERE operation_id=?1",
+                [original.id],
+            )
+            .unwrap();
+        assert!(store.dispatch_intent(&mut retry, &config).unwrap());
+        retry.state = "unknown".into();
+        store.save(&retry, "dispatch_outcome_unknown").unwrap();
+        let status = store.status(&config).unwrap();
+        assert_eq!(
+            status["work"]["answer"]["retry"]["reason"],
+            "answer_attempt_budget_exhausted"
+        );
+        assert_eq!(status["work"]["answer"]["retry"]["policy_eligible"], false);
+        assert!(!store.answer_retry_allowed(&config, &retry).unwrap());
+        store.observe(62, true).unwrap();
+        let status = store.status(&config).unwrap();
+        assert_eq!(
+            status["work"]["answer"]["retry"]["reason"],
+            "answer_attempt_budget_exhausted"
+        );
+        assert_eq!(status["work"]["answer"]["retry"]["policy_eligible"], false);
+        assert_eq!(
+            store.operation(original.id).unwrap().unwrap().state,
+            "unknown"
+        );
+        assert!(!status.to_string().contains("captured answer"));
+    }
+
+    #[test]
+    fn uncertain_answer_retry_projection_uses_effective_policy_and_preserves_fences() {
+        let (_temp, mut config, mut store) = participation_fixture();
+        let original = dispatched_unknown(&mut store, &config, WorkKind::Answer, 62);
+        store.observe(62, false).unwrap();
+        for (mode, enabled, capacity, delay, expected) in [
+            (ParticipationMode::Strict, true, 8, 0, "strict_uncertainty"),
+            (
+                ParticipationMode::ParticipationFirst,
+                false,
+                8,
+                0,
+                "uncertain_retry_disabled",
+            ),
+            (
+                ParticipationMode::ParticipationFirst,
+                true,
+                1,
+                0,
+                "unresolved_capacity",
+            ),
+            (
+                ParticipationMode::ParticipationFirst,
+                true,
+                8,
+                3600,
+                "uncertain_answer_retry_delay",
+            ),
+            (
+                ParticipationMode::Manual,
+                true,
+                8,
+                0,
+                "manual_authorization_required",
+            ),
+        ] {
+            config.participation.mode = mode;
+            config.participation.retry_uncertain_answers = enabled;
+            config.participation.max_unresolved_operations = capacity;
+            config.participation.uncertain_answer_retry_seconds = delay;
+            store.runtime_state(&config, false).unwrap();
+            let status = store.status(&Config::default()).unwrap();
+            assert_eq!(status["work"]["answer"]["retry"]["reason"], expected);
+            assert_eq!(status["work"]["answer"]["retry"]["policy_eligible"], false);
+            assert!(!store.answer_retry_allowed(&config, &original).unwrap());
+            assert_eq!(
+                store.operation(original.id).unwrap().unwrap().state,
+                "unknown"
+            );
+        }
     }
 
     #[test]
@@ -6283,6 +6626,65 @@ mod tests {
             store.operation(retry.id).unwrap().unwrap().state,
             "model_unknown"
         );
+    }
+
+    #[test]
+    fn completed_model_retry_budget_survives_restart_without_retrying_uncertain_work() {
+        let (_temp, config, mut store) = participation_fixture();
+        assert_eq!(config.preparation.max_attempts_per_work, 2);
+        assert!(!config.preparation.retry_uncertain);
+        let mut first = begin(&mut store, WorkKind::Answer, "7:words", "generating");
+        first.result = Some(json!({"answer":"invalid completed draft"}));
+        first.state = "rejected".into();
+        store.save(&first, "model_output_invalid").unwrap();
+        drop(store);
+        let mut store = Store::open(&config).unwrap();
+        store.retry_models(&config).unwrap();
+        assert_eq!(
+            store.operation(first.id).unwrap().unwrap().state,
+            "retry_model"
+        );
+        assert!(!store.answer_epoch_attempted(7).unwrap());
+        assert_eq!(
+            store
+                .model_budget_used(WorkKind::Answer, "7:words")
+                .unwrap(),
+            1
+        );
+
+        let mut second = begin(&mut store, WorkKind::Answer, "7:words", "generating");
+        second.result = first.result.clone();
+        second.state = "rejected".into();
+        store.save(&second, "model_output_invalid").unwrap();
+        let mut uncertain = begin(&mut store, WorkKind::Judge, "uncertain-model", "generating");
+        uncertain.state = "model_unknown".into();
+        store.save(&uncertain, "model_launch_unknown").unwrap();
+        let mut dispatched = dispatched_unknown(&mut store, &config, WorkKind::Answer, 9);
+        dispatched.state = "rejected".into();
+        store.save(&dispatched, "submission_rejected").unwrap();
+        drop(store);
+        let mut store = Store::open(&config).unwrap();
+        store.retry_models(&config).unwrap();
+        assert_eq!(
+            store
+                .model_budget_used(WorkKind::Answer, "7:words")
+                .unwrap(),
+            2
+        );
+        assert!(store.answer_epoch_attempted(7).unwrap());
+        assert_eq!(
+            store.operation(second.id).unwrap().unwrap().state,
+            "rejected"
+        );
+        assert_eq!(
+            store.operation(uncertain.id).unwrap().unwrap().state,
+            "model_unknown"
+        );
+        let retained = store.operation(dispatched.id).unwrap().unwrap();
+        assert_eq!(retained.state, "rejected");
+        assert_eq!(retained.payload, dispatched.payload);
+        assert_eq!(store.attempt_count(WorkKind::Answer, "7:words").unwrap(), 2);
+        assert!(store.effect().unwrap().is_none());
     }
 
     #[test]

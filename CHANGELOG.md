@@ -4,6 +4,9 @@
 
 Source change history; this heading does not assert publication, signed release provenance or live acceptance of every feature.
 
+- Raise the default HTTP deadline to 90 seconds (including reads without an explicit override) and the model-preparation budget to two attempts. Preserve strict participation and uncertain-inference retry opt-in; completed invalid drafts may incur one additional inference. Explicit configured limits and shipped guidance remain unchanged.
+- Explain uncertain-answer retry policy separately from authoritative recovery in status and health, including server floors, attempt limits and fresh-evidence waits. Preserve unknown outcomes and reserved answer capacity; an elapsed deadline never grants retry authority.
+
 - Add opt-in participation-first `accepted_linked` historical capacity accounting while keeping strict/default bounded behavior. Only identifier-less unknown answers with a directly linked same-epoch accepted retry qualify; originals remain unknown, historical risk can accumulate, and active caps/reservation and dispatch fences remain. Revisioned witnesses and compact admission snapshots avoid repeatedly copying the accumulated historical set.
 - Publish derived registration credentials/metadata/network profiles through synced atomic no-replace renames so local resume can complete interrupted publication without overwriting conflicts. Keep intent/capture fences and the remote lost-key boundary.
 - Report missing/mismatched proof algorithm approval precisely before registration POST, and give invalid-init argument/profile repair actions before verification or onboarding writes. Document native service-PATH prerequisites, actual local diagnostic commands and deferred privilege-isolation boundaries; no live registration acceptance is claimed.

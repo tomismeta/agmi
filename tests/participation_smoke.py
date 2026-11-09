@@ -59,6 +59,7 @@ class Fixture:
                            retry_uncertain_answers=False,
                            uncertain_answer_retry_seconds=1,
                            max_answer_attempts_per_epoch=2)
+        self.preparation = {}
         self.capabilities = dict(answer='active', judge='off', mine='off')
         self.server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), self.handler())
         self.server.daemon_threads = True
@@ -217,6 +218,7 @@ print(json.dumps({'provider': 'openai-codex', 'model': payload['model'],
         value = lambda item: str(item).lower() if isinstance(item, bool) else json.dumps(item)
         capabilities = '\n'.join(f'{key} = {json.dumps(val)}' for key, val in self.capabilities.items())
         participation = '\n'.join(f'{key} = {value(val)}' for key, val in self.policy.items())
+        preparation = '\n'.join(f'{key} = {value(val)}' for key, val in self.preparation.items())
         solver = '\n'.join(f'''[solver.{kind}]
 harness = "hermes"
 executable = {json.dumps(str(self.native))}
@@ -234,6 +236,8 @@ credential_file = {json.dumps(str(self.key))}
 {solver}
 [participation]
 {participation}
+[preparation]
+{preparation}
 [timeouts]
 http_seconds = {self.http_seconds}
 read_http_seconds = {self.read_http_seconds}
@@ -265,6 +269,7 @@ jitter_seconds = 0
                              stdin=json.dumps(patch))
         assert result['saved'] and result['runtime_applied'] is None
         self.policy.update(patch.get('participation', {}))
+        self.preparation.update(patch.get('preparation', {}))
         if self.child is not None:
             self.wait(lambda: self.status()['effective_runtime']['revision'] == result['revision'],
                       'CLI configuration save was not loaded by the running controller')
@@ -591,6 +596,7 @@ def retry_after_scenario(f):
 
 
 def manual_scenario(f):
+    f.preparation['max_attempts_per_work'] = 1
     old = old_judgment(f)
     f.configure(mode='manual', uncertainty_grace_seconds=3600,
                 uncertain_answer_retry_seconds=3600, retry_uncertain_answers=True)
