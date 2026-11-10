@@ -140,6 +140,23 @@ pub(crate) fn execution(error: &Error, config: Option<&Path>) -> Value {
             "next_actions":[action(config, &["status"], false), action(config, &["operations", "list"], false)]
         });
     }
+    if let Some(error) = error.downcast_ref::<agmi::store::RefusalRecoveryError>() {
+        let message = match error.0 {
+            "refusal_recovery_conflict" => {
+                "Refusal preview changed. Preview this operation again before applying its new token."
+            }
+            "refusal_recovery_ineligible" => {
+                "Retained evidence does not permit refusal retirement. Preserve the unknown operation; inspect its refusal preview."
+            }
+            _ => {
+                "Refusal recovery requires an intact adopted journal. Preserve state and inspect recovery prerequisites."
+            }
+        };
+        return json!({
+            "code":error.0,"message":message,"details":{},
+            "next_actions":[action(config, &["recover", "resolve", "--help"], false)]
+        });
+    }
     if let Some((code, message, details)) = agmi::registration::error_details(error) {
         return json!({
             "code":code,

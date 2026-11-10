@@ -287,7 +287,7 @@ enum RecoveryCommand {
         #[arg(long, value_parser = clap::value_parser!(i64).range(1..))]
         grant: i64,
     },
-    /// Verify terminal evidence for an identifier already bound in the journal.
+    /// Verify bound terminal evidence, or preview/retire a retained pre-enqueue refusal locally.
     Resolve {
         #[arg(long)]
         operation: i64,
@@ -295,6 +295,15 @@ enum RecoveryCommand {
         job_id: Option<String>,
         #[arg(long)]
         txid: Option<String>,
+        /// Local retained-evidence recovery; no network. Defaults to preview, never resubmits.
+        #[arg(long, conflicts_with_all = ["job_id", "txid"])]
+        refusal: bool,
+        /// Explicit nonmutating refusal preview; returns an eligible record's approval token.
+        #[arg(long, requires = "refusal", conflicts_with = "apply")]
+        dry_run: bool,
+        /// Apply exactly the reviewed refusal preview while the controller is stopped.
+        #[arg(long, requires = "refusal", value_name = "PREVIEW_TOKEN")]
+        apply: Option<String>,
     },
 }
 
@@ -450,7 +459,7 @@ fn discovery() -> Value {
         {"name":"recover-model","network_writes":false,"local_writes":true,"purpose":"allow regeneration of model-only work; requires stopped writer"},
         {"name":"recover inspect","network_reads":false,"network_writes":false,"local_writes":false,"purpose":"private captured operation and evidence; may contain payload/model text"},
         {"name":"recover adopt","network_reads":false,"network_writes":false,"local_writes":true,"purpose":"stopped-writer intact journal migration"},
-        {"name":"recover resolve","network_reads":true,"network_writes":false,"local_writes":true,"purpose":"verify authoritative terminal evidence for an already-bound request; never force-clear"},
+        {"name":"recover resolve","network_reads":true,"network_writes":false,"local_writes":true,"purpose":"verify already-bound terminal evidence; --operation ID --refusal --dry-run is local-only and nonmutating; --refusal --apply TOKEN retires the reviewed refusal while stopped without network calls or replay"},
         {"name":"recover authorize","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":true,"purpose":"stopped-writer one-dispatch manual participation grant; --epoch N --kind answer|judge|mine"},
         {"name":"recover grants","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":false,"purpose":"paginated grant history; --limit N --before ID"},
         {"name":"recover revoke","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":true,"purpose":"stopped-writer revoke --grant ID without erasing grant history"},
@@ -866,10 +875,17 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
                 operation,
                 job_id,
                 txid,
+                refusal,
+                dry_run: _,
+                apply,
             } => Ok((
                 "recovery_resolve",
-                runtime::recovery_resolve(&path, *operation, job_id.as_deref(), txid.as_deref())
-                    .await?,
+                if *refusal {
+                    agmi::store::recovery_refusal(&path, *operation, apply.as_deref())?
+                } else {
+                    runtime::recovery_resolve(&path, *operation, job_id.as_deref(), txid.as_deref())
+                        .await?
+                },
             )),
         },
         Command::Status => Ok(("status", runtime::status(&config)?)),
@@ -1078,6 +1094,107 @@ async fn main() {
                 eprintln!("Next: {}", error["next_actions"]);
             }
             std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refusal_resolution_requires_explicit_preview_approval_and_excludes_bound_recovery() {
+        for arguments in [
+            vec![
+                "agmi",
+                "recover",
+                "resolve",
+                "--operation",
+                "1",
+                "--refusal",
+            ],
+            vec![
+                "agmi",
+                "recover",
+                "resolve",
+                "--operation",
+                "1",
+                "--refusal",
+                "--dry-run",
+            ],
+            vec![
+                "agmi",
+                "recover",
+                "resolve",
+                "--operation",
+                "1",
+                "--refusal",
+                "--apply",
+                "token",
+            ],
+            vec![
+                "agmi",
+                "recover",
+                "resolve",
+                "--operation",
+                "1",
+                "--job-id",
+                "bound",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(arguments).is_ok());
+        }
+        for arguments in [
+            vec![
+                "agmi",
+                "recover",
+                "resolve",
+                "--operation",
+                "1",
+                "--apply",
+                "token",
+            ],
+            vec![
+                "agmi",
+                "recover",
+                "resolve",
+                "--operation",
+                "1",
+                "--dry-run",
+            ],
+            vec![
+                "agmi",
+                "recover",
+                "resolve",
+                "--operation",
+                "1",
+                "--refusal",
+                "--dry-run",
+                "--apply",
+                "token",
+            ],
+            vec![
+                "agmi",
+                "recover",
+                "resolve",
+                "--operation",
+                "1",
+                "--refusal",
+                "--job-id",
+                "bound",
+            ],
+            vec![
+                "agmi",
+                "recover",
+                "resolve",
+                "--operation",
+                "1",
+                "--refusal",
+                "--txid",
+                "bound",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(arguments).is_err());
         }
     }
 }

@@ -568,13 +568,16 @@ fn components(status: &Value, health: &Value, at: i64, stale: u64, timing: &Work
         } else {
             let read_only = mode == Some("read_only");
             let admission = status["participation"]["uncertainty_blocks"][name].as_bool();
+            let reserved = name != "answer" && work["admission_reservation"]["active"] == true;
             // Only explicit per-capability admission evidence can fence this row.
             // Unknown effects remain risk, not a global outage or replay permission.
-            if !read_only && (admission == Some(true) || work["phase"] == "blocked") {
+            if !read_only && (admission == Some(true) || reserved || work["phase"] == "blocked") {
                 finding = (
                     "blocked",
                     if admission == Some(true) {
                         "admission_blocked"
+                    } else if reserved {
+                        "answer_retry_reserved"
                     } else {
                         "work_blocked"
                     },
@@ -1250,6 +1253,31 @@ mod tests {
             {"scope":"receipt","state":"idle","finished_at":1,"last_failure_at":1,"status":500}
         ]);
         (config, options, status)
+    }
+
+    #[test]
+    fn refusal_priority_is_not_reported_as_uncertain_execution() {
+        let (config, options, mut status) = component_fixture();
+        status["participation"]["unresolved_count"] = json!(0);
+        status["pending"] = Value::Null;
+        for kind in ["answer", "judge", "mine"] {
+            status["work"][kind]["admission_reservation"] =
+                json!({"active":true,"same_operation":true,"basis":"proven_refusal_retry"});
+        }
+        let result = evaluate(&config, options, &status, 10000);
+        assert_eq!(result["components"]["answer"]["state"], "ok");
+        for kind in ["judge", "mine"] {
+            assert_eq!(result["components"][kind]["state"], "blocked");
+            assert_eq!(
+                result["components"][kind]["reasons"][0],
+                "answer_retry_reserved"
+            );
+        }
+        status["effective_runtime"]["capabilities"]["judge"] = json!("read_only");
+        assert_eq!(
+            evaluate(&config, options, &status, 10000)["components"]["judge"]["state"],
+            "ok"
+        );
     }
 
     #[test]

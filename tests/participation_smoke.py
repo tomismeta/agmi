@@ -53,6 +53,8 @@ class Fixture:
         self.delayed_grade = None
         self.nonce = 1
         self.jobs = {}
+        self.queued_grades = False
+        self.assignment_number = 10
         self.policy = dict(mode='strict', uncertainty_grace_seconds=1,
                            max_unresolved_operations=4, allow_answer=True,
                            allow_judge=False, allow_mine=True,
@@ -125,6 +127,12 @@ print(json.dumps({'provider': 'openai-codex', 'model': payload['model'],
                                  received_at=time.monotonic(), nonce=fixture.nonce)
                     fixture.writes.append(write)
                     if route.endswith('/api/hosted/grade'):
+                        if fixture.queued_grades:
+                            job = 'grade-' + str(fixture.assignment_number)
+                            fixture.jobs[job] = 'pending'
+                            fixture.assignment_number += 1
+                            self.reply(202, {'state': 'queued', 'job_id': job})
+                            return
                         # Keep the actual received request alive after dropping its response.
                         fixture.delayed_grade = write
                         self.close_connection = True
@@ -181,7 +189,9 @@ print(json.dumps({'provider': 'openai-codex', 'model': payload['model'],
                         body = {'epoch': fixture.epoch, 'answered': fixture.answered,
                                 'words': ['clock', 'bridge'], 'min_chars': 120, 'max_chars': 600}
                     elif route.endswith('/api/hosted/assignments'):
-                        rows = ([{'answer_txid': 'a' * 64, 'answer_epoch': 9,
+                        rows = ([{'answer_txid': (f'{fixture.assignment_number:064x}'
+                                                 if fixture.queued_grades else 'a' * 64),
+                                  'answer_epoch': 9,
                                   'answer': 'A clock on the bridge enforces a delay before each claim.',
                                   'words': ['clock', 'bridge'], 'author_prior': [],
                                   'pending_meta': {'expires_at_epoch': 1000}}]
@@ -191,6 +201,9 @@ print(json.dumps({'provider': 'openai-codex', 'model': payload['model'],
                     elif '/api/job/' in route:
                         job = route.rsplit('/', 1)[1]
                         outcome = fixture.jobs.get(job)
+                        if outcome == 'pending':
+                            self.reply(202, {'state': 'queued'})
+                            return
                         if outcome == 'bad_nonce':
                             self.reply(400, {'state': 'done', 'ok': False, 'error': 'bad_nonce',
                                              'next_nonce': fixture.nonce})
@@ -198,10 +211,17 @@ print(json.dumps({'provider': 'openai-codex', 'model': payload['model'],
                         if outcome != 'final':
                             self.send_error(404)
                             return
-                        body = {'state': 'done', 'ok': True, 'challenge_txid': TXID}
-                    elif route.endswith('/api/receipt/' + TXID):
-                        body = {'status': 'included', 'txid': TXID, 'sender': fixture.address,
-                                'next_nonce': fixture.nonce + 1}
+                        body = {'state': 'done', 'ok': True}
+                        if job.startswith('grade-'):
+                            body['id'] = hashlib.sha256(job.encode()).hexdigest()
+                        else:
+                            body['challenge_txid'] = TXID
+                    elif route.endswith('/api/receipt/' + TXID) or (
+                            fixture.queued_grades and any(
+                                route.endswith('/api/receipt/' + hashlib.sha256(job.encode()).hexdigest())
+                                for job in fixture.jobs if job.startswith('grade-'))):
+                        body = {'status': 'included', 'txid': route.rsplit('/', 1)[1],
+                                'sender': fixture.address, 'next_nonce': fixture.nonce + 1}
                         if fixture.receipt_state == 'final':
                             body['checkpoint_covered'] = True
                         elif fixture.receipt_state == 'confirmed':
@@ -738,11 +758,80 @@ def local_retry_scenario(f):
                 zero_grace_and_manual_unblocked=True, restart_preserved_server_minimum_separation=True)
 
 
+def retry_priority_scenario(f):
+    """A due retry owns admission across fresh-read cadence, not just one tick."""
+    f.queued_grades = True
+    f.assignments = True
+    f.answered = True
+    f.capabilities['judge'] = 'active'
+    f.configure(mode='participation_first', allow_judge=True,
+                uncertainty_grace_seconds=2, max_unresolved_operations=8)
+    f.start(resume=True)
+    f.wait(lambda: any(row['state'] == 'queued' for row in f.operations('judge')),
+           'initial judgment did not queue')
+    # Obtain the original failure and its genuine upstream floor through HTTP.
+    with f.lock:
+        f.answer_response, f.retry_after, f.answered = 'backoff', 3600, False
+    f.unknown('answer')
+    f.stop()
+    original = f.dispatched('answer')[0]
+    judges = len(f.dispatched('judge'))
+    assert f.rows('SELECT retry_not_before FROM operation_timing WHERE operation_id=?',
+                  (original['id'],))[0]['retry_not_before'] > time.time() + 3000
+    # Only the fixture clocks move: expire the original delay/floor and leave a
+    # bounded fresh-read cadence gap. Old admission fills this gap with another
+    # eligible judgment, starting grace again; priority admission must not.
+    with sqlite3.connect(f.database) as db:
+        db.execute('UPDATE operation_timing SET retry_not_before=0')
+        db.execute('UPDATE operation_evidence SET observed_at=? WHERE operation_id=?',
+                   (int(time.time()) - 3601, original['id']))
+        db.execute('UPDATE operation_evidence SET blocked_since=?', (int(time.time()) - 100,))
+        db.execute("UPDATE operations SET next_at=0 WHERE state='queued'")
+        db.execute("INSERT OR REPLACE INTO schedule(kind,next_at) VALUES ('answer',?)",
+                   (int(time.time()) + 8,))
+        db.execute("INSERT OR REPLACE INTO schedule(kind,next_at) VALUES ('judge',0)")
+    f.answer_response, f.receipt_state = 'included', 'confirmed'
+    f.configure(retry_uncertain_answers=True, uncertain_answer_retry_seconds=2)
+    before_polls = sum('/api/job/grade-' in route for route, _, _ in f.reads)
+    retry_started = time.monotonic()
+    f.start()
+    f.wait(lambda: len(f.dispatched('judge')) > judges or
+           (any(row['state'] in ('prepared', 'generated') for row in f.operations('judge'))
+            and sum('/api/job/grade-' in route for route, _, _ in f.reads) >= before_polls + 2),
+           'retained judgment preparation and queued reconciliation did not progress', seconds=7)
+    assert len(f.dispatched('judge')) == judges, (
+        'lower-priority dispatch renewed grace during a due answer retry', f.dispatched())
+    retained = next(row['id'] for row in f.operations('judge')
+                    if row['state'] in ('prepared', 'generated'))
+    with f.lock:
+        for job in f.jobs:
+            if job.startswith('grade-'):
+                f.jobs[job] = 'final'
+    f.wait(lambda: any(row['state'] == 'confirmed' for row in f.operations('judge')),
+           'existing queued judgment did not settle during retry admission')
+    f.wait(lambda: any(row['txid'] for row in f.dispatched('answer')),
+           'due answer retry did not dispatch after existing gates cleared')
+    f.wait(lambda: any(row['id'] == retained for row in f.dispatched('judge')),
+           'retained lower-priority draft did not resume after answer acceptance')
+    assert len(f.dispatched('answer')) == 2
+    attempts = f.dispatched('answer')
+    assert attempts[0]['payload'] == attempts[1]['payload']
+    assert f.model_calls('answer') == 1
+    f.preserved(original)
+    retry_write = next(write for write in f.writes
+                       if write['route'].endswith('/answer') and write['received_at'] >= retry_started)
+    assert any(route.endswith('/api/hosted/challenge')
+               and retry_started <= at <= retry_write['received_at'] for route, _, at in f.reads)
+    return dict(answer_attempts=2, lower_priority_waited=True, retained_judge_resumed=True,
+                queued_reconciliation_continued=True, original_unknown_preserved=True)
+
+
 SCENARIOS = dict(rollover=rollover_scenario, retry=retry_scenario, fences=fences_scenario,
                  inclusion=inclusion_scenario, final=final_scenario,
                  retry_after=retry_after_scenario, manual=manual_scenario,
                  slow_read=slow_read_scenario, changed_epoch=changed_epoch_scenario,
-                 mine_epoch=mine_epoch_scenario, local_retry=local_retry_scenario)
+                 mine_epoch=mine_epoch_scenario, local_retry=local_retry_scenario,
+                 retry_priority=retry_priority_scenario)
 
 
 def main():

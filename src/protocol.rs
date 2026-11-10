@@ -19,6 +19,7 @@ use std::{
 
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_TEXT_CHARS: usize = 16384;
+const HALT_MIDDLEWARE_ERROR: &str = "endpoint temporarily halted — API hardening in progress";
 
 /// Bounded diagnostics only; these categories never establish a write outcome.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -774,7 +775,7 @@ fn unknown(reason: &str) -> Outcome {
 
 pub fn classify_source(kind: WorkKind, response: &Response, source: ResponseSource) -> Outcome {
     let body = &response.body;
-    if !body.is_object() {
+    if response.read_failure.is_some() || !body.is_object() {
         return unknown("response_shape_unknown");
     }
     let code = error_code(body);
@@ -785,8 +786,17 @@ pub fn classify_source(kind: WorkKind, response: &Response, source: ResponseSour
     {
         return unknown("conflicting_error_codes");
     }
+    let refused_submit = source == ResponseSource::Submit
+        && (response.status == 429
+            || (kind != WorkKind::Mine
+                && response.status == 503
+                && matches!(code, Some("epoch_closing" | HALT_MIDDLEWARE_ERROR))));
     if body.get("state").is_some_and(|state| !state.is_string()) {
-        return unknown("job_state_unknown");
+        return unknown(if refused_submit {
+            "contradictory_acceptance"
+        } else {
+            "job_state_unknown"
+        });
     }
     let state = body.get("state").and_then(Value::as_str);
     let has_tx = ["id", "challenge_txid", "txid"]
@@ -828,19 +838,42 @@ pub fn classify_source(kind: WorkKind, response: &Response, source: ResponseSour
     {
         return unknown("contradictory_acceptance");
     }
-    if kind != WorkKind::Mine && !has_tx {
-        if source == ResponseSource::Submit
-            && ((response.status == 429 && code == Some("accept queue full"))
-                || (response.status == 503 && code == Some("epoch_closing")))
-            && state.is_none()
+    if refused_submit {
+        // Every 429 rejects before enqueue/write, including hosted mining.
+        // The identified halt middleware covers answer/judge routes only;
+        // diagnostic halt flags alone do not identify that middleware.
+        if has_tx
+            || state.is_some()
+            || body.get("ok") == Some(&Value::Bool(true))
+            || body.get("success") == Some(&Value::Bool(true))
+            || body.get("next_nonce").is_some()
+            || body.get("attested").is_some()
+            || body.get("processed").is_some_and(|value| value != false)
+            || matches!(
+                body.get("status").and_then(Value::as_str),
+                Some(
+                    "accepted"
+                        | "queued"
+                        | "running"
+                        | "processing"
+                        | "done"
+                        | "included"
+                        | "completed"
+                )
+            )
         {
-            return Outcome::Retry {
-                after_seconds: response
-                    .retry_after_seconds
-                    .unwrap_or(if response.status == 429 { 5 } else { 30 })
-                    .max(1),
-            };
+            return unknown("contradictory_acceptance");
         }
+        return Outcome::Retry {
+            after_seconds: max_delay(
+                response.retry_after_seconds,
+                body.get("retry_after_seconds").and_then(Value::as_u64),
+            )
+            .unwrap_or(if response.status == 429 { 5 } else { 30 })
+            .max(1),
+        };
+    }
+    if kind != WorkKind::Mine && !has_tx {
         if source == ResponseSource::BoundJob
             && response.status == 408
             && code == Some("job_expired")
@@ -979,7 +1012,9 @@ fn response_error_category(kind: WorkKind, response: &Response) -> Option<&'stat
         (_, "accept queue full") => Some("accept_queue_full"),
         (_, "epoch_closing") => Some("epoch_closing"),
         (_, "job_expired") => Some("job_expired"),
-        (_, "endpoint temporarily halted — API hardening in progress") => Some("endpoint_halted"),
+        (_, HALT_MIDDLEWARE_ERROR) if kind != WorkKind::Mine && response.status == 503 => {
+            Some("halt_middleware")
+        }
         (WorkKind::Answer, value) => {
             let limit = value.strip_prefix("answer surface is at its global ceiling (")?;
             let limit = limit.strip_suffix(" — retry shortly").unwrap_or(limit);
@@ -1474,22 +1509,55 @@ mod tests {
     }
     #[test]
     fn only_documented_nonacceptance_can_retry() {
-        for (status, code) in [(429, "accept queue full"), (503, "epoch_closing")] {
-            let mut result = response(status, json!({"error":code}));
-            result.retry_after_seconds = Some(123);
+        for (status, body, fallback) in [
+            (429, json!({"error":"accept queue full"}), 5),
+            (429, json!({"error":"rate_limited"}), 5),
+            (429, json!({"error":"grade queue is full"}), 5),
+            (429, json!({}), 5),
+            (503, json!({"error":"epoch_closing"}), 30),
+            (503, json!({"error":HALT_MIDDLEWARE_ERROR}), 30),
+        ] {
+            let mut result = response(status, body);
+            for kind in [WorkKind::Answer, WorkKind::Judge] {
+                assert_eq!(
+                    classify_source(kind, &result, ResponseSource::Submit),
+                    Outcome::Retry {
+                        after_seconds: fallback
+                    }
+                );
+                assert!(matches!(
+                    classify_source(kind, &result, ResponseSource::BoundJob),
+                    Outcome::Unknown { .. }
+                ));
+            }
+            result.retry_after_seconds = Some(3600);
             assert_eq!(
                 classify_source(WorkKind::Answer, &result, ResponseSource::Submit),
-                Outcome::Retry { after_seconds: 123 }
+                Outcome::Retry {
+                    after_seconds: 3600
+                }
             );
-            assert!(matches!(
-                classify_source(WorkKind::Mine, &result, ResponseSource::Submit),
-                Outcome::Unknown { .. }
-            ));
+            if status == 429 {
+                assert_eq!(
+                    classify_source(WorkKind::Mine, &result, ResponseSource::Submit),
+                    Outcome::Retry {
+                        after_seconds: 3600
+                    }
+                );
+            } else {
+                assert!(matches!(
+                    classify_source(WorkKind::Mine, &result, ResponseSource::Submit),
+                    Outcome::Unknown { .. }
+                ));
+            }
         }
         for (status, code) in [
             (503, "overloaded"),
             (500, "epoch_closing"),
-            (429, "rate_limited"),
+            (400, "rate_limited"),
+            (403, HALT_MIDDLEWARE_ERROR),
+            (502, HALT_MIDDLEWARE_ERROR),
+            (504, "rate_limited"),
         ] {
             assert!(matches!(
                 classify_source(
@@ -1499,6 +1567,64 @@ mod tests {
                 ),
                 Outcome::Unknown { .. }
             ));
+        }
+    }
+
+    #[test]
+    fn only_exact_halt_middleware_has_authoritative_diagnostic_category() {
+        let halted = response(503, json!({"error":HALT_MIDDLEWARE_ERROR}));
+        let evidence = response_evidence(WorkKind::Judge, ResponseSource::Submit, Some(&halted));
+        assert_eq!(evidence.error_category.as_deref(), Some("halt_middleware"));
+        assert_eq!(failure_category(&halted), Some("endpoint_halted"));
+        assert_eq!(
+            response_evidence(
+                WorkKind::Judge,
+                ResponseSource::Submit,
+                Some(&response(503, json!({"halted":true}))),
+            )
+            .error_category
+            .as_deref(),
+            Some("endpoint_halted")
+        );
+    }
+
+    #[test]
+    fn refusal_retry_delay_preserves_valid_server_minima() {
+        for (header, body, expected) in [
+            (Some(300), json!(3600), 3600),
+            (Some(3600), json!(300), 3600),
+            (None, json!(3600), 3600),
+            (None, json!(0), 1),
+            (Some(3600), json!(-1), 3600),
+            (Some(3600), json!("7200"), 3600),
+            (None, json!(1.5), 5),
+            (None, json!(u64::MAX), u64::MAX),
+        ] {
+            let mut result = response(429, json!({"retry_after_seconds":body}));
+            result.retry_after_seconds = header;
+            assert_eq!(
+                classify_source(WorkKind::Judge, &result, ResponseSource::Submit),
+                Outcome::Retry {
+                    after_seconds: expected
+                }
+            );
+        }
+        assert_eq!(parse_retry_after("3600"), Some(3600));
+        assert_eq!(parse_retry_after("-1"), None);
+        assert_eq!(parse_retry_after("18446744073709551616"), None);
+    }
+
+    #[test]
+    fn incomplete_refusal_responses_remain_unknown() {
+        for status in [429, 503, 502, 504] {
+            for body in [Value::Null, json!({"error":HALT_MIDDLEWARE_ERROR})] {
+                let mut result = response(status, body);
+                result.read_failure = Some(ReadFailure::Timeout);
+                assert!(matches!(
+                    classify_source(WorkKind::Judge, &result, ResponseSource::Submit),
+                    Outcome::Unknown { .. }
+                ));
+            }
         }
     }
     #[test]
@@ -1871,32 +1997,116 @@ mod tests {
     }
     #[test]
     fn acceptance_evidence_prevents_refusal_retries() {
-        for body in [
-            json!({"error":"accept queue full","job_id":"capability"}),
-            json!({"error":"accept queue full","id":txid()}),
-            json!({"error":"accept queue full","accepted":true}),
-            json!({"error":"accept queue full","ok":true}),
+        for (status, code) in [
+            (429, "accept queue full"),
+            (429, "rate_limited"),
+            (503, HALT_MIDDLEWARE_ERROR),
+            (503, "epoch_closing"),
         ] {
+            for indicator in [
+                json!({"job_id":"capability"}),
+                json!({"job_id":null}),
+                json!({"id":txid()}),
+                json!({"challenge_txid":txid()}),
+                json!({"txid":null}),
+                json!({"accepted":true}),
+                json!({"queued":true}),
+                json!({"ok":true}),
+                json!({"success":true}),
+                json!({"state":"done"}),
+                json!({"status":"processing"}),
+                json!({"processed":true}),
+                json!({"next_nonce":7}),
+                json!({"attested":1}),
+                json!({"code":"different_error"}),
+            ] {
+                let mut body = indicator;
+                body["error"] = json!(code);
+                for kind in [WorkKind::Answer, WorkKind::Judge, WorkKind::Mine] {
+                    assert!(matches!(
+                        classify_source(
+                            kind,
+                            &response(status, body.clone()),
+                            ResponseSource::Submit
+                        ),
+                        Outcome::Unknown { .. }
+                    ));
+                }
+            }
+        }
+        for body in [json!({"ok":true}), json!({"success":true})] {
             assert!(matches!(
                 classify_source(
-                    WorkKind::Answer,
+                    WorkKind::Judge,
                     &response(429, body),
                     ResponseSource::Submit
                 ),
                 Outcome::Unknown { .. }
             ));
         }
-        for (status, body) in [
-            (429, json!({"error":"answer ceiling"})),
-            (429, json!({"error":"grade queue full"})),
-            (503, json!({"halted":true})),
-            (200, json!({"state":"done","error":"unspecified failure"})),
+        let duplicate = response(429, json!({"error":"duplicate_in_flight","job_id":"bound"}));
+        assert!(matches!(
+            classify_source(WorkKind::Judge, &duplicate, ResponseSource::Submit),
+            Outcome::Queued { .. }
+        ));
+    }
+
+    #[test]
+    fn refusal_contradictions_survive_in_recovery_diagnostics_without_candidates() {
+        for (kind, status, code, category) in [
+            (WorkKind::Answer, 429, "rate_limited", "rate_limited"),
+            (WorkKind::Judge, 429, "rate_limited", "rate_limited"),
+            (WorkKind::Mine, 429, "rate_limited", "rate_limited"),
+            (
+                WorkKind::Answer,
+                503,
+                HALT_MIDDLEWARE_ERROR,
+                "halt_middleware",
+            ),
+            (
+                WorkKind::Judge,
+                503,
+                HALT_MIDDLEWARE_ERROR,
+                "halt_middleware",
+            ),
         ] {
-            for source in [ResponseSource::Submit, ResponseSource::BoundJob] {
-                assert!(matches!(
-                    classify_source(WorkKind::Judge, &response(status, body.clone()), source),
-                    Outcome::Unknown { .. }
-                ));
+            for indicator in [
+                json!({"state":"done"}),
+                json!({"state":"expired"}),
+                json!({"state":"unrecognized"}),
+                json!({"state":null}),
+                json!({"id":null}),
+                json!({"id":"invalid"}),
+                json!({"challenge_txid":null}),
+                json!({"txid":null}),
+                json!({"job_id":null}),
+                json!({"accepted":true}),
+                json!({"queued":true}),
+                json!({"ok":true}),
+                json!({"success":true}),
+                json!({"status":"processing"}),
+                json!({"processed":true}),
+                json!({"next_nonce":7}),
+                json!({"attested":1}),
+            ] {
+                let mut body = indicator;
+                body["error"] = json!(code);
+                let result = response(status, body);
+                let classified = classify_source(kind, &result, ResponseSource::Submit);
+                assert_eq!(
+                    classified,
+                    Outcome::Unknown {
+                        reason: "contradictory_acceptance".into()
+                    }
+                );
+                let candidates = response_candidates(&result);
+                assert!(candidates.job_id.is_none());
+                assert!(candidates.transaction_ids.is_empty());
+                let evidence = response_evidence(kind, ResponseSource::Submit, Some(&result));
+                assert_eq!(evidence.reason, "contradictory_acceptance");
+                assert_eq!(evidence.error_category.as_deref(), Some(category));
+                assert_eq!(evidence.stage, ResponseSource::Submit);
+                assert_eq!(evidence.status, Some(status));
             }
         }
     }
@@ -1974,7 +2184,6 @@ mod tests {
                 "authentication_rejected",
             ),
             (403, json!({}), "permission_denied"),
-            (429, json!({"error":"private-canary"}), "rate_limited"),
             (502, json!({}), "bad_gateway"),
             (504, json!({}), "gateway_timeout"),
             (500, json!({}), "upstream_error"),
@@ -2026,7 +2235,7 @@ mod tests {
     }
 
     #[test]
-    fn recognized_rate_limit_diagnostic_never_authorizes_unknown_replay() {
+    fn rate_limit_refusal_keeps_bounded_diagnostics() {
         let limited = response(
             429,
             json!({
@@ -2040,10 +2249,10 @@ mod tests {
             diagnostic.error_category.as_deref(),
             Some("answer_global_ceiling")
         );
-        assert!(matches!(
+        assert_eq!(
             classify_source(WorkKind::Answer, &limited, ResponseSource::Submit),
-            Outcome::Unknown { .. }
-        ));
+            Outcome::Retry { after_seconds: 60 }
+        );
         let injected = response(
             429,
             json!({

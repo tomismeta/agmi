@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Reserve effect admission for an authorized current-epoch uncertain-answer retry once its own delay and retained floor expire. New judgments/mining cannot continually renew its grace; preparation, reads and existing-job reconciliation continue. Keep all retry risk, freshness, capacity and manual authorization fences, and expose local original/blocking operation identities with wait deadlines.
+- Treat explicit submission rate-limit and halt refusals as retryable nonacceptance without discarding valid artifacts or shortening retained server delays. Keep ambiguous gateway/server failures and contradictory acceptance evidence unresolved.
+- Add explicit stopped-writer refusal-recovery preview and token-bound application. Retire only evidence-supported historical refusals with an audit record, without replaying stale payloads, changing nonces or erasing original evidence; generic historical 503s remain unresolved.
+
 ## 0.1.0
 
 Source change history; this heading does not assert publication, signed release provenance or live acceptance of every feature.

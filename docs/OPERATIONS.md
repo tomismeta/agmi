@@ -78,7 +78,7 @@ evidence: an interrupted 503 body may be labeled `timeout`, not a proven halt.
 
 | Category | Next action |
 | --- | --- |
-| `endpoint_halted`, `service_unavailable`, `bad_gateway`, `gateway_timeout`, `upstream_error` | Let scheduled read recovery proceed; inspect freshness and work deadlines. |
+| `halt_middleware`, `endpoint_halted`, `service_unavailable`, `bad_gateway`, `gateway_timeout`, `upstream_error` | Let scheduled read recovery proceed; inspect freshness and work deadlines. |
 | `rate_limited`, `answer_global_ceiling`, `grade_queue_full` | Honor the retained retry floor; do not restart to bypass it. |
 | `authentication_rejected`, `permission_denied` | Inspect credential configuration with `config check` and recorded endpoint evidence with `reads`; neither validates a credential remotely. Do not move credentials into a URL or register a replacement identity. A 403 alone does not prove an invalid key. |
 | `redirect_refused`, `not_found`, `gone`, `request_rejected`, `upstream_rejected` | Inspect the configured network profile and operation evidence. A missing job or receipt is not proof a write failed. |
@@ -90,10 +90,15 @@ not “the service will be restored at this time.” Free-form outage prose is n
 parsed into a recovery timestamp. Unknown error bodies retain a safe HTTP or
 transport category; they never silently become success.
 
-These categories are diagnostic, not write-retry authority. A generic 429, halt,
-503 or timeout on submission can still leave the operation unknown. Existing
-bound-job reconciliation and configured participation policy decide subsequent
-work; neither maintenance wording nor a deadline proves the earlier write missed.
+For submissions, a complete, structurally valid JSON HTTP 429 refusal or a 503
+with the exact halt middleware error on answer/judge submission permits retry
+of retained work after backoff and fresh eligibility checks. This follows the upstream developer's pre-acceptance rejection contract;
+it is not a general rule that all 4xx/5xx responses prove nonexecution.
+Acceptance indicators or contradictory response fields prevent this shortcut.
+Generic 503, 502/504, interrupted responses and timeouts remain uncertain.
+Job/receipt lookup errors never establish rejection of the original submission.
+Retained server minima still apply, including an earlier one-hour `Retry-After`;
+maintenance prose or an expected server fix does not shorten them.
 
 Accepted bound jobs can opt into a separate polling policy:
 
@@ -178,6 +183,26 @@ Local reconciliation cadence and jitter do not extend the risk-admission grace o
 Status scopes `participation.uncertainty_blocks` to `observation_epoch` and the effective policy. A false value means uncertainty itself does not block that capability—not that fresh eligibility, upstream availability or acceptance is guaranteed. An already accepted answer is not labelled an uncertainty blocker.
 
 Retrying an uncertain answer in the **same epoch** additionally requires `retry_uncertain_answers = true`, `uncertain_answer_retry_seconds` (default 600), and remaining `max_answer_attempts_per_epoch` (default 2). The budget counts distinct dispatched operations, not model failures or safe retries of proven nonacceptance. Matching captured payloads are reused without new inference; a changed challenge requires current-valid preparation. Included, confirmed, final or freshly reported answered work is not retried for finality delay alone.
+
+A due, authorized current-epoch uncertain-answer retry temporarily reserves **new effect admission**, not model preparation or reads. The reservation begins only after the original answer's retained retry floor and its own applicable grace/retry delay; it does not stop judging for the original long `Retry-After`. New judging/mining submissions then wait rather than continually moving the retry's eligibility window. Already-started effects and bound jobs continue settling, prepared judgments are retained, and every other operation's floor/grace, capacity limit, fresh challenge/identity check and attempt budget still applies.
+
+This is derived priority, not another retry permission or resolution of the original. Both queued and unknown answers use the existing explicit uncertain-answer retry policy; known queued jobs keep their reconciliation. Strict mode never reserves for a risk retry; manual mode requires an unconsumed current-generation answer grant. The reservation ends when the answer is accepted/reported answered, the epoch changes, retry intent is disabled/paused, its dispatch budget is exhausted, or unsent preparation fails without a permitted model-retry transition. Discarding a stale draft or rejecting a dispatched retry does not end priority while another retry remains permitted. Upstream outages or unresolved capacity can still prolong the wait; no timer supplies fresh eligibility.
+
+`status.work.answer.retry` identifies the original and, for floor/grace/live-effect waits, the blocking local operation (`blocking_operation_id`) and `next_at` deadline. `reservation_active` and `reservation_retry_not_before` describe the derived reservation. Prepared lower-priority work waiting for admission reports `answer_retry_reserved`; reads and preparation retain their own progress phases. The separate `admission_reservation` exposes `original_operation_id` and `retry_not_before`; that timestamp is the original's earliest retry point, **not** a promised dispatch time. These are local journal numbers, never bearer-like job identifiers or payloads.
+
+A due, positively refused answer also reserves admission for retry of its same
+captured operation, including when no earlier unknown answer exists. Reusing
+that operation does not consume a new distinct-attempt slot; this never permits
+a fresh third attempt beyond the budget. Its own delay must expire first.
+Ordinary retries with no unresolved effects retain existing strict/manual
+permission; overlapping uncertain effects still require the existing policy
+and, in manual mode, an unused grant.
+`admission_reservation` on each work kind exposes `active`, `same_operation`,
+and `basis`; for a standalone refusal its `original_operation_id` identifies
+the refused operation itself, not a fabricated uncertain predecessor.
+Priority reservations are reported separately from `uncertainty_blocks`.
+Health uses `answer_retry_reserved` for this admission wait without inventing
+an unresolved effect.
 
 Manual administration, with the runtime stopped:
 
@@ -295,6 +320,32 @@ Before live activation, stop other client writers for the account. Preserve unre
 `model_unknown` means no MinePOA request was dispatched for that attempt. Configured uncertain-model retries are disabled by default. For explicit manual regeneration, stop the runtime, run `agmi --config ./config.local.toml recover-model`, then restart it. This preserves pause and never clears an unknown network request.
 
 `recover inspect --operation N` exposes **private** captured payloads, admission evidence and identifiers; do not forward it. With the writer stopped, `recover resolve --operation N` performs authenticated read-only reconciliation of an already-bound job/transaction. Optional `--job-id` or `--txid` must match the existing binding, never a guessed identifier. Identifier-less outcomes can remain unknown indefinitely without upstream attribution. A classifier upgrade, nonce snapshot, timeout, assignment disappearance, model opinion or risk grant cannot supply terminal proof.
+
+Historical refusal recovery is a separate, local-only operator action with the
+writer stopped:
+
+```sh
+agmi --json recover resolve --operation "$OPERATION_ID" --refusal --dry-run
+# Review eligibility and evidence_limit, then use that preview's token.
+agmi --json recover resolve --operation "$OPERATION_ID" --refusal --apply "$PREVIEW_TOKEN"
+```
+
+This retires an eligible operation as `refused`, not successful and not scheduled
+for replay. Retained request, artifact, submission evidence, retry floors and
+dispatch history remain intact; the resolution is audited. A changed preview
+cannot authorize application, and repeating an applied token is idempotent.
+Recovery requires positive retained refusal evidence and excludes bound or
+contradictory acceptance evidence. Old generic `service_unavailable` or
+`endpoint_halted` diagnostics do not establish the exact halt response and cannot
+authorize historical 503 recovery. Missing original response details remain an
+explicit evidence limitation, not reconstructed proof.
+An unexpired server delay blocks retirement even if a crash interrupted the
+normal retry-timing update after response capture.
+For legacy 429s, approval applies the developer-reported pre-acceptance contract
+to the retained status/category. Original response fields that were not retained
+cannot be rechecked; this is an explicit recovery-policy decision, not newly
+observed upstream execution evidence. Any retained acceptance or contradiction
+evidence still excludes recovery.
 
 Model launch rechecks durable pause generation under the admission lock after native harness discovery, immediately before spawning inference. Pause therefore cannot acknowledge success and then allow a stale preflight to launch new inference.
 

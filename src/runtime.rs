@@ -1188,6 +1188,8 @@ impl Runtime {
             op.state = "discarded".into();
             self.store.save(&op, "unsent_admission_closed")?;
         } else if !self.store.admission_allowed(&self.config, &op)? {
+            // A due answer retry reserves only effect admission. Keep prepared
+            // judgments intact, and keep challenge observation/reconciliation live.
             if matches!(kind, WorkKind::Answer | WorkKind::Mine)
                 && self.store.next_at(kind)? <= now()
             {
@@ -1911,17 +1913,14 @@ impl Runtime {
         };
         match result {
             Ok(response) => {
-                self.store.record_candidates(
-                    op.id,
-                    &serde_json::to_value(crate::protocol::response_candidates(&response))?,
-                )?;
-                self.store.record_evidence(
+                self.store.record_submission_evidence(
                     op.id,
                     &serde_json::to_value(response_evidence(
                         op.kind,
                         ResponseSource::Submit,
                         Some(&response),
                     ))?,
+                    &serde_json::to_value(crate::protocol::response_candidates(&response))?,
                 )?;
                 self.outcome(
                     op,
@@ -1931,13 +1930,14 @@ impl Runtime {
                 )?;
             }
             _ => {
-                self.store.record_evidence(
+                self.store.record_submission_evidence(
                     op.id,
                     &serde_json::to_value(response_evidence(
                         op.kind,
                         ResponseSource::Submit,
                         None,
                     ))?,
+                    &Value::Null,
                 )?;
                 op.state = "unknown".into();
                 op.next_at = not_before(self.retry_delay(None));
@@ -2012,7 +2012,10 @@ impl Runtime {
                 if submitted {
                     op.state = "retry".into();
                 }
-                op.next_at = not_before(self.retry_delay(Some(after_seconds)));
+                let (_, retained_minimum) = self.store.operation_poll_timing(op.id)?;
+                op.next_at =
+                    not_before(self.retry_delay(Some(after_seconds.max(retry_after.unwrap_or(0)))))
+                        .max(retained_minimum);
                 "submission_backoff"
             }
             Outcome::Expired => {
@@ -2585,6 +2588,398 @@ mod tests {
             body.len()
         );
         stream.write_all(reply.as_bytes()).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn refusal_retries_reuse_artifacts_after_server_floor_and_fresh_eligibility() {
+        for kind in [WorkKind::Answer, WorkKind::Judge] {
+            for status in [429, 503] {
+                for eligible in [true, false] {
+                    let credentials = tempfile::tempdir().unwrap();
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let mut config = active_judge_config(credentials.path());
+                    config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
+                    config.capabilities.answer = if kind == WorkKind::Answer {
+                        Mode::Active
+                    } else {
+                        Mode::Off
+                    };
+                    let (_temp, mut runtime, _sender) = fixture_with(config);
+                    runtime.store.defer(WorkKind::Answer, 3600).unwrap();
+                    let challenge_body = json!({
+                        "epoch":8,"words":["burn"],"answered":false,
+                        "min_chars":4,"max_chars":100
+                    });
+                    let mut op = if kind == WorkKind::Answer {
+                        let challenge = parse_challenge(&response(challenge_body.clone())).unwrap();
+                        let input = Input {
+                            solver: runtime.request(kind, &challenge, None).unwrap(),
+                            challenge_fingerprint: Some(challenge.fingerprint.clone()),
+                        };
+                        let mut op = runtime
+                            .store
+                            .begin(
+                                kind,
+                                &format!("8:{}", challenge.fingerprint),
+                                "prepared",
+                                &serde_json::to_value(&input).unwrap(),
+                                runtime.store.control().unwrap(),
+                                &runtime.config.revision().unwrap(),
+                            )
+                            .unwrap();
+                        op.payload = Some(payload(&input.solver, &result()).unwrap());
+                        op
+                    } else {
+                        judging_operation(&mut runtime, &"a".repeat(64), "generated")
+                    };
+                    op.result = Some(serde_json::to_value(result()).unwrap());
+                    runtime.store.save(&op, "model_result_captured").unwrap();
+                    let captured = (op.payload.clone(), op.result.clone());
+                    let prefix = format!("/chain/{}", runtime.config.network.chain);
+                    let fresh_path = format!(
+                        "GET {prefix}/api/hosted/{}",
+                        if kind == WorkKind::Answer {
+                            "challenge"
+                        } else {
+                            "assignments"
+                        }
+                    );
+                    let submit_path = format!(
+                        "POST {prefix}/api/hosted/{}",
+                        if kind == WorkKind::Answer {
+                            "answer"
+                        } else {
+                            "grade"
+                        }
+                    );
+                    let identity_path = format!("GET {prefix}/api/hosted/me");
+                    let fresh_body = if kind == WorkKind::Answer {
+                        challenge_body
+                    } else {
+                        judging_inventory(&[op.key.clone()]).body
+                    };
+                    let identity = json!({"address":runtime.config.network.address});
+                    let initial_fresh = fresh_body.clone();
+                    let paths = (
+                        fresh_path.clone(),
+                        identity_path.clone(),
+                        submit_path.clone(),
+                    );
+                    let initial_identity = identity.clone();
+                    let server = tokio::spawn(async move {
+                        api_reply(&listener, &paths.0, 200, None, initial_fresh).await;
+                        api_reply(&listener, &paths.1, 200, None, initial_identity).await;
+                        let (header, body_delay, error) = if status == 429 {
+                            (3600, 300, "rate_limited")
+                        } else {
+                            (
+                                300,
+                                3600,
+                                "endpoint temporarily halted — API hardening in progress",
+                            )
+                        };
+                        api_reply(
+                            &listener,
+                            &paths.2,
+                            status,
+                            Some(header),
+                            json!({"error":error,"retry_after_seconds":body_delay}),
+                        )
+                        .await;
+                        listener
+                    });
+                    let before = now();
+                    runtime.dispatch(&mut op).await.unwrap();
+                    let listener = server.await.unwrap();
+                    assert_eq!(op.state, "retry");
+                    assert_eq!((op.payload.clone(), op.result.clone()), captured);
+                    assert!(op.next_at >= before + 3600);
+                    assert!(runtime.store.operation_poll_timing(op.id).unwrap().1 >= before + 3600);
+                    assert!(runtime.store.effect().unwrap().is_none());
+                    assert!(runtime.store.reconciliation_batch().unwrap().is_empty());
+                    assert_eq!(runtime.store.preparation(kind).unwrap().unwrap().id, op.id);
+
+                    // Reopening or shortening local scheduling cannot erase a server floor.
+                    op.next_at = 0;
+                    runtime
+                        .store
+                        .save(&op, "test_local_delay_shortened")
+                        .unwrap();
+                    runtime.store = Store::open(&runtime.config).unwrap();
+                    runtime.dispatch(&mut op).await.unwrap();
+                    assert_eq!(op.state, "retry");
+                    assert!(
+                        tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                            .await
+                            .is_err()
+                    );
+
+                    // Advance the test clock floor only; retry must still perform fresh reads.
+                    let db =
+                        rusqlite::Connection::open(runtime.config.state_dir.join("state.sqlite3"))
+                            .unwrap();
+                    db.execute(
+                        "UPDATE operation_timing SET retry_not_before=0 WHERE operation_id=?1",
+                        [op.id],
+                    )
+                    .unwrap();
+                    drop(db);
+                    let mut fresh_body = fresh_body;
+                    if !eligible {
+                        if kind == WorkKind::Answer {
+                            fresh_body["answered"] = json!(true);
+                        } else {
+                            fresh_body["assignments"] = json!([]);
+                        }
+                    }
+                    let server = tokio::spawn(async move {
+                        api_reply(&listener, &fresh_path, 200, None, fresh_body).await;
+                        if eligible {
+                            api_reply(&listener, &identity_path, 200, None, identity).await;
+                            api_reply(
+                                &listener,
+                                &submit_path,
+                                202,
+                                None,
+                                json!({"job_id":"retry-job"}),
+                            )
+                            .await;
+                        }
+                        listener
+                    });
+                    runtime.advance_preparation(kind).await.unwrap();
+                    let listener = server.await.unwrap();
+                    let retried = runtime.store.operation(op.id).unwrap().unwrap();
+                    assert_eq!(retried.state, if eligible { "queued" } else { "discarded" });
+                    assert_eq!((retried.payload, retried.result), captured);
+                    assert_eq!(runtime.store.attempt_count(kind, &op.key).unwrap(), 1);
+                    assert!(runtime.preparations.is_empty());
+                    assert!(
+                        tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                            .await
+                            .is_err()
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mine_rate_limit_retries_after_floor_and_current_epoch_check() {
+        for eligible in [true, false] {
+            let credentials = tempfile::tempdir().unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut config = active_judge_config(credentials.path());
+            config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
+            config.capabilities.mine = Mode::Active;
+            let (_temp, mut runtime, _sender) = fixture_with(config);
+            let challenge_body = json!({"epoch":8,"words":["burn"],"answered":true});
+            let challenge = parse_challenge(&response(challenge_body.clone())).unwrap();
+            let input = Input {
+                solver: runtime.request(WorkKind::Mine, &challenge, None).unwrap(),
+                challenge_fingerprint: Some(challenge.fingerprint.clone()),
+            };
+            let mut op = runtime
+                .store
+                .begin(
+                    WorkKind::Mine,
+                    &format!("8:{}", challenge.fingerprint),
+                    "prepared",
+                    &serde_json::to_value(&input).unwrap(),
+                    runtime.store.control().unwrap(),
+                    &runtime.config.revision().unwrap(),
+                )
+                .unwrap();
+            op.payload = Some(json!({}));
+            runtime.store.save(&op, "prepared").unwrap();
+            let prefix = format!("GET /chain/{}/api/hosted", runtime.config.network.chain);
+            let identity = json!({"address":runtime.config.network.address});
+            let initial_prefix = prefix.clone();
+            let initial_identity = identity.clone();
+            let initial_challenge = challenge_body.clone();
+            let server = tokio::spawn(async move {
+                api_reply(
+                    &listener,
+                    &format!("{initial_prefix}/challenge"),
+                    200,
+                    None,
+                    initial_challenge,
+                )
+                .await;
+                api_reply(
+                    &listener,
+                    &format!("{initial_prefix}/me"),
+                    200,
+                    None,
+                    initial_identity,
+                )
+                .await;
+                api_reply(
+                    &listener,
+                    &format!("{initial_prefix}/mine"),
+                    429,
+                    Some(3600),
+                    json!({"error":"rate_limited"}),
+                )
+                .await;
+                listener
+            });
+            let before = now();
+            runtime.dispatch(&mut op).await.unwrap();
+            let listener = server.await.unwrap();
+            assert_eq!(op.state, "retry");
+            assert!(op.next_at >= before + 3600);
+            assert!(runtime.store.effect().unwrap().is_none());
+            assert_eq!(op.payload, Some(json!({})));
+            assert!(op.result.is_none());
+
+            op.next_at = 0;
+            runtime
+                .store
+                .save(&op, "test_local_delay_shortened")
+                .unwrap();
+            runtime.store = Store::open(&runtime.config).unwrap();
+            runtime.dispatch(&mut op).await.unwrap();
+            assert_eq!(op.state, "retry");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                    .await
+                    .is_err()
+            );
+            let db =
+                rusqlite::Connection::open(runtime.config.state_dir.join("state.sqlite3")).unwrap();
+            db.execute(
+                "UPDATE operation_timing SET retry_not_before=0 WHERE operation_id=?1",
+                [op.id],
+            )
+            .unwrap();
+            drop(db);
+
+            let mut fresh = challenge_body;
+            if !eligible {
+                fresh["epoch"] = json!(9);
+            }
+            let server = tokio::spawn(async move {
+                api_reply(&listener, &format!("{prefix}/challenge"), 200, None, fresh).await;
+                if eligible {
+                    api_reply(&listener, &format!("{prefix}/me"), 200, None, identity).await;
+                    api_reply(
+                        &listener,
+                        &format!("{prefix}/mine"),
+                        200,
+                        None,
+                        json!({"ok":true,"attested":1}),
+                    )
+                    .await;
+                }
+                listener
+            });
+            runtime.advance_preparation(WorkKind::Mine).await.unwrap();
+            let listener = server.await.unwrap();
+            let retried = runtime.store.operation(op.id).unwrap().unwrap();
+            assert_eq!(
+                retried.state,
+                if eligible { "completed" } else { "discarded" }
+            );
+            assert_eq!(
+                runtime
+                    .store
+                    .attempt_count(WorkKind::Mine, &op.key)
+                    .unwrap(),
+                1
+            );
+            assert!(runtime.preparations.is_empty());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ambiguous_submit_errors_keep_the_effect_unresolved() {
+        for (status, body) in [
+            (503, json!({})),
+            (502, json!({"error":"bad_gateway"})),
+            (504, json!({"error":"gateway_timeout"})),
+            (429, json!({"ok":true})),
+            (429, json!({"error":"rate_limited","next_nonce":7})),
+            (
+                503,
+                json!({
+                    "error":"endpoint temporarily halted — API hardening in progress",
+                    "job_id":"contradictory-job"
+                }),
+            ),
+        ] {
+            let credentials = tempfile::tempdir().unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut config = active_judge_config(credentials.path());
+            config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
+            let (_temp, mut runtime, _sender) = fixture_with(config);
+            let mut op = judging_operation(&mut runtime, &"a".repeat(64), "generated");
+            let prefix = format!("/chain/{}", runtime.config.network.chain);
+            let inventory = judging_inventory(&[op.key.clone()]).body;
+            let identity = json!({"address":runtime.config.network.address});
+            let server = tokio::spawn(async move {
+                api_reply(
+                    &listener,
+                    &format!("GET {prefix}/api/hosted/assignments"),
+                    200,
+                    None,
+                    inventory,
+                )
+                .await;
+                api_reply(
+                    &listener,
+                    &format!("GET {prefix}/api/hosted/me"),
+                    200,
+                    None,
+                    identity,
+                )
+                .await;
+                api_reply(
+                    &listener,
+                    &format!("POST {prefix}/api/hosted/grade"),
+                    status,
+                    Some(3600),
+                    body,
+                )
+                .await;
+                listener
+            });
+            runtime.dispatch(&mut op).await.unwrap();
+            let listener = server.await.unwrap();
+            assert_eq!(op.state, "unknown");
+            assert_eq!(runtime.store.effect().unwrap().unwrap().id, op.id);
+            assert!(
+                runtime
+                    .store
+                    .preparation(WorkKind::Judge)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(op.job_id.is_none());
+            assert!(op.txid.is_none());
+            runtime.advance_preparation(WorkKind::Judge).await.unwrap();
+            assert!(runtime.preparations.is_empty());
+            assert_eq!(
+                runtime
+                    .store
+                    .attempt_count(WorkKind::Judge, &op.key)
+                    .unwrap(),
+                1
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                    .await
+                    .is_err()
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -3230,6 +3625,14 @@ mod tests {
         assert_eq!(status["work"]["answer"]["retry"]["policy_eligible"], true);
         assert_eq!(status["work"]["answer"]["retry"]["reason"], "read_backoff");
         assert_eq!(
+            status["work"]["answer"]["retry"]["reservation_active"],
+            true
+        );
+        assert_eq!(
+            status["work"]["judge"]["admission_reservation"]["original_operation_id"],
+            original.id
+        );
+        assert_eq!(
             runtime.store.operation(original.id).unwrap().unwrap().state,
             "unknown"
         );
@@ -3583,6 +3986,39 @@ mod tests {
         assert!(stagger(&runtime.config, "retry") > 0);
         assert!(runtime.retry_delay(Some(900)) > 900);
         assert!(runtime.retry_delay(Some(900)) <= 930);
+    }
+
+    #[test]
+    fn refusal_retry_retains_prior_minimum_and_saturates_large_delays() {
+        let (_temp, mut runtime, _sender) = fixture();
+        let mut op = operation(&mut runtime);
+        let before = now();
+        runtime.store.record_retry_minimum(op.id, 7200).unwrap();
+        runtime
+            .outcome(
+                &mut op,
+                Outcome::Retry { after_seconds: 1 },
+                true,
+                Some(3600),
+            )
+            .unwrap();
+        assert_eq!(op.state, "retry");
+        assert!(op.next_at >= before + 7200);
+        runtime
+            .outcome(
+                &mut op,
+                Outcome::Retry {
+                    after_seconds: u64::MAX,
+                },
+                true,
+                Some(u64::MAX),
+            )
+            .unwrap();
+        assert_eq!(op.next_at, i64::MAX);
+        assert_eq!(
+            runtime.store.operation_poll_timing(op.id).unwrap().1,
+            i64::MAX
+        );
     }
 
     #[cfg(unix)]
