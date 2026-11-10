@@ -29,6 +29,29 @@ jobs:
         run: cargo +1.96.0 clippy --locked --all-targets -- -D warnings
       - name: Build binary
         run: cargo +1.96.0 build --locked
+      - name: Build release lifecycle binary
+        # These boundaries include repeated ELF hashing/copying; use shipped
+        # optimization rather than a large unoptimized debug executable.
+        run: cargo +1.96.0 build --release --locked
+      - name: Isolated systemd release lifecycle
+        run: |
+          docker build -f tests/systemd_fixture.Dockerfile -t agmi-systemd-fixture tests
+          name="agmi-systemd-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          trap 'docker rm -f "$name" >/dev/null 2>&1 || true' EXIT
+          docker run -d --name "$name" --privileged --cgroupns=private \
+            --network=none --tmpfs /run --tmpfs /run/lock --tmpfs /tmp:exec,mode=1777 \
+            -v "$PWD:/src:ro" -v "$PWD/target/release/agmi:/input/agmi:ro" \
+            agmi-systemd-fixture
+          timeout 60 docker exec "$name" sh -c \
+            'until systemctl start user@17321.service; do sleep 1; done'
+          docker exec "$name" runuser -u agmi-systemd-fixture -- env \
+            HOME=/home/agmi-systemd-fixture XDG_RUNTIME_DIR=/run/user/17321 \
+            DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/17321/bus \
+            python3 -u /src/tests/installer_smoke.py /input/agmi --isolated-home
+          docker exec "$name" runuser -u agmi-systemd-fixture -- env \
+            HOME=/home/agmi-systemd-fixture XDG_RUNTIME_DIR=/run/user/17321 \
+            DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/17321/bus \
+            python3 -u /src/tests/systemd_smoke.py /input/agmi
       - name: CLI discovery
         run: ./target/debug/agmi commands --json
       - name: Lost-grade cold-restart safety
@@ -67,25 +90,6 @@ jobs:
         run: python3 tests/registration_smoke.py target/debug/agmi
       - name: Configurable endpoint trust and durable routing
         run: python3 tests/endpoints_smoke.py target/debug/agmi
-      - name: Isolated systemd release lifecycle
-        run: |
-          docker build -f tests/systemd_fixture.Dockerfile -t agmi-systemd-fixture tests
-          name="agmi-systemd-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          trap 'docker rm -f "$name" >/dev/null 2>&1 || true' EXIT
-          docker run -d --name "$name" --privileged --cgroupns=private \
-            --network=none --tmpfs /run --tmpfs /run/lock --tmpfs /tmp:exec,mode=1777 \
-            -v "$PWD:/src:ro" -v "$PWD/target/debug/agmi:/input/agmi:ro" \
-            agmi-systemd-fixture
-          timeout 60 docker exec "$name" sh -c \
-            'until systemctl start user@17321.service; do sleep 1; done'
-          docker exec "$name" runuser -u agmi-systemd-fixture -- env \
-            HOME=/home/agmi-systemd-fixture XDG_RUNTIME_DIR=/run/user/17321 \
-            DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/17321/bus \
-            python3 /src/tests/installer_smoke.py /input/agmi --isolated-home
-          docker exec "$name" runuser -u agmi-systemd-fixture -- env \
-            HOME=/home/agmi-systemd-fixture XDG_RUNTIME_DIR=/run/user/17321 \
-            DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/17321/bus \
-            python3 /src/tests/systemd_smoke.py /input/agmi
       - name: Build identity
         run: ./target/debug/agmi build-info --manifest
       - name: Inspect distributable contents
