@@ -653,18 +653,17 @@ mod native {
         if !output.status.success() {
             // Newer update commands preserve partial activation in their stdout
             // report even when subsequent diagnosis/repair exits unsuccessfully.
-            if let Ok(envelope) = serde_json::from_slice::<Value>(&output.stdout) {
-                if action == "update"
-                    && envelope["schema"] == "agmi.cli.v1"
-                    && envelope["type"] == "update"
-                    && envelope["data"]["installation"].is_object()
-                {
-                    let evidence = installer_evidence(Some(&envelope["data"]["installation"]));
-                    if evidence["stage"] == "complete" && evidence["failure_code"] == "none" {
-                        return Ok(envelope["data"].clone());
-                    }
-                    return Err(InstallerError { evidence }.into());
+            if let Ok(envelope) = serde_json::from_slice::<Value>(&output.stdout)
+                && action == "update"
+                && envelope["schema"] == "agmi.cli.v1"
+                && envelope["type"] == "update"
+                && envelope["data"]["installation"].is_object()
+            {
+                let evidence = installer_evidence(Some(&envelope["data"]["installation"]));
+                if evidence["stage"] == "complete" && evidence["failure_code"] == "none" {
+                    return Ok(envelope["data"].clone());
                 }
+                return Err(InstallerError { evidence }.into());
             }
             let evidence = output
                 .stderr

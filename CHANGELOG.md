@@ -1,15 +1,14 @@
 # Changelog
 
-## Unreleased
+## 0.1.1
 
-- Reserve effect admission for an authorized current-epoch uncertain-answer retry once its own delay and retained floor expire. New judgments/mining cannot continually renew its grace; preparation, reads and existing-job reconciliation continue. Keep all retry risk, freshness, capacity and manual authorization fences, and expose local original/blocking operation identities with wait deadlines.
-- Treat explicit submission rate-limit and halt refusals as retryable nonacceptance without discarding valid artifacts or shortening retained server delays. Keep ambiguous gateway/server failures and contradictory acceptance evidence unresolved.
-- Add explicit stopped-writer refusal-recovery preview and token-bound application. Retire only evidence-supported historical refusals with an audit record, without replaying stale payloads, changing nonces or erasing original evidence; generic historical 503s remain unresolved.
-- Add shared per-action progress and intervention reporting to status, health and doctor: distinguish configured automatic recovery, operator-required fences and insufficient evidence without changing participation policy or existing health exits.
-- Add read-only `doctor` and explicit `doctor --repair`, orchestrating existing token-fenced refusal recovery and validated managed-runtime stop/restoration. Preserve partial results, pause/configuration, uncertain writes and model history; disclose legacy 429 evidence limits and unsupported service boundaries.
-- Add explicit latest-stable discovery and verified managed updates, nonmutating `update --check`/dry-run, and opt-in `update --repair`. Reuse the installer and activated doctor; preserve user configuration, credentials, guidance, pause intent and history, fence concurrent activation, refuse unproven source ordering, and report update/repair/readiness separately.
-- Add generated Bash/Zsh/Fish completions, command examples/effect guidance, and sanitized `logs --follow` with ID-based paging, graceful shutdown and explicit retention-gap/journal-replacement errors.
-- Separate transient identity-read failures from authentication rejection and confirmed account/chain mismatches. Preserve rejection across later outages, expose scheduled unattended recovery consistently, and retain fresh identity checks before submissions. Extend guarded `doctor --repair` to normalize ambiguous legacy identity flags without asserting verification, changing retry deadlines or clearing uncertain work.
+- **Keep answers moving:** prevent new judging/mining work from continually delaying an authorized current-epoch answer retry, while observation and existing-job reconciliation continue.
+- **Less babysitting during upstream trouble:** back off on explicit rate-limit and halt refusals without regenerating valid artifacts. Treat temporary identity outages separately from bad credentials; retain uncertainty when a submission may have gone through.
+- **Know when to act:** shared answer, judge and mine status distinguishes automatic recovery, required operator action and insufficient evidence. Local health is not proof of remote acceptance or payment.
+- **Safer cleanup:** read-only `doctor` explains issues; explicit `doctor --repair` handles supported historical refusal and legacy identity conditions with guarded service stop/restoration. It preserves pause intent, uncertain submissions and model history instead of blindly replaying or clearing them.
+- **Easier upgrades without losing your setup:** discover the latest stable release and verify it before activation. Preserve configuration, credentials, custom guidance and history; use `update --check` to preview and opt into doctor repair with `update --repair`. Retain the previous release for explicit rollback.
+- **Better everyday controls:** discover commands and examples, generate Bash/Zsh/Fish completions, and follow sanitized logs with clear retention-gap reporting.
+- **Security maintenance:** upgrade bundled SQLite through rusqlite 0.41.1/libsqlite3-sys 0.39.1 to address RUSTSEC-2026-0459. Simplify a status-query type annotation to restore the strict Clippy gate.
 
 ## 0.1.0
 

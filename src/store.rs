@@ -3778,7 +3778,7 @@ impl Store {
             let manual_authorized = self.manual_authorized(kind, epoch)?;
             work[kind.as_str()]["manual_authorized"] = json!(manual_authorized);
             if has_evidence && self.has_table("operation_links")? && kind != WorkKind::Mine {
-                let latest: Option<(i64, String, String, Option<String>, Option<bool>)> = self.db.query_row(
+                let latest = self.db.query_row(
                     "SELECT o.id,o.work_key,o.state,e.evidence,
                      o.revision=(SELECT effective_revision FROM runtime_state WHERE singleton=1) FROM operations o
                      LEFT JOIN operation_evidence e ON e.operation_id=o.id
@@ -3787,7 +3787,8 @@ impl Store {
                      AND o.payload IS NULL AND o.job_id IS NULL AND o.txid IS NULL
                      AND o.state IN ('model_unknown','superseded_model_unknown','rejected','retry_model','prelaunch_failed')",
                     params![kind.as_str(),control.generation,format!("{}:%",epoch.unwrap_or(u64::MAX))],
-                    |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
+                    |r| Ok((r.get::<_, i64>(0)?,r.get::<_, String>(1)?,r.get::<_, String>(2)?,
+                        r.get::<_, Option<String>>(3)?,r.get::<_, Option<bool>>(4)?)),
                 ).optional()?;
                 let empty_inventory = kind == WorkKind::Judge
                     && selection.as_ref().is_some_and(|selection| {
@@ -5068,13 +5069,12 @@ impl Store {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(error.into()),
         };
-        if let Some(journal) = cursor.and_then(|cursor| cursor.journal.as_ref()) {
-            if !before
+        if let Some(journal) = cursor.and_then(|cursor| cursor.journal.as_ref())
+            && !before
                 .as_ref()
                 .is_some_and(|metadata| same_journal_file(&journal.file, metadata))
-            {
-                return Err(EventCursorError::Replaced.into());
-            }
+        {
+            return Err(EventCursorError::Replaced.into());
         }
         let Some(store) = Self::read_only(config)? else {
             if before.is_some() {

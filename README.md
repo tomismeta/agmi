@@ -36,7 +36,7 @@ Put Cargo's binary directory (normally `~/.cargo/bin`) on `PATH`. This installs 
 
 Both installation methods require a separately installed, authenticated [Hermes or OpenClaw runtime](docs/OPERATIONS.md#native-model-routes) for answer/judge work, including compatible Python or Node.js.
 
-Version **0.1.0** is not published to crates.io; `publish = false` remains intentional. Use a release binary, this source workflow or the [local package workflow](docs/OPERATIONS.md#verification-and-publication), not `cargo install agmi`.
+Version **0.1.1** is not published to crates.io; `publish = false` remains intentional. Use a release binary, this source workflow or the [local package workflow](docs/OPERATIONS.md#verification-and-publication), not `cargo install agmi`.
 
 ## Set up an identity
 

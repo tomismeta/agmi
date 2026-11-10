@@ -549,7 +549,7 @@ async fn embedded_identity(binary: &Path, published: &str) -> Result<()> {
         actual.len() == IDENTITY_FIELDS.len()
             && IDENTITY_FIELDS
                 .iter()
-                .all(|key| actual.get(key).is_some() && actual.get(key) == expected.get(key)),
+                .all(|key| actual.contains_key(key) && actual.get(key) == expected.get(key)),
         failure("update_binary_identity_invalid")
     );
     Ok(())
@@ -1085,7 +1085,7 @@ async fn complete_discovery(
     };
     let mut order = ordering(&identity, &published);
     if order == Ordering::Compare {
-        order = ancestry(&client, &identity, &published)
+        order = ancestry(client, &identity, &published)
             .await
             .unwrap_or(Ordering::Refused("commit_ordering_unverified"));
     }
@@ -1127,7 +1127,7 @@ async fn complete_discovery(
     let archive_path = directory.path().join("release.tar.gz");
     let mut archive =
         File::create(&archive_path).map_err(|_| failure("update_staging_unavailable"))?;
-    let mut response = response(&client, &asset.browser_download_url, true).await?;
+    let mut response = response(client, &asset.browser_download_url, true).await?;
     ensure!(
         response
             .content_length()

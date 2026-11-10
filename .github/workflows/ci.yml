@@ -95,7 +95,7 @@ jobs:
           cargo +1.96.0 package --locked --allow-dirty
           package_root="$RUNNER_TEMP/agmi-package"
           mkdir -p "$package_root"
-          tar -xzf target/package/agmi-0.1.0.crate -C "$package_root"
-          cargo +1.96.0 install --path "$package_root/agmi-0.1.0" --locked --root "$package_root/install"
+          tar -xzf target/package/agmi-0.1.1.crate -C "$package_root"
+          cargo +1.96.0 install --path "$package_root/agmi-0.1.1" --locked --root "$package_root/install"
           "$package_root/install/bin/agmi" build-info --manifest
           python3 tests/lifecycle_smoke.py "$package_root/install/bin/agmi" --scenario init

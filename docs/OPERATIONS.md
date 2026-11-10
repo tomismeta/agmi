@@ -688,8 +688,8 @@ Build and inspect the local distributable, then install its extracted sources in
 cargo package --locked --list --allow-dirty
 cargo package --locked --allow-dirty
 package_root="$(mktemp -d)"
-tar -xzf target/package/agmi-0.1.0.crate -C "$package_root"
-cargo install --path "$package_root/agmi-0.1.0" --locked --root "$package_root/install"
+tar -xzf target/package/agmi-0.1.1.crate -C "$package_root"
+cargo install --path "$package_root/agmi-0.1.1" --locked --root "$package_root/install"
 "$package_root/install/bin/agmi" build-info --manifest
 ```
 
