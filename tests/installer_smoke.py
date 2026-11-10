@@ -122,8 +122,11 @@ elif args[0] not in ('stop', 'enable', 'disable'):
         result = subprocess.run([str(binary), '--json', *arguments], env=environment or env,
                                 capture_output=True, text=True, timeout=180)
         assert (result.returncode == 0) == success, (arguments, result.stdout, result.stderr)
-        envelope = json.loads(result.stdout if success else result.stderr)
+        envelope = json.loads(result.stdout if success or arguments[0] == 'update' else result.stderr)
         assert envelope['schema'] == 'agmi.cli.v1'
+        if arguments[0] == 'update':
+            assert envelope['type'] == 'update' and envelope['ok'] is success
+            return envelope['data']
         return envelope['data'] if success else envelope['error']
 
     def calls():
@@ -203,7 +206,7 @@ elif args[0] not in ('stop', 'enable', 'disable'):
     (root / 'wrong-manager').touch()
     before = len(calls())
     error = cli('update', '--release', first_id, '--stopped', success=False)
-    assert error['details']['failure_code'] == 'manager_context_mismatch'
+    assert error['installation']['failure_code'] == 'manager_context_mismatch'
     assert not any(call[2] == 'stop' for call in calls()[before:])
     assert not (releases / 'current').is_symlink()
     (root / 'wrong-manager').unlink()
@@ -228,7 +231,7 @@ elif args[0] not in ('stop', 'enable', 'disable'):
     (root / 'state-query-failed').touch()
     before = len(calls())
     error = cli('update', '--release', second_id, '--stopped', success=False)
-    assert error['details']['failure_code'] == 'service_state_unavailable'
+    assert error['installation']['failure_code'] == 'service_state_unavailable'
     assert not any(call[2] == 'stop' for call in calls()[before:])
     assert os.readlink(releases / 'current') == first_id
     (root / 'state-query-failed').unlink()
@@ -250,7 +253,7 @@ elif args[0] not in ('stop', 'enable', 'disable'):
         process.send_signal(interruption)
         stdout, stderr = process.communicate(timeout=30)
         assert process.returncode != 0, stdout
-        evidence = json.loads(stderr)['error']['details']
+        evidence = json.loads(stdout)['data']['installation']
         assert evidence['failure_code'] == 'reload_failed'
         assert evidence['activation'] == 'selected' and evidence['service'] == 'stopped'
         assert os.readlink(releases / 'current') == selected, 'Cancellation silently reverted current'
@@ -296,7 +299,7 @@ elif args[0] not in ('stop', 'enable', 'disable'):
         process.send_signal(signal.SIGCONT)
         stdout, stderr = process.communicate(timeout=30)
         assert process.returncode != 0, 'delegated installer reported success after cancellation'
-        evidence = json.loads(stderr)['error']['details']
+        evidence = json.loads(stdout)['data']['installation']
         assert evidence['failure_code'] == 'interrupted', evidence
         assert evidence['stage'] == 'complete' and evidence['activation'] == 'loaded_verified'
         assert evidence['service'] != 'unknown'

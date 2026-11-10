@@ -106,8 +106,11 @@ def main():
 
     def cli(*words, success=True):
         result = run([str(binary), '--json', *words], success=success)
-        envelope = json.loads(result.stdout if success else result.stderr)
+        envelope = json.loads(result.stdout if success or words[0] == 'update' else result.stderr)
         assert envelope['schema'] == 'agmi.cli.v1'
+        if words[0] == 'update':
+            assert envelope['type'] == 'update' and envelope['ok'] is success
+            return envelope['data']
         return envelope['data'] if success else envelope['error']
 
     def selected(candidate, runtime=False, timer=False):
@@ -210,8 +213,8 @@ def main():
         runtime_override.mkdir(parents=True, mode=0o700)
         (runtime_override / 'fixture.conf').write_text('[Unit]\nDescription=isolated fixture post-switch rejection\n')
         error = cli('update', '--release', ids[first], success=False)
-        assert error['code'] == 'installer_failed'
-        evidence = error['details']
+        assert error['update']['reason'] == 'installer_failed'
+        evidence = error['installation']
         assert evidence['failure_code'] == 'reload_failed'
         assert evidence['stage'] == 'reloading' and evidence['activation'] == 'selected'
         assert evidence['service'] == 'stopped'

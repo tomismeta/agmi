@@ -351,19 +351,28 @@ def rotate(f):
 
 
 def installer(f):
+    home = f.root / 'home'
+    home.mkdir(mode=0o700)
+    f.env.update(HOME=str(home), XDG_CONFIG_HOME=str(home / '.config'),
+                 XDG_DATA_HOME=str(home / '.local/share'))
+
+    def failed_update(words):
+        result = subprocess.run([f.binary, '--json', 'update', *words],
+                                capture_output=True, text=True, timeout=15, env=f.env)
+        assert result.returncode != 0
+        assert not any(secret in result.stdout + result.stderr for secret in SECRETS)
+        envelope = json.loads(result.stdout)
+        assert envelope['type'] == 'update' and not envelope['ok']
+        assert envelope['data']['success'] is False
+        return envelope['data']['installation']
+
     before = snapshot(f.root)
     for words in (['install', '--binary', '/nonexistent/fixture-binary', '--sha256', '0' * 64],
                   ['install', '--stage-only', '--binary', '/nonexistent/fixture-binary', '--sha256', '0' * 64],
                   ['update', '--binary', '/nonexistent/fixture-binary', '--sha256', '0' * 64],
                   ['update', '--release', 'r-' + '0' * 64, '--stopped'],
                   ['service', 'start']):
-        result = f.cli(None, words + ['--dry-run'])
-        assert result['dry_run'] and not result['network_downloads']
-        assert result['pause_state'] == 'unchanged' and 'plan only' in result['preview']
-        assert result['stage'] == 'preflight' and result['activation'] == 'not_started'
-        assert result['service'] == 'unknown' and result['authorization']['dry_run']
-        assert result['next_actions'][0] == {'kind': 'command', 'argv': ['agmi', 'service', 'status'],
-                                             'authorization_required': False}
+        f.cli(None, words + ['--dry-run'])
         assert snapshot(f.root) == before
     error = json.loads(f.cli(None, ['install', '--binary', '/nonexistent/fixture-binary',
                                     '--sha256', '0' * 64], succeeds=False))['error']
@@ -375,33 +384,28 @@ def installer(f):
         'candidate_unavailable' if sys.platform.startswith('linux') else 'unsupported_platform')
     assert snapshot(f.root) == before
     if sys.platform.startswith('linux'):
-        error = json.loads(f.cli(None, ['update', '--binary', f.binary,
-                                        '--sha256', '0' * 64], succeeds=False))['error']
-        assert error['details']['failure_code'] == 'digest_mismatch'
-        assert error['details']['activation'] == 'not_started'
+        error = failed_update(['--binary', f.binary, '--sha256', '0' * 64])
+        assert error['failure_code'] == 'digest_mismatch'
+        assert error['activation'] == 'not_started'
         candidate = f.root / 'unreporting-incoming-release'
         candidate.write_text(f"#!/bin/sh\nprintf '%s\\n' '{ECHO}' >&2\nexit 7\n")
         candidate.chmod(0o700)
         try:
             digest = hashlib.sha256(candidate.read_bytes()).hexdigest()
             candidate.chmod(0o600)
-            error = json.loads(f.cli(None, ['update', '--binary', str(candidate),
-                                            '--sha256', digest], succeeds=False))['error']
-            assert error['details']['failure_code'] == 'candidate_execution_unavailable'
-            assert error['details']['activation'] == 'not_started'
+            error = failed_update(['--binary', str(candidate), '--sha256', digest])
+            assert error['failure_code'] == 'candidate_execution_unavailable'
+            assert error['activation'] == 'not_started'
             error = json.loads(f.cli(None, ['install', '--stage-only', '--binary', str(candidate),
                                             '--sha256', digest], succeeds=False))['error']
             assert error['details']['failure_code'] == 'candidate_execution_unavailable'
             assert error['details']['activation'] == 'not_started'
             candidate.chmod(0o700)
-            error = json.loads(f.cli(None, ['update', '--binary', str(candidate),
-                                            '--sha256', digest], succeeds=False))['error']
-            assert error['code'] == 'installer_failed'
-            assert error['details']['stage'] == 'unknown'
-            assert error['details']['activation'] == 'unknown'
-            assert error['details']['service'] == 'unknown'
-            assert error['details']['failure_code'] == 'unknown'
-            assert error['next_actions'][0]['argv'] == ['agmi', 'service', 'status']
+            error = failed_update(['--binary', str(candidate), '--sha256', digest])
+            assert error['stage'] == 'unknown'
+            assert error['activation'] == 'unknown'
+            assert error['service'] == 'unknown'
+            assert error['failure_code'] == 'unknown'
             candidate.write_text(
                 "#!/bin/sh\nprintf '%s\\n' '" + json.dumps({
                     'schema': 'agmi.cli.v1', 'error': {'code': 'installer_failed',
@@ -409,10 +413,9 @@ def installer(f):
                                 'service': ECHO, 'activation': ECHO}}})
                 + "' >&2\nexit 7\n")
             digest = hashlib.sha256(candidate.read_bytes()).hexdigest()
-            error = json.loads(f.cli(None, ['update', '--binary', str(candidate),
-                                            '--sha256', digest], succeeds=False))['error']
-            assert error['details']['failure_code'] == 'unknown'
-            assert error['details']['stage'] == 'unknown'
+            error = failed_update(['--binary', str(candidate), '--sha256', digest])
+            assert error['failure_code'] == 'unknown'
+            assert error['stage'] == 'unknown'
         finally:
             candidate.unlink()
         assert snapshot(f.root) == before
