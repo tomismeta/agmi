@@ -260,10 +260,10 @@ jitter_seconds = 0
                     wait_until(lambda: (invoke('status')['data'].get('pending') or {}).get('state') == 'unknown')
                     assert len(shared['writes']) == 1
                 else:
-                    wait_until(lambda: invoke('status')['data']['hosted_identity_verified'] is False)
+                    wait_until(lambda: invoke('status')['data']['hosted_identity']['status'] == 'invalid_response')
                     time.sleep(2)
                     assert not shared['writes'] and not (root / 'calls').exists()
-                    assert 'hosted_identity_unverified' in invoke('health')['data']['issues']
+                    assert invoke('health')['data']['hosted_identity_verified'] is None
                 print(json.dumps({'mode': 'identity-baseline' if args.baseline else 'identity-fenced',
                                   'wallet_mutations': len(shared['writes'])}))
                 return

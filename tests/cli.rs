@@ -1128,3 +1128,152 @@ fn doctor_repairs_only_proven_refusals_without_resetting_uncertainty_or_pause() 
     assert_eq!(repeated["data"]["repair_outcome"], "no_eligible_repairs");
     assert_eq!(control(), original_control);
 }
+
+#[test]
+fn doctor_normalizes_legacy_identity_without_verifying_or_resetting_work() {
+    use agmi::config::Config;
+    use rusqlite::Connection;
+    use serde_json::Value;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let mut config = Config::default();
+    config.state_dir = dir.path().join("state");
+    config.network.chain = format!(
+        "test-{}",
+        dir.path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .replace('.', "")
+    );
+    config.network.address = format!("poa1{}", "1".repeat(32));
+    config.network.credential_file = dir.path().join("nonexistent-credential");
+    let original_config = toml::to_string(&config).unwrap();
+    fs::write(&path, &original_config).unwrap();
+    let invoke = |arguments: &[&str]| {
+        let output = binary()
+            .args(["--config", path.to_str().unwrap(), "--json"])
+            .args(arguments)
+            .output()
+            .unwrap();
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    assert_eq!(invoke(&["pause"])["ok"], true);
+    let db = Connection::open(config.state_dir.join("state.sqlite3")).unwrap();
+    db.execute_batch(
+        "INSERT INTO health_evidence(singleton,hosted_identity_verified) VALUES(1,0)
+         ON CONFLICT(singleton) DO UPDATE SET hosted_identity_verified=0;
+         INSERT INTO read_backoff(scope,failures,next_at) VALUES('identity',3,2000000000);
+         INSERT INTO read_observations(scope,last_failure_at,failure_category,local_next_at,server_not_before)
+         VALUES('identity',1900000000,'timeout',2000000000,1999999999);
+         INSERT INTO operations(kind,work_key,state,request,result,generation,revision,created_at,updated_at)
+         VALUES('judge','retained-model','model_unknown','{}','{\"private\":\"identity-canary\"}',0,'fixture',1,1);",
+    ).unwrap();
+    let preserved = || {
+        let control: (i64, i64) = db
+            .query_row("SELECT paused,generation FROM control", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        let authority: (String, i64) = db
+            .query_row(
+                "SELECT database_id,dispatch_sequence FROM authority",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let timing: (i64, i64, i64, i64) = db
+            .query_row(
+                "SELECT failures,next_at,local_next_at,server_not_before
+             FROM read_backoff JOIN read_observations USING(scope) WHERE scope='identity'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        let work: (String, String) = db
+            .query_row(
+                "SELECT state,result FROM operations WHERE work_key='retained-model'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        (control, authority, timing, work)
+    };
+    let before = preserved();
+    let version: i64 = db
+        .query_row("PRAGMA data_version", [], |r| r.get(0))
+        .unwrap();
+    let preview = invoke(&["doctor"]);
+    assert!(
+        preview["data"]["repairs"]["eligible"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["classification"] == "legacy_identity_evidence_normalization")
+    );
+    assert_eq!(
+        db.query_row("PRAGMA data_version", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        version
+    );
+    let repaired = invoke(&["doctor", "--repair"]);
+    assert_eq!(repaired["data"]["repair_outcome"], "applied", "{repaired}");
+    assert_eq!(
+        repaired["data"]["hosted_identity"]["status"],
+        "legacy_unknown"
+    );
+    assert_eq!(repaired["data"]["hosted_identity"]["legacy_failure"], true);
+    assert!(repaired["data"]["hosted_identity_verified"].is_null());
+    assert_eq!(
+        db.query_row(
+            "SELECT hosted_identity_verified FROM health_evidence",
+            [],
+            |r| r.get::<_, Option<bool>>(0)
+        )
+        .unwrap(),
+        None
+    );
+    assert_eq!(preserved(), before);
+    assert_eq!(fs::read_to_string(&path).unwrap(), original_config);
+    assert!(!config.network.credential_file.exists());
+    assert!(!repaired.to_string().contains("identity-canary"));
+    let repeated = invoke(&["doctor", "--repair"]);
+    assert_eq!(repeated["data"]["repair_outcome"], "no_eligible_repairs");
+    assert_eq!(preserved(), before);
+
+    // A backoff-only journal has no observation row until the guarded writer
+    // opens it. That migration must not invalidate doctor's own preview.
+    db.execute_batch(
+        "DROP TABLE hosted_identity_evidence;
+         DROP TABLE identity_normalizations;
+         DELETE FROM read_observations WHERE scope='identity';
+         UPDATE health_evidence SET hosted_identity_verified=0;",
+    )
+    .unwrap();
+    let migrated = invoke(&["doctor", "--repair"]);
+    assert_eq!(migrated["data"]["repair_outcome"], "applied", "{migrated}");
+    assert_eq!(
+        migrated["data"]["hosted_identity"]["status"],
+        "legacy_unknown"
+    );
+    assert_eq!(migrated["data"]["hosted_identity"]["legacy_failure"], true);
+    assert!(migrated["data"]["hosted_identity_verified"].is_null());
+    let after = preserved();
+    assert_eq!(after.0, before.0);
+    assert_eq!(after.1, before.1);
+    assert_eq!((after.2.0, after.2.1), (before.2.0, before.2.1));
+    assert_eq!(after.3, before.3);
+    assert_eq!(
+        db.query_row(
+            "SELECT retained_conservative_floor FROM read_observations WHERE scope='identity'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        before.2.1
+    );
+    assert_eq!(
+        invoke(&["doctor", "--repair"])["data"]["repair_outcome"],
+        "no_eligible_repairs"
+    );
+}

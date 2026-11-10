@@ -337,7 +337,10 @@ pub(crate) fn diagnostics(data: &mut Value, config: Option<&Path>) {
             "model_work_overdue" | "model_execution_unresolved" | "participation_risk_admitted" |
             "admission_blocked" => (&["operations", "list"], false),
             "challenge_unobserved" | "challenge_observation_stale" | "current_epoch_unanswered" |
-            "answer_evidence_unavailable" | "hosted_identity_unverified" | "hosted_identity_unobserved" => (&["reads"], false),
+            "answer_evidence_unavailable" | "hosted_identity_unverified" | "hosted_identity_unobserved" |
+            "hosted_identity_unavailable" | "hosted_identity_invalid_response" |
+            "hosted_identity_legacy_unknown" | "hosted_identity_authentication_failed" => (&["reads"], false),
+            "hosted_identity_mismatch" => (&["config", "show"], false),
             "not_initialized" => (&["run", "--once"], true),
             _ => (&["status"], false),
         };
@@ -349,6 +352,12 @@ pub(crate) fn diagnostics(data: &mut Value, config: Option<&Path>) {
                 Some("Inspect state filesystem capacity and access. Preserve the journal, WAL, retained evidence and credentials; do not delete state to free space."),
             "clock_regressed" => Some("Inspect host clock synchronization before trusting age or deadline evidence."),
             "identity_mismatch" => Some("Restore the configuration for this journal's existing identity. Do not replace its account or erase state."),
+            "hosted_identity_authentication_failed" => Some("Hosted identity verification recorded an authentication rejection. Review the selected credential without exposing it; any replacement requires the existing paused/stopped same-identity checks. A later timeout does not clear the rejection."),
+            "hosted_identity_mismatch" => Some("Hosted identity verification recorded a different identity. Review the bound account and network configuration; preserve the journal and do not replace identity or erase evidence to bypass the mismatch."),
+            "hosted_identity_unavailable" | "hosted_identity_invalid_response" =>
+                Some("Identity availability or response evidence is inconclusive, not a credential rejection. Follow a reported retry only when the controller has a retained automatic path; do not change credentials to bypass a timeout."),
+            "hosted_identity_legacy_unknown" | "hosted_identity_unverified" =>
+                Some("Legacy identity evidence does not establish the original failure or current verification. Doctor --repair can normalize an eligible legacy false flag while retaining uncertainty; it cannot verify identity or repair credentials."),
             "api_routing_mismatch" => Some("Restore the bound network.api profile shown by status. Routing changes require a stopped controller and no unresolved or reusable work; never erase evidence to bypass this boundary."),
             "model_execution_unresolved" => Some("Retained model uncertainty is risk evidence, not necessarily a current blocker. Inspect the affected lane before considering stopped-writer recover-model; never reset an unresolved network request."),
             "no_active_capabilities" => Some("Review model authentication, routes, guidance and desired capability modes before explicitly changing configuration."),
@@ -383,6 +392,17 @@ pub(crate) fn diagnostics(data: &mut Value, config: Option<&Path>) {
             .is_some_and(|rows| !rows.is_empty())
     {
         actions.push(action(config, &["doctor", "--repair"], true));
+    }
+    if ["eligible", "ineligible", "applied", "skipped"]
+        .iter()
+        .any(|key| {
+            data["repairs"][*key]
+                .as_array()
+                .is_some_and(|rows| rows.iter().any(|row| row["kind"] == "identity"))
+        })
+    {
+        actions.push(json!({"kind":"instruction","authorization_required":false,
+            "message":"Identity repair is local legacy-evidence normalization only. It retains legacy uncertainty and recorded rejection; it does not verify identity, replace credentials, change read retries or authorize work."}));
     }
     if let Some(existing) = data["next_actions"].as_array() {
         for step in existing {
@@ -485,12 +505,25 @@ pub(crate) fn human(kind: &str, data: &Value) {
                 data["operational"]["status"].as_str().unwrap_or("unknown"),
                 data["risk"]["unresolved_effects"]
             );
+            if let Some(identity) = data["hosted_identity"]["status"].as_str() {
+                println!(
+                    "Hosted identity: {identity}; retained rejection: {}",
+                    data["hosted_identity"]["rejection"]
+                );
+            }
             if kind == "doctor" {
                 for candidate in data["repairs"]["eligible"].as_array().into_iter().flatten() {
-                    println!(
-                        "Repair basis: operation={}; classification={}",
-                        candidate["operation_id"], candidate["classification"]
-                    );
+                    if candidate["kind"] == "identity" {
+                        println!(
+                            "Repair basis: identity; classification={}",
+                            candidate["classification"]
+                        );
+                    } else {
+                        println!(
+                            "Repair basis: operation={}; classification={}",
+                            candidate["operation_id"], candidate["classification"]
+                        );
+                    }
                     println!(
                         "  {}",
                         candidate["evidence_limit"]
@@ -538,16 +571,23 @@ pub(crate) fn human(kind: &str, data: &Value) {
                     repairs["failure"], repairs["restoration"]
                 );
                 for outcome in repairs["applied"].as_array().into_iter().flatten() {
-                    println!(
-                        "  Applied: operation={}, state={}",
-                        outcome["operation_id"], outcome["state"]
-                    );
+                    if outcome["kind"] == "identity" {
+                        println!(
+                            "  Applied: identity; classification={}",
+                            outcome["classification"]
+                        );
+                    } else {
+                        println!(
+                            "  Applied: operation={}, state={}",
+                            outcome["operation_id"], outcome["state"]
+                        );
+                    }
                 }
                 for outcome in repairs["skipped"].as_array().into_iter().flatten() {
                     println!("  Skipped: {}", outcome);
                 }
                 println!(
-                    "Repair counts are local outcomes, not proof of current participation or remote success. Ineligible, skipped and unknown outcomes remain unresolved evidence."
+                    "Repair counts are local outcomes, not proof of current participation or remote success. Identity normalization retains uncertainty; it does not verify identity or repair credentials. Ineligible, skipped and unknown outcomes remain unresolved evidence."
                 );
             }
         }
@@ -858,6 +898,29 @@ mod tests {
                 .iter()
                 .any(|step| step["argv"] == json!(["agmi", "recover", "resolve", "--help"]))
         );
+    }
+
+    #[test]
+    fn identity_repair_guidance_explains_limits_without_fabricating_a_wait() {
+        let mut value = json!({"checked_at":100,"issues":["hosted_identity_legacy_unknown"],
+            "intervention":{"status":"undetermined","reason":"hosted_identity_legacy_unknown",
+                "next_action":"inspect_local_evidence"},
+            "repair_requested":false,"repairs":{"eligible":[{"kind":"identity",
+                "classification":"legacy_identity_evidence_normalization"}]}});
+        diagnostics(&mut value, None);
+        let actions = value["next_actions"].as_array().unwrap();
+        assert!(
+            actions
+                .iter()
+                .any(|step| step["argv"] == json!(["agmi", "doctor", "--repair"])
+                    && step["authorization_required"] == true)
+        );
+        assert!(actions.iter().any(|step| {
+            step["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("does not verify identity"))
+        }));
+        assert!(actions.iter().all(|step| step["kind"] != "wait"));
     }
 
     #[test]

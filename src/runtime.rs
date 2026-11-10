@@ -10,7 +10,8 @@ use crate::solver::{
     failure_code, solve,
 };
 use crate::store::{
-    AccountLock, AdmissionGuard, Control, Operation, ReadScope, Store, digest, not_before, now,
+    AccountLock, AdmissionGuard, Control, HostedIdentityOutcome, Operation, ReadScope, Store,
+    digest, not_before, now,
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -96,7 +97,7 @@ pub async fn recovery_resolve(
         identity_ready: None,
         identity_nonblocking: false,
     };
-    if !runtime.identity_matches(op.kind).await? {
+    if runtime.take_identity_permit(op.kind).await?.is_none() {
         bail!("recovery identity unverified");
     }
     runtime.reconcile(&mut op).await?;
@@ -119,6 +120,8 @@ pub fn status(config: &Config) -> Result<Value> {
         None => json!({"initialized":false,"paused":true,"generation":0,
             "configured_revision":config.optional_revision()?,"effective_runtime":null,
             "hosted_identity_verified":null,"pending":null,"operations":[],
+            "hosted_identity":{"status":"unobserved","observed_at":null,
+                "last_verified_at":null,"rejection":null,"legacy_failure":false},
             "reads":[],"work":{},
             "participation":{"policy":Participation::default(),"policy_source":"unavailable",
                 "unresolved_count":0,"risk_admissions":0,
@@ -284,6 +287,66 @@ struct IdentityReady {
     protocol: Arc<Protocol>,
     control: Control,
     completed_at: Instant,
+}
+
+fn identity_read_failure(failure: crate::protocol::ReadFailure) -> HostedIdentityOutcome {
+    use crate::protocol::ReadFailure;
+    match failure {
+        ReadFailure::Timeout
+        | ReadFailure::Connect
+        | ReadFailure::Request
+        | ReadFailure::BodyInterrupted => HostedIdentityOutcome::Unavailable,
+        ReadFailure::ResponseTooLarge
+        | ReadFailure::InvalidJson
+        | ReadFailure::CredentialEchoRedacted => HostedIdentityOutcome::InvalidResponse,
+    }
+}
+
+fn classify_hosted_identity(config: &Config, response: &Response) -> HostedIdentityOutcome {
+    if matches!(response.status, 401 | 403) {
+        return HostedIdentityOutcome::AuthenticationFailed;
+    }
+    if matches!(response.status, 408 | 429) || (500..600).contains(&response.status) {
+        return HostedIdentityOutcome::Unavailable;
+    }
+    if let Some(failure) = response.read_failure {
+        return identity_read_failure(failure);
+    }
+    if !(200..300).contains(&response.status)
+        || ["ok", "success"].iter().any(|field| {
+            response
+                .body
+                .get(field)
+                .is_some_and(|value| value.as_bool() != Some(true))
+        })
+    {
+        return HostedIdentityOutcome::InvalidResponse;
+    }
+    let Some(address) = response
+        .body
+        .get("address")
+        .and_then(Value::as_str)
+        .filter(|address| crate::config::valid_address(address))
+    else {
+        return HostedIdentityOutcome::InvalidResponse;
+    };
+    // The hosted API may omit chain_id; malformed values are not mismatch proof.
+    let chain = match response.body.get("chain_id") {
+        Some(value) => match value
+            .as_str()
+            .filter(|chain| crate::config::safe_segment(chain, 64))
+        {
+            Some(chain) => Some(chain),
+            None => return HostedIdentityOutcome::InvalidResponse,
+        },
+        None => None,
+    };
+    if address != config.network.address || chain.is_some_and(|chain| chain != config.network.chain)
+    {
+        HostedIdentityOutcome::IdentityMismatch
+    } else {
+        HostedIdentityOutcome::Verified
+    }
 }
 
 struct Runtime {
@@ -677,6 +740,11 @@ impl Runtime {
     ) -> Result<Option<Response>> {
         match result {
             Ok(response) => {
+                if scope == ReadScope::Identity {
+                    return Ok(self
+                        .evaluate_hosted_identity(kind, &response)?
+                        .then_some(response));
+                }
                 self.store.read_finished(
                     scope,
                     Some(response.status),
@@ -711,9 +779,20 @@ impl Runtime {
             }
             Err(error) => {
                 let category = transport_failure(&error);
-                self.store
-                    .read_finished(scope, None, Some(category.as_str()))?;
-                self.read_failed(scope, None)?;
+                if scope == ReadScope::Identity {
+                    let (base, cap) = self.read_policy(scope);
+                    self.store.complete_identity_read(
+                        None,
+                        Some(category.as_str()),
+                        identity_read_failure(category),
+                        (base, cap, stagger(&self.config, "retry")),
+                        None,
+                    )?;
+                } else {
+                    self.store
+                        .read_finished(scope, None, Some(category.as_str()))?;
+                    self.read_failed(scope, None)?;
+                }
                 self.store.event("upstream_read_failed", Some(kind))?;
                 Ok(None)
             }
@@ -1058,7 +1137,7 @@ impl Runtime {
             return Ok(());
         }
         let response = self.finish_read(read.kind, ReadScope::Identity, result)?;
-        if self.validate_identity(read.kind, response)? {
+        if response.is_some() {
             self.identity_ready = Some(IdentityReady {
                 protocol: read.protocol,
                 control: read.control,
@@ -1073,38 +1152,50 @@ impl Runtime {
         Ok(())
     }
 
-    async fn identity_matches(&mut self, kind: WorkKind) -> Result<bool> {
+    async fn take_identity_permit(&mut self, kind: WorkKind) -> Result<Option<IdentityReady>> {
         if !self.identity_nonblocking {
+            self.reload()?;
+            let protocol = Arc::clone(&self.protocol);
+            let control = self.store.control()?;
             let response = self
                 .get(kind, ReadScope::Identity, Endpoint::Identity, None)
                 .await?;
-            return self.validate_identity(kind, response);
+            return Ok((response.is_some()
+                && !self.reload_blocked
+                && !self.stopping()
+                && Arc::ptr_eq(&protocol, &self.protocol)
+                && control == self.store.control()?)
+            .then(|| IdentityReady {
+                protocol,
+                control,
+                completed_at: Instant::now(),
+            }));
         }
         loop {
             self.collect_identity().await?;
             if self.stopping() || self.reload_blocked {
-                return Ok(false);
+                return Ok(None);
             }
-            if self.identity_ready.take().is_some() {
-                return Ok(true);
+            if let Some(permit) = self.identity_ready.take() {
+                return Ok(Some(permit));
             }
             self.start_identity(kind)?;
             // Keep a selected judgment across this wait: a later inventory-page
             // failure may forbid re-reading the usable earlier page for a while.
             // Answers remain independently serviced; no admission guard is held.
             if kind != WorkKind::Judge || self.urgent_context || self.identity_read.is_none() {
-                return Ok(false);
+                return Ok(None);
             }
             let wake = Arc::clone(&self.model_wake);
             let delay = self.urgent_delay()?;
             tokio::select! {
-                _ = self.stop.changed() => return Ok(false),
+                _ = self.stop.changed() => return Ok(None),
                 _ = wake.notified() => {},
                 _ = tokio::time::sleep(delay) => {},
             }
             Box::pin(self.service_urgent(true)).await?;
             if !self.active(kind)? {
-                return Ok(false);
+                return Ok(None);
             }
         }
     }
@@ -1139,29 +1230,17 @@ impl Runtime {
         Ok(())
     }
 
-    fn validate_identity(&mut self, kind: WorkKind, response: Option<Response>) -> Result<bool> {
-        let Some(response) = response else {
-            self.store.record_hosted_identity(false)?;
-            return Ok(false);
-        };
-        let matched = (200..300).contains(&response.status)
-            && ["ok", "success"].iter().all(|field| {
-                response
-                    .body
-                    .get(field)
-                    .is_none_or(|value| value.as_bool() == Some(true))
-            })
-            && response
-                .body
-                .get("address")
-                .and_then(Value::as_str)
-                .is_some_and(|address| address == self.config.network.address)
-            && response
-                .body
-                .get("chain_id")
-                .is_none_or(|chain| chain.as_str() == Some(self.config.network.chain.as_str()));
-        self.store.record_hosted_identity(matched)?;
-        self.read_evaluated(ReadScope::Identity, matched, response.retry_after_seconds)?;
+    fn evaluate_hosted_identity(&mut self, kind: WorkKind, response: &Response) -> Result<bool> {
+        let outcome = classify_hosted_identity(&self.config, response);
+        let (base, cap) = self.read_policy(ReadScope::Identity);
+        self.store.complete_identity_read(
+            Some(response.status),
+            crate::protocol::failure_category(response),
+            outcome,
+            (base, cap, stagger(&self.config, "retry")),
+            response.retry_after_seconds,
+        )?;
+        let matched = outcome == HostedIdentityOutcome::Verified;
         if !matched {
             self.store.event("identity_unverified", Some(kind))?;
             self.store
@@ -1254,7 +1333,7 @@ impl Runtime {
         } else {
             None
         };
-        if !self.identity_matches(kind).await? {
+        if self.take_identity_permit(kind).await?.is_none() {
             return Ok(());
         }
         let input = Input {
@@ -1400,7 +1479,7 @@ impl Runtime {
                     let Some((key, assignment)) = selected else {
                         continue;
                     };
-                    if !self.identity_matches(kind).await?
+                    if self.take_identity_permit(kind).await?.is_none()
                         || self.store.control()?.generation != inventory.generation
                     {
                         continue;
@@ -1440,7 +1519,7 @@ impl Runtime {
                     if !self.active(kind)?
                         || (self.config.schedule.mine_each_epoch
                             && self.store.mine_epoch_attempted(challenge.epoch)?)
-                        || !self.identity_matches(kind).await?
+                        || self.take_identity_permit(kind).await?.is_none()
                     {
                         continue;
                     }
@@ -1818,16 +1897,23 @@ impl Runtime {
             }
             None => return Ok(()),
         }
-        if !self.identity_matches(op.kind).await? {
+        let Some(identity_permit) = self.take_identity_permit(op.kind).await? else {
             return Ok(());
-        }
+        };
         let gate = AdmissionGuard::acquire(&self.config)?;
         self.reload()?;
         if self.discard_excluded_judgment(op)? || !self.active(op.kind)? {
             return Ok(());
         }
         let control = self.store.control()?;
-        if control.paused || control != expected_control || self.stopping() {
+        if control.paused
+            || control != expected_control
+            || self.stopping()
+            || identity_permit.control != control
+            || !Arc::ptr_eq(&identity_permit.protocol, &self.protocol)
+            || identity_permit.completed_at.elapsed()
+                > Duration::from_secs(self.config.timeouts.effective_read_http_seconds())
+        {
             return Ok(());
         }
         let payload = op
@@ -2255,6 +2341,333 @@ mod tests {
             retry_after_seconds: None,
             read_failure: None,
         }
+    }
+
+    #[test]
+    fn identity_classification_requires_valid_matching_evidence() {
+        use crate::protocol::ReadFailure;
+        use HostedIdentityOutcome::*;
+        let mut config = Config::default();
+        config.network.address = format!("poa1{}", "1".repeat(32));
+        config.network.chain = "expected-chain".into();
+        let address = &config.network.address;
+        let other = format!("poa1{}2", "1".repeat(31));
+        for (status, body, failure, expected) in [
+            (200, json!({"address":address}), None, Verified),
+            (
+                200,
+                json!({"address":address,"chain_id":"expected-chain","ok":true}),
+                None,
+                Verified,
+            ),
+            (
+                401,
+                Value::Null,
+                Some(ReadFailure::InvalidJson),
+                AuthenticationFailed,
+            ),
+            (
+                403,
+                Value::Null,
+                Some(ReadFailure::Timeout),
+                AuthenticationFailed,
+            ),
+            (429, json!({"address":"other"}), None, Unavailable),
+            (503, json!({"address":"other"}), None, Unavailable),
+            (408, Value::Null, None, Unavailable),
+            (200, Value::Null, Some(ReadFailure::Timeout), Unavailable),
+            (
+                200,
+                Value::Null,
+                Some(ReadFailure::BodyInterrupted),
+                Unavailable,
+            ),
+            (
+                200,
+                Value::Null,
+                Some(ReadFailure::InvalidJson),
+                InvalidResponse,
+            ),
+            (
+                200,
+                Value::Null,
+                Some(ReadFailure::ResponseTooLarge),
+                InvalidResponse,
+            ),
+            (200, Value::Null, None, InvalidResponse),
+            (200, json!({}), None, InvalidResponse),
+            (200, json!({"address":17}), None, InvalidResponse),
+            (200, json!({"address":""}), None, InvalidResponse),
+            (
+                200,
+                json!({"address":"other","ok":false}),
+                None,
+                InvalidResponse,
+            ),
+            (
+                200,
+                json!({"address":address,"success":false}),
+                None,
+                InvalidResponse,
+            ),
+            (
+                200,
+                json!({"address":address,"chain_id":null}),
+                None,
+                InvalidResponse,
+            ),
+            (
+                200,
+                json!({"address":address,"chain_id":17}),
+                None,
+                InvalidResponse,
+            ),
+            (
+                200,
+                json!({"address":address,"chain_id":""}),
+                None,
+                InvalidResponse,
+            ),
+            (
+                200,
+                json!({"address":address,"chain_id":"wrong chain"}),
+                None,
+                InvalidResponse,
+            ),
+            (200, json!({"address":"other"}), None, InvalidResponse),
+            (200, json!({"address":other}), None, IdentityMismatch),
+            (
+                200,
+                json!({"address":address,"chain_id":"other"}),
+                None,
+                IdentityMismatch,
+            ),
+            (400, json!({"error":"unauthorized"}), None, InvalidResponse),
+        ] {
+            let response = Response {
+                status,
+                body,
+                read_failure: failure,
+                retry_after_seconds: None,
+            };
+            assert_eq!(classify_hosted_identity(&config, &response), expected);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn identity_timeout_retains_rejection_until_matching_success_and_skips_do_not_record() {
+        let credentials = tempfile::tempdir().unwrap();
+        let (_temp, mut runtime, _sender) = fixture_with(active_judge_config(credentials.path()));
+        let mut rejected = response(Value::Null);
+        rejected.status = 401;
+        assert!(
+            runtime
+                .finish_read(WorkKind::Judge, ReadScope::Identity, Ok(rejected))
+                .unwrap()
+                .is_none()
+        );
+        let rejected = runtime.store.status(&runtime.config).unwrap()["hosted_identity"].clone();
+        assert!(
+            runtime
+                .take_identity_permit(WorkKind::Judge)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            runtime.store.status(&runtime.config).unwrap()["hosted_identity"],
+            rejected
+        );
+        assert!(
+            runtime
+                .finish_read(
+                    WorkKind::Judge,
+                    ReadScope::Identity,
+                    Err(crate::protocol::ReadFailure::Timeout.into())
+                )
+                .unwrap()
+                .is_none()
+        );
+        let status = runtime.store.status(&runtime.config).unwrap();
+        assert_eq!(status["hosted_identity"]["status"], "unavailable");
+        assert_eq!(
+            status["hosted_identity"]["rejection"],
+            "authentication_failed"
+        );
+        assert_eq!(status["hosted_identity_verified"], false);
+        let matching = response(json!({"address":runtime.config.network.address}));
+        assert!(
+            runtime
+                .finish_read(WorkKind::Judge, ReadScope::Identity, Ok(matching))
+                .unwrap()
+                .is_some()
+        );
+        let status = runtime.store.status(&runtime.config).unwrap();
+        assert_eq!(status["hosted_identity"]["status"], "verified");
+        assert!(status["hosted_identity"]["rejection"].is_null());
+        assert_eq!(
+            runtime
+                .store
+                .read_backoff(ReadScope::Identity)
+                .unwrap()
+                .next_at,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn identity_permits_are_single_use_and_fenced_by_age_protocol_and_control() {
+        for invalidate in ["none", "age", "protocol", "control"] {
+            let (_temp, mut runtime, _sender) = fixture();
+            runtime.identity_nonblocking = true;
+            runtime.urgent_context = true;
+            runtime
+                .store
+                .record_identity_outcome(HostedIdentityOutcome::Verified)
+                .unwrap();
+            runtime
+                .store
+                .fail_read(ReadScope::Identity, 60, 60, 0, None)
+                .unwrap();
+            runtime.identity_ready = Some(IdentityReady {
+                protocol: Arc::clone(&runtime.protocol),
+                control: runtime.store.control().unwrap(),
+                completed_at: Instant::now(),
+            });
+            match invalidate {
+                "age" => {
+                    runtime.identity_ready.as_mut().unwrap().completed_at -= Duration::from_secs(
+                        runtime.config.timeouts.effective_read_http_seconds() + 1,
+                    )
+                }
+                "protocol" => runtime.protocol = Arc::new(Protocol::new(&runtime.config).unwrap()),
+                "control" => {
+                    runtime.store.set_paused(true).unwrap();
+                }
+                _ => {}
+            }
+            assert_eq!(
+                runtime
+                    .take_identity_permit(WorkKind::Judge)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                invalidate == "none"
+            );
+            assert!(
+                runtime
+                    .take_identity_permit(WorkKind::Judge)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(runtime.identity_read.is_none());
+            assert_eq!(
+                runtime.store.status(&runtime.config).unwrap()["hosted_identity"]["status"],
+                "verified"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn identity_timeout_retries_then_resumes_the_same_prepared_work() {
+        let credentials = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = active_judge_config(credentials.path());
+        config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
+        config.capabilities.mine = Mode::Active;
+        config.timeouts.read_http_seconds = Some(1);
+        let (_temp, mut runtime, _sender) = fixture_with(config);
+        let body = json!({"epoch":8,"words":["burn"],"answered":true});
+        let challenge = parse_challenge(&response(body.clone())).unwrap();
+        let input = Input {
+            solver: runtime.request(WorkKind::Mine, &challenge, None).unwrap(),
+            challenge_fingerprint: Some(challenge.fingerprint.clone()),
+        };
+        let mut op = runtime
+            .store
+            .begin(
+                WorkKind::Mine,
+                &format!("8:{}", challenge.fingerprint),
+                "prepared",
+                &serde_json::to_value(&input).unwrap(),
+                runtime.store.control().unwrap(),
+                &runtime.config.revision().unwrap(),
+            )
+            .unwrap();
+        op.payload = Some(json!({}));
+        runtime.store.save(&op, "prepared").unwrap();
+        let prefix = format!("GET /chain/{}/api/hosted", runtime.config.network.chain);
+        let fresh_path = format!("{prefix}/challenge");
+        let initial_body = body.clone();
+        let server = tokio::spawn(async move {
+            api_reply(&listener, &fresh_path, 200, None, initial_body).await;
+            let (stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            drop(stream);
+            listener
+        });
+        runtime.dispatch(&mut op).await.unwrap();
+        let listener = server.await.unwrap();
+        assert_eq!(op.state, "prepared");
+        let status = runtime.store.status(&runtime.config).unwrap();
+        assert_eq!(status["hosted_identity"]["status"], "unavailable");
+        assert!(status["hosted_identity_verified"].is_null());
+        assert!(
+            runtime
+                .store
+                .read_backoff(ReadScope::Identity)
+                .unwrap()
+                .next_at
+                > now()
+        );
+        runtime.store = Store::open(&runtime.config).unwrap();
+        runtime.dispatch(&mut op).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+        expire_read_deadlines(&runtime);
+        let matching = json!({"address":runtime.config.network.address});
+        let server = tokio::spawn(async move {
+            api_reply(&listener, &format!("{prefix}/challenge"), 200, None, body).await;
+            api_reply(&listener, &format!("{prefix}/me"), 200, None, matching).await;
+            api_reply(
+                &listener,
+                &format!("{prefix}/mine"),
+                200,
+                None,
+                json!({"ok":true,"attested":1}),
+            )
+            .await;
+            listener
+        });
+        runtime.dispatch(&mut op).await.unwrap();
+        let listener = server.await.unwrap();
+        assert_eq!(op.state, "completed");
+        assert_eq!(op.payload, Some(json!({})));
+        assert_eq!(
+            runtime
+                .store
+                .attempt_count(WorkKind::Mine, &op.key)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            runtime.store.status(&runtime.config).unwrap()["hosted_identity"]["status"],
+            "verified"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
     }
 
     fn request(kind: WorkKind) -> SolverRequest {
@@ -3830,7 +4243,13 @@ mod tests {
                 state
             );
             assert!(runtime.challenge(WorkKind::Answer).await.unwrap().is_none());
-            assert!(runtime.identity_matches(WorkKind::Answer).await.unwrap());
+            assert!(
+                runtime
+                    .take_identity_permit(WorkKind::Answer)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
             assert_eq!(
                 runtime.store.read_backoff(ReadScope::Challenge).unwrap(),
                 state
@@ -4433,7 +4852,7 @@ export async function callGatewayFromCli(_method, _options, params) {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn identity_matches_persists_latest_success_mismatch_and_unavailable_result() {
+    async fn identity_verification_persists_classified_results_without_inventing_rejections() {
         let credentials = tempfile::tempdir().unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut config = active_judge_config(credentials.path());
@@ -4453,7 +4872,7 @@ export async function callGatewayFromCli(_method, _options, params) {
         let server = tokio::spawn(async move {
             for body in [
                 json!({"address":address}),
-                json!({"address":"different-account"}),
+                json!({"address":format!("poa1{}2", "1".repeat(31))}),
                 json!({"address":address}),
                 json!({"address":address,"ok":false}),
                 json!({"address":address,"success":false}),
@@ -4471,35 +4890,70 @@ export async function callGatewayFromCli(_method, _options, params) {
                 .unwrap();
             drop(stream);
         });
-        for matched in [
-            true, false, true, false, false, false, false, false, false, true,
+        for (outcome, rejection) in [
+            ("verified", None),
+            ("identity_mismatch", Some("identity_mismatch")),
+            ("verified", None),
+            ("invalid_response", None),
+            ("invalid_response", None),
+            ("invalid_response", None),
+            ("invalid_response", None),
+            ("identity_mismatch", Some("identity_mismatch")),
+            ("invalid_response", Some("identity_mismatch")),
+            ("verified", None),
         ] {
+            let matched = outcome == "verified";
             let scheduled = runtime.store.next_at(WorkKind::Judge).unwrap();
             let before = now();
             assert_eq!(
-                runtime.identity_matches(WorkKind::Judge).await.unwrap(),
+                runtime
+                    .take_identity_permit(WorkKind::Judge)
+                    .await
+                    .unwrap()
+                    .is_some(),
                 matched
             );
+            let status = runtime.store.status(&runtime.config).unwrap();
+            assert_eq!(status["hosted_identity"]["status"], outcome);
+            assert_eq!(status["hosted_identity"]["rejection"], json!(rejection));
             assert_eq!(
-                runtime.store.status(&runtime.config).unwrap()["hosted_identity_verified"],
-                matched
+                status["hosted_identity_verified"],
+                if rejection.is_some() {
+                    json!(false)
+                } else if matched {
+                    json!(true)
+                } else {
+                    Value::Null
+                }
             );
             let after = runtime.store.next_at(WorkKind::Judge).unwrap();
             if matched {
                 assert_eq!(after, scheduled);
             } else {
                 assert!(after >= before + runtime.config.schedule.retry_seconds as i64);
-                assert!(!runtime.identity_matches(WorkKind::Judge).await.unwrap());
+                assert!(
+                    runtime
+                        .take_identity_permit(WorkKind::Judge)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
                 expire_read_deadlines(&runtime);
             }
         }
         let before = now();
-        assert!(!runtime.identity_matches(WorkKind::Judge).await.unwrap());
-        server.await.unwrap();
-        assert_eq!(
-            runtime.store.status(&runtime.config).unwrap()["hosted_identity_verified"],
-            false
+        assert!(
+            runtime
+                .take_identity_permit(WorkKind::Judge)
+                .await
+                .unwrap()
+                .is_none()
         );
+        server.await.unwrap();
+        let status = runtime.store.status(&runtime.config).unwrap();
+        assert!(status["hosted_identity_verified"].is_null());
+        assert_eq!(status["hosted_identity"]["status"], "unavailable");
+        assert!(status["hosted_identity"]["rejection"].is_null());
         assert!(
             runtime
                 .store

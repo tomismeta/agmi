@@ -9,6 +9,7 @@
 - Add read-only `doctor` and explicit `doctor --repair`, orchestrating existing token-fenced refusal recovery and validated managed-runtime stop/restoration. Preserve partial results, pause/configuration, uncertain writes and model history; disclose legacy 429 evidence limits and unsupported service boundaries.
 - Add explicit latest-stable discovery and verified managed updates, nonmutating `update --check`/dry-run, and opt-in `update --repair`. Reuse the installer and activated doctor; preserve user configuration, credentials, guidance, pause intent and history, fence concurrent activation, refuse unproven source ordering, and report update/repair/readiness separately.
 - Add generated Bash/Zsh/Fish completions, command examples/effect guidance, and sanitized `logs --follow` with ID-based paging, graceful shutdown and explicit retention-gap/journal-replacement errors.
+- Separate transient identity-read failures from authentication rejection and confirmed account/chain mismatches. Preserve rejection across later outages, expose scheduled unattended recovery consistently, and retain fresh identity checks before submissions. Extend guarded `doctor --repair` to normalize ambiguous legacy identity flags without asserting verification, changing retry deadlines or clearing uncertain work.
 
 ## 0.1.0
 

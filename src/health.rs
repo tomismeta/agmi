@@ -12,6 +12,87 @@ use serde_json::{Value, json};
 mod api;
 mod intervention;
 
+/// A bounded view of canonical evidence, not an upstream-response classifier.
+/// Legacy booleans cannot establish either a current permit or a rejection.
+pub(crate) struct HostedIdentity<'a> {
+    evidence: &'a Value,
+    status: &'a str,
+    rejection: Option<&'a str>,
+    legacy_failure: bool,
+}
+
+pub(crate) fn hosted_identity(status: &Value) -> HostedIdentity<'_> {
+    let evidence = &status["hosted_identity"];
+    let state = if status["initialized"] == false {
+        "unobserved"
+    } else {
+        match evidence["status"].as_str() {
+            Some(
+                state @ ("verified"
+                | "unavailable"
+                | "authentication_failed"
+                | "identity_mismatch"
+                | "invalid_response"
+                | "legacy_unknown"
+                | "unobserved"),
+            ) => state,
+            _ if !evidence.is_object() && status["hosted_identity_verified"].is_boolean() => {
+                "legacy_unknown"
+            }
+            _ => "unobserved",
+        }
+    };
+    let rejection = if status["initialized"] == false {
+        None
+    } else {
+        evidence["rejection"]
+            .as_str()
+            .filter(|value| matches!(*value, "authentication_failed" | "identity_mismatch"))
+            .or_else(|| {
+                matches!(state, "authentication_failed" | "identity_mismatch").then_some(state)
+            })
+    };
+    HostedIdentity {
+        evidence,
+        status: state,
+        rejection,
+        legacy_failure: status["initialized"] != false
+            && (evidence["legacy_failure"] == true
+                || (!evidence.is_object() && status["hosted_identity_verified"] == false)),
+    }
+}
+
+impl HostedIdentity<'_> {
+    fn rejected(&self) -> bool {
+        self.rejection.is_some()
+    }
+
+    pub(crate) fn verified(&self) -> Option<bool> {
+        if self.rejected() {
+            Some(false)
+        } else {
+            (self.status == "verified").then_some(true)
+        }
+    }
+
+    fn reason(&self) -> &'static str {
+        match self.rejection.unwrap_or(self.status) {
+            "authentication_failed" => "hosted_identity_authentication_failed",
+            "identity_mismatch" => "hosted_identity_mismatch",
+            "unavailable" => "hosted_identity_unavailable",
+            "invalid_response" => "hosted_identity_invalid_response",
+            "legacy_unknown" => "hosted_identity_legacy_unknown",
+            _ => "hosted_identity_unobserved",
+        }
+    }
+
+    pub(crate) fn value(&self) -> Value {
+        let timestamp = |key: &str| self.evidence[key].as_i64().filter(|time| *time >= 0);
+        json!({"status":self.status,"rejection":self.rejection,
+            "observed_at":timestamp("observed_at"),"last_verified_at":timestamp("last_verified_at"),
+            "legacy_failure":self.legacy_failure})
+    }
+}
 #[derive(Clone, Copy, Debug)]
 pub struct Options {
     pub stale_seconds: u64,
@@ -253,10 +334,9 @@ fn evaluate(config: &Config, options: Options, status: &Value, at: i64) -> Value
     if status["network_routing"]["matches_config"].as_bool() == Some(false) {
         issues.push("api_routing_mismatch");
     }
-    if status["hosted_identity_verified"].as_bool() == Some(false) {
-        issues.push("hosted_identity_unverified");
-    } else if status["hosted_identity_verified"].as_bool().is_none() && !paused && active {
-        issues.push("hosted_identity_unobserved");
+    let identity = hosted_identity(status);
+    if active && (identity.rejected() || (!paused && identity.verified() != Some(true))) {
+        issues.push(identity.reason());
     }
     if status["controller_stopped"].as_bool() == Some(true) {
         issues.push("controller_stopped");
@@ -413,7 +493,7 @@ fn evaluate(config: &Config, options: Options, status: &Value, at: i64) -> Value
         "unresolved_model_attempts":unresolved_models,
         "initialized":initialized,"paused":paused,"expect_participation":options.expect_participation,
         "controller_stopped":status["controller_stopped"].as_bool().unwrap_or(false),
-        "hosted_identity_verified":status["hosted_identity_verified"].as_bool(),
+        "hosted_identity_verified":identity.verified(),"hosted_identity":identity.value(),
         "heartbeat_age_seconds":heartbeat_age,"observation_age_seconds":observation_age,
         "heartbeat_recent":heartbeat_age.is_some_and(|age|age<=stale),
         "observing":observation_age.is_some_and(|age|age<=stale),"preparing":preparing,
@@ -536,14 +616,13 @@ fn components(status: &Value, health: &Value, at: i64, stale: u64, timing: &Work
     let active = ["answer", "judge", "mine"]
         .iter()
         .any(|name| effective["capabilities"][name] == "active");
+    let identity = hosted_identity(status);
     let controller_issue = if status["initialized"] != true {
         Some(("unknown", "not_initialized"))
     } else if status["identity_matches_config"] == false {
         Some(("blocked", "identity_mismatch"))
     } else if status["network_routing"]["matches_config"] == false {
         Some(("blocked", "api_routing_mismatch"))
-    } else if status["hosted_identity_verified"] == false {
-        Some(("blocked", "hosted_identity_unverified"))
     } else if status["controller_stopped"] == true {
         Some(("blocked", "controller_stopped"))
     } else if status["paused"] == true && active {
@@ -558,8 +637,15 @@ fn components(status: &Value, health: &Value, at: i64, stale: u64, timing: &Work
         Some(("unknown", "controller_unobserved"))
     } else if !fresh(observed, at, stale) {
         Some(("unknown", "controller_stale"))
-    } else if status["hosted_identity_verified"].is_null() && active {
-        Some(("unknown", "hosted_identity_unobserved"))
+    } else if identity.verified() != Some(true) && active {
+        Some((
+            if identity.rejected() {
+                "blocked"
+            } else {
+                "unknown"
+            },
+            identity.reason(),
+        ))
     } else if status["paused"].as_bool().is_none()
         || status["identity_matches_config"].as_bool().is_none()
     {
@@ -596,7 +682,13 @@ fn components(status: &Value, health: &Value, at: i64, stale: u64, timing: &Work
             mode != Some("read_only")
                 || !matches!(
                     *reason,
-                    "participation_paused" | "hosted_identity_unobserved"
+                    "participation_paused"
+                        | "hosted_identity_unobserved"
+                        | "hosted_identity_unavailable"
+                        | "hosted_identity_invalid_response"
+                        | "hosted_identity_legacy_unknown"
+                        | "hosted_identity_authentication_failed"
+                        | "hosted_identity_mismatch"
                 )
         }) {
             finding = (state, reason, observed);
@@ -756,6 +848,8 @@ mod tests {
         config.capabilities.answer = Mode::Active;
         let status = json!({"initialized":true,"paused":false,"identity_matches_config":true,
             "hosted_identity_verified":true,"admission_blocked":false,
+            "hosted_identity":{"status":"verified","observed_at":10000,"last_verified_at":10000,
+                "rejection":null,"legacy_failure":false},
             "effective_runtime":{"observed_at":10000,"reload_blocked":false,
                 "policy":{"timeouts":{"http_seconds":config.timeouts.http_seconds,
                     "shutdown_seconds":config.timeouts.shutdown_seconds},
@@ -802,10 +896,15 @@ mod tests {
         let health = evaluate(&config, options, &status, 10000);
         assert_eq!(health["healthy"], true);
         assert_eq!(health["hosted_identity_verified"], true);
-        status["hosted_identity_verified"] = json!(false);
+        status["hosted_identity"] = json!({"status":"authentication_failed",
+            "observed_at":10000,"last_verified_at":9990,"rejection":"authentication_failed",
+            "legacy_failure":false});
         let health = evaluate(&config, options, &status, 10000);
         assert_eq!(health["healthy"], false);
-        assert_eq!(health["issues"], json!(["hosted_identity_unverified"]));
+        assert_eq!(
+            health["issues"],
+            json!(["hosted_identity_authentication_failed"])
+        );
         assert_eq!(health["hosted_identity_verified"], false);
         assert!(!has(&health, "identity_mismatch"));
         assert!(has(
@@ -818,10 +917,39 @@ mod tests {
                 &status,
                 10000
             ),
-            "hosted_identity_unverified"
+            "hosted_identity_authentication_failed"
         ));
-        status["hosted_identity_verified"] = json!(true);
+        status["hosted_identity"]["status"] = json!("verified");
+        status["hosted_identity"]["rejection"] = Value::Null;
         assert_eq!(evaluate(&config, options, &status, 10000)["healthy"], true);
+    }
+
+    #[test]
+    fn uncertain_identity_is_not_health_or_credential_failure() {
+        let (config, options, mut status) = component_fixture();
+        for state in ["unavailable", "invalid_response", "legacy_unknown"] {
+            status["hosted_identity"] = json!({"status":state,"observed_at":10000,
+                "last_verified_at":9900,"rejection":null,"legacy_failure":true});
+            status["hosted_identity_verified"] = json!(false);
+            let result = evaluate(&config, options, &status, 10000);
+            assert_eq!(result["healthy"], false);
+            assert_eq!(result["hosted_identity_verified"], Value::Null);
+            assert_eq!(result["hosted_identity"], status["hosted_identity"]);
+            assert_eq!(result["components"]["answer"]["state"], "unknown");
+            assert_eq!(result["components"]["controller"]["state"], "unknown");
+        }
+        status.as_object_mut().unwrap().remove("hosted_identity");
+        for legacy in [true, false] {
+            status["hosted_identity_verified"] = json!(legacy);
+            let before = status.clone();
+            let result = evaluate(&config, options, &status, 10000);
+            assert_eq!(result["hosted_identity"]["status"], "legacy_unknown");
+            assert_eq!(result["hosted_identity"]["legacy_failure"], !legacy);
+            assert_eq!(result["hosted_identity"]["rejection"], Value::Null);
+            assert_eq!(result["hosted_identity_verified"], Value::Null);
+            assert_eq!(result["healthy"], false);
+            assert_eq!(status, before);
+        }
     }
 
     #[test]
@@ -831,7 +959,7 @@ mod tests {
         config.capabilities.judge = Mode::Off;
         config.capabilities.mine = Mode::Active;
         status["observation"] = Value::Null;
-        status["hosted_identity_verified"] = Value::Null;
+        status["hosted_identity"]["status"] = json!("unobserved");
         status["admission_blocked"] = json!(false);
         for expect_participation in [false, true] {
             let options = Options {
@@ -846,11 +974,11 @@ mod tests {
             assert!(health["hosted_identity_verified"].is_null());
             assert_eq!(health["risk"]["attention_required"], false);
             assert_eq!(health["evidence"], "local_only");
-            status["hosted_identity_verified"] = json!(true);
+            status["hosted_identity"]["status"] = json!("verified");
             let verified = evaluate(&config, options, &status, 10000);
             assert_eq!(verified["healthy"], true);
             assert_eq!(verified["operational"]["status"], "clear");
-            status["hosted_identity_verified"] = Value::Null;
+            status["hosted_identity"]["status"] = json!("unobserved");
         }
     }
 
@@ -861,7 +989,7 @@ mod tests {
             expect_participation: false,
             ..Options::default()
         };
-        status["hosted_identity_verified"] = Value::Null;
+        status["hosted_identity"]["status"] = json!("unobserved");
         status["paused"] = json!(true);
         let health = evaluate(&config, options, &status, 10000);
         assert_eq!(health["healthy"], true);
@@ -1363,7 +1491,7 @@ mod tests {
         let (config, options, mut status) = component_fixture();
         status["effective_runtime"]["capabilities"] =
             json!({"answer":"read_only","judge":"read_only","mine":"off"});
-        status["hosted_identity_verified"] = Value::Null;
+        status["hosted_identity"]["status"] = json!("unobserved");
         status["paused"] = json!(true);
         let result = evaluate(&config, options, &status, 10000);
         for name in ["controller", "answer", "judge"] {
@@ -1378,11 +1506,11 @@ mod tests {
         let result = evaluate(&config, options, &status, 10000);
         assert_eq!(result["components"]["answer"]["state"], "unknown");
         assert_eq!(result["components"]["judge"]["state"], "ok");
-        status["hosted_identity_verified"] = json!(false);
-        assert_eq!(
-            evaluate(&config, options, &status, 10000)["components"]["judge"]["state"],
-            "blocked"
-        );
+        status["hosted_identity"] =
+            json!({"status":"unavailable","rejection":"authentication_failed"});
+        let result = evaluate(&config, options, &status, 10000);
+        assert_eq!(result["components"]["answer"]["state"], "blocked");
+        assert_eq!(result["components"]["judge"]["state"], "ok");
     }
 
     #[test]
@@ -1464,7 +1592,11 @@ mod tests {
             ("paused", json!(true), "blocked"),
             ("controller_stopped", json!(true), "blocked"),
             ("identity_matches_config", json!(false), "blocked"),
-            ("hosted_identity_verified", json!(false), "blocked"),
+            (
+                "hosted_identity",
+                json!({"status":"authentication_failed","rejection":"authentication_failed"}),
+                "blocked",
+            ),
         ] {
             let mut changed = status.clone();
             changed[field] = value;

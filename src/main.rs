@@ -113,7 +113,7 @@ enum Command {
     },
     /// Check or install the latest stable release; preserve user settings and runtime intent.
     #[command(
-        after_help = "EXAMPLES\n  agmi update --check\n  agmi update\n  agmi update --repair\n  agmi update --dry-run\n  agmi update --binary /path/to/agmi --sha256 <trusted-digest>\n  agmi update --release r-<retained-sha256>\n\nDefault source: published stable releases from tomismeta/agmi, never main.\nChecks and dry runs do not activate, repair or submit work. Automatic updates refuse\nunproven source ordering; explicit local sources remain operator-selected.\n--repair uses guarded refusal recovery, not model abandonment or replay.\nUpdate, repair and readiness are separate outcomes. A restored service may resume\nalready-authorized participation. Managed updates use the default configuration."
+        after_help = "EXAMPLES\n  agmi update --check\n  agmi update\n  agmi update --repair\n  agmi update --dry-run\n  agmi update --binary /path/to/agmi --sha256 <trusted-digest>\n  agmi update --release r-<retained-sha256>\n\nDefault source: published stable releases from tomismeta/agmi, never main.\nChecks and dry runs do not activate, repair or submit work. Automatic updates refuse\nunproven source ordering; explicit local sources remain operator-selected.\n--repair uses guarded refusal recovery and legacy identity-evidence normalization,\nnot model abandonment or replay. Identity normalization retains uncertainty;\nit does not verify identity, repair credentials or change retry deadlines.\nUpdate, repair and readiness are separate outcomes. A restored service may resume\nalready-authorized participation. Managed updates use the default configuration."
     )]
     Update {
         /// Select a retained compatible release instead of downloading.
@@ -130,7 +130,7 @@ enum Command {
         /// Query latest stable without installing or repairing.
         #[arg(long, conflicts_with_all = ["release", "binary", "sha256", "stopped", "dry_run", "repair"])]
         check: bool,
-        /// Authorize guarded local refusal repairs after successful update/no-op.
+        /// Authorize guarded refusal repairs and legacy identity normalization after update/no-op.
         #[arg(long)]
         repair: bool,
         /// Leave the service stopped after activation; never changes pause intent.
@@ -160,12 +160,12 @@ enum Command {
     },
     /// Inspect local durable state without contacting MinePOA or a model.
     Status,
-    /// Diagnose unattended progress; --repair applies only guarded local refusal recovery.
+    /// Diagnose unattended progress; optionally apply guarded local evidence repairs.
     #[command(
-        after_help = "EXAMPLES\n  agmi doctor\n  agmi --json doctor\n  agmi doctor --repair\n\nRead-only by default. --repair authorizes only guarded refusal recovery;\nit preserves ambiguous writes, model history, guidance and pause intent.\nWaiting automatically is not a guarantee of success. Follow the reported next\naction for operator-required or undetermined evidence."
+        after_help = "EXAMPLES\n  agmi doctor\n  agmi --json doctor\n  agmi doctor --repair\n\nRead-only by default. --repair authorizes guarded refusal recovery and eligible\nlegacy identity-evidence normalization; it preserves ambiguous writes, model history,\nguidance and pause intent. Identity normalization retains the original uncertain\nfailure; it never clears a recorded rejection, verifies identity, replaces credentials\nor changes retry deadlines. Timeouts are not credential rejection. Automatic recovery\nrequires a retained retry or in-flight read and is not a guarantee of success.\nFollow the reported next action for operator-required or undetermined evidence."
     )]
     Doctor {
-        /// Repair eligible refusals, briefly stopping/restoring a matching managed runtime if needed.
+        /// Apply eligible local repairs, briefly stopping/restoring a matching managed runtime if needed.
         #[arg(long)]
         repair: bool,
     },

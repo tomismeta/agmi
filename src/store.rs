@@ -54,13 +54,14 @@ pub fn recovery_refusal(config_path: &Path, operation: i64, apply: Option<&str>)
     }
 }
 
-/// Doctor discovers and applies the same token-fenced refusals as recover resolve.
-/// An expected configuration revision authorizes application, never broader recovery.
-pub(crate) fn doctor_refusals(config_path: &Path, apply: Option<&str>) -> Result<Value> {
+/// Local doctor repairs share the stopped-writer guards. Identity normalization
+/// also requires the original preview, so new observations cannot be overwritten.
+pub(crate) fn doctor_repairs(config_path: &Path, apply: Option<&Value>) -> Result<Value> {
     let _configuration = crate::admin::lock_config_directory(config_path)?;
     let config = Config::load_metadata(config_path)?;
     let revision = digest(fs::read(config_path)?);
-    if apply.is_some_and(|expected| expected != revision) {
+    if apply.is_some_and(|expected| expected["config_revision"].as_str() != Some(revision.as_str()))
+    {
         return Err(RefusalRecoveryError("refusal_recovery_conflict").into());
     }
     let mut report = json!({"config_revision":revision,"eligible":[],"ineligible":[],
@@ -75,21 +76,72 @@ pub(crate) fn doctor_refusals(config_path: &Path, apply: Option<&str>) -> Result
     store.routing_change_allowed(&config)?;
     if apply.is_none() {
         let snapshot = store.db.unchecked_transaction()?;
-        let (eligible, ineligible) = Store::refusal_candidates(&snapshot, &revision)?;
+        let (mut eligible, ineligible) = Store::refusal_candidates(&snapshot, &revision)?;
+        let (identity, _) = Store::identity_normalization_preview(&snapshot, &revision)?;
+        if identity["eligible"] == true {
+            eligible.push(identity);
+        }
         report["eligible"] = json!(eligible);
         report["ineligible"] = json!(ineligible);
         snapshot.commit()?;
         return Ok(report);
     }
+    // Writer acquisition may bind a new routing profile. That must not reset
+    // observations as a side effect of local identity normalization.
+    if apply
+        .and_then(|preview| preview["eligible"].as_array())
+        .is_some_and(|rows| rows.iter().any(|row| row["kind"] == "identity"))
+        && store.routing_status(&config)?["matches_config"] != true
+    {
+        return Err(RefusalRecoveryError("identity_evidence_changed").into());
+    }
     drop(store);
     let (_account, mut store) = AccountLock::acquire(&config)
         .map_err(|error| error.context(RefusalRecoveryError("doctor_account_unavailable")))?;
     let _gate = AdmissionGuard::acquire(&config)?;
-    let (eligible, ineligible) = Store::refusal_candidates(&store.db, &revision)?;
+    let (mut eligible, ineligible) = Store::refusal_candidates(&store.db, &revision)?;
+    if let Some(identity) = apply
+        .and_then(|preview| preview["eligible"].as_array())
+        .and_then(|rows| {
+            rows.iter().find(|row| {
+                row["kind"] == "identity"
+                    && row["classification"] == "legacy_identity_evidence_normalization"
+            })
+        })
+    {
+        eligible.push(identity.clone());
+    }
     report["ineligible"] = json!(ineligible);
     let mut applied = Vec::new();
     let mut skipped = Vec::new();
     for preview in &eligible {
+        if preview["kind"] == "identity" {
+            let mut skipped_row = preview.clone();
+            if !report["failure"].is_null() {
+                skipped_row["reason"] = json!("earlier_repair_failed");
+                skipped.push(skipped_row);
+                continue;
+            }
+            let token = preview["preview_token"]
+                .as_str()
+                .context("missing identity token")?;
+            match store.normalize_legacy_identity(&revision, token) {
+                Ok(result) if result["applied"] == true => applied.push(result),
+                Ok(result) => skipped.push(result),
+                Err(error) => {
+                    let code = error
+                        .downcast_ref::<RefusalRecoveryError>()
+                        .map_or("identity_normalization_failed", |error| error.0);
+                    if code != "identity_evidence_changed" {
+                        report["failure"] = json!(code);
+                    }
+                    skipped_row["eligible"] = json!(false);
+                    skipped_row["reason"] = json!(code);
+                    skipped.push(skipped_row);
+                }
+            }
+            continue;
+        }
         let id = preview["operation_id"]
             .as_i64()
             .context("invalid refusal operation")?;
@@ -127,6 +179,34 @@ pub(crate) fn now() -> i64 {
         .as_secs() as i64
 }
 
+/// Durable observations are diagnostics, never a submission permit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HostedIdentityOutcome {
+    Verified,
+    Unavailable,
+    AuthenticationFailed,
+    IdentityMismatch,
+    InvalidResponse,
+}
+
+impl HostedIdentityOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Verified => "verified",
+            Self::Unavailable => "unavailable",
+            Self::AuthenticationFailed => "authentication_failed",
+            Self::IdentityMismatch => "identity_mismatch",
+            Self::InvalidResponse => "invalid_response",
+        }
+    }
+
+    fn rejection(self) -> Option<&'static str> {
+        match self {
+            Self::AuthenticationFailed | Self::IdentityMismatch => Some(self.as_str()),
+            _ => None,
+        }
+    }
+}
 /// Persisted second-resolution deadlines must never expire a fractional second
 /// before Retry-After. Rounding upward is conservative across process restarts.
 pub(crate) fn not_before(seconds: u64) -> i64 {
@@ -1050,7 +1130,16 @@ impl Store {
                 singleton INTEGER PRIMARY KEY CHECK(singleton=1),
                 hosted_identity_verified INTEGER CHECK(hosted_identity_verified IN (0,1)),
                 epoch INTEGER, first_observed_at INTEGER,
-                answered INTEGER CHECK(answered IN (0,1)));"
+                answered INTEGER CHECK(answered IN (0,1)));
+             CREATE TABLE IF NOT EXISTS hosted_identity_evidence (
+                singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                status TEXT NOT NULL CHECK(status IN ('verified','unavailable','authentication_failed',
+                    'identity_mismatch','invalid_response','legacy_unknown')),
+                observed_at INTEGER, last_verified_at INTEGER,
+                rejection TEXT CHECK(rejection IN ('authentication_failed','identity_mismatch')),
+                legacy_failure INTEGER NOT NULL CHECK(legacy_failure IN (0,1)));
+             CREATE TABLE IF NOT EXISTS identity_normalizations (
+                id INTEGER PRIMARY KEY, preview_token TEXT NOT NULL UNIQUE, audit TEXT NOT NULL);"
         )?;
         let expected = identity(config)?;
         let existing: Option<(String, i64)> = tx
@@ -1205,6 +1294,7 @@ impl Store {
             tx.execute_batch("DELETE FROM observation;
                 UPDATE control SET generation=generation+1 WHERE singleton=1;
                 UPDATE health_evidence SET hosted_identity_verified=NULL,epoch=NULL,first_observed_at=NULL,answered=NULL;
+                DELETE FROM hosted_identity_evidence;
                 UPDATE read_observations SET in_flight=0,started_at=NULL,last_success_at=NULL,last_http_success_at=NULL;")?;
         }
         tx.execute(
@@ -2970,6 +3060,28 @@ impl Store {
         jitter_seconds: u64,
         server_minimum: Option<u64>,
     ) -> Result<ReadBackoff> {
+        let tx = self.db.unchecked_transaction()?;
+        let state = self.fail_read_in(
+            &tx,
+            scope,
+            retry_seconds,
+            cap_seconds,
+            jitter_seconds,
+            server_minimum,
+        )?;
+        tx.commit()?;
+        Ok(state)
+    }
+
+    fn fail_read_in(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        scope: ReadScope,
+        retry_seconds: u64,
+        cap_seconds: u64,
+        jitter_seconds: u64,
+        server_minimum: Option<u64>,
+    ) -> Result<ReadBackoff> {
         let failures = self.read_backoff(scope)?.failures.saturating_add(1);
         let local = not_before(read_delay(
             failures,
@@ -2990,7 +3102,6 @@ impl Store {
             failures,
             next_at: local.max(floor).max(legacy_floor),
         };
-        let tx = self.db.unchecked_transaction()?;
         tx.execute(
             "INSERT INTO read_backoff(scope,failures,next_at) VALUES (?1,?2,?3)
             ON CONFLICT(scope) DO UPDATE SET failures=excluded.failures,next_at=excluded.next_at",
@@ -3002,12 +3113,17 @@ impl Store {
             server_not_before=excluded.server_not_before,
             failure_category=COALESCE(read_observations.failure_category,'unusable_response')",
             params![scope.as_str(),now(),local,floor])?;
-        tx.commit()?;
         Ok(state)
     }
 
     pub(crate) fn reset_read(&self, scope: ReadScope) -> Result<()> {
         let tx = self.db.unchecked_transaction()?;
+        Self::reset_read_in(&tx, scope)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn reset_read_in(tx: &rusqlite::Transaction<'_>, scope: ReadScope) -> Result<()> {
         tx.execute("DELETE FROM read_backoff WHERE scope=?1", [scope.as_str()])?;
         tx.execute(
             "INSERT INTO read_observations(scope,last_success_at) VALUES (?1,?2)
@@ -3015,7 +3131,6 @@ impl Store {
             local_next_at=0,server_not_before=0,retained_conservative_floor=0,failure_category=NULL",
             params![scope.as_str(), now()],
         )?;
-        tx.commit()?;
         Ok(())
     }
     pub(crate) fn observe(&self, epoch: u64, answered: bool) -> Result<()> {
@@ -3114,16 +3229,124 @@ impl Store {
         Ok(())
     }
 
-    /// Latest hosted identity result, independent of bounded diagnostic events.
-    /// This is persisted evidence, not a live verification or freshness guarantee.
-    pub(crate) fn record_hosted_identity(&self, verified: bool) -> Result<()> {
-        self.db.execute(
-            "INSERT INTO health_evidence(singleton,hosted_identity_verified) VALUES (1,?1)
-             ON CONFLICT(singleton) DO UPDATE SET
-             hosted_identity_verified=excluded.hosted_identity_verified",
-            [verified],
+    /// Persist the completed read, identity evidence and retry floor together.
+    /// A failed write must never leave a durable rejection paired with old identity.
+    pub(crate) fn complete_identity_read(
+        &self,
+        status: Option<u16>,
+        category: Option<&str>,
+        outcome: HostedIdentityOutcome,
+        retry: (u64, u64, u64),
+        minimum: Option<u64>,
+    ) -> Result<()> {
+        let tx = self.db.unchecked_transaction()?;
+        self.read_finished(ReadScope::Identity, status, category)?;
+        Self::write_identity_outcome(&tx, outcome)?;
+        if outcome == HostedIdentityOutcome::Verified {
+            Self::reset_read_in(&tx, ReadScope::Identity)?;
+        } else {
+            self.fail_read_in(&tx, ReadScope::Identity, retry.0, retry.1, retry.2, minimum)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_identity_outcome(&self, outcome: HostedIdentityOutcome) -> Result<()> {
+        let tx = self.db.unchecked_transaction()?;
+        Self::write_identity_outcome(&tx, outcome)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    // Skipped/cancelled reads never call this; only a match clears rejection.
+    fn write_identity_outcome(
+        tx: &rusqlite::Transaction<'_>,
+        outcome: HostedIdentityOutcome,
+    ) -> Result<()> {
+        tx.execute(
+            "INSERT INTO hosted_identity_evidence VALUES(1,?1,?2,
+                CASE WHEN ?1='verified' THEN ?2 ELSE
+                    (SELECT last_success_at FROM read_observations WHERE scope='identity'
+                     AND (SELECT hosted_identity_verified FROM health_evidence WHERE singleton=1)=1)
+                END,?3,
+                CASE WHEN ?1='verified' THEN 0 ELSE
+                    COALESCE((SELECT hosted_identity_verified=0 FROM health_evidence WHERE singleton=1),0)
+                END)
+             ON CONFLICT(singleton) DO UPDATE SET status=excluded.status,
+                observed_at=excluded.observed_at,
+                last_verified_at=CASE WHEN excluded.status='verified' THEN excluded.observed_at
+                    ELSE hosted_identity_evidence.last_verified_at END,
+                rejection=CASE WHEN excluded.status='verified' THEN NULL
+                    ELSE COALESCE(excluded.rejection,hosted_identity_evidence.rejection) END,
+                legacy_failure=CASE WHEN excluded.status='verified' THEN 0
+                    ELSE hosted_identity_evidence.legacy_failure END",
+            params![outcome.as_str(), now(), outcome.rejection()],
+        )?;
+        // The legacy column is a migration input only, not a second classifier.
+        tx.execute(
+            "UPDATE health_evidence SET hosted_identity_verified=NULL WHERE singleton=1",
+            [],
         )?;
         Ok(())
+    }
+
+    fn hosted_identity(db: &Connection) -> Result<Value> {
+        let has_table = |name: &str| -> Result<bool> {
+            Ok(db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1)",
+                [name],
+                |row| row.get(0),
+            )?)
+        };
+        if has_table("hosted_identity_evidence")?
+            && let Some(evidence) = db
+                .query_row(
+                    "SELECT status,observed_at,last_verified_at,rejection,legacy_failure
+                 FROM hosted_identity_evidence WHERE singleton=1",
+                    [],
+                    |row| {
+                        Ok(json!({
+                            "status":row.get::<_,String>(0)?,
+                            "observed_at":row.get::<_,Option<i64>>(1)?,
+                            "last_verified_at":row.get::<_,Option<i64>>(2)?,
+                            "rejection":row.get::<_,Option<String>>(3)?,
+                            "legacy_failure":row.get::<_,bool>(4)?
+                        }))
+                    },
+                )
+                .optional()?
+        {
+            return Ok(evidence);
+        }
+        let legacy: Option<bool> = if has_table("health_evidence")? {
+            db.query_row(
+                "SELECT hosted_identity_verified FROM health_evidence WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten()
+        } else {
+            None
+        };
+        let last_verified_at: Option<i64> =
+            if legacy == Some(true) && has_table("read_observations")? {
+                db.query_row(
+                    "SELECT last_success_at FROM read_observations WHERE scope='identity'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten()
+            } else {
+                None
+            };
+        Ok(
+            json!({"status":if legacy.is_some() {"legacy_unknown"} else {"unobserved"},
+            "observed_at":null,"last_verified_at":last_verified_at,"rejection":null,
+            "legacy_failure":legacy == Some(false)}),
+        )
     }
 
     pub(crate) fn safety_observed(&self, id: i64) -> Result<()> {
@@ -3829,22 +4052,26 @@ impl Store {
             [],
             |r| r.get(0),
         )?;
-        let (hosted_identity_verified, first_observed_at, answered): (
-            Option<bool>,
-            Option<i64>,
-            Option<bool>,
-        ) = if has_health_evidence {
+        let (first_observed_at, answered): (Option<i64>, Option<bool>) = if has_health_evidence {
             self.db
                 .query_row(
-                    "SELECT hosted_identity_verified,first_observed_at,answered
+                    "SELECT first_observed_at,answered
                      FROM health_evidence WHERE singleton=1",
                     [],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()?
-                .unwrap_or((None, None, None))
+                .unwrap_or((None, None))
         } else {
-            (None, None, None)
+            (None, None)
+        };
+        let hosted_identity = Self::hosted_identity(&self.db)?;
+        let hosted_identity_verified = if !hosted_identity["rejection"].is_null() {
+            Some(false)
+        } else if hosted_identity["status"] == "verified" {
+            Some(true)
+        } else {
+            None
         };
         let epoch_evidence = json!({"first_observed_at":first_observed_at,"answered":answered});
         let effect = self.effect()?;
@@ -4059,6 +4286,7 @@ impl Store {
             "controller_stopped":controller_stopped,"epoch_evidence":epoch_evidence,
             "identity_matches_config":stored_identity==identity(config)?,"last_event":last_event,
             "hosted_identity_verified":hosted_identity_verified,
+            "hosted_identity":hosted_identity,
             "reads":reads,"work":work,
             "pending":pending,"operations":counts,"evidence":"authenticated_hosted_response",
             "admission_blocked":blocked,"oldest_unresolved_operation":oldest_unresolved_operation,
@@ -4071,6 +4299,178 @@ impl Store {
             "finality":"node_reported_only","paid":"not_verified"});
         snapshot.commit()?;
         Ok(status)
+    }
+
+    fn identity_normalization_preview(db: &Connection, revision: &str) -> Result<(Value, Value)> {
+        let exists = |name: &str| -> Result<bool> {
+            Ok(db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1)",
+                [name],
+                |row| row.get(0),
+            )?)
+        };
+        let legacy: Option<bool> = if exists("health_evidence")? {
+            db.query_row(
+                "SELECT hosted_identity_verified FROM health_evidence WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten()
+        } else {
+            None
+        };
+        let structured = exists("hosted_identity_evidence")?
+            && db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM hosted_identity_evidence WHERE singleton=1)",
+                [],
+                |row| row.get::<_, bool>(0),
+            )?;
+        let mut observation = if exists("read_observations")? {
+            db.query_row(
+                "SELECT in_flight,started_at,finished_at,last_http_success_at,last_success_at,
+                 last_failure_at,failure_category,status,local_next_at,server_not_before,
+                 retained_conservative_floor FROM read_observations WHERE scope='identity'",
+                [], |row| Ok(json!({
+                    "in_flight":row.get::<_,bool>(0)?, "started_at":row.get::<_,Option<i64>>(1)?,
+                    "finished_at":row.get::<_,Option<i64>>(2)?,
+                    "last_http_success_at":row.get::<_,Option<i64>>(3)?,
+                    "last_success_at":row.get::<_,Option<i64>>(4)?,
+                    "last_failure_at":row.get::<_,Option<i64>>(5)?,
+                    "failure_category":row.get::<_,Option<String>>(6)?,
+                    "status":row.get::<_,Option<i64>>(7)?,
+                    "local_next_at":row.get::<_,i64>(8)?,
+                    "server_not_before":row.get::<_,i64>(9)?,
+                    "retained_conservative_floor":row.get::<_,i64>(10)?
+                })),
+            ).optional()?.unwrap_or(Value::Null)
+        } else {
+            Value::Null
+        };
+        let backoff = db
+            .query_row(
+                "SELECT failures,next_at FROM read_backoff WHERE scope='identity'",
+                [],
+                |row| Ok(json!({"failures":row.get::<_,i64>(0)?,"next_at":row.get::<_,i64>(1)?})),
+            )
+            .optional()?
+            .unwrap_or(Value::Null);
+        // Opening an old journal materializes this default row from backoff.
+        // Bind the preview to its meaning, not the presence of migration metadata.
+        if observation.is_null() && !backoff.is_null() {
+            observation = json!({"in_flight":false,"started_at":null,"finished_at":null,
+                "last_http_success_at":null,"last_success_at":null,"last_failure_at":null,
+                "failure_category":null,"status":null,"local_next_at":0,"server_not_before":0,
+                "retained_conservative_floor":backoff["next_at"]});
+        }
+        let binding = db.query_row(
+            "SELECT a.database_id,a.dispatch_sequence,c.generation,c.paused
+             FROM authority a,control c WHERE a.singleton=1 AND c.singleton=1",
+            [],
+            |row| {
+                Ok(json!({"database_id":row.get::<_,String>(0)?,
+                "dispatch_sequence":row.get::<_,i64>(1)?,"generation":row.get::<_,i64>(2)?,
+                "paused":row.get::<_,bool>(3)?}))
+            },
+        )?;
+        let routing: Option<String> = if exists("routing_profile")? {
+            db.query_row(
+                "SELECT profile FROM routing_profile WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?
+        } else {
+            None
+        };
+        let captured = json!({"hosted_identity_verified":legacy,
+            "structured_evidence_present":structured,"read_observation":observation,
+            "read_backoff":backoff,"binding":binding,
+            "routing_fingerprint":routing.map(digest)
+                .unwrap_or_else(|| crate::endpoints::LEGACY_API_FINGERPRINT.to_owned())});
+        let eligible = legacy == Some(false) && !structured;
+        let token = eligible.then(|| {
+            digest(
+                json!({"contract":"legacy_identity_normalization_v1",
+            "config_revision":revision,"captured":captured})
+                .to_string(),
+            )
+        });
+        Ok((
+            json!({"kind":"identity","classification":"legacy_identity_evidence_normalization",
+            "eligible":eligible,"reason":if eligible {"eligible"} else {"not_legacy_identity_failure"},
+            "target_status":"legacy_unknown","legacy_failure":true,
+            "preview_token":token,"config_revision":revision,
+            "dry_run":true,"resolved":false,"applied":false,"already_resolved":false,
+            "network_requests_reset":false,"historical_payload_retried":false,
+            "evidence_limit":"Local normalization of an ambiguous legacy failure. Its cause is unknown; this is neither credential repair nor identity verification."}),
+            captured,
+        ))
+    }
+
+    fn normalize_legacy_identity(&mut self, revision: &str, token: &str) -> Result<Value> {
+        self.continuity()?;
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (mut preview, captured) = Self::identity_normalization_preview(&tx, revision)?;
+        let previous_audit: Option<String> = tx
+            .query_row(
+                "SELECT audit FROM identity_normalizations WHERE preview_token=?1",
+                [token],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(audit) = previous_audit {
+            let audit: Value = serde_json::from_str(&audit)?;
+            if captured["hosted_identity_verified"].is_null()
+                && Self::hosted_identity(&tx)? == audit["normalized_evidence"]
+            {
+                preview["dry_run"] = json!(false);
+                preview["resolved"] = json!(true);
+                preview["already_resolved"] = json!(true);
+                preview["reason"] = json!("already_resolved");
+                tx.commit()?;
+                return Ok(preview);
+            }
+        }
+        if preview["eligible"] != true || preview["preview_token"].as_str() != Some(token) {
+            return Err(RefusalRecoveryError("identity_evidence_changed").into());
+        }
+        let normalized = json!({"status":"legacy_unknown","observed_at":null,
+            "last_verified_at":null,"rejection":null,"legacy_failure":true});
+        let audit = json!({"source":"doctor_legacy_identity_normalization",
+            "contract":"legacy_identity_normalization_v1","at":now(),
+            "preview_token":token,"config_revision":revision,
+            "classification":preview["classification"],"previous_evidence":captured,
+            "normalized_evidence":normalized,"evidence_limit":preview["evidence_limit"]});
+        tx.execute(
+            "INSERT INTO identity_normalizations(preview_token,audit) VALUES(?1,?2)",
+            params![token, serde_json::to_string(&audit)?],
+        )?;
+        tx.execute(
+            "INSERT INTO hosted_identity_evidence VALUES(1,'legacy_unknown',NULL,NULL,NULL,1)",
+            [],
+        )?;
+        let changed = tx.execute(
+            "UPDATE health_evidence SET hosted_identity_verified=NULL
+             WHERE singleton=1 AND hosted_identity_verified=0",
+            [],
+        )?;
+        if changed != 1 {
+            return Err(RefusalRecoveryError("identity_evidence_changed").into());
+        }
+        tx.execute(
+            "INSERT INTO events(at,code) VALUES(?1,'legacy_identity_evidence_normalized')",
+            [now()],
+        )?;
+        tx.commit()?;
+        preview["eligible"] = json!(false);
+        preview["reason"] = json!("legacy_identity_evidence_normalized");
+        preview["dry_run"] = json!(false);
+        preview["resolved"] = json!(true);
+        preview["applied"] = json!(true);
+        Ok(preview)
     }
 
     fn refusal_candidates(db: &Connection, revision: &str) -> Result<(Vec<Value>, Vec<Value>)> {
@@ -4826,11 +5226,16 @@ mod tests {
             age_refusal_evidence(&store, op.id);
         }
         store.set_paused(true).unwrap();
-        let preview = doctor_refusals(&path, None).unwrap();
-        let revision = preview["config_revision"].as_str().unwrap();
-        assert!(doctor_refusals(&path, Some(revision)).is_err());
+        let preview = doctor_repairs(&path, None).unwrap();
+        assert!(doctor_repairs(&path, Some(&preview)).is_err());
         drop(account);
-        assert!(doctor_refusals(&path, Some("stale-configuration")).is_err());
+        assert!(
+            doctor_repairs(
+                &path,
+                Some(&json!({"config_revision":"stale-configuration"}))
+            )
+            .is_err()
+        );
         assert_eq!(store.operation(1).unwrap().unwrap().state, "unknown");
         store
             .db
@@ -4841,7 +5246,7 @@ mod tests {
             )
             .unwrap();
         drop(store);
-        let result = doctor_refusals(&path, Some(revision)).unwrap();
+        let result = doctor_repairs(&path, Some(&preview)).unwrap();
         assert_eq!(result["failure"], "refusal_recovery_failed");
         assert_eq!(result["applied"][0]["operation_id"], 1);
         assert_eq!(result["skipped"][0]["operation_id"], 2);
@@ -6175,7 +6580,9 @@ mod tests {
         config.participation.mode = ParticipationMode::Manual;
         config.participation.allow_answer = true;
         store.observe(9, false).unwrap();
-        store.record_hosted_identity(true).unwrap();
+        store
+            .record_identity_outcome(HostedIdentityOutcome::Verified)
+            .unwrap();
         let grant = store.authorize(&config, 9, WorkKind::Answer).unwrap();
         config.network.api.routes.insert(
             crate::endpoints::Endpoint::Challenge,
@@ -6197,6 +6604,11 @@ mod tests {
             )
             .unwrap();
         assert_eq!(identity, None);
+        assert_eq!(
+            store.status(&config).unwrap()["hosted_identity"],
+            json!({"status":"unobserved","observed_at":null,"last_verified_at":null,
+                "rejection":null,"legacy_failure":false})
+        );
         dispatched_unknown(&mut store, &config, WorkKind::Judge, 8);
         let mut answer = prepared_epoch(&mut store, WorkKind::Answer, 9, "fresh");
         assert!(!store.dispatch_intent(&mut answer, &config).unwrap());
@@ -8437,6 +8849,378 @@ mod tests {
     }
 
     #[test]
+    fn identity_completion_rolls_back_read_evidence_and_retry_floor_together() {
+        for (fail_at, outcome, http) in [
+            (
+                "BEFORE INSERT ON hosted_identity_evidence",
+                HostedIdentityOutcome::AuthenticationFailed,
+                401,
+            ),
+            (
+                "BEFORE INSERT ON read_backoff",
+                HostedIdentityOutcome::AuthenticationFailed,
+                403,
+            ),
+            (
+                "BEFORE DELETE ON read_backoff",
+                HostedIdentityOutcome::Verified,
+                200,
+            ),
+        ] {
+            let (_temp, config) = fixture();
+            let store = Store::open(&config).unwrap();
+            store.read_started(ReadScope::Identity).unwrap();
+            let prior = if outcome == HostedIdentityOutcome::Verified {
+                HostedIdentityOutcome::AuthenticationFailed
+            } else {
+                HostedIdentityOutcome::Verified
+            };
+            store
+                .complete_identity_read(
+                    Some(if prior == HostedIdentityOutcome::Verified {
+                        200
+                    } else {
+                        401
+                    }),
+                    None,
+                    prior,
+                    (10, 60, 0),
+                    Some(100),
+                )
+                .unwrap();
+            store.read_started(ReadScope::Identity).unwrap();
+            let before = store.status(&config).unwrap()["hosted_identity"].clone();
+            let reads = store.reads().unwrap();
+            let before_read = reads
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["scope"] == "identity")
+                .unwrap()
+                .clone();
+            store
+                .db
+                .execute_batch(&format!(
+                    "CREATE TRIGGER reject_identity_write {fail_at}
+                 BEGIN SELECT RAISE(ABORT,'injected identity write failure'); END;"
+                ))
+                .unwrap();
+            assert!(
+                store
+                    .complete_identity_read(
+                        Some(http),
+                        Some("http_status"),
+                        outcome,
+                        (10, 60, 0),
+                        Some(300),
+                    )
+                    .is_err()
+            );
+            drop(store);
+            let reader = Store::read_only(&config).unwrap().unwrap();
+            assert_eq!(reader.status(&config).unwrap()["hosted_identity"], before);
+            let reads = reader.reads().unwrap();
+            let after_read = reads
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["scope"] == "identity")
+                .unwrap();
+            for field in [
+                "state",
+                "status",
+                "failure_category",
+                "failures",
+                "next_at",
+                "last_failure_at",
+                "last_success_at",
+                "server_not_before",
+            ] {
+                assert_eq!(after_read[field], before_read[field], "{fail_at}: {field}");
+            }
+            drop(reader);
+            let store = Store::open(&config).unwrap();
+            store
+                .db
+                .execute_batch("DROP TRIGGER reject_identity_write;")
+                .unwrap();
+            let started = now();
+            store
+                .complete_identity_read(
+                    Some(http),
+                    Some("http_status"),
+                    outcome,
+                    (10, 60, 0),
+                    Some(300),
+                )
+                .unwrap();
+            drop(store);
+            let reader = Store::read_only(&config).unwrap().unwrap();
+            let status = reader.status(&config).unwrap();
+            assert_eq!(status["hosted_identity"]["status"], outcome.as_str());
+            assert_eq!(
+                status["hosted_identity_verified"],
+                outcome == HostedIdentityOutcome::Verified
+            );
+            let backoff = reader.read_backoff(ReadScope::Identity).unwrap();
+            if outcome == HostedIdentityOutcome::Verified {
+                assert_eq!(backoff.failures, 0);
+            } else {
+                assert!(backoff.next_at >= started + 300);
+                assert_eq!(
+                    status["hosted_identity"]["rejection"],
+                    "authentication_failed"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn identity_rejection_and_last_verification_survive_transient_outcomes_and_reopen() {
+        let (_temp, config) = fixture();
+        let store = Store::open(&config).unwrap();
+        store
+            .record_identity_outcome(HostedIdentityOutcome::Verified)
+            .unwrap();
+        let verified = store.status(&config).unwrap()["hosted_identity"].clone();
+        for rejection in [
+            HostedIdentityOutcome::AuthenticationFailed,
+            HostedIdentityOutcome::IdentityMismatch,
+        ] {
+            store.record_identity_outcome(rejection).unwrap();
+            for outcome in [
+                HostedIdentityOutcome::Unavailable,
+                HostedIdentityOutcome::InvalidResponse,
+            ] {
+                store.record_identity_outcome(outcome).unwrap();
+                let reader = Store::read_only(&config).unwrap().unwrap();
+                let status = reader.status(&config).unwrap();
+                assert_eq!(status["hosted_identity"]["status"], outcome.as_str());
+                assert_eq!(status["hosted_identity"]["rejection"], rejection.as_str());
+                assert_eq!(
+                    status["hosted_identity"]["last_verified_at"],
+                    verified["last_verified_at"]
+                );
+                assert_eq!(status["hosted_identity_verified"], false);
+            }
+        }
+        drop(store);
+        let store = Store::open(&config).unwrap();
+        assert_eq!(
+            store.status(&config).unwrap()["hosted_identity"]["rejection"],
+            "identity_mismatch"
+        );
+        store
+            .record_identity_outcome(HostedIdentityOutcome::Verified)
+            .unwrap();
+        let status = store.status(&config).unwrap();
+        assert_eq!(status["hosted_identity_verified"], true);
+        assert!(status["hosted_identity"]["rejection"].is_null());
+        assert_eq!(status["hosted_identity"]["legacy_failure"], false);
+    }
+
+    #[test]
+    fn readonly_legacy_identity_flags_remain_uncertain_without_schema_migration() {
+        for legacy in [false, true] {
+            let (_temp, config) = fixture();
+            let store = Store::open(&config).unwrap();
+            store
+                .db
+                .execute("DROP TABLE hosted_identity_evidence", [])
+                .unwrap();
+            store
+                .db
+                .execute(
+                    "INSERT INTO health_evidence(singleton,hosted_identity_verified) VALUES(1,?1)",
+                    [legacy],
+                )
+                .unwrap();
+            store.db.execute(
+                "INSERT INTO read_observations(scope,last_success_at,last_failure_at,failure_category)
+                 VALUES('identity',123,456,'timeout')", [],
+            ).unwrap();
+            let before = store.db.total_changes();
+            let reader = Store::read_only(&config).unwrap().unwrap();
+            let status = reader.status(&config).unwrap();
+            assert_eq!(
+                status["hosted_identity"],
+                json!({"status":"legacy_unknown","observed_at":null,
+                    "last_verified_at":if legacy {Some(123)} else {None},
+                    "rejection":null,"legacy_failure":!legacy})
+            );
+            assert!(status["hosted_identity_verified"].is_null());
+            assert_eq!(reader.db.total_changes(), 0);
+            assert!(!reader.has_table("hosted_identity_evidence").unwrap());
+            assert_eq!(store.db.total_changes(), before);
+        }
+    }
+
+    #[test]
+    fn legacy_identity_normalization_is_audited_idempotent_and_preserves_other_evidence() {
+        let (_temp, config, mut store) = participation_fixture();
+        store.observe(42, false).unwrap();
+        store
+            .db
+            .execute("UPDATE health_evidence SET hosted_identity_verified=0", [])
+            .unwrap();
+        store.read_started(ReadScope::Identity).unwrap();
+        store
+            .read_finished(ReadScope::Identity, None, Some("timeout"))
+            .unwrap();
+        store
+            .fail_read(ReadScope::Identity, 30, 120, 0, Some(900))
+            .unwrap();
+        let op = prepared_epoch(&mut store, WorkKind::Judge, 42, "captured");
+        let control = store.control().unwrap();
+        let operation = store.inspect(op.id).unwrap();
+        let reads = store.reads().unwrap();
+        let before = store.status(&config).unwrap();
+        let (preview, captured) =
+            Store::identity_normalization_preview(&store.db, "config").unwrap();
+        assert!(preview.get("operation_id").is_none());
+        assert_eq!(preview["kind"], "identity");
+        assert_eq!(preview["eligible"], true);
+        let token = preview["preview_token"].as_str().unwrap();
+        let applied = store.normalize_legacy_identity("config", token).unwrap();
+        assert_eq!(applied["applied"], true);
+        assert_eq!(store.control().unwrap(), control);
+        assert_eq!(store.inspect(op.id).unwrap(), operation);
+        assert_eq!(store.reads().unwrap(), reads);
+        let after = store.status(&config).unwrap();
+        assert_eq!(before["hosted_identity"], after["hosted_identity"]);
+        assert_eq!(before["epoch_evidence"], after["epoch_evidence"]);
+        assert!(after["hosted_identity_verified"].is_null());
+        let audit: String = store
+            .db
+            .query_row("SELECT audit FROM identity_normalizations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let audit: Value = serde_json::from_str(&audit).unwrap();
+        assert_eq!(audit["previous_evidence"], captured);
+        assert_eq!(audit["normalized_evidence"], after["hosted_identity"]);
+        let changes = store.db.total_changes();
+        assert_eq!(
+            store.normalize_legacy_identity("config", token).unwrap()["already_resolved"],
+            true
+        );
+        assert_eq!(store.db.total_changes(), changes);
+        assert_eq!(
+            Store::identity_normalization_preview(&store.db, "config")
+                .unwrap()
+                .0["eligible"],
+            false
+        );
+        store
+            .record_identity_outcome(HostedIdentityOutcome::Unavailable)
+            .unwrap();
+        assert_eq!(
+            store.status(&config).unwrap()["hosted_identity"]["legacy_failure"],
+            true
+        );
+        store
+            .record_identity_outcome(HostedIdentityOutcome::Verified)
+            .unwrap();
+        assert_eq!(
+            store.status(&config).unwrap()["hosted_identity"]["legacy_failure"],
+            false
+        );
+        assert!(store.normalize_legacy_identity("config", token).is_err());
+        drop(store);
+        let reader = Store::read_only(&config).unwrap().unwrap();
+        assert_eq!(
+            reader
+                .db
+                .query_row("SELECT COUNT(*) FROM identity_normalizations", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn legacy_identity_normalization_refuses_changed_evidence_and_rolls_back_failed_audit() {
+        for outcome in [
+            None,
+            Some(HostedIdentityOutcome::AuthenticationFailed),
+            Some(HostedIdentityOutcome::Verified),
+        ] {
+            let (_temp, config) = fixture();
+            let mut store = Store::open(&config).unwrap();
+            store
+                .db
+                .execute(
+                    "INSERT INTO health_evidence(singleton,hosted_identity_verified) VALUES(1,0)",
+                    [],
+                )
+                .unwrap();
+            let (preview, _) = Store::identity_normalization_preview(&store.db, "config").unwrap();
+            if let Some(outcome) = outcome {
+                store.record_identity_outcome(outcome).unwrap();
+            } else {
+                store.read_started(ReadScope::Identity).unwrap();
+            }
+            let before = store.status(&config).unwrap()["hosted_identity"].clone();
+            let error = store
+                .normalize_legacy_identity("config", preview["preview_token"].as_str().unwrap())
+                .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<RefusalRecoveryError>().unwrap().0,
+                "identity_evidence_changed"
+            );
+            assert_eq!(store.status(&config).unwrap()["hosted_identity"], before);
+            assert_eq!(
+                store
+                    .db
+                    .query_row("SELECT COUNT(*) FROM identity_normalizations", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap(),
+                0
+            );
+        }
+        let (_temp, config) = fixture();
+        let mut store = Store::open(&config).unwrap();
+        store
+            .db
+            .execute(
+                "INSERT INTO health_evidence(singleton,hosted_identity_verified) VALUES(1,0)",
+                [],
+            )
+            .unwrap();
+        let (preview, _) = Store::identity_normalization_preview(&store.db, "config").unwrap();
+        store
+            .db
+            .execute_batch(
+                "CREATE TRIGGER reject_identity_audit BEFORE INSERT ON events
+            WHEN NEW.code='legacy_identity_evidence_normalized'
+            BEGIN SELECT RAISE(ABORT,'fixture audit failure'); END;",
+            )
+            .unwrap();
+        assert!(
+            store
+                .normalize_legacy_identity("config", preview["preview_token"].as_str().unwrap())
+                .is_err()
+        );
+        assert_eq!(
+            Store::identity_normalization_preview(&store.db, "config")
+                .unwrap()
+                .0,
+            preview
+        );
+        assert_eq!(
+            store
+                .db
+                .query_row("SELECT COUNT(*) FROM identity_normalizations", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
     fn hosted_identity_failure_survives_event_pruning_and_reopen_until_verified() {
         use crate::health::{self, Options};
         let (_temp, mut config) = fixture();
@@ -8444,7 +9228,9 @@ mod tests {
         let mut store = Store::open(&config).unwrap();
         assert!(store.status(&config).unwrap()["hosted_identity_verified"].is_null());
         store.set_paused(false).unwrap();
-        store.record_hosted_identity(false).unwrap();
+        store
+            .record_identity_outcome(HostedIdentityOutcome::IdentityMismatch)
+            .unwrap();
         store.event("identity_mismatch", None).unwrap();
         store
             .db
@@ -8485,8 +9271,10 @@ mod tests {
         };
         let health = health::check(&config, options).unwrap();
         assert_eq!(health["healthy"], false);
-        assert_eq!(health["issues"], json!(["hosted_identity_unverified"]));
-        store.record_hosted_identity(true).unwrap();
+        assert_eq!(health["hosted_identity"]["rejection"], "identity_mismatch");
+        store
+            .record_identity_outcome(HostedIdentityOutcome::Verified)
+            .unwrap();
         assert_eq!(health::check(&config, options).unwrap()["healthy"], true);
         drop(store);
         let reader = Store::read_only(&config).unwrap().unwrap();
@@ -8521,7 +9309,11 @@ mod tests {
         assert_eq!(status["observation"]["epoch"], 54);
         assert_eq!(status["identity_matches_config"], true);
         assert_eq!(reader.db.total_changes(), 0);
-        assert!(reader.record_hosted_identity(false).is_err());
+        assert!(
+            reader
+                .record_identity_outcome(HostedIdentityOutcome::Unavailable)
+                .is_err()
+        );
         drop(reader);
         assert_eq!(
             store
@@ -8552,7 +9344,9 @@ mod tests {
         let store = Store::open(&config).unwrap();
         assert!(store.status(&config).unwrap()["hosted_identity_verified"].is_null());
         assert!(store.status(&config).unwrap()["epoch_evidence"]["answered"].is_null());
-        store.record_hosted_identity(true).unwrap();
+        store
+            .record_identity_outcome(HostedIdentityOutcome::Verified)
+            .unwrap();
         assert_eq!(
             store.status(&config).unwrap()["hosted_identity_verified"],
             true
@@ -8791,13 +9585,17 @@ mod tests {
         config.capabilities.answer = crate::config::Mode::Active;
         let mut store = Store::open(&config).unwrap();
         store.set_paused(false).unwrap();
-        store.record_hosted_identity(false).unwrap();
+        store
+            .record_identity_outcome(HostedIdentityOutcome::Unavailable)
+            .unwrap();
         store.observe(54, false).unwrap();
         store
             .db
             .execute("UPDATE health_evidence SET first_observed_at=1", [])
             .unwrap();
-        store.record_hosted_identity(true).unwrap();
+        store
+            .record_identity_outcome(HostedIdentityOutcome::Verified)
+            .unwrap();
         let options = Options {
             min_free_mib: 0,
             ..Options::default()
@@ -8873,7 +9671,9 @@ mod tests {
         let mut store = Store::open(&config).unwrap();
         store.set_paused(false).unwrap();
         store.runtime_state(&config, false).unwrap();
-        store.record_hosted_identity(true).unwrap();
+        store
+            .record_identity_outcome(HostedIdentityOutcome::Verified)
+            .unwrap();
         store.observe(54, true).unwrap();
         store.event("runtime_stopped", None).unwrap();
         assert_eq!(store.status(&config).unwrap()["controller_stopped"], true);

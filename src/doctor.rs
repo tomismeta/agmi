@@ -1,4 +1,4 @@
-//! Local diagnosis and orchestration of existing, token-fenced refusal recovery.
+//! Local diagnosis and guarded refusal recovery / legacy identity normalization.
 use crate::{config::Config, health, lifecycle, store};
 use serde_json::{Value, json};
 use std::path::Path;
@@ -68,7 +68,7 @@ fn qualify_restoration(report: &mut Value, repairs: &Value) {
 /// No network/model calls. Repair may restore a previously running managed service;
 /// that service resumes its existing participation policy, not a doctor replay.
 pub fn check(path: &Path, repair: bool) -> Value {
-    let mut repairs = match store::doctor_refusals(path, None) {
+    let mut repairs = match store::doctor_repairs(path, None) {
         Ok(preview) => preview,
         Err(error) => failed_repairs(recovery_code(&error)),
     };
@@ -76,12 +76,8 @@ pub fn check(path: &Path, repair: bool) -> Value {
         .as_array()
         .is_some_and(|rows| !rows.is_empty());
     if repair && eligible && repairs["failure"].is_null() {
-        let revision = repairs["config_revision"]
-            .as_str()
-            .unwrap_or_default()
-            .to_owned();
         match lifecycle::with_repair_runtime(path, || {
-            Ok(json!({"repairs":store::doctor_refusals(path, Some(&revision))?}))
+            Ok(json!({"repairs":store::doctor_repairs(path, Some(&repairs))?}))
         }) {
             Ok(mut report) => repairs = report["repairs"].take(),
             Err(error) => {
@@ -118,12 +114,18 @@ pub fn check(path: &Path, repair: bool) -> Value {
         .is_some_and(|rows| !rows.is_empty())
     {
         "applied"
+    } else if repairs["skipped"]
+        .as_array()
+        .is_some_and(|rows| !rows.is_empty())
+    {
+        "skipped"
     } else {
         "no_eligible_repairs"
     });
     report["effects"] = json!({"direct_network_requests":false,"direct_model_calls":false,
         "unknown_submissions_replayed":false,"model_attempts_abandoned":false,
         "configuration_changed":false,"pause_state_changed":false,
+        "identity_verified":false,"read_deadlines_reset":false,
         "restored_runtime_may_participate":repairs["restoration"]["manager_action"]
             .as_str().is_some_and(|action| action != "none")});
     qualify_restoration(&mut report, &repairs);
@@ -133,6 +135,12 @@ pub fn check(path: &Path, repair: bool) -> Value {
             "evidence":"local_only"});
         report["attention_required"] = json!(true);
     }
+    repairs["counts"] = json!({
+        "eligible":repairs["eligible"].as_array().map_or(0, Vec::len),
+        "ineligible":repairs["ineligible"].as_array().map_or(0, Vec::len),
+        "applied":repairs["applied"].as_array().map_or(0, Vec::len),
+        "skipped":repairs["skipped"].as_array().map_or(0, Vec::len),
+    });
     report["repairs"] = repairs;
     report
 }

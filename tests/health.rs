@@ -201,6 +201,11 @@ fn uninitialized_status_and_health_share_progress_without_creating_state() {
     .unwrap();
     assert_eq!(status["work"], result["work"]);
     assert_eq!(status["intervention"], result["intervention"]);
+    assert_eq!(status["hosted_identity"], result["hosted_identity"]);
+    assert_eq!(result["hosted_identity"]["status"], "unobserved");
+    assert_eq!(result["hosted_identity"]["rejection"], Value::Null);
+    assert_eq!(result["hosted_identity"]["legacy_failure"], false);
+    assert_eq!(result["hosted_identity_verified"], Value::Null);
     assert_eq!(result["healthy"], false);
     assert!(!config.state_dir.exists());
 }

@@ -606,6 +606,8 @@ fn safe_intervention(value: &Value) -> Value {
             "answer_attempt_budget_exhausted", "generation_changed", "effect_in_flight", "admission_paused",
             "hosted_identity_unverified", "read_authentication_failed", "read_authentication_evidence_stale",
             "in_flight_outcome_overdue", "hosted_identity_unobserved", "no_eligible_assignments_observed",
+            "hosted_identity_authentication_failed", "hosted_identity_mismatch",
+            "hosted_identity_unavailable", "hosted_identity_invalid_response", "hosted_identity_legacy_unknown",
             "model_authentication_failed", "model_configuration_failed", "model_attempt_budget_exhausted",
             "admission_recovery_unproven", "model_retry_eligible", "model_uncertain", "model_retry_unavailable",
             "model_retry_evidence_unavailable", "unbound_outcome_requires_evidence", "admission_evidence_unavailable",
@@ -622,7 +624,7 @@ fn safe_intervention(value: &Value) -> Value {
             "resume", "read_job", "read_receipt", "review_model_configuration", "inspect_model_attempts",
             "retry_model", "recover_model", "await_assignments", "await_challenge", "observe_assignments",
             "observe_challenge", "await_answer_retry", "inspect_answer_retry", "inspect_repair_failure",
-            "inspect_state_filesystem",
+            "inspect_state_filesystem", "await_identity",
         ], "inspect_local_evidence"),
         "evidence":"local_only"
     });
@@ -647,10 +649,27 @@ fn doctor_outcome(report: &mut Value, data: &Value, repair: bool, exited: bool) 
             readiness[key] = json!(value);
         }
     }
+    let identity = crate::health::hosted_identity(data);
+    readiness["hosted_identity"] = identity.value();
+    readiness["hosted_identity_verified"] = json!(identity.verified());
+    let legacy_identity =
+        !data["hosted_identity"].is_object() && data["hosted_identity_verified"] == false;
+    let legacy_root =
+        legacy_identity && data["intervention"]["reason"] == "hosted_identity_unverified";
+    let intervention = |value: &Value| {
+        let mut bounded = safe_intervention(value);
+        if legacy_identity && value["reason"] == "hosted_identity_unverified" {
+            bounded["status"] = json!("undetermined");
+            bounded["reason"] = json!("hosted_identity_legacy_unknown");
+            bounded["next_action"] = json!("inspect_local_evidence");
+            bounded["next_at"] = Value::Null;
+            bounded["unattended"] = Value::Null;
+        }
+        bounded
+    };
     if data["intervention"].is_object() {
-        readiness["intervention"] = safe_intervention(&data["intervention"]);
-        readiness["intervention"]["controller"] =
-            safe_intervention(&data["intervention"]["controller"]);
+        readiness["intervention"] = intervention(&data["intervention"]);
+        readiness["intervention"]["controller"] = intervention(&data["intervention"]["controller"]);
         for lane in ["answer", "judge", "mine"] {
             readiness["intervention"]["lanes"][lane] = safe_enum(
                 &data["intervention"]["lanes"][lane],
@@ -667,8 +686,26 @@ fn doctor_outcome(report: &mut Value, data: &Value, repair: bool, exited: bool) 
                 "phase":safe_enum(&work["phase"], &["stopped", "blocked", "preparing", "prepared", "generating", "dispatching",
                     "queued", "observing", "answered", "completed", "included", "waiting"], "unknown"),
                 "progress":safe_enum(&work["progress"], &["waiting", "blocked", "working", "idle", "complete"], "waiting"),
-                "intervention":safe_intervention(&work["intervention"]),
+                "intervention":intervention(&work["intervention"]),
             });
+            if legacy_identity
+                && (work["intervention"]["reason"] == "hosted_identity_unverified"
+                    || (legacy_root && !work["intervention"].is_object()))
+            {
+                readiness["intervention"]["lanes"][lane] =
+                    readiness["work"][lane]["intervention"]["status"].clone();
+            }
+            // Removing an unproven legacy rejection must not hide an independently
+            // reported operator requirement from another lane.
+            if legacy_root
+                && readiness["work"][lane]["intervention"]["status"] == "operator_required"
+            {
+                for key in ["status", "reason", "next_action", "next_at"] {
+                    readiness["intervention"][key] =
+                        readiness["work"][lane]["intervention"][key].clone();
+                }
+                readiness["intervention"]["unattended"] = json!(false);
+            }
         }
     }
     report["readiness"] = readiness;
@@ -698,6 +735,17 @@ fn doctor_outcome(report: &mut Value, data: &Value, repair: bool, exited: bool) 
             {
                 "no_eligible_repairs"
             }
+            Some("skipped")
+                if complete
+                    && data["repairs"]["skipped"]
+                        .as_array()
+                        .is_some_and(|rows| !rows.is_empty())
+                    && data["repairs"]["applied"]
+                        .as_array()
+                        .is_some_and(Vec::is_empty) =>
+            {
+                "skipped"
+            }
             _ => "failed",
         };
         report["repair"]["status"] = json!(status);
@@ -705,6 +753,15 @@ fn doctor_outcome(report: &mut Value, data: &Value, repair: bool, exited: bool) 
             if let Some(rows) = data["repairs"][key].as_array() {
                 report["repair"][format!("{key}_count")] = json!(rows.len());
                 report["repair"][key] = Value::Array(rows.iter().take(256).filter_map(|row| {
+                    if row["kind"] == "identity"
+                        && row["classification"] == "legacy_identity_evidence_normalization"
+                    {
+                        return Some(json!({"kind":"identity",
+                            "classification":"legacy_identity_evidence_normalization",
+                            "reason":safe_enum(&row["reason"], &["eligible", "already_resolved",
+                                "identity_evidence_changed", "legacy_identity_evidence_normalized",
+                                "not_legacy_identity_failure"], "unavailable")}));
+                    }
                     let id = row["operation_id"].as_i64().filter(|id| *id > 0)?;
                     Some(json!({
                         "operation_id":id,
@@ -729,7 +786,7 @@ fn doctor_outcome(report: &mut Value, data: &Value, repair: bool, exited: bool) 
                 &["none", "runtime_stop_attempted"], "unrecognized"),
         });
         report["repair"]["evidence_limit"] = json!(
-            "Retained refusal evidence only; original response bodies were not retained and no new network verification was performed. Legacy 429 repairs apply the developer's all-429 pre-enqueue refusal contract; hidden body contradictions cannot be ruled out."
+            "Retained local evidence only; no new network verification was performed. Identity normalization retains legacy uncertainty and recorded rejection; it does not verify identity or repair credentials. Refusal response bodies were not retained. Legacy 429 repairs apply the developer's all-429 pre-enqueue refusal contract; hidden body contradictions cannot be ruled out."
         );
         if status == "failed" || !data["repairs"]["failure"].is_null() {
             report["success"] = json!(false);
@@ -748,6 +805,8 @@ fn doctor_outcome(report: &mut Value, data: &Value, repair: bool, exited: bool) 
                     "refusal_recovery_schema",
                     "refusal_recovery_conflict",
                     "refusal_recovery_failed",
+                    "identity_evidence_changed",
+                    "identity_normalization_failed",
                     "refusal_recovery_ineligible",
                 ],
                 "doctor_repair_failed",
@@ -1346,6 +1405,120 @@ mod tests {
         );
         assert!(!result.to_string().contains("secret-response-body"));
         assert!(!result.to_string().contains("credential"));
+    }
+
+    #[test]
+    fn legacy_child_identity_is_uncertain_without_hiding_independent_operator_work() {
+        let old = json!({"status":"operator_required","reason":"hosted_identity_unverified",
+            "next_action":"review_credentials","unattended":false});
+        let mut data = json!({"initialized":true,"hosted_identity_verified":false,
+            "intervention":old,"work":{}});
+        for lane in ["answer", "judge", "mine"] {
+            data["work"][lane]["intervention"] = old.clone();
+            data["intervention"]["lanes"][lane] = json!("operator_required");
+        }
+        let mut report = json!({"success":true});
+        doctor_outcome(&mut report, &data, false, false);
+        let readiness = &report["readiness"];
+        assert_eq!(readiness["hosted_identity"]["status"], "legacy_unknown");
+        assert_eq!(readiness["hosted_identity_verified"], Value::Null);
+        assert_eq!(readiness["intervention"]["status"], "undetermined");
+        assert_eq!(readiness["intervention"]["unattended"], Value::Null);
+        assert_eq!(
+            readiness["intervention"]["next_action"],
+            "inspect_local_evidence"
+        );
+        for lane in ["answer", "judge", "mine"] {
+            assert_eq!(readiness["intervention"]["lanes"][lane], "undetermined");
+            assert_ne!(
+                readiness["work"][lane]["intervention"]["next_action"],
+                "review_credentials"
+            );
+        }
+        data["work"]["judge"]["intervention"] = json!({"status":"operator_required",
+            "reason":"model_authentication_failed","next_action":"review_model_configuration"});
+        doctor_outcome(&mut report, &data, false, false);
+        assert_eq!(
+            report["readiness"]["intervention"]["status"],
+            "operator_required"
+        );
+        assert_eq!(report["readiness"]["intervention"]["unattended"], false);
+        assert_eq!(
+            report["readiness"]["intervention"]["reason"],
+            "model_authentication_failed"
+        );
+        assert_eq!(
+            report["readiness"]["intervention"]["next_action"],
+            "review_model_configuration"
+        );
+    }
+
+    #[test]
+    fn identity_repairs_survive_without_operation_ids_and_remain_bounded() {
+        let identity = json!({"kind":"identity","classification":"legacy_identity_evidence_normalization",
+            "evidence":"private-evidence","credential":"private-credential"});
+        let data = json!({"healthy":false,"initialized":true,"repair_requested":true,
+            "repair_outcome":"applied",
+            "hosted_identity":{"status":"legacy_unknown","observed_at":100,
+                "last_verified_at":null,"rejection":null,"legacy_failure":true,
+                "raw":"private-upstream-body"},
+            "intervention":{"status":"undetermined","reason":"hosted_identity_legacy_unknown",
+                "next_action":"inspect_local_evidence"},
+            "repairs":{"eligible":[identity.clone()],"ineligible":[identity.clone()],
+                "applied":[identity.clone(),{"operation_id":7,"kind":"answer",
+                    "classification":"submit_429_pre_enqueue"}],
+                "skipped":[identity],"failure":null,"restoration":{"verified":true}}});
+        let mut report = json!({"success":true,"update":{},"repair":{}});
+        doctor_outcome(&mut report, &data, true, false);
+        assert_eq!(report["success"], true);
+        assert_eq!(report["repair"]["status"], "applied");
+        assert_eq!(report["repair"]["applied_count"], 2);
+        assert_eq!(report["repair"]["applied"][1]["operation_id"], 7);
+        assert_eq!(
+            report["readiness"]["hosted_identity"]["legacy_failure"],
+            true
+        );
+        assert_eq!(report["readiness"]["hosted_identity_verified"], Value::Null);
+        assert_eq!(
+            report["readiness"]["intervention"]["reason"],
+            "hosted_identity_legacy_unknown"
+        );
+        assert!(!report.to_string().contains("private-"));
+
+        let mut data = data;
+        data["hosted_identity"]["status"] = json!("unavailable");
+        data["hosted_identity"]["rejection"] = json!("authentication_failed");
+        data["intervention"] = json!({"status":"operator_required",
+            "reason":"hosted_identity_authentication_failed","next_action":"review_credentials"});
+        doctor_outcome(&mut report, &data, true, false);
+        assert_eq!(report["readiness"]["hosted_identity_verified"], false);
+        assert_eq!(
+            report["readiness"]["intervention"]["reason"],
+            "hosted_identity_authentication_failed"
+        );
+        data["hosted_identity"]["rejection"] = Value::Null;
+        data["intervention"] = json!({"status":"automatic_recovery",
+            "reason":"hosted_identity_unavailable","next_action":"await_identity","next_at":120});
+        doctor_outcome(&mut report, &data, true, false);
+        assert_eq!(
+            report["readiness"]["intervention"]["next_action"],
+            "await_identity"
+        );
+        assert_eq!(report["readiness"]["intervention"]["next_at"], 120);
+        assert_eq!(report["readiness"]["hosted_identity_verified"], Value::Null);
+        // New evidence can make the proposed repair unnecessary without making
+        // the update fail or manufacturing successful identity verification.
+        data["repair_outcome"] = json!("skipped");
+        data["repairs"]["applied"] = json!([]);
+        data["repairs"]["skipped"][0]["reason"] = json!("identity_evidence_changed");
+        doctor_outcome(&mut report, &data, true, false);
+        assert_eq!(report["success"], true);
+        assert_eq!(report["repair"]["status"], "skipped");
+        assert_eq!(
+            report["repair"]["skipped"][0]["reason"],
+            "identity_evidence_changed"
+        );
+        assert_eq!(report["readiness"]["hosted_identity_verified"], Value::Null);
     }
 
     fn identity(version: &str, commit: char, dirty: bool) -> Identity {

@@ -359,7 +359,7 @@ agmi doctor --repair
 ```
 
 `doctor` is local and read-only by default. It combines health, separate answer/
-judge/mine progress, intervention requirements and eligible refusal repairs.
+judge/mine progress, intervention requirements and eligible guarded repairs.
 It does not contact MinePOA, invoke a model or read credentials. Add `--json`
 for the same machine-readable assessment.
 
@@ -388,13 +388,24 @@ health even when recovery is automatic. Agents should use `intervention`, not
 application has no failure. A repair can therefore be `applied` while the command
 still exits nonzero because participation is paused or other blockers remain.
 
-`--repair` explicitly authorizes the existing token-fenced refusal recovery
-described above. It discovers candidates and rechecks them under the configuration,
+`--repair` explicitly authorizes token-fenced refusal recovery and local legacy
+identity-evidence normalization. It discovers candidates and rechecks them under the configuration,
 account and admission locks; no IDs or copied tokens are required. Human previews
 show each candidate's classification and evidence limitation. Legacy 429 retirement
 uses the developer-reported rejection policy: the original response body was not
 retained, hidden contradictions cannot be ruled out, and no new upstream
 verification is performed.
+
+Older builds used the same identity flag for a timeout and an actual rejection.
+Doctor can normalize an eligible legacy `false` flag into explicit
+`legacy_unknown` evidence, preserving the original failure and an audit record.
+It does not infer why that old check failed, mark identity verified, rotate
+credentials or clear a classified authentication/account mismatch. Changed
+evidence between preview and application is not overwritten; the repair reports
+`skipped`, including through `update --repair`. Repeated repair is a no-op.
+Backoff-only legacy journals can be normalized in the same invocation that upgrades
+their local metadata. Retry deadlines, prepared work, uncertain submissions and
+model attempts remain intact. A later successful runtime identity check is still required.
 
 Only when eligible work exists, doctor can stop a validated matching canonical
 Linux user-systemd runtime and restore its previous running state. A previously
@@ -565,6 +576,26 @@ journalctl --user --user-unit=agmi-health.service
 Health is a local, read-only check: no network requests, model calls, credential/guidance reads or state initialization. Unhealthy checks return nonzero with structured issues for stale/stopped execution, blocked or unobserved admission, overdue work, missed-answer evidence, identity failures, inactive participation and low disk space. Evidence reflects local observations, not a fresh network verification or proof of rewards. Warnings are reported separately from health failures: a healthy runtime may have warnings, and warnings alone preserve a successful exit status. Neither warnings nor a healthy result permit replaying uncertain work.
 
 `hosted_identity_unobserved` means no identity result exists yet for unpaused active participation. It is an operational readiness failure, not a fabricated mismatch; the evidence stays null. Paused or read-only installations do not acquire this failure merely for avoiding upstream requests.
+
+`hosted_identity` separates the latest verification outcome from availability:
+timeouts, disconnected reads, rate limits and temporary server errors do not prove
+bad credentials. Automatic recovery requires an identity read in flight or
+scheduled pending/observably eligible work that can retry verification. A retained
+backoff deadline alone is only a not-before floor, not a scheduled identity job;
+without a demonstrated recovery path the result stays undetermined.
+Completed answers/mines and an idle judge keep
+their progress labels; they do not erase identity uncertainty or independent
+operator-required blockers. The existing bounded read backoff remains in force,
+including server minimums. Identity outcomes, completed-read evidence and their
+retry state are committed together.
+
+Explicit authentication rejection or a confirmed account/chain mismatch requires
+operator attention. Later timeouts or malformed replies cannot erase that
+rejection; only matching verification clears it. A 403 is a reason to inspect
+access policy, not proof that rotating a key will help. Missing or malformed
+identity data stays unverified. `hosted_identity_verified` is a derived nullable
+summary, not permission to submit: every submission retains the fresh identity
+guard. Legacy unknown evidence and successful doctor cleanup are not verification.
 
 Thresholds are CLI options: `--stale-seconds`, `--work-seconds`, `--answer-grace-seconds`, `--min-free-mib` and `--expect-participation`. For deliberate read-only observation use `--expect-participation false`; a live controller is still required. Active work is evaluated against captured deadlines/effective policy rather than silently adopting a newly edited timeout. Health distinguishes desired/effective policy, heartbeat, progress and admission blocking. Repeated unchanged receipts are observations, not fresh transition events.
 

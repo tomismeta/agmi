@@ -155,8 +155,9 @@ agmi logs --follow
 
 `doctor` gives separate answer/judge/mine progress and distinguishes automatic
 waiting from operator intervention or insufficient evidence. `agmi doctor --repair`
-applies only eligible, audited refusal repairs—not a clear-all—and preserves
-runtime intent and unresolved evidence. [Doctor and recovery limits](docs/OPERATIONS.md#doctor-and-unattended-status).
+applies eligible, audited refusal repairs and normalizes ambiguous legacy identity
+flags—not a clear-all or credential repair. It preserves runtime intent and
+unresolved evidence. [Doctor and recovery limits](docs/OPERATIONS.md#doctor-and-unattended-status).
 
 Run one authoritative writer per account. Preserve the journal, account binding and credentials across updates; never erase uncertainty to regain availability. `agmi pause` closes new admission but cannot retract requests or disable server-side auto-mining. Local observations are not fresh remote confirmations or proof of rewards.
 

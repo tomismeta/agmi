@@ -431,8 +431,16 @@ fn lane<'a>(
     if !read_only && status["paused"] == true {
         return Finding::blocked("admission_paused", "resume");
     }
-    if !read_only && status["hosted_identity_verified"] == false {
-        return Finding::blocked("hosted_identity_unverified", "review_credentials");
+    let identity = super::hosted_identity(status);
+    if !read_only && identity.rejected() {
+        return Finding::blocked(
+            identity.reason(),
+            if identity.rejection == Some("identity_mismatch") {
+                "repair_config"
+            } else {
+                "review_credentials"
+            },
+        );
     }
     let scope = if name == "judge" {
         "assignments"
@@ -464,6 +472,7 @@ fn lane<'a>(
             return Finding::unknown("clock_regressed");
         }
         if let Some(row) = read(status, dependency)
+            && dependency != "identity"
             && read_failed(row)
             && matches!(row["status"].as_u64(), Some(401 | 403))
         {
@@ -499,14 +508,6 @@ fn lane<'a>(
             action,
             next_at: next,
         };
-    }
-    if !read_only
-        && status["hosted_identity_verified"].is_null()
-        && !read(status, "identity").is_some_and(|row| {
-            row["state"] == "in_flight" || timestamp(&row["next_at"]).is_some_and(|time| time > at)
-        })
-    {
-        return Finding::unknown("hosted_identity_unobserved");
     }
     let observed = if name == "judge" {
         timestamp(&work["selection"]["observed_at"])
@@ -720,6 +721,69 @@ fn lane<'a>(
     Finding::unknown("work_evidence_unavailable")
 }
 
+fn identity_work_retry_at(status: &Value, at: i64, stale: u64) -> Option<i64> {
+    LANES
+        .into_iter()
+        .filter_map(|name| {
+            if mode(status, name) != Some("active") {
+                return None;
+            }
+            let work = &status["work"][name];
+            let next = timestamp(&work["next_at"])?;
+            let eligible = match work["phase"].as_str() {
+                Some("prepared") => true,
+                Some("observing") if name == "judge" => {
+                    work["selection"]["eligible"] == true
+                        && fresh(timestamp(&work["selection"]["observed_at"]), at, stale)
+                }
+                Some("observing") => {
+                    status["observation"]["epoch"].as_u64().is_some()
+                        && fresh(timestamp(&status["observation"]["observed_at"]), at, stale)
+                        && (name == "mine" || status["epoch_evidence"]["answered"] == false)
+                }
+                _ => false,
+            };
+            eligible.then_some(next)
+        })
+        .min()
+}
+
+fn identity_recovery(status: &Value, at: i64, stale: u64) -> Option<Finding<'static>> {
+    let identity = super::hosted_identity(status);
+    if identity.verified() == Some(true) || identity.rejected() {
+        return None;
+    }
+    let finding = if let Some(row) = read(status, "identity") {
+        if ["started_at", "last_failure_at", "last_success_at"]
+            .iter()
+            .any(|field| timestamp(&row[*field]).is_some_and(|time| time > at))
+        {
+            Finding::unknown("clock_regressed")
+        } else if row["state"] == "in_flight" {
+            match timestamp(&row["started_at"]) {
+                Some(started)
+                    if super::cycle_floor(&status["effective_runtime"]["policy"])
+                        .is_some_and(|limit| at.saturating_sub(started) as u64 <= limit) =>
+                {
+                    Finding::automatic(identity.reason(), "await_identity", None)
+                }
+                Some(_) => Finding::unknown("read_outcome_overdue"),
+                None => Finding::unknown(identity.reason()),
+            }
+        } else if read_failed(row)
+            && let Some(floor) = timestamp(&row["next_at"]).filter(|time| *time > at)
+            && let Some(next) = identity_work_retry_at(status, at, stale)
+        {
+            Finding::automatic(identity.reason(), "await_identity", Some(floor.max(next)))
+        } else {
+            Finding::unknown(identity.reason())
+        }
+    } else {
+        Finding::unknown(identity.reason())
+    };
+    Some(finding)
+}
+
 pub(super) fn project(status: &Value, options: Options, at: i64) -> (Value, Value) {
     let policy = &status["effective_runtime"]["policy"];
     let floor = super::cycle_floor(policy);
@@ -747,8 +811,17 @@ pub(super) fn project(status: &Value, options: Options, at: i64) -> (Value, Valu
     let mut work = status["work"]
         .as_object()
         .map_or_else(|| json!({}), |work| Value::Object(work.clone()));
+    let rank = |status: &str| match status {
+        "operator_required" => 3,
+        "undetermined" => 2,
+        "automatic_recovery" => 1,
+        _ => 0,
+    };
+    let identity = (ready == Some(true) && status["paused"] == false)
+        .then(|| identity_recovery(status, at, stale.unwrap_or(0)))
+        .flatten();
     for name in LANES {
-        let finding = if mode(status, name) == Some("off") {
+        let mut finding = if mode(status, name) == Some("off") {
             Finding {
                 progress: "idle",
                 status: "none_required",
@@ -769,6 +842,24 @@ pub(super) fn project(status: &Value, options: Options, at: i64) -> (Value, Valu
         } else {
             lane(status, name, at, stale.unwrap_or(0), &timing)
         };
+        if mode(status, name) == Some("active")
+            && let Some(identity) = &identity
+            && (rank(identity.status) > rank(finding.status)
+                || (identity.status == "automatic_recovery"
+                    && finding.status == "automatic_recovery"))
+        {
+            finding = Finding {
+                progress: if matches!(finding.progress, "complete" | "idle" | "working") {
+                    finding.progress
+                } else {
+                    identity.progress
+                },
+                status: identity.status,
+                reason: identity.reason,
+                action: identity.action,
+                next_at: identity.next_at,
+            };
+        }
         if !work[name].is_object() {
             work[name] = json!({});
         }
@@ -824,12 +915,6 @@ pub(super) fn project(status: &Value, options: Options, at: i64) -> (Value, Valu
             }));
         }
     }
-    let rank = |status: &str| match status {
-        "operator_required" => 3,
-        "undetermined" => 2,
-        "automatic_recovery" => 1,
-        _ => 0,
-    };
     let mut root = controller.value(observed, current);
     for name in LANES {
         let lane = &work[name]["intervention"];
@@ -871,6 +956,8 @@ mod tests {
         let mut status = json!({
             "initialized":true,"paused":false,"controller_stopped":false,
             "identity_matches_config":true,"hosted_identity_verified":true,
+            "hosted_identity":{"status":"verified","observed_at":10000,
+                "last_verified_at":10000,"rejection":null,"legacy_failure":false},
             "effective_runtime":{"observed_at":10000,"reload_blocked":false,
                 "capabilities":{"answer":"active","judge":"active","mine":"active"},
                 "policy":{"timeouts":config.timeouts,"schedule":config.schedule,
@@ -891,6 +978,158 @@ mod tests {
 
     fn projection(status: &Value) -> (Value, Value) {
         project(status, Options::default(), 10000)
+    }
+
+    #[test]
+    fn identity_recovery_requires_a_real_retained_retry_or_live_read() {
+        for state in [
+            "unavailable",
+            "invalid_response",
+            "legacy_unknown",
+            "unobserved",
+        ] {
+            let mut status = fixture();
+            status["hosted_identity"]["status"] = json!(state);
+            // A stale compatibility flag is not canonical rejection evidence.
+            status["hosted_identity_verified"] = json!(false);
+            let (work, root) = projection(&status);
+            assert_eq!(root["status"], "undetermined");
+            assert_eq!(root["unattended"], Value::Null);
+            assert_eq!(work["answer"]["intervention"]["next_at"], Value::Null);
+            status["reads"] = json!([{"scope":"identity","state":"idle",
+                "last_failure_at":10000,"failure_category":"timeout","next_at":10030}]);
+            let (work, root) = projection(&status);
+            assert_eq!(root["status"], "automatic_recovery");
+            for name in LANES {
+                assert_eq!(work[name]["intervention"]["next_action"], "await_identity");
+                assert_eq!(work[name]["intervention"]["next_at"], 10030);
+            }
+            status["reads"][0]["state"] = json!("in_flight");
+            status["reads"][0]["started_at"] = json!(9999);
+            let (work, _) = projection(&status);
+            assert_eq!(
+                work["answer"]["intervention"]["status"],
+                "automatic_recovery"
+            );
+            assert_eq!(work["answer"]["intervention"]["next_at"], Value::Null);
+            status["reads"][0]["started_at"] = json!(1);
+            assert_eq!(projection(&status).1["status"], "undetermined");
+            status["reads"][0]["state"] = json!("idle");
+            status["reads"][0]["next_at"] = json!(9999);
+            assert_eq!(projection(&status).1["status"], "undetermined");
+        }
+    }
+
+    #[test]
+    fn identity_uncertainty_remains_visible_after_current_work_completes() {
+        let mut status = fixture();
+        status["hosted_identity"]["status"] = json!("unavailable");
+        status["epoch_evidence"]["answered"] = json!(true);
+        status["work"]["answer"]["phase"] = json!("answered");
+        status["work"]["mine"]["phase"] = json!("completed");
+        status["work"]["mine"]["operation_epoch"] = json!(7);
+        status["work"]["judge"]["selection"] = json!({
+            "observed_at":10000,"inventory_complete":true,"eligible":false
+        });
+        for scheduled in [false, true] {
+            if scheduled {
+                status["reads"] = json!([{"scope":"identity","state":"idle",
+                    "last_failure_at":10000,"failure_category":"timeout","next_at":10030}]);
+            }
+            let (work, root) = projection(&status);
+            // The retained deadline is a floor, not a scheduled identity job.
+            assert_eq!(root["status"], "undetermined");
+            assert_eq!(root["unattended"], Value::Null);
+            for (name, progress) in [
+                ("answer", "complete"),
+                ("judge", "idle"),
+                ("mine", "complete"),
+            ] {
+                assert_eq!(work[name]["progress"], progress);
+                assert_eq!(work[name]["intervention"]["status"], "undetermined");
+            }
+        }
+        // Pending work supplies a real revalidation path; its own schedule can
+        // be later than the identity floor.
+        status["work"]["judge"] = json!({"phase":"prepared",
+            "reason":"identity_backoff","next_action":"revalidate_assignment","next_at":10040});
+        let (work, root) = projection(&status);
+        assert_eq!(root["status"], "automatic_recovery");
+        assert_eq!(root["unattended"], true);
+        assert_eq!(root["next_at"], 10040);
+        assert_eq!(work["answer"]["progress"], "complete");
+        assert_eq!(work["mine"]["progress"], "complete");
+    }
+
+    #[test]
+    fn identity_backoff_does_not_hide_independent_operator_fences() {
+        let mut status = fixture();
+        status["hosted_identity"]["status"] = json!("unavailable");
+        status["reads"] = json!([{"scope":"identity","state":"idle",
+            "last_failure_at":10000,"failure_category":"timeout","next_at":10030}]);
+        status["work"]["answer"]["model"] = json!({
+            "current_route":true,"failure_category":"native_auth_unavailable"
+        });
+        let (work, root) = projection(&status);
+        assert_eq!(
+            work["answer"]["intervention"]["reason"],
+            "model_authentication_failed"
+        );
+        assert_eq!(root["status"], "operator_required");
+        status["work"]["answer"]["model"] = Value::Null;
+        status["work"]["answer"]["admission"] = json!({"reason":"manual_authorization_required"});
+        let (work, root) = projection(&status);
+        assert_eq!(work["answer"]["intervention"]["next_action"], "authorize");
+        assert_eq!(root["status"], "operator_required");
+    }
+
+    #[test]
+    fn retained_identity_rejection_survives_timeout_until_matching_verification() {
+        for (rejection, action) in [
+            ("authentication_failed", "review_credentials"),
+            ("identity_mismatch", "repair_config"),
+        ] {
+            let mut status = fixture();
+            status["hosted_identity"]["status"] = json!("unavailable");
+            status["hosted_identity"]["rejection"] = json!(rejection);
+            status["reads"] = json!([{"scope":"identity","state":"idle",
+                "last_failure_at":10000,"failure_category":"timeout","next_at":10030}]);
+            let (work, root) = projection(&status);
+            assert_eq!(root["status"], "operator_required");
+            for name in LANES {
+                assert_eq!(work[name]["intervention"]["next_action"], action);
+                assert_eq!(work[name]["intervention"]["next_at"], Value::Null);
+            }
+            status["hosted_identity"]["status"] = json!("verified");
+            status["hosted_identity"]["rejection"] = Value::Null;
+            status["reads"] = json!([]);
+            assert_ne!(projection(&status).1["status"], "operator_required");
+        }
+    }
+
+    #[test]
+    fn missing_identity_object_is_uncertain_and_read_only_lanes_are_not_escalated() {
+        let mut status = fixture();
+        status.as_object_mut().unwrap().remove("hosted_identity");
+        for legacy in [json!(true), json!(false), Value::Null] {
+            status["hosted_identity_verified"] = legacy;
+            let (work, _) = projection(&status);
+            assert_eq!(work["answer"]["intervention"]["status"], "undetermined");
+        }
+        status["hosted_identity"] =
+            json!({"status":"unavailable","rejection":"authentication_failed"});
+        status["effective_runtime"]["capabilities"]["judge"] = json!("read_only");
+        status["effective_runtime"]["capabilities"]["mine"] = json!("off");
+        let (work, _) = projection(&status);
+        assert_eq!(work["judge"]["intervention"]["status"], "none_required");
+        assert_eq!(work["mine"]["intervention"]["status"], "none_required");
+        status["paused"] = json!(true);
+        assert_eq!(
+            projection(&status).0["answer"]["intervention"]["reason"],
+            "admission_paused"
+        );
+        status["initialized"] = json!(false);
+        assert_eq!(projection(&status).1["reason"], "not_initialized");
     }
 
     #[test]
