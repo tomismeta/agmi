@@ -4,6 +4,7 @@
 
 pub mod admin;
 pub mod config;
+pub mod doctor;
 pub mod endpoints;
 pub mod health;
 mod installer;

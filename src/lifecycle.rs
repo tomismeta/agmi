@@ -616,3 +616,77 @@ pub fn installer(arguments: &[String], dry_run: bool) -> Result<Value> {
         }
     })
 }
+
+/// Sanitized lifecycle evidence survives both a failed repair and a failed
+/// restoration. The original callback error remains downcastable through the
+/// anyhow context; `report` retains completed repair evidence on restore failure.
+#[derive(Debug)]
+pub(crate) struct RepairRuntimeError {
+    pub(crate) code: &'static str,
+    pub(crate) restoration: Value,
+    pub(crate) report: Option<Value>,
+}
+impl std::fmt::Display for RepairRuntimeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("doctor repair did not complete; inspect runtime restoration evidence")
+    }
+}
+impl std::error::Error for RepairRuntimeError {}
+
+/// Stop only a validated canonical user-systemd runtime, run the locked repair,
+/// then restore and verify its previous intent. No pause state or timer
+/// enablement is changed. Other configurations remain caller-managed: the
+/// callback must acquire the account/config/admission locks before mutating.
+///
+/// Result errors and handled HUP/INT/TERM restore intent before returning.
+/// A hard kill, process abort, or host failure cannot guarantee restoration.
+pub(crate) fn with_repair_runtime(
+    config_path: &Path,
+    repair: impl FnOnce() -> Result<Value>,
+) -> Result<Value> {
+    crate::installer::with_repair_runtime(config_path, repair)
+}
+
+#[cfg(test)]
+mod repair_tests {
+    use super::*;
+
+    #[test]
+    fn caller_managed_repair_retains_report_and_typed_failure() -> Result<()> {
+        let config = std::env::temp_dir().join("agmi-caller-managed-repair/config.toml");
+        let report = with_repair_runtime(&config, || {
+            Ok(json!({"repairs":{"applied":2},"sentinel":"preserved"}))
+        })?;
+        assert_eq!(report["sentinel"], "preserved");
+        assert_eq!(report["repairs"]["applied"], 2);
+        assert_eq!(report["repairs"]["restoration"]["manager_action"], "none");
+        assert_eq!(
+            report["repairs"]["restoration"]["runtime"],
+            "caller_managed"
+        );
+
+        let error = with_repair_runtime(&config, || {
+            Err(LifecycleError {
+                code: "repair_refused",
+                message: "sanitized refusal",
+            }
+            .into())
+        })
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<LifecycleError>().unwrap().code,
+            "repair_refused"
+        );
+        let evidence = error.downcast_ref::<RepairRuntimeError>().unwrap();
+        assert_eq!(evidence.code, "repair_action_failed");
+        assert_eq!(evidence.restoration["manager_action"], "none");
+        assert!(evidence.report.is_none());
+
+        let error = with_repair_runtime(&config, || Ok(json!({"not_a_report":true}))).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<RepairRuntimeError>().unwrap().code,
+            "repair_report_invalid"
+        );
+        Ok(())
+    }
+}

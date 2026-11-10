@@ -351,6 +351,72 @@ Model launch rechecks durable pause generation under the admission lock after na
 
 Assignments use the returned `answer_epoch`, never the inventory's current epoch. Bounded offset pagination deduplicates canonical transaction IDs, preserves partial coverage and prioritizes supplied expiry with deterministic ties. Moving/partial inventories never prove a sent operation failed. Missing target metadata triggers selected-transaction hydration; missing authoritative original words prevents judging. Supplied author history is candidate-bound and labelled missing, supplied or truncated; supplied does not mean exhaustive. Answer novelty context may include locally submitted text with unresolved acceptance.
 
+## Doctor and unattended status
+
+```sh
+agmi doctor
+agmi doctor --repair
+```
+
+`doctor` is local and read-only by default. It combines health, separate answer/
+judge/mine progress, intervention requirements and eligible refusal repairs.
+It does not contact MinePOA, invoke a model or read credentials. Add `--json`
+for the same machine-readable assessment.
+
+`status`, `health` and `doctor` share `work.{answer,judge,mine}.progress`
+(`working`, `idle`, `complete`, `waiting`, `blocked`) and an `intervention`
+object with reason, next action/time and evidence freshness:
+
+| Intervention | Operator meaning |
+| --- | --- |
+| `none_required` | No intervention indicated for this lane; inspect progress and effective mode. |
+| `automatic_recovery` | A configured automatic path exists. Wait for its next observation; success is not guaranteed. |
+| `operator_required` | A known fence requires operator action; use the reported action, not a blind replay. |
+| `undetermined` | Evidence is missing, stale or inconclusive. Inspect before assuming recovery or failure. |
+
+Root `intervention.unattended` is `true` only when the observed controller is
+ready, participation is resumed, at least one capability is active, and no lane
+requires intervention or has undetermined progress. `false` also covers deliberate
+pause/inactivity; `null` preserves insufficient evidence. A live process alone,
+an old successful epoch or retained audit warnings do not establish this result.
+Completion is scoped to fresh local epoch/inventory evidence, not rewards.
+
+The existing `health` exit contract is unchanged: admission waits can still fail
+health even when recovery is automatic. Agents should use `intervention`, not
+`attention_required` or the exit code alone, to decide whether to ask a human.
+`doctor` exits successfully only when `unattended` is true and its repair scan/
+application has no failure. A repair can therefore be `applied` while the command
+still exits nonzero because participation is paused or other blockers remain.
+
+`--repair` explicitly authorizes the existing token-fenced refusal recovery
+described above. It discovers candidates and rechecks them under the configuration,
+account and admission locks; no IDs or copied tokens are required. Human previews
+show each candidate's classification and evidence limitation. Legacy 429 retirement
+uses the developer-reported rejection policy: the original response body was not
+retained, hidden contradictions cannot be ruled out, and no new upstream
+verification is performed.
+
+Only when eligible work exists, doctor can stop a validated matching canonical
+Linux user-systemd runtime and restore its previous running state. A previously
+stopped runtime stays stopped; pause, configuration, guidance, timer and enablement
+are preserved. Normal graceful-shutdown uncertainty remains possible. A restored
+runtime may resume its already-configured network/model work; doctor itself
+does not replay submissions or authorize model abandonment/regeneration.
+
+Noncanonical configurations, absent installations and unsupported hosts remain
+caller-managed: repair requires their writer to be stopped. Failed integrity,
+ownership, override or manager checks on an existing canonical installation
+refuse automatic repair; correct the installation or use explicit stopped-writer
+recovery. Doctor does not kill unmanaged processes.
+
+`repairs` separates eligible, ineligible, applied and skipped records, failures
+and restoration evidence. Partial progress is retained. Ambiguous writes,
+generic historical 503s and model-only unknowns are not cleared. No history reset,
+nonce change, capacity increase or policy relaxation occurs. Failed restoration
+requires attention; a hard kill, process abort or host failure can prevent it.
+A newly restored process without a fresh controller observation remains
+`undetermined`, not a claim that participation has resumed.
+
 ## Supervision
 
 The canonical Rust Linux user-systemd installer stages versioned matching binary/unit sets under `~/.local/share/agmi/releases`; no shell installer is shipped. State, credentials and native authentication stay outside those release sets. Build from this Git checkout or a Cargo package retaining `.cargo_vcs_info.json`; `agmi build-info --manifest` exposes commit, dirty marker, target, schema and embedded unit/adapter checksums. The installer requires known commit/dirty labels. Cargo package VCS labels are metadata, not signed source proof; an archive without either its own Git identity or valid Cargo VCS metadata remains unknown.
@@ -471,6 +537,9 @@ Disk headroom warns below the larger of 512 MiB or four times `--min-free-mib`; 
 ### Agent-owned forwarding
 
 Agents can read agmi's structured health, events and warnings and optionally forward relevant findings through their existing native channels. agmi itself does not configure external destinations, manage notification credentials/state or send Telegram/webhook messages. Forwarding policy and delivery belong to the agent, not the participation runtime; the shared installer does not enable forwarding.
+Forward `work` progress and `intervention` for each action. Distinguish automatic
+waits, operator-required blockers and insufficient evidence; historical warnings
+alone are not a request for a restart or model abandonment.
 
 Local health remains read-only even when another agent consumes its output. Forward only sanitized evidence, never private payloads, model output, credentials or native diagnostics. Agent forwarding is not proof of human receipt or host-down coverage; use independent monitoring for an offline host. Neither health findings nor forwarding outcomes authorize replaying uncertain work, restarting native gateways or deleting participation state.
 

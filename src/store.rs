@@ -54,6 +54,69 @@ pub fn recovery_refusal(config_path: &Path, operation: i64, apply: Option<&str>)
     }
 }
 
+/// Doctor discovers and applies the same token-fenced refusals as recover resolve.
+/// An expected configuration revision authorizes application, never broader recovery.
+pub(crate) fn doctor_refusals(config_path: &Path, apply: Option<&str>) -> Result<Value> {
+    let _configuration = crate::admin::lock_config_directory(config_path)?;
+    let config = Config::load_metadata(config_path)?;
+    let revision = digest(fs::read(config_path)?);
+    if apply.is_some_and(|expected| expected != revision) {
+        return Err(RefusalRecoveryError("refusal_recovery_conflict").into());
+    }
+    let mut report = json!({"config_revision":revision,"eligible":[],"ineligible":[],
+        "applied":[],"skipped":[],"failure":null,
+        "restoration":{"manager_action":"none","runtime":"unchanged"}});
+    let Some(store) = Store::read_only(&config)? else {
+        return Ok(report);
+    };
+    if store.schema_version()? != 2 {
+        return Err(RefusalRecoveryError("refusal_recovery_schema").into());
+    }
+    store.routing_change_allowed(&config)?;
+    if apply.is_none() {
+        let snapshot = store.db.unchecked_transaction()?;
+        let (eligible, ineligible) = Store::refusal_candidates(&snapshot, &revision)?;
+        report["eligible"] = json!(eligible);
+        report["ineligible"] = json!(ineligible);
+        snapshot.commit()?;
+        return Ok(report);
+    }
+    drop(store);
+    let (_account, mut store) = AccountLock::acquire(&config)
+        .map_err(|error| error.context(RefusalRecoveryError("doctor_account_unavailable")))?;
+    let _gate = AdmissionGuard::acquire(&config)?;
+    let (eligible, ineligible) = Store::refusal_candidates(&store.db, &revision)?;
+    report["ineligible"] = json!(ineligible);
+    let mut applied = Vec::new();
+    let mut skipped = Vec::new();
+    for preview in &eligible {
+        let id = preview["operation_id"]
+            .as_i64()
+            .context("invalid refusal operation")?;
+        if !report["failure"].is_null() {
+            skipped.push(json!({"operation_id":id,"reason":"earlier_repair_failed"}));
+            continue;
+        }
+        let token = preview["preview_token"]
+            .as_str()
+            .context("missing refusal token")?;
+        match store.resolve_refusal(id, &revision, token) {
+            Ok(result) => applied.push(result),
+            Err(error) => {
+                let code = error
+                    .downcast_ref::<RefusalRecoveryError>()
+                    .map_or("refusal_recovery_failed", |error| error.0);
+                report["failure"] = json!(code);
+                skipped.push(json!({"operation_id":id,"reason":code}));
+            }
+        }
+    }
+    report["eligible"] = json!(eligible);
+    report["applied"] = json!(applied);
+    report["skipped"] = json!(skipped);
+    Ok(report)
+}
+
 // SQLite may see a new inode only after its raw creation descriptor is closed.
 static DATABASE_OPEN: Mutex<()> = Mutex::new(());
 
@@ -2278,6 +2341,19 @@ impl Store {
             .is_none())
     }
 
+    fn manual_authorized(&self, kind: WorkKind, epoch: Option<u64>) -> Result<Option<bool>> {
+        let Some(epoch) = epoch else { return Ok(None) };
+        if !self.has_table("manual_grants")? || !self.has_table("manual_grant_revocations")? {
+            return Ok(None);
+        }
+        Ok(Some(self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM manual_grants WHERE epoch=?1 AND kind=?2 AND generation=?3 AND consumed_by IS NULL
+             AND NOT EXISTS(SELECT 1 FROM manual_grant_revocations WHERE grant_id=manual_grants.id))",
+            params![i64::try_from(epoch)?,kind.as_str(),self.control()?.generation],
+            |r| r.get(0),
+        )?))
+    }
+
     fn uncertainty_blocker_with(
         &self,
         config: &Config,
@@ -2323,15 +2399,7 @@ impl Store {
             )));
         }
         if policy.mode == ParticipationMode::Manual {
-            let granted = if let Some(epoch) = epoch {
-                self.db.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM manual_grants WHERE epoch=?1 AND kind=?2 AND generation=?3 AND consumed_by IS NULL
-                    AND NOT EXISTS(SELECT 1 FROM manual_grant_revocations WHERE grant_id=manual_grants.id))",
-                    params![i64::try_from(epoch)?,kind.as_str(),self.control()?.generation], |r| r.get::<_,bool>(0),
-                )?
-            } else {
-                false
-            };
+            let granted = self.manual_authorized(kind, epoch)?.unwrap_or(false);
             if !granted {
                 return Ok(Some(("manual_authorization_required", None)));
             }
@@ -3407,6 +3475,73 @@ impl Store {
             work[kind.as_str()] = json!({"phase":phase,"reason":reason,"next_action":action,
                 "next_at":next_at,"epoch":epoch,"operation_id":op.map(|op| op.id),
                 "operation_epoch":op.and_then(|op| op.request["solver"]["epoch"].as_u64())});
+            work[kind.as_str()]["admission"] = if self.has_table("operation_timing")?
+                && self.has_table("manual_grants")?
+                && self.has_table("manual_grant_revocations")?
+            {
+                json!(
+                    self.uncertainty_blocker_with(config, kind, epoch, &accounting)?
+                        .map(|(reason, next_at)| json!({"reason":reason,"next_at":next_at}))
+                )
+            } else {
+                Value::Null
+            };
+            let manual_authorized = self.manual_authorized(kind, epoch)?;
+            work[kind.as_str()]["manual_authorized"] = json!(manual_authorized);
+            if has_evidence && self.has_table("operation_links")? && kind != WorkKind::Mine {
+                let latest: Option<(i64, String, String, Option<String>, Option<bool>)> = self.db.query_row(
+                    "SELECT o.id,o.work_key,o.state,e.evidence,
+                     o.revision=(SELECT effective_revision FROM runtime_state WHERE singleton=1) FROM operations o
+                     LEFT JOIN operation_evidence e ON e.operation_id=o.id
+                     WHERE o.id=(SELECT id FROM operations WHERE kind=?1 AND generation=?2
+                        AND (?1='judge' OR work_key LIKE ?3) ORDER BY id DESC LIMIT 1)
+                     AND o.payload IS NULL AND o.job_id IS NULL AND o.txid IS NULL
+                     AND o.state IN ('model_unknown','superseded_model_unknown','rejected','retry_model','prelaunch_failed')",
+                    params![kind.as_str(),control.generation,format!("{}:%",epoch.unwrap_or(u64::MAX))],
+                    |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
+                ).optional()?;
+                let empty_inventory = kind == WorkKind::Judge
+                    && selection.as_ref().is_some_and(|selection| {
+                        selection["inventory_complete"] == true && selection["observed_count"] == 0
+                    });
+                if !empty_inventory
+                    && let Some((id, key, state, diagnostic, current_route)) = latest
+                {
+                    let used = self.model_budget_used(kind, &key)?;
+                    let limit = config.preparation.max_attempts_per_work;
+                    let retry_eligible = used < limit
+                        && (state != "model_unknown" || config.preparation.retry_uncertain);
+                    let diagnostic = diagnostic
+                        .as_deref()
+                        .and_then(|value| serde_json::from_str::<Value>(value).ok());
+                    let failure = diagnostic
+                        .as_ref()
+                        .filter(|value| value["stage"] == "model")
+                        .and_then(|value| value["reason"].as_str())
+                        .filter(|code| {
+                            matches!(
+                                *code,
+                                "native_auth_unavailable"
+                                    | "native_route_mismatch"
+                                    | "native_api_unsupported"
+                                    | "executable_unavailable"
+                                    | "invalid_solver_setup"
+                                    | "core_guidance_missing"
+                                    | "unsupported_harness_version"
+                                    | "invalid_model_deadline"
+                                    | "model_admission_closed"
+                                    | "model_launch_unknown"
+                                    | "model_execution_unknown"
+                            )
+                        });
+                    work[kind.as_str()]["model"] = json!({"operation_id":id,
+                        "state":state,"retry_eligible":retry_eligible,"budget_used":used,
+                        "budget_limit":limit,"failure_category":failure,
+                        "scope":if kind == WorkKind::Answer { "current_work" } else { "historical_assignment" },
+                        "current_route":current_route,
+                        "evidence":"latest_model_only_attempt_in_current_generation"});
+                }
+            }
             if let Some(reservation) = reservation {
                 work[kind.as_str()]["admission_reservation"] = json!({
                     "original_operation_id":reservation.original_operation_id,
@@ -3487,6 +3622,7 @@ impl Store {
                     "requires_fresh_eligibility":true,
                     "blocking_operation_id":blocking_operation,
                     "reservation_active":reservation.is_some_and(|r| r.original_operation_id == original.id),
+                    "manual_authorized":manual_authorized,
                     "reservation_retry_not_before":reservation.map(|r| r.ready_at)
                 });
             }
@@ -3781,25 +3917,61 @@ impl Store {
         } else {
             None
         };
-        let mut statement = self.db.prepare(if self.schema_version()? == 2 {
-            "SELECT o.id,o.state,o.created_at,o.updated_at,e.http_deadline,e.model_deadline,o.kind
-             FROM operations o LEFT JOIN operation_evidence e ON e.operation_id=o.id
-             WHERE o.state IN ('generating','generated','prepared','retry','dispatching','queued','unknown','included_pending')
-             ORDER BY o.id"
+        let timing = self.has_table("operation_timing")?;
+        let (evidence_join, deadlines) = if self.schema_version()? == 2 {
+            (
+                "LEFT JOIN operation_evidence e ON e.operation_id=o.id",
+                "e.http_deadline,e.model_deadline",
+            )
         } else {
-            "SELECT id,state,created_at,updated_at,NULL,NULL,kind FROM operations
-             WHERE state IN ('generating','generated','prepared','retry','dispatching','queued','unknown','included_pending')
-             ORDER BY id"
-        })?;
+            ("", "NULL,NULL")
+        };
+        let timing_join = if timing {
+            "LEFT JOIN operation_timing t ON t.operation_id=o.id"
+        } else {
+            ""
+        };
+        let floor = if timing {
+            "COALESCE(t.retry_not_before,o.next_at)"
+        } else {
+            "o.next_at"
+        };
+        let mut statement = self.db.prepare(&format!(
+            "SELECT o.id,o.state,o.created_at,o.updated_at,{deadlines},o.kind,o.next_at,{floor},
+             CASE WHEN o.txid IS NOT NULL THEN 'receipt' WHEN o.job_id IS NOT NULL THEN 'job' END
+             FROM operations o {evidence_join} {timing_join}
+             WHERE o.state IN ('generating','generated','prepared','retry','dispatching','queued','unknown','included_pending')
+             ORDER BY o.id"))?;
         let pending_work = statement
             .query_map([], |r| {
-                Ok(json!({
-                    "operation_id":r.get::<_,i64>(0)?,"state":r.get::<_,String>(1)?,
-                    "created_at":r.get::<_,i64>(2)?,"updated_at":r.get::<_,i64>(3)?,
-                    "http_deadline":r.get::<_,Option<i64>>(4)?,
-                    "model_deadline":r.get::<_,Option<i64>>(5)?,
-                    "kind":r.get::<_,String>(6)?
-                }))
+                let id: i64 = r.get(0)?;
+                let state: String = r.get(1)?;
+                let kind: String = r.get(6)?;
+                let effect = matches!(
+                    state.as_str(),
+                    "dispatching" | "queued" | "unknown" | "included_pending"
+                );
+                let capacity_counted = if !effect
+                    || accounting
+                        .historical
+                        .iter()
+                        .any(|row| row.operation_id == id)
+                {
+                    Some(false)
+                } else if kind != "answer"
+                    || accounting.exempt == accounting.historical.len() as u64
+                {
+                    Some(true)
+                } else {
+                    None
+                };
+                Ok(json!({"operation_id":id,"state":state,
+                "created_at":r.get::<_,i64>(2)?,"updated_at":r.get::<_,i64>(3)?,
+                "http_deadline":r.get::<_,Option<i64>>(4)?,
+                "model_deadline":r.get::<_,Option<i64>>(5)?,"kind":kind,
+                "next_at":r.get::<_,i64>(7)?,"retry_not_before":r.get::<_,i64>(8)?,
+                "reconciliation_scope":r.get::<_,Option<String>>(9)?,
+                "capacity_counted":capacity_counted}))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let reads = self.reads()?;
@@ -3833,6 +4005,23 @@ impl Store {
             "finality":"node_reported_only","paid":"not_verified"});
         snapshot.commit()?;
         Ok(status)
+    }
+
+    fn refusal_candidates(db: &Connection, revision: &str) -> Result<(Vec<Value>, Vec<Value>)> {
+        let mut statement =
+            db.prepare("SELECT id FROM operations WHERE state='unknown' ORDER BY id")?;
+        let mut rows = statement.query([])?;
+        let mut eligible = Vec::new();
+        let mut ineligible = Vec::new();
+        while let Some(row) = rows.next()? {
+            let (preview, _) = Self::refusal_preview(db, row.get(0)?, revision)?;
+            if preview["eligible"] == true {
+                eligible.push(preview);
+            } else {
+                ineligible.push(preview);
+            }
+        }
+        Ok((eligible, ineligible))
     }
 
     fn refusal_preview(db: &Connection, id: i64, revision: &str) -> Result<(Value, Option<Value>)> {
@@ -4419,6 +4608,111 @@ mod tests {
             "reason":"route_result_unknown","retry_after_seconds":3600,
             "shape":"object","error_category":category
         })
+    }
+
+    #[test]
+    fn doctor_batch_preserves_partial_progress_and_fences_configuration_and_writer() {
+        let (temp, mut config) = fixture();
+        config.network.chain = format!(
+            "test-{}",
+            temp.path()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .replace('.', "")
+        );
+        config.network.address = format!("poa1{}", "1".repeat(32));
+        config.network.credential_file = temp.path().join("unused-credential");
+        let path = temp.path().join("config.toml");
+        fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+        let (account, mut store) = AccountLock::acquire(&config).unwrap();
+        store.set_paused(false).unwrap();
+        for epoch in 1..=3 {
+            let op = prepared_epoch(&mut store, WorkKind::Judge, epoch, "historical");
+            // Seed legacy retained outcomes; do not ask today's dispatcher to
+            // reproduce historical concurrent writes or ignore refusal floors.
+            store
+                .db
+                .execute("UPDATE operations SET state='unknown' WHERE id=?1", [op.id])
+                .unwrap();
+            store
+                .record_evidence(op.id, &refusal_evidence(op.kind, 429, Some("rate_limited")))
+                .unwrap();
+            age_refusal_evidence(&store, op.id);
+        }
+        store.set_paused(true).unwrap();
+        let preview = doctor_refusals(&path, None).unwrap();
+        let revision = preview["config_revision"].as_str().unwrap();
+        assert!(doctor_refusals(&path, Some(revision)).is_err());
+        drop(account);
+        assert!(doctor_refusals(&path, Some("stale-configuration")).is_err());
+        assert_eq!(store.operation(1).unwrap().unwrap().state, "unknown");
+        store
+            .db
+            .execute_batch(
+                "CREATE TRIGGER reject_second_audit BEFORE INSERT ON events
+             WHEN NEW.code='historical_refusal_retired' AND NEW.operation_id=2
+             BEGIN SELECT RAISE(ABORT,'fixture audit failure'); END;",
+            )
+            .unwrap();
+        drop(store);
+        let result = doctor_refusals(&path, Some(revision)).unwrap();
+        assert_eq!(result["failure"], "refusal_recovery_failed");
+        assert_eq!(result["applied"][0]["operation_id"], 1);
+        assert_eq!(result["skipped"][0]["operation_id"], 2);
+        assert_eq!(result["skipped"][1]["operation_id"], 3);
+        let store = Store::read_only(&config).unwrap().unwrap();
+        assert_eq!(store.operation(1).unwrap().unwrap().state, "refused");
+        assert_eq!(store.operation(2).unwrap().unwrap().state, "unknown");
+        assert_eq!(store.operation(3).unwrap().unwrap().state, "unknown");
+        assert!(store.control().unwrap().paused);
+    }
+
+    #[test]
+    fn work_diagnostics_preserve_bound_recovery_and_effective_model_budget() {
+        let (_temp, mut config, mut store) = participation_fixture();
+        let mut judge = dispatched_unknown(&mut store, &config, WorkKind::Judge, 1);
+        judge.job_id = Some("private-job-canary".into());
+        store.save(&judge, "dispatch_outcome_unknown").unwrap();
+        store.observe(2, false).unwrap();
+        config.participation.mode = ParticipationMode::Manual;
+        config.preparation.retry_uncertain = true;
+        config.preparation.max_attempts_per_work = 1;
+        let mut model = store
+            .begin(
+                WorkKind::Answer,
+                "2:words",
+                "generating",
+                &json!({"solver":{"epoch":2}}),
+                store.control().unwrap(),
+                "fixture",
+            )
+            .unwrap();
+        model.state = "model_unknown".into();
+        store.save(&model, "model_launch_unknown").unwrap();
+        store.runtime_state(&config, false).unwrap();
+        let status = store.status(&config).unwrap();
+        assert_eq!(status["pending_work"][0]["reconciliation_scope"], "job");
+        assert_eq!(status["pending_work"][0]["capacity_counted"], true);
+        assert!(!status.to_string().contains("private-job-canary"));
+        assert_eq!(status["work"]["answer"]["model"]["retry_eligible"], false);
+        assert_eq!(status["work"]["answer"]["model"]["budget_used"], 1);
+        assert_eq!(status["work"]["answer"]["manual_authorized"], false);
+        assert_eq!(
+            status["work"]["answer"]["admission"]["reason"],
+            "manual_authorization_required"
+        );
+        config.preparation.max_attempts_per_work = 2;
+        // Desired configuration alone must not make the old loaded budget larger.
+        assert_eq!(
+            store.status(&config).unwrap()["work"]["answer"]["model"]["retry_eligible"],
+            false
+        );
+        store.runtime_state(&config, false).unwrap();
+        store.authorize(&config, 2, WorkKind::Answer).unwrap();
+        let status = store.status(&config).unwrap();
+        assert_eq!(status["work"]["answer"]["model"]["retry_eligible"], true);
+        assert_eq!(status["work"]["answer"]["manual_authorized"], true);
     }
 
     #[test]

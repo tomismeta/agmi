@@ -41,6 +41,14 @@ fn missing_installation_is_nonzero_structured_and_does_not_initialize_state() {
     assert_eq!(value["type"], "health");
     assert_eq!(value["ok"], false);
     assert_eq!(value["data"]["healthy"], false);
+    assert_eq!(value["data"]["intervention"]["unattended"], false);
+    for kind in ["answer", "judge", "mine"] {
+        assert_eq!(value["data"]["work"][kind]["progress"], "blocked");
+        assert_eq!(
+            value["data"]["work"][kind]["intervention"]["status"],
+            "operator_required"
+        );
+    }
     assert_eq!(value["data"]["thresholds"]["warn_free_mib"], 0);
     assert_eq!(value["data"]["admission_blocked"], Value::Null);
     for field in [
@@ -133,6 +141,14 @@ fn health_before_onboarding_is_structured_read_only_and_preserves_config_selecti
             "unknown"
         );
         assert!(envelope["data"]["risk"]["unresolved_effects"].is_null());
+        assert_eq!(envelope["data"]["intervention"]["status"], "undetermined");
+        assert_eq!(envelope["data"]["intervention"]["unattended"], Value::Null);
+        for kind in ["answer", "judge", "mine"] {
+            assert_eq!(
+                envelope["data"]["work"][kind]["intervention"]["status"],
+                "undetermined"
+            );
+        }
         assert_eq!(envelope["data"]["mutations"], false);
         let action = &envelope["data"]["diagnostics"][0]["next_actions"][0];
         assert_eq!(action["kind"], "command");
@@ -167,4 +183,24 @@ fn health_with_default_missing_config_never_creates_onboarding_directories() {
         serde_json::json!(["config_missing"])
     );
     assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn uninitialized_status_and_health_share_progress_without_creating_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = Config::default();
+    config.state_dir = dir.path().join("missing-state");
+    let status = agmi::runtime::status(&config).unwrap();
+    let result = agmi::health::check(
+        &config,
+        agmi::health::Options {
+            min_free_mib: 0,
+            ..agmi::health::Options::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(status["work"], result["work"]);
+    assert_eq!(status["intervention"], result["intervention"]);
+    assert_eq!(result["healthy"], false);
+    assert!(!config.state_dir.exists());
 }

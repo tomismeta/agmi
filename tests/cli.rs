@@ -930,3 +930,127 @@ fn configuration_check_identifies_guidance_route_and_layer_without_private_value
     }
     assert!(!dir.path().join("uncreated-state").exists());
 }
+
+#[test]
+fn doctor_repairs_only_proven_refusals_without_resetting_uncertainty_or_pause() {
+    use agmi::config::Config;
+    use rusqlite::{Connection, params};
+    use serde_json::{Value, json};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let mut config = Config::default();
+    config.state_dir = dir.path().join("state");
+    config.network.chain = format!(
+        "test-{}",
+        dir.path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .replace('.', "")
+    );
+    config.network.address = format!("poa1{}", "1".repeat(32));
+    // Local diagnosis/recovery must not need to open this credential.
+    config.network.credential_file = dir.path().join("nonexistent-credential");
+    let original_config = toml::to_string(&config).unwrap();
+    fs::write(&path, &original_config).unwrap();
+    let invoke = |arguments: &[&str]| {
+        binary()
+            .args(["--config", path.to_str().unwrap(), "--json"])
+            .args(arguments)
+            .output()
+            .unwrap()
+    };
+    let paused = invoke(&["pause"]);
+    assert!(paused.status.success(), "{paused:?}");
+    let db = Connection::open(config.state_dir.join("state.sqlite3")).unwrap();
+    for (id, state) in [(1, "unknown"), (2, "unknown"), (3, "model_unknown")] {
+        db.execute("INSERT INTO operations(id,kind,work_key,state,request,result,payload,generation,revision,created_at,updated_at)
+            VALUES(?1,'judge',?2,?3,'{\"private\":\"request-canary\"}','{\"private\":\"result-canary\"}',NULL,0,'fixture',1,1)",
+            params![id,format!("work-{id}"),state]).unwrap();
+    }
+    db.execute(
+        "INSERT INTO operation_evidence(operation_id,evidence,observed_at) VALUES(1,?1,1)",
+        [
+            json!({"stage":"submit","route":"judge","status":429,"reason":"route_result_unknown",
+            "shape":"object","error_category":"rate_limited","retry_after_seconds":1})
+            .to_string(),
+        ],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO operation_evidence(operation_id,evidence,observed_at) VALUES(2,?1,1)",
+        [
+            json!({"stage":"submit","route":"judge","status":503,"reason":"route_result_unknown",
+            "shape":"object","error_category":"unrecognized"})
+            .to_string(),
+        ],
+    )
+    .unwrap();
+    let control = || {
+        db.query_row("SELECT paused,generation FROM control", [], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+        })
+        .unwrap()
+    };
+    let original_control = control();
+    let before: i64 = db
+        .query_row("PRAGMA data_version", [], |r| r.get(0))
+        .unwrap();
+    let preview = invoke(&["doctor"]);
+    let preview: Value = serde_json::from_slice(&preview.stdout).unwrap();
+    assert_eq!(preview["data"]["repairs"]["eligible"][0]["operation_id"], 1);
+    assert_eq!(
+        preview["data"]["repairs"]["ineligible"][0]["operation_id"],
+        2
+    );
+    assert_eq!(
+        preview["data"]["repairs"]["eligible"][0]["classification"],
+        "legacy_429_policy_refusal"
+    );
+    assert_eq!(
+        db.query_row("PRAGMA data_version", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        before
+    );
+    assert!(!preview.to_string().contains("canary"));
+    let repaired = invoke(&["doctor", "--repair"]);
+    let repaired: Value = serde_json::from_slice(&repaired.stdout).unwrap();
+    assert_eq!(repaired["data"]["repair_outcome"], "applied", "{repaired}");
+    assert_eq!(repaired["data"]["repairs"]["applied"][0]["operation_id"], 1);
+    assert_eq!(repaired["data"]["repairs"]["failure"], Value::Null);
+    assert_eq!(control(), original_control);
+    assert_eq!(fs::read_to_string(&path).unwrap(), original_config);
+    let states: Vec<(i64, String)> = db
+        .prepare("SELECT id,state FROM operations ORDER BY id")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        states,
+        vec![
+            (1, "refused".into()),
+            (2, "unknown".into()),
+            (3, "model_unknown".into())
+        ]
+    );
+    let retained: String = db
+        .query_row("SELECT result FROM operations WHERE id=1", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(retained, "{\"private\":\"result-canary\"}");
+    let audit: String = db
+        .query_row(
+            "SELECT resolution FROM operation_evidence WHERE operation_id=1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let audit: Value = serde_json::from_str(&audit).unwrap();
+    assert_eq!(audit["contract"], "retained_refusal_v2");
+    assert_eq!(audit["historical_payload_retried"], false);
+    let repeated = invoke(&["doctor", "--repair"]);
+    let repeated: Value = serde_json::from_slice(&repeated.stdout).unwrap();
+    assert_eq!(repeated["data"]["repair_outcome"], "no_eligible_repairs");
+    assert_eq!(control(), original_control);
+}

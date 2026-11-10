@@ -114,16 +114,18 @@ pub async fn recovery_resolve(
     )
 }
 pub fn status(config: &Config) -> Result<Value> {
-    match Store::read_only(config)? {
-        Some(store) => store.status(config),
-        None => Ok(json!({"initialized":false,"paused":true,"generation":0,
+    let mut status = match Store::read_only(config)? {
+        Some(store) => store.status(config)?,
+        None => json!({"initialized":false,"paused":true,"generation":0,
             "configured_revision":config.optional_revision()?,"effective_runtime":null,
             "hosted_identity_verified":null,"pending":null,"operations":[],
             "reads":[],"work":{},
             "participation":{"policy":Participation::default(),"policy_source":"unavailable",
                 "unresolved_count":0,"risk_admissions":0,
-                "uncertainty_blocks":{"answer":false,"judge":false,"mine":false}}})),
-    }
+                "uncertainty_blocks":{"answer":false,"judge":false,"mine":false}}}),
+    };
+    crate::health::enrich_status(&mut status, crate::health::Options::default(), now());
+    Ok(status)
 }
 
 /// Local metadata only: never initializes a journal or contacts the network.

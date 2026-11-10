@@ -5,6 +5,8 @@
 - Reserve effect admission for an authorized current-epoch uncertain-answer retry once its own delay and retained floor expire. New judgments/mining cannot continually renew its grace; preparation, reads and existing-job reconciliation continue. Keep all retry risk, freshness, capacity and manual authorization fences, and expose local original/blocking operation identities with wait deadlines.
 - Treat explicit submission rate-limit and halt refusals as retryable nonacceptance without discarding valid artifacts or shortening retained server delays. Keep ambiguous gateway/server failures and contradictory acceptance evidence unresolved.
 - Add explicit stopped-writer refusal-recovery preview and token-bound application. Retire only evidence-supported historical refusals with an audit record, without replaying stale payloads, changing nonces or erasing original evidence; generic historical 503s remain unresolved.
+- Add shared per-action progress and intervention reporting to status, health and doctor: distinguish configured automatic recovery, operator-required fences and insufficient evidence without changing participation policy or existing health exits.
+- Add read-only `doctor` and explicit `doctor --repair`, orchestrating existing token-fenced refusal recovery and validated managed-runtime stop/restoration. Preserve partial results, pause/configuration, uncertain writes and model history; disclose legacy 429 evidence limits and unsupported service boundaries.
 
 ## 0.1.0
 

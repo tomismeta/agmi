@@ -3,7 +3,7 @@ mod cli_error;
 use agmi::{
     admin,
     config::{Config, NetworkConfig, WorkKind},
-    health, lifecycle, registration, runtime,
+    doctor, health, lifecycle, registration, runtime,
 };
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -143,6 +143,12 @@ enum Command {
     },
     /// Inspect local durable state without contacting MinePOA or a model.
     Status,
+    /// Diagnose unattended progress; --repair applies only guarded local refusal recovery.
+    Doctor {
+        /// Repair eligible refusals, briefly stopping/restoring a matching managed runtime if needed.
+        #[arg(long)]
+        repair: bool,
+    },
     /// Inspect sanitized read progress, failures and retry deadlines without network access.
     Reads,
     /// Inspect sanitized durable operations without exposing bearer IDs or payloads.
@@ -404,8 +410,18 @@ fn health_prerequisite(code: &'static str) -> Value {
         "readiness":"prerequisites_missing","evidence":"local_only",
         "operational":{"status":"unknown","issues":[code]},
         "risk":{"status":"unknown","attention_required":null,"unresolved_effects":null,"unresolved_model_attempts":null},
-        "initialized":null,"paused":null,"mutations":false
+        "initialized":null,"paused":null,"mutations":false,
+        "work":health::unknown_work(code),"intervention":health::unknown_intervention(code)
     })
+}
+
+fn doctor_prerequisite(code: &'static str, repair: bool) -> Value {
+    let mut report = health_prerequisite(code);
+    report["repair_requested"] = json!(repair);
+    report["repair_outcome"] = json!("failed");
+    report["repairs"] = json!({"eligible":[],"ineligible":[],"applied":[],"skipped":[],
+        "failure":code,"restoration":{"manager_action":"none","runtime":"unchanged"}});
+    report
 }
 
 fn initialize(path: &Path) -> Result<Value> {
@@ -445,6 +461,7 @@ fn discovery() -> Value {
         {"name":"status","network_reads":false,"network_writes":false,"purpose":"local state and blockers"},
         {"name":"reads","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":false,"purpose":"sanitized read progress, failure categories and retry deadlines"},
         {"name":"health","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":false,"purpose":"sanitized local health; unhealthy exits nonzero"},
+        {"name":"doctor","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":"only with --repair","confirmation_flag":"--repair","purpose":"local unattended/intervention diagnosis; --repair orchestrates existing guarded refusal recovery, preserving runtime intent; a restored runtime may resume its configured network/model work"},
         {"name":"config init","network_writes":false,"local_writes":true},
         {"name":"config show","network_writes":false,"local_writes":false},
         {"name":"config check","network_writes":false,"local_writes":false},
@@ -502,6 +519,15 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
         Ok(path) => path,
         Err(_) if matches!(cli.command, Command::Health { .. }) => {
             return Ok(("health", health_prerequisite("config_location_unavailable")));
+        }
+        Err(_) if matches!(cli.command, Command::Doctor { .. }) => {
+            let Command::Doctor { repair } = cli.command else {
+                unreachable!()
+            };
+            return Ok((
+                "doctor",
+                doctor_prerequisite("config_location_unavailable", repair),
+            ));
         }
         Err(_) => {
             return Err(cli_error::BoundaryError(
@@ -822,6 +848,9 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
             if matches!(cli.command, Command::Health { .. }) {
                 return Ok(("health", health_prerequisite(code)));
             }
+            if let Command::Doctor { repair } = cli.command {
+                return Ok(("doctor", doctor_prerequisite(code, repair)));
+            }
             return Err(error);
         }
     };
@@ -889,6 +918,7 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
             )),
         },
         Command::Status => Ok(("status", runtime::status(&config)?)),
+        Command::Doctor { repair } => Ok(("doctor", doctor::check(&path, *repair))),
         Command::Reads => Ok(("reads", runtime::reads(&config)?)),
         Command::Health {
             stale_seconds,
@@ -1020,7 +1050,7 @@ async fn main() {
             if kind == "init" {
                 cli_error::onboarding(&mut data, action_config.as_deref());
             }
-            if matches!(kind, "health" | "status") {
+            if matches!(kind, "health" | "status" | "doctor") {
                 cli_error::diagnostics(&mut data, action_config.as_deref());
             }
             if matches!(kind, "install" | "update" | "service") {
@@ -1043,6 +1073,7 @@ async fn main() {
                 cli.command,
                 Command::Pause
                     | Command::Resume
+                    | Command::Doctor { repair: true }
                     | Command::Run { .. }
                     | Command::Init { .. }
                     | Command::Install { .. }
@@ -1066,7 +1097,14 @@ async fn main() {
                 data["authorization"] = json!({"required":true,"source":"explicit_command",
                     "dry_run":data["dry_run"].as_bool().or_else(|| data["plan"]["dry_run"].as_bool()).unwrap_or(false)});
             }
-            let ok = kind != "health" || data["healthy"].as_bool() == Some(true);
+            let ok = match kind {
+                "health" => data["healthy"].as_bool() == Some(true),
+                "doctor" => {
+                    data["intervention"]["unattended"] == true
+                        && data["repairs"]["failure"].is_null()
+                }
+                _ => true,
+            };
             let value = json!({"schema":SCHEMA,"ok":ok,"type":kind,"data":data});
             if cli.json {
                 println!("{value}");

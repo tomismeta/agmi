@@ -1,8 +1,79 @@
 //! Release-set installation. Only host systemd integration is delegated to tools;
 //! filesystem publication, integrity, rendering and cutover belong to this module.
-use crate::lifecycle::{InstallerError, installer_evidence, installer_preflight_error};
+use crate::lifecycle::{
+    InstallerError, RepairRuntimeError, installer_evidence, installer_preflight_error,
+};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
+use std::path::Path;
+
+fn repair_restoration(reason: &'static str) -> Value {
+    json!({
+        "manager_action":"none","prior_runtime":"unknown","runtime":"caller_managed",
+        "verified":false,"health_timer":"unchanged","enablement":"unchanged",
+        "pause_state":"unchanged","reason":reason,"failure_code":"none",
+        "hard_kill_limit":"SIGKILL, process abort, or host failure can prevent restoration"
+    })
+}
+
+fn finish_repair(
+    result: Result<Value>,
+    restoration: Value,
+    failure: Option<&'static str>,
+) -> Result<Value> {
+    match result {
+        Ok(mut report) => {
+            let Some(repairs) = report.get_mut("repairs").and_then(Value::as_object_mut) else {
+                return Err(RepairRuntimeError {
+                    code: failure.unwrap_or("repair_report_invalid"),
+                    restoration,
+                    report: Some(report),
+                }
+                .into());
+            };
+            repairs.insert("restoration".into(), restoration.clone());
+            if let Some(code) = failure {
+                return Err(RepairRuntimeError {
+                    code,
+                    restoration,
+                    report: Some(report),
+                }
+                .into());
+            }
+            Ok(report)
+        }
+        Err(error) => Err(error.context(RepairRuntimeError {
+            code: failure.unwrap_or("repair_action_failed"),
+            restoration,
+            report: None,
+        })),
+    }
+}
+
+fn caller_managed_repair(
+    reason: &'static str,
+    repair: impl FnOnce() -> Result<Value>,
+) -> Result<Value> {
+    finish_repair(repair(), repair_restoration(reason), None)
+}
+
+pub(crate) fn with_repair_runtime(
+    config_path: &Path,
+    repair: impl FnOnce() -> Result<Value>,
+) -> Result<Value> {
+    if !cfg!(target_os = "linux") {
+        return caller_managed_repair("unsupported_host", repair);
+    }
+    #[cfg(unix)]
+    {
+        native::with_repair_runtime(config_path, repair)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = config_path;
+        caller_managed_repair("unsupported_host", repair)
+    }
+}
 
 pub(crate) fn run(arguments: &[String], dry_run: bool) -> Result<Value> {
     let mut plan = json!({"arguments":arguments,"dry_run":dry_run,"network_downloads":false,
@@ -291,11 +362,16 @@ mod native {
         ensure!(file.metadata()?.is_file(), "artifact is not a regular file");
         Ok(file)
     }
-    fn digest(mut file: File) -> Result<String> {
+    fn digest(file: File) -> Result<String> {
+        digest_cancellable(file, true)
+    }
+    fn digest_cancellable(mut file: File, cancellable: bool) -> Result<String> {
         let mut hasher = Sha256::new();
         let mut buffer = [0_u8; 65536];
         loop {
-            checkpoint()?;
+            if cancellable {
+                checkpoint()?;
+            }
             let count = file.read(&mut buffer)?;
             if count == 0 {
                 break;
@@ -588,6 +664,8 @@ mod native {
         stop_on_failure: bool,
         lock: Option<InstallLock>,
         output: String,
+        #[cfg(test)]
+        proc_root: PathBuf,
     }
     impl Installation {
         fn new(home: PathBuf) -> Result<Self> {
@@ -608,6 +686,8 @@ mod native {
                 stop_on_failure: false,
                 lock: None,
                 output: String::new(),
+                #[cfg(test)]
+                proc_root: "/proc".into(),
             })
         }
         fn evidence(&self, success: bool) -> Value {
@@ -665,7 +745,10 @@ mod native {
             Ok(())
         }
         fn unit_path(&self, unit: &str) -> Result<()> {
-            let loaded = self.property(unit, "FragmentPath", true)?;
+            self.unit_path_cancellable(unit, true)
+        }
+        fn unit_path_cancellable(&self, unit: &str, cancellable: bool) -> Result<()> {
+            let loaded = self.property(unit, "FragmentPath", cancellable)?;
             ensure!(!loaded.is_empty(), "loaded unit has no file identity");
             ensure!(
                 fs::canonicalize(loaded)? == fs::canonicalize(self.units.join(unit))?,
@@ -704,20 +787,23 @@ mod native {
             Ok(())
         }
         fn loaded(&self, id: &str) -> Result<()> {
+            self.loaded_cancellable(id, true)
+        }
+        fn loaded_cancellable(&self, id: &str, cancellable: bool) -> Result<()> {
             for (unit, _, _) in UNITS {
-                self.unit_path(unit)?;
+                self.unit_path_cancellable(unit, cancellable)?;
                 ensure!(
-                    self.property(unit, "Description", true)?
+                    self.property(unit, "Description", cancellable)?
                         .ends_with(&format!("[release={id}]")),
                     "loaded identity mismatch"
                 );
                 ensure!(
-                    self.property(unit, "DropInPaths", true)?.is_empty(),
+                    self.property(unit, "DropInPaths", cancellable)?.is_empty(),
                     "unsupported loaded overrides"
                 );
             }
             ensure!(
-                self.property("agmi.service", "TimeoutStopUSec", true)? == "infinity",
+                self.property("agmi.service", "TimeoutStopUSec", cancellable)? == "infinity",
                 "incompatible loaded stop deadline"
             );
             Ok(())
@@ -1174,6 +1260,375 @@ mod native {
             checkpoint()
         }
     }
+
+    fn repair_unavailable(error: anyhow::Error) -> anyhow::Error {
+        let mut restoration = repair_restoration("canonical_installation_unverified");
+        restoration["runtime"] = json!("unknown");
+        restoration["failure_code"] = json!("preflight_failed");
+        error.context(RepairRuntimeError {
+            code: "repair_runtime_unavailable",
+            restoration,
+            report: None,
+        })
+    }
+
+    fn account_owned(path: &Path) -> Result<()> {
+        let metadata = fs::metadata(path)?;
+        ensure!(
+            metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.permissions().mode() & 0o022 == 0,
+            "installation path is not exclusively account-owned"
+        );
+        Ok(())
+    }
+
+    fn account_owned_ancestors(path: &Path, home: &Path) -> Result<()> {
+        ensure!(
+            path.starts_with(home),
+            "installation path leaves account home"
+        );
+        for ancestor in path.ancestors() {
+            account_owned(ancestor)?;
+            if ancestor == home {
+                return Ok(());
+            }
+        }
+        anyhow::bail!("installation path has no account home")
+    }
+
+    struct RepairIntent {
+        runtime: String,
+        timer: String,
+        enablement: [String; 3],
+    }
+
+    impl Installation {
+        fn repair_release(&self) -> Result<String> {
+            let id = fs::read_link(self.root.join("current"))?;
+            let id = id.to_str().context("invalid selected release")?;
+            ensure!(valid_id(id), "invalid selected release");
+            let release = self.root.join(id);
+            for path in [&self.root, &release, &self.bin, &self.units, &self.config] {
+                account_owned_ancestors(path, &self.home)?;
+            }
+            regular(&self.config)?;
+            // Validate ownership before validate_release executes the selected
+            // binary's embedded-manifest query.
+            for name in ARTIFACTS.into_iter().chain(["SHA256SUMS"]) {
+                account_owned(&release.join(name))?;
+            }
+            validate_release(&release, id)?;
+            for (name, destination) in std::iter::once(("agmi", self.bin.join("agmi"))).chain(
+                UNITS
+                    .iter()
+                    .map(|(name, _, _)| (*name, self.units.join(name))),
+            ) {
+                ensure!(
+                    fs::read_link(&destination)? == self.root.join("current").join(name),
+                    "installation entry is not a canonical release link"
+                );
+            }
+            for (unit, _, template) in UNITS {
+                ensure!(
+                    !exists(&self.units.join(format!("{unit}.d")))?,
+                    "unsupported unit overrides"
+                );
+                ensure!(
+                    fs::read_to_string(release.join(unit))?
+                        == template.replace("@AGMI_RELEASE_ID@", id),
+                    "unsupported canonical runtime template"
+                );
+            }
+            self.manager_context()?;
+            self.loaded(id)?;
+            self.repair_loaded(true)?;
+            Ok(id.to_owned())
+        }
+
+        fn repair_loaded(&self, cancellable: bool) -> Result<()> {
+            for (unit, _, _) in UNITS {
+                ensure!(
+                    self.property(unit, "LoadState", cancellable)? == "loaded"
+                        && self.property(unit, "NeedDaemonReload", cancellable)? == "no",
+                    "installed units are not coherently loaded"
+                );
+            }
+            Ok(())
+        }
+
+        fn repair_runtime_state(&self, cancellable: bool) -> Result<String> {
+            let state = self.property("agmi.service", "ActiveState", cancellable)?;
+            ensure!(
+                matches!(state.as_str(), "active" | "inactive" | "failed"),
+                "runtime state is transitional"
+            );
+            let job = self.property("agmi.service", "Job", cancellable)?;
+            ensure!(job.is_empty() || job == "0", "runtime has a pending job");
+            ensure!(
+                self.property("agmi.service", "ControlPID", cancellable)? == "0",
+                "runtime has an active control process"
+            );
+            if state == "active" {
+                ensure!(
+                    self.property("agmi.service", "SubState", cancellable)? == "running",
+                    "runtime is not stably running"
+                );
+            } else {
+                ensure!(
+                    self.property("agmi.service", "MainPID", cancellable)? == "0",
+                    "stopped runtime still owns a process"
+                );
+            }
+            Ok(state)
+        }
+
+        fn repair_intent(&self) -> Result<RepairIntent> {
+            let runtime = self.repair_runtime_state(true)?;
+            let timer = self.property("agmi-health.timer", "ActiveState", true)?;
+            ensure!(
+                matches!(timer.as_str(), "active" | "inactive" | "failed"),
+                "health timer state is transitional"
+            );
+            let mut enablement = [String::new(), String::new(), String::new()];
+            for ((unit, _, _), state) in UNITS.into_iter().zip(&mut enablement) {
+                *state = self.property(unit, "UnitFileState", true)?;
+                ensure!(
+                    matches!(
+                        state.as_str(),
+                        "enabled"
+                            | "enabled-runtime"
+                            | "disabled"
+                            | "static"
+                            | "indirect"
+                            | "linked"
+                            | "linked-runtime"
+                    ),
+                    "unit enablement is unsupported"
+                );
+            }
+            Ok(RepairIntent {
+                runtime,
+                timer,
+                enablement,
+            })
+        }
+
+        fn repair_runtime_identity(&self, id: &str, cancellable: bool) -> Result<()> {
+            let pid = self.property("agmi.service", "MainPID", cancellable)?;
+            ensure!(
+                pid.parse::<u32>().is_ok_and(|pid| pid > 0),
+                "runtime has no process identity"
+            );
+            #[cfg(test)]
+            let proc_root = self.proc_root.as_path();
+            #[cfg(not(test))]
+            let proc_root = Path::new("/proc");
+            let process = proc_root.join(&pid);
+            ensure!(
+                fs::metadata(&process)?.uid() == unsafe { libc::geteuid() },
+                "runtime process belongs to another account"
+            );
+            let binary = self.root.join(id).join("agmi");
+            ensure!(
+                fs::canonicalize(process.join("exe"))? == fs::canonicalize(&binary)?
+                    && digest_cancellable(File::open(process.join("exe"))?, cancellable)?
+                        == id[2..],
+                "runtime binary does not match the selected release"
+            );
+            let command = fs::read(process.join("cmdline"))?;
+            let mut arguments = command.split(|byte| *byte == 0);
+            ensure!(
+                arguments.next() == Some(binary.as_os_str().as_bytes())
+                    && arguments.next() == Some(b"--config".as_slice())
+                    && arguments.next() == Some(self.config.as_os_str().as_bytes())
+                    && arguments.next() == Some(b"run".as_slice())
+                    && arguments.next() == Some(b"".as_slice())
+                    && arguments.next().is_none(),
+                "runtime arguments do not own the canonical configuration"
+            );
+            ensure!(
+                self.property("agmi.service", "MainPID", cancellable)? == pid,
+                "runtime identity changed during inspection"
+            );
+            Ok(())
+        }
+
+        fn restore_repair_runtime(
+            &self,
+            id: &str,
+            intent: &RepairIntent,
+            stop_attempted: bool,
+            restoration: &mut Value,
+        ) -> Result<()> {
+            // Recovery is deliberately non-cancellable. A handled signal cannot
+            // interrupt the commands or identity checks needed to restore intent.
+            self.loaded_cancellable(id, false)?;
+            self.repair_loaded(false)?;
+            ensure!(
+                fs::read_link(self.root.join("current"))? == Path::new(id),
+                "selected release changed during repair"
+            );
+            let state = self.repair_runtime_state(false)?;
+            if stop_attempted {
+                if state != "active" {
+                    ensure!(
+                        self.systemctl(&["start", "agmi.service"], false)?
+                            .status
+                            .success(),
+                        "runtime restoration start failed"
+                    );
+                }
+                ensure!(
+                    self.repair_runtime_state(false)? == "active",
+                    "restored runtime is not active"
+                );
+                self.repair_runtime_identity(id, false)?;
+                restoration["runtime"] = json!("restored");
+            } else {
+                ensure!(
+                    state == intent.runtime,
+                    "runtime intent changed during repair"
+                );
+                if state == "active" {
+                    self.repair_runtime_identity(id, false)?;
+                }
+                restoration["runtime"] = json!("unchanged");
+            }
+            ensure!(
+                self.property("agmi-health.timer", "ActiveState", false)? == intent.timer,
+                "health timer state changed during repair"
+            );
+            restoration["health_timer"] = json!("unchanged");
+            for ((unit, _, _), expected) in UNITS.into_iter().zip(&intent.enablement) {
+                ensure!(
+                    self.property(unit, "UnitFileState", false)? == *expected,
+                    "unit enablement changed during repair"
+                );
+            }
+            restoration["enablement"] = json!("unchanged");
+            restoration["verified"] = json!(true);
+            Ok(())
+        }
+
+        fn repair_runtime(&self, repair: impl FnOnce() -> Result<Value>) -> Result<Value> {
+            let (id, intent) = (|| {
+                ensure!(self.lock.is_some(), "repair requires the installer lock");
+                let id = self.repair_release()?;
+                let intent = self.repair_intent()?;
+                if intent.runtime == "active" {
+                    self.repair_runtime_identity(&id, true)?;
+                }
+                checkpoint()?;
+                Ok::<_, anyhow::Error>((id, intent))
+            })()
+            .map_err(repair_unavailable)?;
+            let mut restoration = repair_restoration("canonical_user_systemd");
+            restoration["prior_runtime"] = json!(intent.runtime);
+            restoration["runtime"] = json!("unknown");
+            restoration["health_timer"] = json!("unverified");
+            restoration["enablement"] = json!("unverified");
+            let mut stop_attempted = false;
+            let mut failure = None;
+            let result = (|| {
+                checkpoint()?;
+                if intent.runtime == "active" {
+                    stop_attempted = true;
+                    restoration["manager_action"] = json!("runtime_stop_attempted");
+                    failure = Some("repair_runtime_stop_failed");
+                    // Let systemctl finish the stop job even when a handled
+                    // cancellation arrives; then skip the action and restore.
+                    ensure!(
+                        self.systemctl(&["stop", "agmi.service"], false)?
+                            .status
+                            .success(),
+                        "runtime stop failed"
+                    );
+                    ensure!(
+                        self.repair_runtime_state(false)? == "inactive",
+                        "runtime did not stop"
+                    );
+                    restoration["manager_action"] = json!("runtime_stop");
+                }
+                failure = None;
+                checkpoint()?;
+                repair()
+            })();
+            let restored =
+                self.restore_repair_runtime(&id, &intent, stop_attempted, &mut restoration);
+            if restored.is_err() {
+                restoration["failure_code"] = json!("restoration_failed");
+                restoration["verified"] = json!(false);
+                // Never publish raw systemctl/proc/config failure text.
+                return finish_repair(result, restoration, Some("repair_runtime_restore_failed"));
+            }
+            if CANCELLED.load(Ordering::Relaxed) != 0 {
+                failure = Some("repair_interrupted");
+            }
+            restoration["failure_code"] = json!(failure.unwrap_or("none"));
+            finish_repair(result, restoration, failure)
+        }
+    }
+
+    pub(super) fn with_repair_runtime(
+        config_path: &Path,
+        repair: impl FnOnce() -> Result<Value>,
+    ) -> Result<Value> {
+        let account_home = crate::store::account_home().map_err(repair_unavailable)?;
+        let selected = if config_path.is_absolute() {
+            config_path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map_err(|error| repair_unavailable(error.into()))?
+                .join(config_path)
+        };
+        let canonical = account_home.join(".config/agmi/config.toml");
+        if resolve_missing(&selected).map_err(repair_unavailable)?
+            != resolve_missing(&canonical).map_err(repair_unavailable)?
+        {
+            return caller_managed_repair("noncanonical_config", repair);
+        }
+        let mut installation = Installation::new(
+            std::env::var_os("HOME")
+                .context("HOME unavailable")
+                .map_err(repair_unavailable)?
+                .into(),
+        )
+        .map_err(repair_unavailable)?;
+        installation.account_context().map_err(repair_unavailable)?;
+        if !prerequisite(&installation.systemctl) {
+            return caller_managed_repair("unsupported_host", repair);
+        }
+        if !exists(&installation.root).map_err(repair_unavailable)? {
+            return caller_managed_repair("installation_absent", repair);
+        }
+        let cancellation = InstallerCancellation::acquire().map_err(repair_unavailable)?;
+        (|| {
+            ensure!(
+                fs::symlink_metadata(&installation.root)?.is_dir(),
+                "release root is not a real directory"
+            );
+            account_owned_ancestors(&installation.root, &installation.home)?;
+            installation.lock = Some(InstallLock::acquire(&installation.root)?);
+            Ok::<_, anyhow::Error>(())
+        })()
+        .map_err(repair_unavailable)?;
+        if !exists(&installation.root.join("current")).map_err(repair_unavailable)? {
+            let absent = (|| {
+                for path in std::iter::once(installation.bin.join("agmi")).chain(
+                    UNITS
+                        .iter()
+                        .map(|(unit, _, _)| installation.units.join(unit)),
+                ) {
+                    ensure!(!exists(&path)?, "installation has no selected release");
+                }
+                Ok::<_, anyhow::Error>(())
+            })();
+            absent.map_err(repair_unavailable)?;
+            drop(cancellation);
+            return caller_managed_repair("installation_absent", repair);
+        }
+        installation.repair_runtime(repair)
+    }
     impl Drop for Installation {
         fn drop(&mut self) {
             // A panic also fails closed. The normal error path records whether
@@ -1384,6 +1839,8 @@ mod native {
     mod tests {
         use super::*;
 
+        static TEST_SERIAL: Mutex<()> = Mutex::new(());
+
         fn quoted(path: &Path) -> String {
             format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
         }
@@ -1419,6 +1876,7 @@ mod native {
         /// manifest validation, publication, fsync and RAII run unchanged.
         #[test]
         fn filesystem_publication_and_failure_boundaries() -> Result<()> {
+            let _serial = TEST_SERIAL.lock().unwrap();
             let _cancellation = InstallerCancellation::acquire()?;
             let temporary =
                 OwnedPath::directory(&std::env::temp_dir(), "agmi-native-installer-test")?;
@@ -1661,6 +2119,388 @@ esac
             fs::create_dir(root.join(".install-lock"))?;
             assert!(InstallLock::acquire(&root).is_err());
             assert!(root.join(".install-lock").is_dir());
+            Ok(())
+        }
+        fn repair_fixture(directory: &Path) -> Result<Installation> {
+            let home = directory.join("home");
+            fs::create_dir(&home)?;
+            let mut installation = Installation::new(home)?;
+            installation.lock = Some(installation.prepare()?);
+            fs::create_dir_all(installation.config.parent().unwrap())?;
+            write_file(
+                &installation.config,
+                b"paused = true\nprivate sentinel\n",
+                0o600,
+            )?;
+            let binary = directory.join("candidate");
+            let expected = candidate(&binary, &directory.join("state"), "clean")?;
+            let verifier = directory.join("verify");
+            write_file(&verifier, b"#!/bin/sh\nexit 0\n", 0o700)?;
+            installation.analyze = verifier;
+            let id = installation.stage(&binary, &expected)?;
+            symlink(&id, installation.root.join("current"))?;
+            symlink(
+                installation.root.join("current/agmi"),
+                installation.bin.join("agmi"),
+            )?;
+            for (unit, _, _) in UNITS {
+                symlink(
+                    installation.root.join("current").join(unit),
+                    installation.units.join(unit),
+                )?;
+            }
+            installation.proc_root = directory.join("proc");
+            let process = installation.proc_root.join("42");
+            fs::create_dir_all(&process)?;
+            let executable = installation.root.join(&id).join("agmi");
+            symlink(&executable, process.join("exe"))?;
+            let mut command = Vec::new();
+            for argument in [
+                executable.as_os_str().as_bytes(),
+                b"--config",
+                installation.config.as_os_str().as_bytes(),
+                b"run",
+            ] {
+                command.extend_from_slice(argument);
+                command.push(0);
+            }
+            fs::write(process.join("cmdline"), command)?;
+            fs::write(directory.join("runtime"), "active")?;
+            fs::write(directory.join("timer"), "active")?;
+            fs::write(directory.join("dropins"), "")?;
+            fs::write(directory.join("job"), "0")?;
+            fs::write(
+                directory.join("fragment"),
+                installation.units.as_os_str().as_bytes(),
+            )?;
+            fs::write(directory.join("events"), "")?;
+            installation.systemctl = directory.join("systemctl");
+            write_file(
+                &installation.systemctl,
+                format!(
+                    r#"#!/bin/sh
+root={}
+units={}
+id={}
+[ -f {} ] || exit 94
+printf '%s\n' "$*" >> "$root/events"
+[ "$1" = --user ] || exit 95
+shift
+case "$1" in
+show)
+  if [ "$2" = --property=UnitPath ]; then printf '%s\n' "$units"; exit; fi
+  case "$3" in
+    --property=LoadState) printf 'loaded\n';;
+    --property=FragmentPath) printf '%s/%s\n' "$(cat "$root/fragment")" "$2";;
+    --property=Description) printf 'fixture [release=%s]\n' "$id";;
+    --property=DropInPaths) cat "$root/dropins";;
+    --property=TimeoutStopUSec) printf 'infinity\n';;
+    --property=NeedDaemonReload) printf 'no\n';;
+    --property=ActiveState)
+      case "$2" in
+        agmi.service) cat "$root/runtime";;
+        agmi-health.timer) cat "$root/timer";;
+        *) printf 'inactive\n';;
+      esac;;
+    --property=SubState) printf 'running\n';;
+    --property=Job) cat "$root/job";;
+    --property=ControlPID) printf '0\n';;
+    --property=MainPID)
+      if [ "$(cat "$root/runtime")" = active ]; then printf '42\n'; else printf '0\n'; fi;;
+    --property=UnitFileState)
+      case "$2" in
+        agmi.service) printf 'disabled\n';;
+        agmi-health.timer) printf 'enabled\n';;
+        *) printf 'static\n';;
+      esac;;
+    *) exit 96;;
+  esac;;
+stop)
+  [ "$2" = agmi.service ] || exit 97
+  [ ! -f "$root/stop-stays-active" ] || exit 1
+  printf 'inactive' > "$root/runtime"
+  [ ! -f "$root/stop-fails" ];;
+start)
+  [ "$2" = agmi.service ] || exit 98
+  [ ! -f "$root/start-fails" ] || exit 1
+  printf 'active' > "$root/runtime";;
+*) exit 99;;
+esac
+"#,
+                    quoted(directory),
+                    quoted(&installation.units),
+                    quoted(Path::new(&id)),
+                    quoted(&installation.root.join(".install-lock/owner")),
+                )
+                .as_bytes(),
+                0o700,
+            )?;
+            Ok(installation)
+        }
+
+        fn repair_report() -> Value {
+            json!({"repairs":{"applied":1,"failure":null}})
+        }
+
+        fn repair_controls(directory: &Path) -> Result<Vec<String>> {
+            Ok(fs::read_to_string(directory.join("events"))?
+                .lines()
+                .filter(|line| !line.starts_with("--user show "))
+                .map(str::to_owned)
+                .collect())
+        }
+
+        #[test]
+        fn repair_restores_active_intent_after_actions_errors_and_cancellation() -> Result<()> {
+            let _serial = TEST_SERIAL.lock().unwrap();
+            let _cancellation = InstallerCancellation::acquire()?;
+            let temporary = OwnedPath::directory(&std::env::temp_dir(), "agmi-repair-test")?;
+            let directory = &temporary.path;
+            let installation = repair_fixture(directory)?;
+            let report = installation.repair_runtime(|| {
+                assert_eq!(fs::read_to_string(directory.join("runtime"))?, "inactive");
+                assert!(InstallLock::acquire(&installation.root).is_err());
+                Ok(repair_report())
+            })?;
+            assert_eq!(report["repairs"]["applied"], 1);
+            assert_eq!(report["repairs"]["restoration"]["verified"], true);
+            assert_eq!(report["repairs"]["restoration"]["runtime"], "restored");
+            assert_eq!(report["repairs"]["restoration"]["prior_runtime"], "active");
+            assert_eq!(
+                repair_controls(directory)?,
+                ["--user stop agmi.service", "--user start agmi.service"]
+            );
+            assert_eq!(fs::read_to_string(directory.join("timer"))?, "active");
+            assert_eq!(
+                fs::read(&installation.config)?,
+                b"paused = true\nprivate sentinel\n"
+            );
+
+            fs::write(directory.join("events"), "")?;
+            let error = installation
+                .repair_runtime(|| {
+                    Err(crate::lifecycle::LifecycleError {
+                        code: "account_locked",
+                        message: "sanitized action refusal",
+                    }
+                    .into())
+                })
+                .unwrap_err();
+            assert_eq!(
+                error
+                    .downcast_ref::<crate::lifecycle::LifecycleError>()
+                    .unwrap()
+                    .code,
+                "account_locked"
+            );
+            let evidence = error.downcast_ref::<RepairRuntimeError>().unwrap();
+            assert_eq!(evidence.code, "repair_action_failed");
+            assert_eq!(evidence.restoration["verified"], true);
+            assert_eq!(fs::read_to_string(directory.join("runtime"))?, "active");
+            assert_eq!(
+                repair_controls(directory)?,
+                ["--user stop agmi.service", "--user start agmi.service"]
+            );
+
+            fs::write(directory.join("events"), "")?;
+            let interrupted = installation.repair_runtime(|| {
+                CANCELLED.store(libc::SIGTERM, Ordering::Relaxed);
+                Ok(repair_report())
+            });
+            CANCELLED.store(0, Ordering::Relaxed);
+            let error = interrupted.unwrap_err();
+            let evidence = error.downcast_ref::<RepairRuntimeError>().unwrap();
+            assert_eq!(evidence.code, "repair_interrupted");
+            assert_eq!(evidence.restoration["verified"], true);
+            assert_eq!(evidence.report.as_ref().unwrap()["repairs"]["applied"], 1);
+            assert_eq!(fs::read_to_string(directory.join("runtime"))?, "active");
+            assert_eq!(
+                repair_controls(directory)?,
+                ["--user stop agmi.service", "--user start agmi.service"]
+            );
+
+            // Stopped and failed intent stays stopped; the paused configuration
+            // and even an inactive health timer remain byte-for-byte unchanged.
+            fs::write(directory.join("timer"), "inactive")?;
+            for state in ["inactive", "failed"] {
+                fs::write(directory.join("events"), "")?;
+                fs::write(directory.join("runtime"), state)?;
+                let report = installation.repair_runtime(|| Ok(repair_report()))?;
+                assert_eq!(report["repairs"]["restoration"]["runtime"], "unchanged");
+                assert_eq!(report["repairs"]["restoration"]["prior_runtime"], state);
+                assert_eq!(report["repairs"]["restoration"]["manager_action"], "none");
+                assert_eq!(report["repairs"]["restoration"]["verified"], true);
+                assert_eq!(fs::read_to_string(directory.join("runtime"))?, state);
+                assert!(repair_controls(directory)?.is_empty());
+            }
+            assert_eq!(fs::read_to_string(directory.join("timer"))?, "inactive");
+            assert_eq!(
+                fs::read(&installation.config)?,
+                b"paused = true\nprivate sentinel\n"
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn repair_stop_and_restore_failures_never_hide_completed_actions() -> Result<()> {
+            let _serial = TEST_SERIAL.lock().unwrap();
+            let _cancellation = InstallerCancellation::acquire()?;
+            let temporary =
+                OwnedPath::directory(&std::env::temp_dir(), "agmi-repair-failure-test")?;
+            let directory = &temporary.path;
+            let installation = repair_fixture(directory)?;
+            for (flag, controls) in [
+                (
+                    "stop-fails",
+                    vec!["--user stop agmi.service", "--user start agmi.service"],
+                ),
+                ("stop-stays-active", vec!["--user stop agmi.service"]),
+            ] {
+                fs::write(directory.join("events"), "")?;
+                fs::write(directory.join(flag), "")?;
+                let error = installation
+                    .repair_runtime(|| panic!("failed stop ran repair"))
+                    .unwrap_err();
+                let evidence = error.downcast_ref::<RepairRuntimeError>().unwrap();
+                assert_eq!(evidence.code, "repair_runtime_stop_failed");
+                assert_eq!(evidence.restoration["verified"], true);
+                assert_eq!(repair_controls(directory)?, controls);
+                assert_eq!(fs::read_to_string(directory.join("runtime"))?, "active");
+                fs::remove_file(directory.join(flag))?;
+            }
+            fs::write(directory.join("start-fails"), "")?;
+            for action_fails in [false, true] {
+                fs::write(directory.join("runtime"), "active")?;
+                fs::write(directory.join("events"), "")?;
+                let error = installation
+                    .repair_runtime(|| {
+                        if action_fails {
+                            anyhow::bail!("private callback failure not for presentation");
+                        }
+                        Ok(repair_report())
+                    })
+                    .unwrap_err();
+                let evidence = error.downcast_ref::<RepairRuntimeError>().unwrap();
+                assert_eq!(evidence.code, "repair_runtime_restore_failed");
+                assert_eq!(evidence.restoration["verified"], false);
+                assert_eq!(evidence.restoration["failure_code"], "restoration_failed");
+                assert_eq!(evidence.report.is_none(), action_fails);
+                if let Some(report) = &evidence.report {
+                    assert_eq!(report["repairs"]["applied"], 1);
+                    assert_eq!(report["repairs"]["restoration"]["verified"], false);
+                }
+                assert!(!error.to_string().contains("private"));
+                assert!(!evidence.restoration.to_string().contains("private"));
+                assert_eq!(fs::read_to_string(directory.join("runtime"))?, "inactive");
+                assert_eq!(
+                    repair_controls(directory)?,
+                    ["--user stop agmi.service", "--user start agmi.service"]
+                );
+            }
+            fs::remove_file(directory.join("start-fails"))?;
+
+            // A successful start is insufficient: the actual process must use
+            // the selected binary and canonical config before success is claimed.
+            fs::write(directory.join("runtime"), "active")?;
+            let error = installation
+                .repair_runtime(|| {
+                    fs::write(
+                        installation.proc_root.join("42/cmdline"),
+                        b"other\0--config\0private\0run\0",
+                    )?;
+                    Ok(repair_report())
+                })
+                .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<RepairRuntimeError>().unwrap().code,
+                "repair_runtime_restore_failed"
+            );
+            assert_eq!(
+                error
+                    .downcast_ref::<RepairRuntimeError>()
+                    .unwrap()
+                    .restoration["verified"],
+                false
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn repair_refuses_unvalidated_installations_before_manager_actions() -> Result<()> {
+            let _serial = TEST_SERIAL.lock().unwrap();
+            let _cancellation = InstallerCancellation::acquire()?;
+            let temporary =
+                OwnedPath::directory(&std::env::temp_dir(), "agmi-repair-preflight-test")?;
+            let directory = &temporary.path;
+            let installation = repair_fixture(directory)?;
+            let refused = || -> Result<()> {
+                fs::write(directory.join("events"), "")?;
+                let error = installation
+                    .repair_runtime(|| panic!("unvalidated installation ran repair"))
+                    .unwrap_err();
+                assert_eq!(
+                    error.downcast_ref::<RepairRuntimeError>().unwrap().code,
+                    "repair_runtime_unavailable"
+                );
+                assert_eq!(
+                    error
+                        .downcast_ref::<RepairRuntimeError>()
+                        .unwrap()
+                        .restoration["manager_action"],
+                    "none"
+                );
+                assert!(repair_controls(directory)?.is_empty());
+                Ok(())
+            };
+            for state in ["activating", "deactivating", "reloading"] {
+                fs::write(directory.join("runtime"), state)?;
+                refused()?;
+            }
+            fs::write(directory.join("runtime"), "active")?;
+            fs::write(directory.join("job"), "12")?;
+            refused()?;
+            fs::write(directory.join("job"), "0")?;
+            fs::write(directory.join("dropins"), "/private/unsupported-override")?;
+            refused()?;
+            fs::write(directory.join("dropins"), "")?;
+            fs::write(directory.join("fragment"), directory.as_os_str().as_bytes())?;
+            refused()?;
+            fs::write(
+                directory.join("fragment"),
+                installation.units.as_os_str().as_bytes(),
+            )?;
+            let override_path = installation.units.join("agmi.service.d");
+            fs::create_dir(&override_path)?;
+            refused()?;
+            fs::remove_dir(override_path)?;
+            fs::set_permissions(&installation.config, fs::Permissions::from_mode(0o666))?;
+            refused()?;
+            fs::set_permissions(&installation.config, fs::Permissions::from_mode(0o600))?;
+
+            let command_path = installation.proc_root.join("42/cmdline");
+            let command = fs::read(&command_path)?;
+            fs::write(&command_path, b"other\0--config\0different-config\0run\0")?;
+            refused()?;
+            fs::write(&command_path, command)?;
+            let id = fs::read_link(installation.root.join("current"))?;
+            let release = installation.root.join(&id);
+            let unit = release.join("agmi.service");
+            let template = fs::read(&unit)?;
+            fs::write(&unit, b"[Service]\nExecStart=/unrelated/runtime\n")?;
+            fs::write(release.join("SHA256SUMS"), checksums(&release)?)?;
+            refused()?;
+            fs::write(&unit, template)?;
+            fs::write(release.join("SHA256SUMS"), checksums(&release)?)?;
+            replace_link(
+                Path::new("not-a-release"),
+                &installation.root.join("current"),
+            )?;
+            refused()?;
+            replace_link(&id, &installation.root.join("current"))?;
+            assert_eq!(
+                installation.repair_runtime(|| Ok(repair_report()))?["repairs"]["restoration"]["verified"],
+                true
+            );
             Ok(())
         }
     }

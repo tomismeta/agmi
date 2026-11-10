@@ -10,6 +10,7 @@ use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 
 mod api;
+mod intervention;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Options {
@@ -32,6 +33,23 @@ impl Default for Options {
     }
 }
 
+/// Add local progress and intervention evidence without changing admission or risk.
+/// Status uses default thresholds; health and doctor use their selected options.
+pub fn enrich_status(status: &mut Value, options: Options, at: i64) {
+    let (work, intervention) = intervention::project(status, options, at);
+    status["work"] = work;
+    status["intervention"] = intervention;
+}
+
+/// Stable diagnostic shapes when configuration or journal evidence is unavailable.
+pub fn unknown_intervention(reason: &str) -> Value {
+    intervention::unknown(reason)
+}
+
+pub fn unknown_work(reason: &str) -> Value {
+    intervention::unknown_work(reason)
+}
+
 /// This command opens existing state read-only, never recovers it, and performs
 /// neither network nor model calls. Errors are deliberately replaced at this boundary.
 pub fn check(config: &Config, options: Options) -> Result<Value> {
@@ -40,6 +58,8 @@ pub fn check(config: &Config, options: Options) -> Result<Value> {
         Err(_) => {
             return Ok(json!({
                 "contract_version":1,"components":unknown_components(),
+                "work":unknown_work("local_evidence_unavailable"),
+                "intervention":unknown_intervention("local_evidence_unavailable"),
                 "healthy":false,"attention_required":true,
                 "issues":["local_evidence_unavailable"],"warnings":[],
                 "operational":{"status":"unknown","issues":["local_evidence_unavailable"]},
@@ -156,34 +176,34 @@ impl WorkTiming {
     }
 }
 
+fn cycle_floor(policy: &Value) -> Option<u64> {
+    let http = policy["timeouts"]["http_seconds"].as_u64()?;
+    Some(
+        http.max(
+            policy["timeouts"]["read_http_seconds"]
+                .as_u64()
+                .unwrap_or(http),
+        )
+        .saturating_add(policy["schedule"]["poll_seconds"].as_u64()?)
+        .saturating_add(policy["schedule"]["jitter_seconds"].as_u64()?)
+        .saturating_add(policy["timeouts"]["shutdown_seconds"].as_u64()?)
+        .saturating_add(1),
+    )
+}
+
 fn evaluate(config: &Config, options: Options, status: &Value, at: i64) -> Value {
     // Use the running controller's policy, not a newly edited desired config.
     // Native inference is independent and no longer expands heartbeat grace.
     let policy = &status["effective_runtime"]["policy"];
-    let timing_known = [
-        &policy["timeouts"]["http_seconds"],
-        &policy["timeouts"]["shutdown_seconds"],
-        &policy["schedule"]["poll_seconds"],
-        &policy["schedule"]["jitter_seconds"],
-    ]
-    .iter()
-    .all(|value| value.as_u64().is_some());
+    let floor = cycle_floor(policy);
+    let timing_known = floor.is_some();
     let http = policy["timeouts"]["http_seconds"].as_u64().unwrap_or(0);
     let read_http = policy["timeouts"]["read_http_seconds"]
         .as_u64()
         .unwrap_or(http);
     let poll = policy["schedule"]["poll_seconds"].as_u64().unwrap_or(0);
-    let jitter = policy["schedule"]["jitter_seconds"].as_u64().unwrap_or(0);
     let shutdown = policy["timeouts"]["shutdown_seconds"].as_u64().unwrap_or(0);
-    let cycle_floor = if timing_known {
-        http.max(read_http)
-            .saturating_add(poll)
-            .saturating_add(jitter)
-            .saturating_add(shutdown)
-            .saturating_add(1)
-    } else {
-        0
-    };
+    let cycle_floor = floor.unwrap_or(0);
     let stale = options.stale_seconds.max(cycle_floor);
     let work_limit = options.work_seconds.max(cycle_floor);
     let grace = options.answer_grace_seconds.max(cycle_floor);
@@ -387,6 +407,7 @@ fn evaluate(config: &Config, options: Options, status: &Value, at: i64) -> Value
             )
         });
     let attention_required = !issues.is_empty() || !warnings.is_empty();
+    let (work, intervention) = intervention::project(status, options, at);
     let mut result = json!({"healthy":issues.is_empty(),"checked_at":at,"issues":issues,
         "warnings":warnings,"attention_required":attention_required,
         "unresolved_model_attempts":unresolved_models,
@@ -397,7 +418,7 @@ fn evaluate(config: &Config, options: Options, status: &Value, at: i64) -> Value
         "heartbeat_recent":heartbeat_age.is_some_and(|age|age<=stale),
         "observing":observation_age.is_some_and(|age|age<=stale),"preparing":preparing,
         "last_safety_observation_at":status["last_safety_observation_at"],
-        "work":status["work"],
+        "work":work,"intervention":intervention,
         "captured_work":status["captured_work"],
         "pending_work":status["pending_work"],
         "epoch_observed_age_seconds":epoch_age,"pending_age_seconds":pending_age,
@@ -447,6 +468,20 @@ fn apply_disk_issue(result: &mut Value, code: &str) {
         .as_array_mut()
         .expect("operational health issues array")
         .push(json!(code));
+    let intervention = &mut result["intervention"];
+    intervention["status"] = json!(if code == "state_disk_space_low" {
+        "operator_required"
+    } else {
+        "undetermined"
+    });
+    intervention["reason"] = json!(code);
+    intervention["next_action"] = json!("inspect_state_filesystem");
+    intervention["next_at"] = Value::Null;
+    intervention["unattended"] = if code == "state_disk_space_low" {
+        json!(false)
+    } else {
+        Value::Null
+    };
     for name in ["controller", "answer", "judge", "mine"] {
         let row = &mut result["components"][name];
         if row["state"] == "ok" {

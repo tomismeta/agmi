@@ -144,12 +144,18 @@ The first bounded run initializes paused state, not live readiness. Resume does 
 ## Inspect and administer
 
 ```sh
+agmi doctor
 agmi status --json
 agmi health --json
 agmi reads --json
 ```
 
 `healthy` and the health command's exit status describe operational readiness. Unresolved outcomes remain visible through `warnings`, `attention_required` and `risk`; a progressing, unblocked agent can be healthy with warnings. Blocked admission, stale evidence and overdue work still fail health.
+
+`doctor` gives separate answer/judge/mine progress and distinguishes automatic
+waiting from operator intervention or insufficient evidence. `agmi doctor --repair`
+applies only eligible, audited refusal repairs—not a clear-all—and preserves
+runtime intent and unresolved evidence. [Doctor and recovery limits](docs/OPERATIONS.md#doctor-and-unattended-status).
 
 Run one authoritative writer per account. Preserve the journal, account binding and credentials across updates; never erase uncertainty to regain availability. `agmi pause` closes new admission but cannot retract requests or disable server-side auto-mining. Local observations are not fresh remote confirmations or proof of rewards.
 

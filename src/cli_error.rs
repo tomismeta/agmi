@@ -334,7 +334,7 @@ pub(crate) fn diagnostics(data: &mut Value, config: Option<&Path>) {
             "clock_regressed" => Some("Inspect host clock synchronization before trusting age or deadline evidence."),
             "identity_mismatch" => Some("Restore the configuration for this journal's existing identity. Do not replace its account or erase state."),
             "api_routing_mismatch" => Some("Restore the bound network.api profile shown by status. Routing changes require a stopped controller and no unresolved or reusable work; never erase evidence to bypass this boundary."),
-            "model_execution_unresolved" => Some("Inspect retained model evidence while stopped before explicitly authorizing recover-model; unresolved network requests must not be reset."),
+            "model_execution_unresolved" => Some("Retained model uncertainty is risk evidence, not necessarily a current blocker. Inspect the affected lane before considering stopped-writer recover-model; never reset an unresolved network request."),
             "no_active_capabilities" => Some("Review model authentication, routes, guidance and desired capability modes before explicitly changing configuration."),
             _ => None,
         };
@@ -353,23 +353,79 @@ pub(crate) fn diagnostics(data: &mut Value, config: Option<&Path>) {
     });
     if let Some(work) = data["work"].as_object_mut() {
         for detail in work.values_mut() {
-            let command: &[&str] = match detail["next_action"].as_str() {
-                Some("resume") => &["resume"],
-                Some("repair_config" | "enable_capability") => &["config", "show"],
-                Some("await_reconciliation") => &["operations", "list"],
-                Some("start_controller") => &["run"],
-                _ => &["reads"],
-            };
-            let authorization = matches!(command, ["resume"] | ["run"]);
-            let mut actions = Vec::new();
+            detail["next_actions"] =
+                intervention_actions(&detail["intervention"], config, checked_at);
+        }
+    }
+    let mut actions = intervention_actions(&data["intervention"], config, checked_at)
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if data["repair_requested"] == false
+        && data["repairs"]["eligible"]
+            .as_array()
+            .is_some_and(|rows| !rows.is_empty())
+    {
+        actions.push(action(config, &["doctor", "--repair"], true));
+    }
+    if let Some(existing) = data["next_actions"].as_array() {
+        for step in existing {
+            if !actions.contains(step) {
+                actions.push(step.clone());
+            }
+        }
+    }
+    data["next_actions"] = json!(actions);
+}
+
+fn intervention_actions(detail: &Value, config: Option<&Path>, checked_at: i64) -> Value {
+    let mut actions = Vec::new();
+    match detail["status"].as_str() {
+        Some("none_required") => return json!([]),
+        Some("automatic_recovery") => {
             if let Some(deadline) = detail["next_at"].as_i64().filter(|at| *at > checked_at) {
                 actions.push(json!({"kind":"wait","until":deadline,"clock":"unix_seconds",
                     "authorization_required":false,"evidence":"reported_local_deadline_not_a_success_guarantee"}));
             }
-            actions.push(action(config, command, authorization));
-            detail["next_actions"] = json!(actions);
+            actions.push(json!({"kind":"instruction","authorization_required":false,
+                "message":"The configured controller has an automatic path; wait for fresh local evidence. Retry eligibility and upstream success are not guaranteed. Do not replay writes or change policy merely to bypass the wait."}));
+            actions.push(action(config, &["health"], false));
+        }
+        _ => {
+            let command: &[&str] = match detail["next_action"].as_str() {
+                Some("resume") => &["resume"],
+                Some("initialize_controller") => &["run", "--once"],
+                Some("start_controller") => &["run"],
+                Some(
+                    "repair_config" | "review_participation_policy" | "review_model_configuration",
+                ) => &["config", "show"],
+                Some("review_credentials") => &["reads"],
+                Some("recover_model") => &["recover-model"],
+                Some("authorize") => &["recover", "authorize", "--help"],
+                Some("inspect_operations" | "inspect_model_attempts" | "inspect_answer_retry") => {
+                    &["operations", "list"]
+                }
+                _ => &["status"],
+            };
+            if command == ["run"] {
+                actions.push(json!({"kind":"instruction","authorization_required":false,
+                    "message":"Inspect the selected managed service or foreground controller before starting it; do not run two controllers."}));
+            }
+            if command == ["recover-model"] {
+                actions.push(json!({"kind":"instruction","authorization_required":false,
+                    "message":"Inspect retained model evidence and stop its controller before explicitly authorizing model-only abandonment. This may incur another model charge and never resets sent network requests."}));
+            }
+            actions.push(action(
+                config,
+                command,
+                matches!(
+                    command,
+                    ["resume"] | ["run"] | ["run", "--once"] | ["recover-model"]
+                ),
+            ));
         }
     }
+    json!(actions)
 }
 
 pub(crate) fn onboarding(data: &mut Value, config: Option<&Path>) {
@@ -396,10 +452,13 @@ pub(crate) fn onboarding(data: &mut Value, config: Option<&Path>) {
 
 pub(crate) fn human(kind: &str, data: &Value) {
     match kind {
-        "health" => {
+        "health" | "doctor" => {
             println!(
-                "Health: {} (local evidence only)",
-                if data["healthy"] == true {
+                "{}: {} (local evidence only)",
+                if kind == "doctor" { "Doctor" } else { "Health" },
+                if kind == "doctor" {
+                    "local assessment; repair outcomes below"
+                } else if data["healthy"] == true {
                     "healthy"
                 } else {
                     "attention required"
@@ -410,6 +469,21 @@ pub(crate) fn human(kind: &str, data: &Value) {
                 data["operational"]["status"].as_str().unwrap_or("unknown"),
                 data["risk"]["unresolved_effects"]
             );
+            if kind == "doctor" {
+                for candidate in data["repairs"]["eligible"].as_array().into_iter().flatten() {
+                    println!(
+                        "Repair basis: operation={}; classification={}",
+                        candidate["operation_id"], candidate["classification"]
+                    );
+                    println!(
+                        "  {}",
+                        candidate["evidence_limit"]
+                            .as_str()
+                            .unwrap_or("Evidence limitation unavailable.")
+                    );
+                }
+            }
+            print_intervention(data);
             for name in ["controller", "answer", "judge", "mine"] {
                 let component = &data["components"][name];
                 print!(
@@ -432,6 +506,34 @@ pub(crate) fn human(kind: &str, data: &Value) {
                 println!("- {}", diagnostic["code"].as_str().unwrap_or("unknown"));
                 print_actions(&diagnostic["next_actions"]);
             }
+            if kind == "doctor" {
+                let repairs = &data["repairs"];
+                let count = |key: &str| json!(repairs[key].as_array().map(Vec::len));
+                println!(
+                    "Repairs: requested={}; eligible={}, ineligible={}, applied={}, skipped={}",
+                    data["repair_requested"],
+                    count("eligible"),
+                    count("ineligible"),
+                    count("applied"),
+                    count("skipped")
+                );
+                println!(
+                    "Repair failure: {}; restoration: {}",
+                    repairs["failure"], repairs["restoration"]
+                );
+                for outcome in repairs["applied"].as_array().into_iter().flatten() {
+                    println!(
+                        "  Applied: operation={}, state={}",
+                        outcome["operation_id"], outcome["state"]
+                    );
+                }
+                for outcome in repairs["skipped"].as_array().into_iter().flatten() {
+                    println!("  Skipped: {}", outcome);
+                }
+                println!(
+                    "Repair counts are local outcomes, not proof of current participation or remote success. Ineligible, skipped and unknown outcomes remain unresolved evidence."
+                );
+            }
         }
         "init" => println!(
             "Identity verified; configuration {}. Participation is not ready; capabilities remain read-only and the journal is not initialized.",
@@ -446,14 +548,7 @@ pub(crate) fn human(kind: &str, data: &Value) {
                 "Local status: initialized={}, paused={} (not a health verdict)",
                 data["initialized"], data["paused"]
             );
-            for (kind, work) in data["work"].as_object().into_iter().flatten() {
-                println!(
-                    "- {kind}: {} ({})",
-                    work["phase"].as_str().unwrap_or("unknown"),
-                    work["reason"].as_str().unwrap_or("unknown")
-                );
-                print_actions(&work["next_actions"]);
-            }
+            print_intervention(data);
             println!(
                 "Unresolved effects: {}; risk admissions: {}",
                 data["participation"]["unresolved_count"], data["participation"]["risk_admissions"]
@@ -487,6 +582,47 @@ pub(crate) fn human(kind: &str, data: &Value) {
         ),
     }
     print_actions(&data["next_actions"]);
+}
+
+fn print_intervention(data: &Value) {
+    let root = &data["intervention"];
+    println!(
+        "Intervention: {}; unattended={}; controller_ready={}",
+        intervention_label(&root["status"]),
+        root["unattended"],
+        root["controller"]["ready"]
+    );
+    for name in ["answer", "judge", "mine"] {
+        let work = &data["work"][name];
+        let intervention = &work["intervention"];
+        println!(
+            "- {name}: {}; {} ({})",
+            work["progress"].as_str().unwrap_or("unknown"),
+            intervention_label(&intervention["status"]),
+            intervention["reason"]
+                .as_str()
+                .unwrap_or("evidence_unavailable")
+        );
+        println!(
+            "  Evidence: controller_fresh={}, observation_fresh={}, next_at={}",
+            intervention["evidence_fresh"],
+            intervention["observation_fresh"],
+            intervention["next_at"]
+        );
+        print_actions(&work["next_actions"]);
+    }
+    println!(
+        "Local deadlines describe configured paths, not guaranteed success; controller identity is not independently verified."
+    );
+}
+
+fn intervention_label(status: &Value) -> &'static str {
+    match status.as_str() {
+        Some("none_required") => "none required",
+        Some("automatic_recovery") => "waiting automatically",
+        Some("operator_required") => "operator required",
+        _ => "undetermined",
+    }
 }
 
 fn print_actions(actions: &Value) {
@@ -567,9 +703,9 @@ mod tests {
     fn diagnostic_actions_use_only_supplied_future_deadlines_and_keep_risk() {
         let mut value = json!({"checked_at":100,"issues":["pending_outcome_uncertain"],
             "risk":{"unresolved_effects":4},"operational":{"status":"clear"},
-            "work":{"answer":{"next_action":"await_reconciliation","next_at":120},
-                "judge":{"next_action":"await_assignments","next_at":null},
-                "mine":{"next_action":"observe_challenge","next_at":99}}});
+            "work":{"answer":{"intervention":{"status":"automatic_recovery","next_action":"await_reconciliation","next_at":120}},
+                "judge":{"intervention":{"status":"automatic_recovery","next_action":"await_assignments","next_at":null}},
+                "mine":{"intervention":{"status":"automatic_recovery","next_action":"observe_challenge","next_at":99}}}});
         diagnostics(&mut value, Some(Path::new("private path/config.toml")));
         assert_eq!(value["risk"]["unresolved_effects"], 4);
         assert_eq!(value["operational"]["status"], "clear");
@@ -605,8 +741,8 @@ mod tests {
     #[test]
     fn recovery_and_resume_suggestions_require_explicit_authorization() {
         let mut value = json!({"issues":["participation_paused","model_execution_unresolved"],
-            "work":{"answer":{"next_action":"resume","next_at":null},
-                "judge":{"next_action":"start_controller","next_at":null}}});
+            "work":{"answer":{"intervention":{"status":"operator_required","next_action":"resume","next_at":null}},
+                "judge":{"intervention":{"status":"operator_required","next_action":"start_controller","next_at":null}}}});
         diagnostics(&mut value, None);
         assert_eq!(
             value["diagnostics"][0]["next_actions"][0]["authorization_required"],
@@ -617,9 +753,55 @@ mod tests {
             json!(["agmi", "operations", "list"])
         );
         for kind in ["answer", "judge"] {
-            assert_eq!(
-                value["work"][kind]["next_actions"][0]["authorization_required"],
-                true
+            assert!(
+                value["work"][kind]["next_actions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|action| action["kind"] == "command"
+                        && action["authorization_required"] == true)
+            );
+        }
+    }
+
+    #[test]
+    fn doctor_repair_is_an_explicit_opt_in_and_preserves_precise_actions() {
+        let mut value = json!({"intervention":{"status":"none_required"},
+            "repair_requested":false,"repairs":{"eligible":[{"operation_id":7}]},
+            "next_actions":[action(None, &["recover", "resolve", "--help"], false)]});
+        diagnostics(&mut value, Some(Path::new("/selected/config.toml")));
+        let actions = value["next_actions"].as_array().unwrap();
+        assert!(actions.iter().any(|step| step["argv"]
+            == json!([
+                "agmi",
+                "--config",
+                "/selected/config.toml",
+                "doctor",
+                "--repair"
+            ])
+            && step["authorization_required"] == true));
+        assert!(
+            actions
+                .iter()
+                .any(|step| step["argv"] == json!(["agmi", "recover", "resolve", "--help"]))
+        );
+    }
+
+    #[test]
+    fn stale_or_manual_work_never_gets_a_misleading_wait_action() {
+        for status in ["undetermined", "operator_required"] {
+            let actions = intervention_actions(
+                &json!({"status":status,
+                "next_action":"inspect_local_evidence","next_at":200}),
+                None,
+                100,
+            );
+            assert!(
+                actions
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|step| step["kind"] != "wait")
             );
         }
     }
