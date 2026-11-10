@@ -3,10 +3,10 @@ mod cli_error;
 use agmi::{
     admin,
     config::{Config, NetworkConfig, WorkKind},
-    doctor, health, lifecycle, registration, runtime,
+    doctor, health, lifecycle, logs, registration, runtime, update,
 };
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use serde_json::{Value, json};
 use std::{
     fs::OpenOptions,
@@ -21,7 +21,8 @@ const SCHEMA: &str = "agmi.cli.v1";
     name = "agmi",
     version,
     about = "Agents Gonna Mine It.",
-    long_about = "Reliable, configurable MinePOA participation. New installations are paused; diagnostics never submit work."
+    long_about = "Reliable, configurable MinePOA participation. New installations are paused; diagnostics never submit work.",
+    after_help = "EVERYDAY WORKFLOW\n  agmi status                 Inspect local participation\n  agmi doctor                 Distinguish automatic waits from intervention\n  agmi doctor --repair        Explicitly authorize eligible guarded repairs\n  agmi logs --follow          Follow sanitized local events\n  agmi update --check         Check latest stable without changes\n  agmi update                 Update, then diagnose readiness\n  agmi update --repair        Update and authorize guarded repairs\n\nUpdates preserve configuration, guidance, credentials and pause intent.\nUnknown submissions are never replayed or erased by maintenance.\nUse agmi <command> --help for examples and agmi --json commands for effect metadata."
 )]
 struct Cli {
     /// Local TOML configuration. Credentials are referenced, never embedded.
@@ -110,16 +111,32 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Update from an operator-trusted local binary or explicit retained r-SHA256.
+    /// Check or install the latest stable release; preserve user settings and runtime intent.
+    #[command(
+        after_help = "EXAMPLES\n  agmi update --check\n  agmi update\n  agmi update --repair\n  agmi update --dry-run\n  agmi update --binary /path/to/agmi --sha256 <trusted-digest>\n  agmi update --release r-<retained-sha256>\n\nDefault source: published stable releases from tomismeta/agmi, never main.\nChecks and dry runs do not activate, repair or submit work. Automatic updates refuse\nunproven source ordering; explicit local sources remain operator-selected.\n--repair uses guarded refusal recovery, not model abandonment or replay.\nUpdate, repair and readiness are separate outcomes. A restored service may resume\nalready-authorized participation. Managed updates use the default configuration."
+    )]
     Update {
-        #[arg(long, conflicts_with_all = ["binary", "sha256"], required_unless_present = "binary")]
+        /// Select a retained compatible release instead of downloading.
+        #[arg(long, conflicts_with_all = ["binary", "sha256"])]
         release: Option<String>,
+        /// Select a local binary instead of downloading; requires its trusted digest.
         #[arg(long, requires = "sha256")]
         binary: Option<PathBuf>,
         #[arg(long, requires = "binary")]
         sha256: Option<String>,
+        /// Internal compare-and-swap fence for incoming verified installer handoff.
+        #[arg(long, hide = true, requires = "binary", conflicts_with_all = ["check", "repair", "dry_run"])]
+        expected_release: Option<String>,
+        /// Query latest stable without installing or repairing.
+        #[arg(long, conflicts_with_all = ["release", "binary", "sha256", "stopped", "dry_run", "repair"])]
+        check: bool,
+        /// Authorize guarded local refusal repairs after successful update/no-op.
+        #[arg(long)]
+        repair: bool,
+        /// Leave the service stopped after activation; never changes pause intent.
         #[arg(long)]
         stopped: bool,
+        /// Show the update/repair plan without applying changes.
         #[arg(long)]
         dry_run: bool,
     },
@@ -144,6 +161,9 @@ enum Command {
     /// Inspect local durable state without contacting MinePOA or a model.
     Status,
     /// Diagnose unattended progress; --repair applies only guarded local refusal recovery.
+    #[command(
+        after_help = "EXAMPLES\n  agmi doctor\n  agmi --json doctor\n  agmi doctor --repair\n\nRead-only by default. --repair authorizes only guarded refusal recovery;\nit preserves ambiguous writes, model history, guidance and pause intent.\nWaiting automatically is not a guarantee of success. Follow the reported next\naction for operator-required or undetermined evidence."
+    )]
     Doctor {
         /// Repair eligible refusals, briefly stopping/restoring a matching managed runtime if needed.
         #[arg(long)]
@@ -191,9 +211,23 @@ enum Command {
     /// Abandon interrupted model-only work while stopped; never resets a sent request.
     RecoverModel,
     /// Read sanitized local runtime events.
+    #[command(
+        after_help = "EXAMPLES\n  agmi logs --limit 50\n  agmi logs --follow\n  agmi --json logs --follow\n\nFollowing prints the initial retained tail oldest-first, then new event IDs.\nJSON following emits one agmi.cli.v1 log_event envelope per line. No credentials,\nguidance or private event detail is read. Ctrl-C or SIGTERM stops following.\nRetention gaps or journal replacement stop the stream rather than silently skipping."
+    )]
     Logs {
         #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u16).range(1..=1000))]
         limit: u16,
+        /// Follow newly recorded sanitized events without network requests.
+        #[arg(long, short)]
+        follow: bool,
+    },
+    /// Print shell completions; does not install or modify shell files.
+    #[command(
+        after_help = "EXAMPLES\n  agmi completions bash\n  agmi completions zsh\n  agmi completions fish\n\nPrints a script to stdout; choose where to install it in your shell configuration.\nWith --json, returns the script in the normal envelope. No configuration is loaded."
+    )]
+    Completions {
+        #[arg(value_parser = ["bash", "zsh", "fish"])]
+        shell: String,
     },
     /// Show configured model routes without starting a harness.
     Agents,
@@ -455,7 +489,7 @@ fn discovery() -> Value {
         {"name":"init","network_reads":true,"network_writes":false,"local_writes":"unless --dry-run","purpose":"existing identity only; --account and --api-key-file, --key-stdin or --key-prompt; never registers or resumes"},
         {"name":"credentials rotate","network_reads":true,"network_writes":false,"local_writes":"credential only unless --dry-run","purpose":"requires initialized, paused, stopped account; verifies replacement identity; file/stdin/hidden prompt"},
         {"name":"install","network_reads":false,"network_writes":false,"local_writes":"unless --dry-run","purpose":"--binary local-path --sha256 trusted-digest; fresh install stages, activates stopped and enables; --stage-only only publishes a verified release and never selects/enables/stops/starts; neither initializes/resumes"},
-        {"name":"update","network_reads":false,"network_writes":false,"local_writes":"unless --dry-run","purpose":"--binary local-path --sha256 trusted-digest or retained --release r-SHA256; preserves service intent, --stopped forces stopped"},
+        {"name":"update","network_reads":"latest stable metadata/assets unless explicit local source","network_writes":false,"model_calls":false,"local_writes":"unless --check or --dry-run","confirmation_flag":"--repair for guarded refusal recovery","purpose":"default: verified latest stable update then read-only doctor; --check nonmutating; --repair explicitly adds guarded repair; local --binary/--sha256 and retained --release preserved; configuration, guidance, credentials and pause unchanged; restored runtime may resume authorized participation"},
         {"name":"service","network_reads":false,"network_writes":false,"local_writes":"unless status or --dry-run","purpose":"status/start/stop/restart/enable/disable; does not resume participation"},
         {"name":"run","network_reads":true,"model_calls":"active capabilities only","network_writes":"active capabilities and resumed state only","local_writes":true},
         {"name":"status","network_reads":false,"network_writes":false,"purpose":"local state and blockers"},
@@ -481,7 +515,8 @@ fn discovery() -> Value {
         {"name":"recover grants","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":false,"purpose":"paginated grant history; --limit N --before ID"},
         {"name":"recover revoke","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":true,"purpose":"stopped-writer revoke --grant ID without erasing grant history"},
         {"name":"operations list","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":false,"purpose":"sanitized paginated operation IDs, state, epoch, timing and linkage; --kind --state --before --limit"},
-        {"name":"logs","network_writes":false,"purpose":"sanitized local events"},
+        {"name":"logs","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":false,"purpose":"sanitized local events; --follow streams retained tail then new IDs, stopping on retention gaps or journal replacement"},
+        {"name":"completions","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":false,"purpose":"print Bash, Zsh or Fish completions from command definitions; never installs shell files"},
         {"name":"agents","network_writes":false,"model_calls":false},
         {"name":"commands","network_writes":false,"local_writes":false}
     ],"capabilities":["answer","judge","mine"],"modes":["active","read_only","off"],
@@ -489,6 +524,8 @@ fn discovery() -> Value {
         "limits":["Local pause cannot retract dispatched requests or stop server-side auto-mining.","A timeout does not prove a submission failed.","Hosted registration returns its API key once. Remote creation followed by a crash before durable private response capture can permanently lose the key; uncertain attempts are never automatically resubmitted."],
         "output_contract":{"json_schema":SCHEMA,"next_actions":"typed_actions_with_argv_not_shell",
             "raw_exception":"build-info --manifest is raw manifest text even with --json",
+            "logs_follow":"with --json, one log_event envelope per event; retention gaps and journal replacement fail explicitly",
+            "completions":"raw shell script without --json; normal envelope containing shell and script with --json",
             "state_path":"config state-path is plain text only without --json"}});
     for command in value["commands"]
         .as_array_mut()
@@ -680,6 +717,9 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
             release,
             binary,
             sha256,
+            expected_release,
+            check,
+            repair,
             stopped,
             dry_run,
         } => {
@@ -687,52 +727,26 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
                 cli.config.is_none(),
                 cli_error::BoundaryError(
                     "service_config_unsupported",
-                    "Installer uses only ~/.config/agmi/config.toml; --config is unsupported. No installer was started."
+                    "Managed updates use only ~/.config/agmi/config.toml; --config is unsupported. No update was started."
                 )
             );
-            let mut arguments = if let Some(release) = release {
-                anyhow::ensure!(
-                    release
-                        .strip_prefix("r-")
-                        .is_some_and(|hash| hash.len() == 64
-                            && hash
-                                .bytes()
-                                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())),
-                    cli_error::BoundaryError(
-                        "invalid_release_identity",
-                        "Release must be an explicit r-SHA256 identity; no installer was started."
-                    )
-                );
-                vec!["activate".into(), release.clone()]
-            } else {
-                let binary = std::path::absolute(
-                    binary
-                        .as_ref()
-                        .context("update requires --binary or --release")?,
+            return Ok((
+                "update",
+                update::run(
+                    &path,
+                    update::Options {
+                        release: release.as_deref(),
+                        binary: binary.as_deref(),
+                        sha256: sha256.as_deref(),
+                        expected_release: expected_release.as_deref(),
+                        check: *check,
+                        repair: *repair,
+                        stopped: *stopped,
+                        dry_run: *dry_run,
+                    },
                 )
-                .context("cannot resolve local binary path")?;
-                let hash = sha256.as_ref().context("update binary requires --sha256")?;
-                anyhow::ensure!(
-                    hash.len() == 64
-                        && hash
-                            .bytes()
-                            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
-                    cli_error::BoundaryError(
-                        "invalid_release_digest",
-                        "Expected SHA256 must be 64 lowercase hex digits; no installer was started."
-                    )
-                );
-                vec![
-                    "update".into(),
-                    binary.to_string_lossy().into_owned(),
-                    "--sha256".into(),
-                    hash.clone(),
-                ]
-            };
-            if *stopped {
-                arguments.push("--stopped".into());
-            }
-            return Ok(("update", lifecycle::installer(&arguments, *dry_run)?));
+                .await?,
+            ));
         }
         Command::Service { action, dry_run } => {
             anyhow::ensure!(
@@ -958,7 +972,10 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
             json!({"abandoned_models":runtime::recover_model(&config)?,
                 "network_requests_reset":false,"note":"Regeneration may incur another model charge."}),
         )),
-        Command::Logs { limit } => Ok(("logs", runtime::events(&config, usize::from(*limit))?)),
+        Command::Logs {
+            limit,
+            follow: false,
+        } => Ok(("logs", runtime::events(&config, usize::from(*limit))?)),
         Command::Agents => Ok((
             "agents",
             json!({"routes":config.solver,"revision":config.optional_revision()?,"verified":false,"note":"Configured routes only; this command does not invoke models or inspect auth secrets or guidance contents."}),
@@ -981,6 +998,8 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
         | Command::Service { .. }
         | Command::Run { .. }
         | Command::Commands
+        | Command::Completions { .. }
+        | Command::Logs { follow: true, .. }
         | Command::Guidance { .. }
         | Command::Config {
             command: ConfigCommand::Schema | ConfigCommand::Show | ConfigCommand::Apply { .. },
@@ -1040,7 +1059,59 @@ async fn main() {
         print!("{}", include_str!(env!("AGMI_BUILD_MANIFEST_PATH")));
         return;
     }
+    if let Command::Completions { shell } = &cli.command {
+        let generator = match shell.as_str() {
+            "bash" => clap_complete::Shell::Bash,
+            "zsh" => clap_complete::Shell::Zsh,
+            "fish" => clap_complete::Shell::Fish,
+            _ => unreachable!("validated shell"),
+        };
+        let mut script = Vec::new();
+        clap_complete::generate(generator, &mut Cli::command(), "agmi", &mut script);
+        let result = if cli.json {
+            writeln!(
+                std::io::stdout().lock(),
+                "{}",
+                json!({"schema":SCHEMA,"ok":true,
+                "type":"completions","data":{"shell":shell,"script":String::from_utf8(script).expect("completion UTF-8")}})
+            )
+        } else {
+            std::io::stdout().lock().write_all(&script)
+        };
+        if let Err(error) = result
+            && error.kind() != std::io::ErrorKind::BrokenPipe
+        {
+            eprintln!("agmi: cannot write completion output");
+            std::process::exit(1);
+        }
+        return;
+    }
     let action_config = config_path(&cli).ok();
+    if let Command::Logs {
+        limit,
+        follow: true,
+    } = cli.command
+    {
+        let result = async {
+            let path = config_path(&cli)?;
+            let config = Config::load_metadata(&path)?;
+            logs::follow(&config, usize::from(limit), cli.json).await
+        }
+        .await;
+        if let Err(error) = result {
+            let diagnostic = cli_error::execution(&error, action_config.as_deref());
+            if cli.json {
+                eprintln!(
+                    "{}",
+                    json!({"schema":SCHEMA,"ok":false,"type":"error","error":diagnostic})
+                );
+            } else {
+                eprintln!("agmi: {} [{}]", diagnostic["message"], diagnostic["code"]);
+            }
+            std::process::exit(1);
+        }
+        return;
+    }
     match execute(&cli).await {
         Ok((kind, mut data)) => {
             if kind == "config_state_path" && !cli.json {
@@ -1053,7 +1124,16 @@ async fn main() {
             if matches!(kind, "health" | "status" | "doctor") {
                 cli_error::diagnostics(&mut data, action_config.as_deref());
             }
-            if matches!(kind, "install" | "update" | "service") {
+            if kind == "update" && data["readiness"]["intervention"].is_object() {
+                cli_error::diagnostics(&mut data["readiness"], action_config.as_deref());
+            }
+            if kind == "update" {
+                data["next_actions"] = json!([
+                    cli_error::action(None, &["update", "--check"], false),
+                    cli_error::action(None, &["doctor"], false)
+                ]);
+            }
+            if matches!(kind, "install" | "service") {
                 data["next_actions"] =
                     json!([cli_error::action(None, &["service", "status"], false)]);
             }
@@ -1077,7 +1157,7 @@ async fn main() {
                     | Command::Run { .. }
                     | Command::Init { .. }
                     | Command::Install { .. }
-                    | Command::Update { .. }
+                    | Command::Update { check: false, .. }
                     | Command::Credentials { .. }
                     | Command::RecoverModel
                     | Command::Recover {
@@ -1095,7 +1175,7 @@ async fn main() {
             ) || matches!(&cli.command, Command::Service { action, .. } if action != "status")
             {
                 data["authorization"] = json!({"required":true,"source":"explicit_command",
-                    "dry_run":data["dry_run"].as_bool().or_else(|| data["plan"]["dry_run"].as_bool()).unwrap_or(false)});
+                    "dry_run":data["dry_run"].as_bool().or_else(|| data["update"]["dry_run"].as_bool()).or_else(|| data["plan"]["dry_run"].as_bool()).unwrap_or(false)});
             }
             let ok = match kind {
                 "health" => data["healthy"].as_bool() == Some(true),
@@ -1103,6 +1183,7 @@ async fn main() {
                     data["intervention"]["unattended"] == true
                         && data["repairs"]["failure"].is_null()
                 }
+                "update" => data["success"] == true,
                 _ => true,
             };
             let value = json!({"schema":SCHEMA,"ok":ok,"type":kind,"data":data});

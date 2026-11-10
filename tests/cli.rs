@@ -5,6 +5,80 @@ fn binary() -> Command {
 }
 
 #[test]
+fn update_check_cannot_authorize_repair_or_mix_release_sources() {
+    for args in [
+        vec!["update", "--check", "--repair"],
+        vec!["update", "--check", "--release", "r-private-value"],
+        vec!["update", "--check", "--dry-run"],
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join("untouched/config.toml");
+        let output = binary()
+            .args(["--json", "--config"])
+            .arg(&config)
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(error["error"]["details"]["reason"], "conflicting_fields");
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("r-private-value"));
+        assert!(!config.parent().unwrap().exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn update_repair_dry_run_preserves_user_files_and_never_executes_candidate() {
+    use sha2::Digest;
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    fs::create_dir_all(home.join(".config/agmi")).unwrap();
+    fs::create_dir_all(home.join(".local/share/agmi")).unwrap();
+    let files = [
+        (
+            ".config/agmi/config.toml",
+            "operator config, not an update template",
+        ),
+        (".config/agmi/voice.md", "private user guidance"),
+        (".config/agmi/core.md", "operator core guidance"),
+        (".config/agmi/key", "private synthetic credential"),
+        (
+            ".local/share/agmi/state.sqlite3",
+            "journal must not be touched",
+        ),
+    ];
+    for (name, text) in files {
+        fs::write(home.join(name), text).unwrap();
+    }
+    let candidate = root.path().join("candidate");
+    let marker = root.path().join("executed");
+    let contents = b"#!/bin/sh\n: > \"$AGMI_PREVIEW_MARKER\"\nexit 1\n";
+    fs::write(&candidate, contents).unwrap();
+    fs::set_permissions(&candidate, fs::Permissions::from_mode(0o700)).unwrap();
+    let digest = format!("{:x}", sha2::Sha256::digest(contents));
+    let output = binary()
+        .env("HOME", &home)
+        .env("PATH", root.path())
+        .env("AGMI_PREVIEW_MARKER", &marker)
+        .args(["--json", "update", "--repair", "--dry-run", "--binary"])
+        .arg(&candidate)
+        .args(["--sha256", &digest])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert!(!marker.exists());
+    for (name, text) in files {
+        assert_eq!(fs::read_to_string(home.join(name)).unwrap(), text);
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["data"]["success"], true);
+    assert!(value["data"]["readiness"].is_null());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("private synthetic credential"));
+}
+#[test]
 fn configuration_initialization_never_overwrites_existing_operator_file() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");

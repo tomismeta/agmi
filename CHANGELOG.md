@@ -7,6 +7,8 @@
 - Add explicit stopped-writer refusal-recovery preview and token-bound application. Retire only evidence-supported historical refusals with an audit record, without replaying stale payloads, changing nonces or erasing original evidence; generic historical 503s remain unresolved.
 - Add shared per-action progress and intervention reporting to status, health and doctor: distinguish configured automatic recovery, operator-required fences and insufficient evidence without changing participation policy or existing health exits.
 - Add read-only `doctor` and explicit `doctor --repair`, orchestrating existing token-fenced refusal recovery and validated managed-runtime stop/restoration. Preserve partial results, pause/configuration, uncertain writes and model history; disclose legacy 429 evidence limits and unsupported service boundaries.
+- Add explicit latest-stable discovery and verified managed updates, nonmutating `update --check`/dry-run, and opt-in `update --repair`. Reuse the installer and activated doctor; preserve user configuration, credentials, guidance, pause intent and history, fence concurrent activation, refuse unproven source ordering, and report update/repair/readiness separately.
+- Add generated Bash/Zsh/Fish completions, command examples/effect guidance, and sanitized `logs --follow` with ID-based paging, graceful shutdown and explicit retention-gap/journal-replacement errors.
 
 ## 0.1.0
 

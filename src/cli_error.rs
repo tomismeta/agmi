@@ -232,6 +232,22 @@ pub(crate) fn execution(error: &Error, config: Option<&Path>) -> Value {
     ) {
         value["details"] = json!({"stage":"preflight","staging":"not_started","activation":"not_started","service":"unknown"});
     }
+    if code.starts_with("update_") {
+        value["next_actions"] = json!([
+            action(None, &["update", "--help"], false),
+            action(None, &["service", "status"], false),
+            {"kind":"instruction","authorization_required":false,
+             "message":"Preserve the installed release and user state. Failed or unverifiable discovery is not authorization to downgrade, replay work or clear uncertainty."}
+        ]);
+    }
+    if code.starts_with("logs_") {
+        value["next_actions"] = json!([
+            action(config, &["logs"], false),
+            action(config, &["doctor"], false),
+            {"kind":"instruction","authorization_required":false,
+             "message":"Following stopped; retained history may be incomplete. Inspect the journal and start a new follow explicitly; do not reset state to restart the cursor."}
+        ]);
+    }
     if let Some(error) = error.downcast_ref::<agmi::lifecycle::InstallerError>() {
         value["code"] = json!("installer_failed");
         value["message"] =
@@ -554,7 +570,64 @@ pub(crate) fn human(kind: &str, data: &Value) {
                 data["participation"]["unresolved_count"], data["participation"]["risk_admissions"]
             );
         }
-        "install" | "update" | "service" => {
+        "update" => {
+            println!(
+                "Update: {} ({})",
+                data["update"]["status"].as_str().unwrap_or("unknown"),
+                data["update"]["reason"]
+                    .as_str()
+                    .unwrap_or("no_reason_reported")
+            );
+            for (key, label) in [("current", "Installed"), ("published", "Published stable")] {
+                let identity = &data["update"][key];
+                if identity.is_object() {
+                    println!(
+                        "{label}: {} / {} / {} ({})",
+                        identity["version"].as_str().unwrap_or("unknown"),
+                        identity["commit"].as_str().unwrap_or("unknown"),
+                        identity["source_dirty"].as_str().unwrap_or("unknown"),
+                        identity["target"].as_str().unwrap_or("unknown")
+                    );
+                }
+            }
+            if let Some(note) = data["repair"]["evidence_limit"].as_str() {
+                println!("Repair evidence: {note}");
+            }
+            println!(
+                "Repair: {}",
+                data["repair"]["status"].as_str().unwrap_or("not_requested")
+            );
+            if let Some(reason) = data["repair"]["reason"].as_str() {
+                println!("Repair reason: {reason}");
+            }
+            if let Some(status) = data["update"]["doctor_status"].as_str() {
+                println!(
+                    "Doctor: {status}; observed release: {}",
+                    data["update"]["doctor_release"]
+                        .as_str()
+                        .unwrap_or("unknown")
+                );
+            }
+            if let Some(evidence) = data.get("installation") {
+                println!(
+                    "Activation: {}; service: {}; failure: {}",
+                    evidence["activation"], evidence["service"], evidence["failure_code"]
+                );
+            }
+            if data["update"]["check"] == true || data["update"]["dry_run"] == true {
+                println!("No activation or repair performed.");
+            }
+            if data["readiness"].is_object() {
+                print_intervention(&data["readiness"]);
+                print_actions(&data["readiness"]["next_actions"]);
+            } else {
+                println!("Readiness: not assessed.");
+            }
+            println!(
+                "Update success is separate from readiness; retained uncertainty and upstream waits are not erased."
+            );
+        }
+        "install" | "service" => {
             let evidence = data.get("installation").unwrap_or(data);
             println!(
                 "{kind}: stage={}, activation={}, service={}",

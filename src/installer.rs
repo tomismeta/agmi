@@ -7,6 +7,23 @@ use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::path::Path;
 
+/// Read-only identity of the selected release, not the possibly stale caller.
+pub(crate) struct InstalledIdentity {
+    pub manifest: String,
+    pub binary: std::path::PathBuf,
+    pub release: String,
+    pub digest: String,
+}
+
+pub(crate) fn installed_identity() -> Result<InstalledIdentity> {
+    #[cfg(unix)]
+    {
+        native::installed_identity()
+    }
+    #[cfg(not(unix))]
+    anyhow::bail!("managed installation requires Unix")
+}
+
 fn repair_restoration(reason: &'static str) -> Value {
     json!({
         "manager_action":"none","prior_runtime":"unknown","runtime":"caller_managed",
@@ -541,6 +558,7 @@ mod native {
         action: &'a str,
         target: &'a str,
         digest: Option<&'a str>,
+        expected_release: Option<&'a str>,
         stopped: bool,
     }
     impl<'a> Request<'a> {
@@ -551,6 +569,7 @@ mod native {
                 action,
                 target,
                 digest: None,
+                expected_release: None,
                 stopped: action == "install",
             };
             let mut rest = arguments[2..].iter();
@@ -562,6 +581,14 @@ mod native {
                             && request.digest.is_none() =>
                     {
                         request.digest = Some(rest.next().context("missing digest")?);
+                    }
+                    "--expected-release"
+                        if matches!(action, "update" | "activate")
+                            && request.expected_release.is_none() =>
+                    {
+                        let expected = rest.next().context("missing expected release")?;
+                        ensure!(valid_id(expected), "invalid expected release");
+                        request.expected_release = Some(expected);
                     }
                     "--stopped" if matches!(action, "activate" | "update") && !stopped_seen => {
                         stopped_seen = true;
@@ -607,6 +634,9 @@ mod native {
         if request.stopped && request.action == "update" {
             command.arg("--stopped");
         }
+        if let Some(expected) = request.expected_release {
+            command.args(["--expected-release", expected]);
+        }
         let output = capture(&mut command, true).map_err(|error| {
             if error
                 .downcast_ref::<std::io::Error>()
@@ -621,6 +651,21 @@ mod native {
             }
         })?;
         if !output.status.success() {
+            // Newer update commands preserve partial activation in their stdout
+            // report even when subsequent diagnosis/repair exits unsuccessfully.
+            if let Ok(envelope) = serde_json::from_slice::<Value>(&output.stdout) {
+                if action == "update"
+                    && envelope["schema"] == "agmi.cli.v1"
+                    && envelope["type"] == "update"
+                    && envelope["data"]["installation"].is_object()
+                {
+                    let evidence = installer_evidence(Some(&envelope["data"]["installation"]));
+                    if evidence["stage"] == "complete" && evidence["failure_code"] == "none" {
+                        return Ok(envelope["data"].clone());
+                    }
+                    return Err(InstallerError { evidence }.into());
+                }
+            }
             let evidence = output
                 .stderr
                 .split(|byte| *byte == b'\n')
@@ -1071,6 +1116,14 @@ mod native {
         fn activate(&mut self, id: &str, request: &Request<'_>) -> Result<()> {
             self.phase = "activation_preflight";
             self.failure = "release_invalid";
+            // Held by run's InstallLock through staging and cutover. A release
+            // discovered before downloading must not replace a concurrent update.
+            if let Some(expected) = request.expected_release {
+                ensure!(
+                    fs::read_link(self.root.join("current"))? == Path::new(expected),
+                    "selected release changed before activation"
+                );
+            }
             let release = self.root.join(id);
             validate_release(&release, id)?;
             self.space_checks(&release.join("agmi"), 0)?;
@@ -1294,6 +1347,47 @@ mod native {
             }
         }
         anyhow::bail!("installation path has no account home")
+    }
+
+    pub(super) fn installed_identity() -> Result<InstalledIdentity> {
+        let installation =
+            Installation::new(std::env::var_os("HOME").context("HOME unavailable")?.into())?;
+        installation.account_context()?;
+        let selected = fs::read_link(installation.root.join("current"))?;
+        let id = selected.to_str().context("invalid selected release")?;
+        ensure!(valid_id(id), "invalid selected release");
+        let release = installation.root.join(id);
+        account_owned_ancestors(&release, &installation.home)?;
+        ensure!(
+            fs::symlink_metadata(&release)?.is_dir(),
+            "selected release is not a real directory"
+        );
+        let binary = release.join("agmi");
+        let manifest_path = release.join("MANIFEST");
+        account_owned(&binary)?;
+        account_owned(&manifest_path)?;
+        let mut manifest = String::new();
+        regular(&manifest_path)?
+            .take(16_385)
+            .read_to_string(&mut manifest)?;
+        ensure!(manifest.len() <= 16_384, "manifest too large");
+        let hash = digest_cancellable(regular(&binary)?, false)?;
+        ensure!(
+            hash == id[2..]
+                && metadata(&manifest, "release_id")? == id
+                && metadata(&manifest, "binary_sha256")? == hash,
+            "selected release identity changed"
+        );
+        ensure!(
+            fs::read_link(installation.bin.join("agmi"))? == installation.root.join("current/agmi"),
+            "executable is not a canonical release link"
+        );
+        Ok(InstalledIdentity {
+            manifest,
+            binary,
+            release: id.to_owned(),
+            digest: hash,
+        })
     }
 
     struct RepairIntent {
@@ -1765,6 +1859,13 @@ mod native {
                 installation.manager_context()?;
             }
             installation.lock = Some(installation.prepare()?);
+            if let Some(expected) = request.expected_release {
+                installation.failure = "release_invalid";
+                ensure!(
+                    fs::read_link(installation.root.join("current"))? == Path::new(expected),
+                    "selected release changed before staging"
+                );
+            }
             if request.action == "install" {
                 installation.fresh()?;
             }
@@ -1840,6 +1941,51 @@ mod native {
         use super::*;
 
         static TEST_SERIAL: Mutex<()> = Mutex::new(());
+
+        #[test]
+        fn expected_release_fence_refuses_before_any_cutover() -> Result<()> {
+            let home = tempfile::tempdir()?;
+            let mut installation = Installation::new(home.path().to_owned())?;
+            fs::create_dir_all(&installation.root)?;
+            let actual = format!("r-{}", "a".repeat(64));
+            let expected = format!("r-{}", "b".repeat(64));
+            symlink(&actual, installation.root.join("current"))?;
+            let arguments = vec![
+                "activate".into(),
+                actual.clone(),
+                "--expected-release".into(),
+                expected,
+            ];
+            let request = Request::parse(&arguments)?;
+            let error = installation.activate(&actual, &request).unwrap_err();
+            assert!(error.to_string().contains("selected release changed"));
+            assert_eq!(installation.phase, "activation_preflight");
+            assert_eq!(installation.activation, "not_started");
+            assert!(!installation.stop_on_failure);
+            assert_eq!(
+                fs::read_link(installation.root.join("current"))?,
+                Path::new(&actual)
+            );
+            for bad in [
+                vec![
+                    "activate".into(),
+                    actual.clone(),
+                    "--expected-release".into(),
+                    "invalid".into(),
+                ],
+                vec![
+                    "activate".into(),
+                    actual.clone(),
+                    "--expected-release".into(),
+                    actual.clone(),
+                    "--expected-release".into(),
+                    actual,
+                ],
+            ] {
+                assert!(Request::parse(&bad).is_err());
+            }
+            Ok(())
+        }
 
         fn quoted(path: &Path) -> String {
             format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
@@ -2081,6 +2227,7 @@ esac
                 action: "activate",
                 target: &id,
                 digest: None,
+                expected_release: None,
                 stopped: true,
             };
             fs::write(&active_state, "activating")?;

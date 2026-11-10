@@ -94,7 +94,7 @@ fn main() {
     let profile = env::var("PROFILE").expect("Cargo supplies PROFILE");
     let version = env::var("CARGO_PKG_VERSION").expect("Cargo supplies package version");
     let mut manifest = format!(
-        "build_format=1\npackage_version={version}\ncommit={commit}\nsource_dirty={dirty}\ntarget={target}\nprofile={profile}\njournal_schema=2\nstop_timeout=infinity\n"
+        "build_format=1\npackage_version={version}\ncommit={commit}\nsource_dirty={dirty}\ntarget={target}\nprofile={profile}\njournal_schema=2\nstop_timeout=infinity\nupdate_protocol=1\n"
     );
     for (key, path) in [
         ("unit_agmi_service_sha256", "deploy/agmi.service"),

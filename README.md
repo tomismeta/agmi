@@ -148,6 +148,7 @@ agmi doctor
 agmi status --json
 agmi health --json
 agmi reads --json
+agmi logs --follow
 ```
 
 `healthy` and the health command's exit status describe operational readiness. Unresolved outcomes remain visible through `warnings`, `attention_required` and `risk`; a progressing, unblocked agent can be healthy with warnings. Blocked admission, stale evidence and overdue work still fail health.
@@ -158,6 +159,24 @@ applies only eligible, audited refusal repairs—not a clear-all—and preserves
 runtime intent and unresolved evidence. [Doctor and recovery limits](docs/OPERATIONS.md#doctor-and-unattended-status).
 
 Run one authoritative writer per account. Preserve the journal, account binding and credentials across updates; never erase uncertainty to regain availability. `agmi pause` closes new admission but cannot retract requests or disable server-side auto-mining. Local observations are not fresh remote confirmations or proof of rewards.
+
+### Keep the managed service current
+
+```sh
+agmi update --check     # Latest stable release; no changes
+agmi update             # Verified update, then read-only doctor
+agmi update --repair    # Also authorize eligible guarded repairs
+```
+
+Updates preserve your configuration, credentials, model settings, core/user guidance
+and pause intent. They retain compatible rollback binaries and never rewind journal
+history. An untagged or newer build is not replaced merely because it shares a
+version number with an older published release. Update, repair and participation
+readiness are reported separately. [Update guarantees and limits](docs/OPERATIONS.md#stable-release-updates).
+
+Use `agmi <command> --help` for examples and effects, or `agmi --json commands`
+for agent-facing discovery. `agmi completions bash`, `zsh` or `fish` prints a shell
+completion script without modifying your shell configuration.
 
 - [Configuration, guidance and network profiles](docs/OPERATIONS.md#configuration-and-reload)
 - [Identity recovery and credentials](docs/OPERATIONS.md#identity-onboarding-and-recovery)

@@ -433,7 +433,67 @@ agmi resume
 
 Fresh `install` stages and activates a verified release while stopped, then enables the user units; it does not start or resume participation and refuses an existing installation. Rust owns filesystem changes, hashing, unit rendering and cutover control flow; only system integration invokes `systemctl`/`systemd-analyze`. `service start|stop|restart|enable|disable|status` provides explicit supervision controls without changing participation pause. Linux user-systemd and the standard configuration layout are required; configure user lingering if supervision must survive logout.
 
-`cargo install` normally puts the administration CLI in `~/.cargo/bin`; service installation separately manages `~/.local/bin/agmi` through its release activation pointer. Updating the Cargo-installed CLI alone does not update a running service: use `agmi update` with the trusted candidate digest.
+`cargo install` normally puts the administration CLI in `~/.cargo/bin`; service installation separately manages `~/.local/bin/agmi` through its release activation pointer. Updating the Cargo-installed CLI alone does not update a running service. `agmi update` updates the canonical managed service, not arbitrary executables on `PATH`; it inspects the selected managed release rather than assuming the invoking CLI is the installed version.
+
+### Stable-release updates
+
+```sh
+agmi update --check
+agmi update --dry-run
+agmi update
+agmi update --repair
+```
+
+The default source is the latest published stable GitHub release in
+`tomismeta/agmi`, not the `main` branch. Discovery reads bounded release metadata,
+checksums and build identity over HTTPS. Downloads are limited to the fixed
+publisher and allowed GitHub release-asset redirects. Archive and extracted-binary
+digests, target, embedded identity and journal compatibility are checked before
+activation. Archives cannot supply arbitrary extraction paths or symlinks.
+HTTPS trusts that publisher's release assets; checksums are integrity checks, not
+independent signatures or protection against a compromised publisher.
+
+`--check` and `--dry-run` do not activate or repair anything. A successful check
+can report no compatible update or unverifiable source ordering; inspect its
+availability/reason rather than treating exit zero as installability. Automatic
+activation requires a compatible managed installation and conservative
+version/commit ancestry evidence. Dirty, divergent or unproven source ordering is
+not resolved by downgrading. Different commits with the same package version are
+not treated as the same build. A selected-release fence is rechecked under the
+installer lock, preventing a concurrent update from invalidating the download's
+original decision. Explicit local sources below remain operator-selected.
+
+Incoming published builds must advertise `update_protocol=1` in their verified
+build manifest: this guarantees support for the lock-held selected-release fence.
+Older builds without that protocol (including the original v0.1.0 artifact) and
+unknown protocols are reported as incompatible during discovery, never offered
+for automatic activation. Explicit local installation remains available; the
+updater does not weaken its concurrency safeguard to accommodate older installers.
+
+Downloads finish before the existing managed installer performs the cutover.
+Configuration bytes, credentials, model/reasoning settings, core/user guidance,
+pause intent and generation remain unchanged. No template is reapplied, account
+is reinitialized, model is abandoned, or journal snapshot is restored. A service
+that was running may resume its previously authorized participation after restart.
+
+After a successful update/no-op, the selected executable runs read-only doctor.
+`--repair` additionally authorizes its existing guarded refusal recovery, including
+the disclosed legacy-429 policy limitation; it is not permission to replay
+uncertain writes or clear history. Checks/dry runs never repair, and `--check`
+cannot be combined with `--repair`. A failed update does not proceed to repair.
+
+JSON `data.update`, `data.repair` and `data.readiness` are separate outcomes.
+Update/repair failure exits nonzero without hiding a completed activation or
+partial repair. An unhealthy doctor report does not undo a successful update;
+readiness may be unavailable if the selected binary cannot provide that contract.
+The report identifies that doctor executable's release and rechecks selection
+afterward. Changed or unverifiable selection makes diagnosis `stale` and removes
+readiness claims; completed repair effects remain reported. Guarded repair itself
+retains the existing installer lock and runtime validation. This is a point-in-time
+observation, not a guarantee that another operator cannot update afterward.
+There is no background updater, release channel switch or automatic rollback.
+
+Explicit pinned/offline paths remain available:
 
 ```sh
 agmi update --binary /absolute/path/to/new-agmi --sha256 "$EXPECTED_SHA256" --dry-run
@@ -444,7 +504,7 @@ agmi install --stage-only --binary /absolute/path/to/new-agmi --sha256 "$EXPECTE
 agmi update --release "$RELEASE_ID"
 ```
 
-Updates preserve prior runtime/timer running intent and unit enablement. `--stopped` forces a stopped cutover. An incoming binary is privately copied and checked against the expected digest before it can execute; its own embedded installer/assets own the cutover. Hashes establish integrity relative to the operator-trusted digest, not signed publisher provenance. No automatic download, “latest” selection or background self-update occurs. Dry-run reports a nonexecuting plan, not a guarantee that operational preconditions will pass. Installed, loaded and running identities are reported separately.
+Updates preserve prior runtime/timer running intent and unit enablement. `--stopped` forces a stopped cutover. An incoming binary is privately copied and checked against the expected digest before it can execute; its own embedded installer/assets own the cutover. Explicit local sources use the operator-supplied digest and make no release-discovery requests. Dry-run reports a nonexecuting plan, not a guarantee that operational preconditions will pass. Installed, loaded and running identities are reported separately.
 
 Release staging and activation use synced artifacts and atomic publication/pointer replacement. A failure during cutover stops the runtime/timer and reports failure; it never automatically reverts the activation pointer or journal. If the delegating parent is interrupted after the incoming installer completed, it reports `interrupted` while preserving the child's completed activation/service evidence—not claiming that services stopped or selection was undone. Inspect that evidence before another lifecycle action.
 
@@ -463,6 +523,36 @@ An unanchored schema-2 journal cannot start normally. Explicit adoption validate
 Releases are retained, but binary rollback requires matching journal compatibility. Schema-1 binaries must not run schema-2 journals; use a compatible release, roll forward or stop—never rewind state. Staging checks actual space for artifacts/legacy retention plus a 256 MiB journal/WAL reserve, without pruning recovery history. The unit uses `TimeoutStopSec=infinity` so systemd does not truncate captured runtime deadlines; agmi bounds shutdown, but a shutdown bug still requires operator intervention.
 
 The example uses control-group cleanup, restrictive umask, private temporary files and restart-on-failure. Account locks live under `.agmi-account-locks` in the operating-system user's canonical home, independently of the state directory and `HOME`/XDG overrides; a tighter sandbox must allow access there. The example is not a complete security sandbox for a compromised harness or local account.
+
+### Help, completions and following logs
+
+`agmi --help` lists everyday workflows; command-specific help explains examples
+and side effects. `agmi --json commands` describes effects and output contracts
+without loading configuration. Shell completions come from the same command
+definitions, not a separately maintained command list:
+
+```sh
+agmi completions bash
+agmi completions zsh
+agmi completions fish
+agmi logs --follow --limit 50
+agmi --json logs --follow
+```
+
+Completion output is a script on stdout, or a normal `{shell, script}` data
+envelope with `--json`. Printing it never installs shell files.
+
+Snapshot `logs` is unchanged. Following first emits the selected retained tail
+oldest-first, then newly recorded event IDs. JSON mode emits one `agmi.cli.v1`
+`log_event` envelope per line with only `id`, `at`, `event` and `kind`. It does not
+read private payloads, credentials or guidance, initialize state, or call an API.
+Ctrl-C/SIGTERM and a closed output pipe stop following cleanly.
+
+The journal normally retains only the newest 2,000 events. Following uses bounded
+pages and short read snapshots; it does not pin the WAL while waiting. A retention
+gap, regressed cursor or replaced journal stops with a specific error instead of
+silently skipping or replaying records. Restart following explicitly after
+inspection; it cannot recover already-pruned history.
 
 ### Local health checks
 

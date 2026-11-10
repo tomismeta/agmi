@@ -36,14 +36,19 @@ include = [
 [dependencies]
 anyhow = "1"
 clap = { version = "4", default-features = false, features = ["derive", "std", "help", "usage", "error-context", "suggestions"] }
+clap_complete = "4"
 dirs = "6"
+flate2 = "1"
 httpdate = "1"
 libc = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
+semver = "1"
 serde_json = "1"
 sha2 = "0.10"
+tar = "0.4"
+tempfile = "3"
 tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 toml = "0.9"
 
@@ -51,5 +56,3 @@ toml = "0.9"
 serde_json = "1"
 sha2 = "0.10"
 
-[dev-dependencies]
-tempfile = "3"

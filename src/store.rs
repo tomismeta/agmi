@@ -152,6 +152,10 @@ fn private_dir(path: &Path) -> Result<()> {
             .create(path)
             .context("cannot create private state directory")?;
     }
+    validate_private_dir(path)
+}
+
+fn validate_private_dir(path: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         bail!("state and lock directories must be real directories");
@@ -706,6 +710,68 @@ pub(crate) struct Store {
     database_file: Option<(PathBuf, fs::Metadata)>,
 }
 
+#[derive(Clone, Debug, serde::Serialize)]
+pub(crate) struct JournalEvent {
+    pub id: i64,
+    pub at: i64,
+    pub event: String,
+    pub kind: Option<String>,
+}
+
+#[derive(Debug)]
+struct EventJournal {
+    database_id: String,
+    dispatch_sequence: i64,
+    file: fs::Metadata,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct EventCursor {
+    journal: Option<EventJournal>,
+    after: i64,
+    observed_through: i64,
+}
+
+#[derive(Debug)]
+pub(crate) struct EventPage {
+    pub cursor: EventCursor,
+    pub events: Vec<JournalEvent>,
+    pub more: bool,
+}
+
+#[derive(Debug)]
+pub(crate) enum EventCursorError {
+    Replaced,
+    Regressed,
+    Gap,
+}
+
+impl std::fmt::Display for EventCursorError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Replaced => "journal identity changed while following logs",
+            Self::Regressed => "journal cursor regressed while following logs",
+            Self::Gap => "retained journal history no longer covers the log cursor",
+        })
+    }
+}
+
+impl std::error::Error for EventCursorError {}
+
+fn same_journal_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        left.dev() == right.dev() && left.ino() == right.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        // database_id and the durable sequence remain authoritative everywhere.
+        let _ = (left, right);
+        true
+    }
+}
+
 #[derive(serde::Serialize)]
 struct HistoricalAnswer {
     operation_id: i64,
@@ -874,7 +940,7 @@ impl Store {
             }
             return Ok(None);
         }
-        private_dir(&config.state_dir)?;
+        validate_private_dir(&config.state_dir)?;
         let path = fs::canonicalize(&config.state_dir)?.join("state.sqlite3");
         let metadata = fs::symlink_metadata(&path)?;
         if !metadata.is_file() || metadata.file_type().is_symlink() {
@@ -4587,6 +4653,125 @@ impl Store {
         Ok(json!({"grant_id":grant_id,"revoked":true,"revoked_at":revoked_at}))
     }
 
+    /// Every page owns a short read snapshot, never a transaction across output
+    /// or polling. An absent journal is itself a cursor: its first events must
+    /// be read from ID 1 rather than taking another, potentially lossy tail.
+    pub(crate) fn follow_events(
+        config: &Config,
+        cursor: Option<&EventCursor>,
+        initial_limit: usize,
+    ) -> Result<EventPage> {
+        const PAGE_SIZE: i64 = 1000;
+        let path = config.state_dir.join("state.sqlite3");
+        let before = match fs::symlink_metadata(&path) {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        if let Some(journal) = cursor.and_then(|cursor| cursor.journal.as_ref()) {
+            if !before
+                .as_ref()
+                .is_some_and(|metadata| same_journal_file(&journal.file, metadata))
+            {
+                return Err(EventCursorError::Replaced.into());
+            }
+        }
+        let Some(store) = Self::read_only(config)? else {
+            if before.is_some() {
+                return Err(EventCursorError::Replaced.into());
+            }
+            return Ok(EventPage {
+                cursor: EventCursor::default(),
+                events: Vec::new(),
+                more: false,
+            });
+        };
+        let before = before.ok_or(EventCursorError::Replaced)?;
+        let snapshot = store.db.unchecked_transaction()?;
+        let (database_id, dispatch_sequence) = store.database_identity()?;
+        if database_id.len() != 32
+            || !database_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || dispatch_sequence < 0
+        {
+            bail!("invalid journal authority");
+        }
+        let high_water: i64 =
+            snapshot.query_row("SELECT COALESCE(MAX(id),0) FROM events", [], |row| {
+                row.get(0)
+            })?;
+        if high_water < 0 {
+            return Err(EventCursorError::Regressed.into());
+        }
+        if let Some(cursor) = cursor {
+            if let Some(journal) = &cursor.journal {
+                if database_id != journal.database_id {
+                    return Err(EventCursorError::Replaced.into());
+                }
+                if dispatch_sequence < journal.dispatch_sequence {
+                    return Err(EventCursorError::Regressed.into());
+                }
+            }
+            if high_water < cursor.observed_through {
+                return Err(EventCursorError::Regressed.into());
+            }
+        }
+        let after = match cursor {
+            Some(cursor) => cursor.after,
+            None if initial_limit == 0 => high_water,
+            None => snapshot.query_row(
+                "SELECT COALESCE(
+                    (SELECT id FROM events ORDER BY id DESC LIMIT 1 OFFSET ?1),
+                    (SELECT MIN(id) FROM events),1)-1",
+                [initial_limit.min(i64::MAX as usize) as i64 - 1],
+                |row| row.get(0),
+            )?,
+        };
+        let events = {
+            let mut statement = snapshot.prepare(
+                "SELECT id,at,code,kind FROM events
+                 WHERE id>?1 AND id<=?2 ORDER BY id LIMIT ?3",
+            )?;
+            statement
+                .query_map(params![after, high_water, PAGE_SIZE], |row| {
+                    Ok(JournalEvent {
+                        id: row.get(0)?,
+                        at: row.get(1)?,
+                        event: row.get(2)?,
+                        kind: row.get(3)?,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let mut after = after;
+        for event in &events {
+            if after.checked_add(1) != Some(event.id) {
+                return Err(EventCursorError::Gap.into());
+            }
+            after = event.id;
+        }
+        if events.is_empty() && after < high_water {
+            return Err(EventCursorError::Gap.into());
+        }
+        snapshot.commit()?;
+        let current = fs::symlink_metadata(&path).map_err(|_| EventCursorError::Replaced)?;
+        if !same_journal_file(&before, &current) {
+            return Err(EventCursorError::Replaced.into());
+        }
+        Ok(EventPage {
+            cursor: EventCursor {
+                journal: Some(EventJournal {
+                    database_id,
+                    dispatch_sequence,
+                    file: before,
+                }),
+                after,
+                observed_through: high_water,
+            },
+            events,
+            more: after < high_water,
+        })
+    }
+
     pub(crate) fn events(&self, limit: usize) -> Result<Value> {
         let mut stmt = self
             .db
@@ -5300,6 +5485,207 @@ mod tests {
             ..Config::default()
         };
         (temp, config)
+    }
+
+    fn append_follow_events(store: &Store, count: i64) {
+        store
+            .db
+            .execute(
+                "WITH RECURSIVE n(i) AS (
+                    VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<?1)
+                 INSERT INTO events(at,code,kind)
+                 SELECT 123,'poll_completed','answer' FROM n",
+                [count],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn follow_tail_and_bursts_drain_ascending_pages_without_timestamp_cursors() {
+        let (_temp, config) = fixture();
+        let store = Store::open(&config).unwrap();
+        append_follow_events(&store, 2505);
+        let snapshot = store.events(5000).unwrap();
+        assert_eq!(snapshot.as_array().unwrap().len(), 1000);
+        assert!(snapshot[0].get("id").is_none());
+
+        let first = Store::follow_events(&config, None, 1500).unwrap();
+        assert_eq!(first.events.len(), 1000);
+        assert_eq!(first.events.first().unwrap().id, 1007);
+        assert_eq!(first.events.last().unwrap().id, 2006);
+        assert!(first.more);
+        // Writers can append between pages without changing the initial tail
+        // boundary. All timestamps deliberately collide.
+        append_follow_events(&store, 1505);
+        let mut ids: Vec<_> = first.events.iter().map(|event| event.id).collect();
+        let mut cursor = first.cursor;
+        loop {
+            let page = Store::follow_events(&config, Some(&cursor), 1500).unwrap();
+            assert!(page.events.len() <= 1000);
+            assert!(page.events.iter().all(|event| event.at == 123));
+            ids.extend(page.events.iter().map(|event| event.id));
+            cursor = page.cursor;
+            if !page.more {
+                break;
+            }
+        }
+        assert_eq!(ids, (1007..=4011).collect::<Vec<_>>());
+        assert!(
+            Store::follow_events(&config, Some(&cursor), 1500)
+                .unwrap()
+                .events
+                .is_empty()
+        );
+        // The reader has not pinned a WAL snapshot between pages.
+        let busy: i64 = store
+            .db
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(busy, 0);
+    }
+
+    #[test]
+    fn follow_missing_journal_cursor_does_not_retail_or_initialize_state() {
+        let (_temp, config) = fixture();
+        let absent = Store::follow_events(&config, None, 0).unwrap();
+        assert!(absent.events.is_empty());
+        assert!(absent.cursor.journal.is_none());
+        assert!(!config.state_dir.exists());
+        let still_absent = Store::follow_events(&config, Some(&absent.cursor), 0).unwrap();
+        assert!(!config.state_dir.exists());
+
+        let store = Store::open(&config).unwrap();
+        append_follow_events(&store, 1205);
+        let first = Store::follow_events(&config, Some(&still_absent.cursor), 0).unwrap();
+        assert_eq!(first.events.len(), 1000);
+        assert_eq!(first.events[0].id, 1);
+        let rest = Store::follow_events(&config, Some(&first.cursor), 0).unwrap();
+        assert_eq!(
+            rest.events.iter().map(|event| event.id).collect::<Vec<_>>(),
+            (1001..=1206).collect::<Vec<_>>()
+        );
+        assert!(!rest.more);
+    }
+
+    #[test]
+    fn follow_zero_limit_captures_boundary_and_empty_journal_keeps_authority() {
+        let (_temp, config) = fixture();
+        let store = Store::open(&config).unwrap();
+        append_follow_events(&store, 5);
+        let tail = Store::follow_events(&config, None, 0).unwrap();
+        assert!(tail.events.is_empty());
+        assert_eq!(tail.cursor.after, 6);
+        append_follow_events(&store, 2);
+        let next = Store::follow_events(&config, Some(&tail.cursor), 0).unwrap();
+        assert_eq!(
+            next.events.iter().map(|event| event.id).collect::<Vec<_>>(),
+            [7, 8]
+        );
+
+        store.db.execute("DELETE FROM events", []).unwrap();
+        let empty = Store::follow_events(&config, None, 100).unwrap();
+        assert!(empty.events.is_empty());
+        assert!(empty.cursor.journal.is_some());
+        append_follow_events(&store, 1);
+        let next = Store::follow_events(&config, Some(&empty.cursor), 100).unwrap();
+        assert_eq!(next.events[0].id, 1);
+        store
+            .db
+            .execute(
+                "UPDATE authority SET database_id=lower(hex(randomblob(16)))",
+                [],
+            )
+            .unwrap();
+        let error = Store::follow_events(&config, Some(&empty.cursor), 100).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<EventCursorError>(),
+            Some(EventCursorError::Replaced)
+        ));
+    }
+
+    #[test]
+    fn follow_rejects_regression_of_unprinted_high_water_and_dispatch_witness() {
+        let (_temp, config) = fixture();
+        let store = Store::open(&config).unwrap();
+        append_follow_events(&store, 2000);
+        let first = Store::follow_events(&config, None, 2001).unwrap();
+        assert_eq!(first.cursor.after, 1000);
+        assert_eq!(first.cursor.observed_through, 2001);
+        store
+            .db
+            .execute("DELETE FROM events WHERE id>1000", [])
+            .unwrap();
+        let error = Store::follow_events(&config, Some(&first.cursor), 2001).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<EventCursorError>(),
+            Some(EventCursorError::Regressed)
+        ));
+
+        store
+            .db
+            .execute("UPDATE authority SET dispatch_sequence=2", [])
+            .unwrap();
+        let first = Store::follow_events(&config, None, 0).unwrap();
+        store
+            .db
+            .execute("UPDATE authority SET dispatch_sequence=1", [])
+            .unwrap();
+        let error = Store::follow_events(&config, Some(&first.cursor), 0).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<EventCursorError>(),
+            Some(EventCursorError::Regressed)
+        ));
+    }
+
+    #[test]
+    fn follow_rejects_pruned_and_interior_gaps_instead_of_silently_skipping() {
+        let (_temp, config) = fixture();
+        let mut store = Store::open(&config).unwrap();
+        let first = Store::follow_events(&config, None, 0).unwrap();
+        append_follow_events(&store, 2000);
+        store.event("poll_completed", None).unwrap();
+        let error = Store::follow_events(&config, Some(&first.cursor), 0).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<EventCursorError>(),
+            Some(EventCursorError::Gap)
+        ));
+
+        let first = Store::follow_events(&config, None, 0).unwrap();
+        append_follow_events(&store, 3);
+        store
+            .db
+            .execute("DELETE FROM events WHERE id=?1", [first.cursor.after + 2])
+            .unwrap();
+        let error = Store::follow_events(&config, Some(&first.cursor), 0).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<EventCursorError>(),
+            Some(EventCursorError::Gap)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn follow_rejects_file_replacement_even_with_the_same_database_authority() {
+        let (_temp, config) = fixture();
+        let store = Store::open(&config).unwrap();
+        let first = Store::follow_events(&config, None, 0).unwrap();
+        drop(store);
+        let path = config.state_dir.join("state.sqlite3");
+        let saved = config.state_dir.join("saved.sqlite3");
+        fs::rename(&path, &saved).unwrap();
+        fs::copy(&saved, &path).unwrap();
+        let error = Store::follow_events(&config, Some(&first.cursor), 0).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<EventCursorError>(),
+            Some(EventCursorError::Replaced)
+        ));
+        fs::remove_file(&path).unwrap();
+        let error = Store::follow_events(&config, Some(&first.cursor), 0).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<EventCursorError>(),
+            Some(EventCursorError::Replaced)
+        ));
+        assert!(!path.exists());
     }
 
     fn begin(store: &mut Store, kind: WorkKind, key: &str, state: &str) -> Operation {
