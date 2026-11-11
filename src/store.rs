@@ -5191,6 +5191,19 @@ mod tests {
         Ok(())
     }
 
+    fn observe_read_only_lanes(store: &Store) -> Result<()> {
+        for (lane, source) in [
+            (LaneId::Judge, DiscoverySource::Assignments),
+            (LaneId::Mine, DiscoverySource::Challenge),
+        ] {
+            let key = ReadKey::Discovery { lane, source };
+            assert!(store.read_started(&key)?);
+            store.read_finished(&key, Some(200), None)?;
+            store.reset_read(&key)?;
+        }
+        Ok(())
+    }
+
     fn shared_floor(store: &Store, config: &Config, deadline: i64) {
         store.db.execute("INSERT INTO request_restrictions VALUES
             (?1,?2,'account_authenticated','*','server_retry_after',?3,?4,'test','job',1,1,3600,NULL)
@@ -7906,6 +7919,7 @@ mod tests {
         let store = Store::open(&config).unwrap();
         store.runtime_state(&config, false).unwrap();
         observe(&store, 54, true).unwrap();
+        observe_read_only_lanes(&store).unwrap();
         assert_eq!(
             store.status(&config).unwrap()["identity_matches_config"],
             true
@@ -8233,6 +8247,7 @@ mod tests {
             store = Store::open(&config).unwrap();
             store.runtime_state(&config, false).unwrap();
             observe(&store, 54, answered).unwrap();
+            observe_read_only_lanes(&store).unwrap();
             let status = store.status(&config).unwrap();
             assert_eq!(
                 status["epoch_evidence"],
@@ -8251,6 +8266,8 @@ mod tests {
             );
         }
         observe(&store, 55, false).unwrap();
+        observe_read_only_lanes(&store).unwrap();
+        prepared_epoch(&mut store, LaneId::Answer, 55, "current_challenge");
         let status = store.status(&config).unwrap();
         assert!(
             status["epoch_evidence"]["first_observed_at"]
@@ -8261,7 +8278,8 @@ mod tests {
         assert_eq!(status["epoch_evidence"]["answered"], false);
         assert_eq!(status["observation"]["epoch"], 55);
         assert_eq!(status["hosted_identity_verified"], true);
-        assert_eq!(health::check(&config, options).unwrap()["healthy"], true);
+        let report = health::check(&config, options).unwrap();
+        assert_eq!(report["healthy"], true, "{report}");
     }
 
     #[test]
@@ -8276,6 +8294,7 @@ mod tests {
             .record_identity_outcome(HostedIdentityOutcome::Verified)
             .unwrap();
         observe(&store, 54, true).unwrap();
+        observe_read_only_lanes(&store).unwrap();
         store.event("runtime_stopped", None).unwrap();
         assert_eq!(store.status(&config).unwrap()["controller_stopped"], true);
         store.runtime_state(&config, false).unwrap();
