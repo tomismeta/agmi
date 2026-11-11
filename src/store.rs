@@ -2106,6 +2106,24 @@ impl Store {
                 "UPDATE authority SET dispatch_sequence=dispatch_sequence+1 WHERE singleton=1",
                 [],
             )?;
+            if let Some(config) = config
+                && op.kind == LaneId::Mine
+                && !config.capabilities.mine.schedule.each_epoch
+            {
+                // Unsent drafts can fail fresh challenge validation. Consume the
+                // interval only with their first durable dispatch, not a retry.
+                tx.execute(
+                    "INSERT INTO schedule(kind,next_at)
+                    SELECT 'mine:participation',?1 WHERE NOT EXISTS(
+                        SELECT 1 FROM operation_evidence
+                        WHERE operation_id=?2 AND dispatch_sequence IS NOT NULL)
+                    ON CONFLICT(kind) DO UPDATE SET next_at=excluded.next_at",
+                    params![
+                        not_before(config.capabilities.mine.schedule.interval_seconds),
+                        op.id
+                    ],
+                )?;
+            }
             tx.execute("INSERT INTO operation_evidence(operation_id,dispatch_sequence,blocked_since)
                 VALUES (?1,(SELECT dispatch_sequence FROM authority WHERE singleton=1),?2)
                 ON CONFLICT(operation_id) DO UPDATE SET dispatch_sequence=excluded.dispatch_sequence,
@@ -3016,19 +3034,6 @@ impl Store {
             )
             .optional()?
             .unwrap_or(0))
-    }
-
-    pub(crate) fn defer_participation(&self, kind: LaneId, seconds: u64) -> Result<()> {
-        self.continuity()?;
-        self.db.execute(
-            "INSERT INTO schedule(kind,next_at) VALUES (?1,?2)
-            ON CONFLICT(kind) DO UPDATE SET next_at=excluded.next_at",
-            params![
-                format!("{}:participation", kind.as_str()),
-                not_before(seconds)
-            ],
-        )?;
-        Ok(())
     }
 
     fn capture_work_revision(db: &Connection) -> Result<()> {

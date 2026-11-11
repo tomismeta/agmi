@@ -549,7 +549,6 @@ fn ordinary_schema_open_never_upgrades_legacy_or_recreates_authority() {
 fn mining_interval_does_not_gate_discovery_or_existing_recovery() {
     let (_dir, config, mut store) = fixture();
     let op = unknown(&mut store, &config, LaneId::Mine, 1, Some("mine"));
-    store.defer_participation(LaneId::Mine, 86400).unwrap();
     store.defer_until(LaneId::Mine, 0).unwrap();
     assert_eq!(store.next_at(LaneId::Mine).unwrap(), 0);
     assert!(store.participation_next_at(LaneId::Mine).unwrap() > now());
@@ -557,6 +556,43 @@ fn mining_interval_does_not_gate_discovery_or_existing_recovery() {
         store.reconciliation_batch(LaneId::Mine).unwrap()[0].id,
         op.id
     );
+}
+
+#[test]
+fn mining_interval_starts_at_first_dispatch_not_preparation_or_retry() {
+    let (_dir, mut config, mut store) = fixture();
+    config.capabilities.mine.schedule.interval_seconds = 3600;
+    let mut stale = prepared(&mut store, LaneId::Mine, 10);
+    assert_eq!(store.participation_next_at(LaneId::Mine).unwrap(), 0);
+    stale.state = "discarded".into();
+    store.save(&stale, "request_no_longer_current").unwrap();
+    assert_eq!(store.participation_next_at(LaneId::Mine).unwrap(), 0);
+
+    let before = now();
+    let mut mine = prepared(&mut store, LaneId::Mine, 11);
+    assert!(store.dispatch_intent(&mut mine, &config).unwrap());
+    let due = store.participation_next_at(LaneId::Mine).unwrap();
+    // Persisted deadlines round upward so the interval cannot expire early.
+    assert!((before + 3600..=now() + 3601).contains(&due));
+
+    // Proven nonacceptance permits this operation's retry even while the
+    // ordinary interval forbids creating another mining operation.
+    mine.state = "retry".into();
+    store.save(&mine, "submission_backoff").unwrap();
+    config.capabilities.mine.schedule.interval_seconds = 7200;
+    assert!(store.dispatch_intent(&mut mine, &config).unwrap());
+    mine.state = "unknown".into();
+    store.save(&mine, "dispatch_outcome_unknown").unwrap();
+    assert_eq!(store.participation_next_at(LaneId::Mine).unwrap(), due);
+
+    drop(store);
+    let mut store = Store::open(&config).unwrap();
+    assert_eq!(store.participation_next_at(LaneId::Mine).unwrap(), due);
+    assert_eq!(store.operation(mine.id).unwrap().unwrap().state, "unknown");
+    config.capabilities.mine.schedule.each_epoch = true;
+    let mut next = prepared(&mut store, LaneId::Mine, 12);
+    assert!(store.dispatch_intent(&mut next, &config).unwrap());
+    assert_eq!(store.participation_next_at(LaneId::Mine).unwrap(), due);
 }
 
 #[test]

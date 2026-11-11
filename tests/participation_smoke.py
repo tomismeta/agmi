@@ -733,11 +733,40 @@ def mine_epoch_scenario(f):
            'new epoch mine did not use its independent write deadline')
     f.no_more_writes(2)
     f.preserved(original)
-    f.apply_config({'capabilities': {'mine': {'schedule': {'each_epoch': False}}}})
-    with f.lock:
-        f.epoch, f.answered = 12, True
-    f.wait(lambda: len(f.dispatched('mine')) == 3, 'interval mining did not start its cadence')
+    handler = f.server.RequestHandlerClass
+    retired = []
+
+    class RolloverAtMineRevalidation(handler):
+        def do_GET(self):
+            if self.path.split('?')[0].endswith('/api/hosted/challenge'):
+                with f.lock:
+                    if f.epoch == 11:
+                        prepared = next((row for row in f.operations('mine')
+                                         if row['state'] == 'prepared'), None)
+                        if prepared is not None:
+                            retired.append(prepared['id'])
+                            f.epoch, f.answered = 12, True
+            super().do_GET()
+
+    # Force the epoch to change after interval intent capture but before its
+    # required fresh challenge check. An unsent draft must not spend the cadence.
+    f.server.RequestHandlerClass = RolloverAtMineRevalidation
+    try:
+        f.apply_config({'capabilities': {'mine': {'schedule': {'each_epoch': False}}}})
+        f.wait(lambda: len(f.dispatched('mine')) == 3, 'interval mining did not start its cadence')
+    finally:
+        f.server.RequestHandlerClass = handler
+    assert len(retired) == 1, 'epoch did not change during mine revalidation'
+    stale = next(row for row in f.operations('mine') if row['id'] == retired[0])
+    assert stale['state'] == 'discarded', 'stale mine intent was not retired'
+    assert all(row['id'] != stale['id'] for row in f.dispatched('mine'))
     f.no_more_writes(3)
+    interval_due = f.rows("SELECT next_at FROM schedule WHERE kind='mine:participation'")[0]['next_at']
+    assert interval_due > time.time(), 'dispatched interval mine did not retain its cadence'
+    f.stop(crash=True)
+    f.start()
+    f.no_more_writes(3)
+    assert f.rows("SELECT next_at FROM schedule WHERE kind='mine:participation'")[0]['next_at'] == interval_due
     with f.lock:
         f.epoch, f.answered = 13, True
     f.no_more_writes(3)
@@ -749,7 +778,8 @@ def mine_epoch_scenario(f):
     assert len(f.risks()) == 3
     f.preserved(original)
     return dict(wallet_mutations=4, one_mine_per_epoch=True, cadence_hot_reloaded=True,
-                effectful_get_uses_write_timeout=True, old_unknown_preserved=True)
+                effectful_get_uses_write_timeout=True, old_unknown_preserved=True,
+                stale_unsent_did_not_consume_interval=True, interval_survived_restart=True)
 
 
 def local_retry_scenario(f):
@@ -776,11 +806,51 @@ def local_retry_scenario(f):
                 zero_grace_and_manual_unblocked=True, restart_preserved_server_minimum_separation=True)
 
 
+def mine_retry_floor_scenario(f):
+    class RefusingMine(f.handler()):
+        def do_GET(self):
+            route = self.path.split('?')[0]
+            with f.lock:
+                if route.endswith('/api/hosted/mine') and not f.writes:
+                    f.writes.append(dict(route=route, body={}, epoch=f.epoch,
+                                         received_at=time.monotonic(), nonce=f.nonce))
+                    self.reply(429, {'error': 'rate_limited'}, retry_after=8)
+                    return
+            super().do_GET()
+
+    f.server.RequestHandlerClass = RefusingMine
+    f.lanes['answer']['mode'] = 'off'
+    f.lanes['mine']['mode'] = 'active'
+    f.lanes['mine']['schedule'].update(interval_seconds=3600, each_epoch=False)
+    f.mine_response = 'completed'
+    f.configure()
+    f.start(resume=True)
+    f.wait(lambda: any(row['state'] == 'retry' for row in f.operations('mine')),
+           'mine refusal did not retain a retry')
+    original = f.operations('mine')[0]
+    due = f.rows("SELECT next_at FROM schedule WHERE kind='mine:participation'")[0]['next_at']
+    assert due > time.time() + 3500
+    f.stop()
+    f.start()
+    f.wait(lambda: any(row['state'] == 'completed' for row in f.operations('mine')),
+           'server-authorized mine retry waited for the ordinary interval')
+    f.cycles()
+    assert len(f.writes) == 2
+    assert len(f.dispatched('mine')) == 1 and f.dispatched('mine')[0]['dispatch_sequence'] == 2
+    assert f.writes[1]['received_at'] - f.writes[0]['received_at'] >= 8
+    assert len(f.operations('mine')) == 1 and f.operations('mine')[0]['id'] == original['id']
+    assert f.rows("SELECT next_at FROM schedule WHERE kind='mine:participation'")[0]['next_at'] == due
+    return dict(wallet_mutations=2, retry_after_seconds=8,
+                same_operation_retried=True, server_floor_survived_restart=True,
+                ordinary_interval_not_renewed=True)
+
+
 SCENARIOS = dict(rollover=rollover_scenario, retry=retry_scenario, fences=fences_scenario,
                  inclusion=inclusion_scenario, final=final_scenario,
                  retry_after=retry_after_scenario, manual=manual_scenario,
                  slow_read=slow_read_scenario, changed_epoch=changed_epoch_scenario,
-                 mine_epoch=mine_epoch_scenario, local_retry=local_retry_scenario)
+                 mine_epoch=mine_epoch_scenario, mine_retry_floor=mine_retry_floor_scenario,
+                 local_retry=local_retry_scenario)
 
 
 def main():

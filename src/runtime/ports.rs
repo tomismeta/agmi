@@ -542,12 +542,6 @@ impl HostAccess {
                 },
             )?
             .is_some();
-        if begun && !self.config.capabilities.mine.schedule.each_epoch {
-            self.store.defer_participation(
-                LaneId::Mine,
-                self.config.capabilities.mine.schedule.interval_seconds,
-            )?;
-        }
         Ok(begun)
     }
     pub(in crate::runtime) fn record_admission_observations(&self) -> Result<()> {
