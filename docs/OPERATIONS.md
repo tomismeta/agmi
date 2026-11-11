@@ -238,7 +238,7 @@ Configuration failures include a bounded `details.reason` and, where known, a so
 
 ### Atomic capability migration
 
-Configuration schema 2 and journal format 4 are an explicit breaking cutover from v0.1.1, not an automatic upgrade or legacy-bot importer. Preserve private backups for investigation; never restore older state to regain availability. Durably pause with the old binary and stop the writer before preview/apply. Existing IDs, dispatch witnesses, operations, binding history, uncertainty and budgets remain intact. Source-3 conversion preserves existing controls and rows while provisioning required lane state; older-layout conversion retains its explicit pause/grant-revocation semantics.
+Configuration schema 2 and journal format 4 are an explicit breaking cutover from v0.1.1, not an automatic upgrade or legacy-bot importer. Preserve private backups for investigation; never restore older state to regain availability. For a live cutover, durably pause with the old binary and stop the writer before preview/apply. The isolated unsealed source-2 rehearsal below does not require pausing production. Existing IDs, dispatch witnesses, operations, binding history, uncertainty and budgets remain intact. Source-3 conversion preserves existing controls and rows while provisioning required lane state; older-layout conversion retains its explicit pause/grant-revocation semantics.
 
 For an existing managed **journal-2 or journal-3 installation**, invoke the independently verified new binary—not the installed old updater:
 
@@ -287,6 +287,29 @@ A recognized historical seal without an explicit target resumes only its exact o
 Pending migration fences ordinary mutators. Migration status/private export remain available even if the installed configuration conflicts. With no journal and no bound authority, conversion changes configuration only and creates neither journal nor authority. Retained legacy floors remain absolute and are never renewed by restart.
 
 After completion, run `config check` and inspect local status. For a managed installation, explicitly run `agmi service enable` and `agmi service start`; migration does not restore either boot activation or running intent. Participation remains paused: review fresh readiness before a separate `agmi resume`. Neither bootstrap nor migration authorizes a fleet rollout or fleet risk-policy changes by itself.
+
+#### Offline rehearsal is not a relocated database restore
+
+A consistent SQLite backup is useful evidence, but is not a complete migration replica. Configuration, guidance, journal identity, canonical paths and the independent dispatch witness must agree. Existing writer/account anchors and sealed approvals also bind filesystem identities. Copying files changes inodes; capturing a newer witness beside an older database can correctly produce a refusal. Never edit those identities, lower a witness, delete anchors or re-adopt established authority to make a rehearsal pass.
+
+An unsealed format-2 source without existing inode anchors can be rehearsed from a coherent live backup plus its unchanged binding/writer marker and exact private inputs, at the required canonical paths inside isolation. Production inode preservation and a preexisting global pause are not prerequisites on that path; conversion pauses the isolated copy and revokes unused manual grants. Do not generalize this exception to anchored or sealed sources. Capture provenance and stable config/guidance/binding evidence are still required; the sequence comparison alone does not prove a coherent capture.
+
+Use only an explicitly authorized coherent capture in an isolated environment that demonstrably preserves the required identities. Deny network access externally, exclude credentials/provider sessions and production mounts, and expose no native execution or production service-manager path. Changing `HOME` or XDG directories is not isolation: account gates use the effective user's canonical passwd home. A snapshot alone does not prove these conditions.
+
+Preview acquires locks and may create local lock artifacts; it is not a zero-write filesystem inspection. For current-shaped source-3 configuration, use the unchanged configuration and `{}` proposal; caps/adoption inputs are not accepted on that path. Apply/resume require the original authority checks; source-3 preview requires a durable pause, whereas the isolated unsealed source-2 path above does not require a preexisting pause. Without an eligible capture, report the rehearsal as blocked or an expected refusal—not a successful conversion.
+
+Offline rehearsal ends with local migration/evidence inspection. Do not run participation, enable/start services, install/update, invoke credentials commands or return copied state to production. The activation instructions above apply only to a separately approved live cutover.
+
+#### Fleet release gate
+
+1. Record each host's observed executable/build, journal format, selected configuration, service/timer intent and current uncertainty. Do not infer deployed versions from an earlier review or a release label alone.
+2. Review each candidate lane's explicit mode, quota, schedule and deadlines; answer/judge model, harness, reasoning and guidance; and uncertain-model/network retry policies. Old global capacity/reservation is not equivalent to three lane quotas. Existing participation-first or accepted-linked policies must not silently become strict—or vice versa.
+3. Require the complete CI pipeline, extracted-package library-test compilation and binary writer/account-authority continuity coverage. Synthetic migration and native fixtures are not a real-journal rehearsal or authenticated-provider proof.
+4. Separately authorize bounded native-provider validation with a designated test identity, exact harness/model route and inference budget. A pass requires successful inference, a valid bound artifact and sufficiently complete native-reported provenance matching the authorized route. Failed calls, mismatches or missing required facts are failed/unavailable proof and block that route's activation. Exercise cancellation separately without treating client exit as remote nonexecution. Do not patch installed harnesses or copy authentication material; ordinary native session/cache/auth-refresh writes may still occur when invoked.
+5. Authorize one account's maintenance window and cutover, never a fleet-wide conversion. Verify effective lane modes after conversion, then separately approve service activation and participation. A format-incompatible old binary is not a rollback path; stop and roll forward without restoring older journal state.
+6. Before expansion, observe at least two complete epoch transitions and one controlled restart. Require observed eligible answer/judge/mine progress, independent lane pause/resume, retained work/retry floors/uncertainty, and diagnostics that agree with observed state. Correctly explained blockers prove diagnostic behavior, not lane readiness. Any lane without demonstrated eligible progress remains failed or untested and blocks expansion, including when no judging opportunity arose. Record CPU, memory and journal growth against agreed limits; remote acceptance/finality require remote evidence.
+
+Keep financial reporting separate: local status supplies participation and health, not balances, spendable/locked funds or seats. Use authorized remote account/explorer sources for those fields, retaining their source and observation time; unavailable data is not zero.
 
 ### Identity onboarding and recovery
 
@@ -356,6 +379,7 @@ Native authentication and OS privilege isolation remain deployment prerequisites
 - Queued, unknown, included and final outcomes remain distinct.
 - Queued work is normally poll-only. Explicit bounded uncertain-answer retry policy may authorize a separate attempt; a matching `408 job_expired` instead proves nonprocessing and permits a safe captured-payload retry after backoff and freshness checks.
 - A lost response or timeout never proves nonacceptance.
+- HTTP status alone is not nonacceptance proof. The [published protocol guide](https://minepoa.com/go.md) explicitly documents `503 epoch_closing` and `429 accept queue full`; it does not establish an arbitrary “Chain indexing” 503 contract. Broader refusal handling requires sanitized captured route/status/body/header evidence plus an authoritative guarantee that no effect was accepted. Missing job/transaction IDs alone do not authorize replay.
 - Strict policy blocks conflicting submissions. Participation-first/manual modes accept explicitly configured overlap risk while retaining uncertainty. Uncertain inference has separate regeneration authority.
 - A stable local writer lock and independently stored database UUID/location binding protect cooperating instances. A narrow dispatch-sequence witness detects database-only rollback across a witnessed effect boundary. Missing, replaced or behind-witness journals fail closed. Deleting/restoring all anchors, whole-host rollback and hostile same-user races are not covered.
 - Account identity is checked before writes. No automatic identity substitution or provider fallback.

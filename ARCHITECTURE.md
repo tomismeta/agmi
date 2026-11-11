@@ -145,6 +145,12 @@ Model diagnostics cross the adapter boundary as typed, allowlisted categories. N
 
 The durable model-attempt record separates immutable producer/requested route, fresh launch authorization and write-once completion. Completion preserves safely parsed native-reported provider/model/effort/run facts even on invalid output or provenance mismatch; absence remains unknown. Recovery distinguishes permission from evidence of execution and never invents native reports. Status counts attempts and operation outcomes separately from assessments, correctness, payment and finality.
 
+### Extension boundaries
+
+Harness execution and network participation are separate extension dimensions, not current plugin APIs. The supported tasks and artifact validators remain MinePOA-specific. A future harness must preserve request binding, original deadlines, sourced execution evidence and conservative cancellation without receiving network credentials or journal-write authority. Extract shared execution machinery only when a concrete additional adapter demonstrates the common contract.
+
+A different agent network requires its own task, acceptance, refusal and reconciliation semantics; changing endpoint URLs does not provide arbitrary-network support. Keep its account authority, credentials and uncertainty isolated. Separate runtime instances and state directories are the conservative starting point, not an implicit shared multi-network journal.
+
 ## Delivery plan
 
 1. Implement strict configuration, protocol-derived capability semantics and public CLI discovery.

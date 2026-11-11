@@ -67,6 +67,8 @@ jobs:
         run: python3 tests/installer_smoke.py target/debug/agmi
       - name: Identity-read and historical-answer continuity
         run: python3 tests/continuity_smoke.py target/debug/agmi
+      - name: Writer and account authority continuity
+        run: python3 tests/writer_continuity_smoke.py target/debug/agmi
       - name: Explicit registration durability and confidentiality
         run: python3 tests/registration_smoke.py target/debug/agmi
       - name: Configurable endpoint trust and durable routing
@@ -81,6 +83,7 @@ jobs:
           package_root="$RUNNER_TEMP/agmi-package"
           mkdir -p "$package_root"
           tar -xzf target/package/agmi-0.1.1.crate -C "$package_root"
+          cargo +1.96.0 test --manifest-path "$package_root/agmi-0.1.1/Cargo.toml" --locked --lib --no-run
           cargo +1.96.0 install --path "$package_root/agmi-0.1.1" --locked --root "$package_root/install"
           "$package_root/install/bin/agmi" build-info --manifest
           python3 tests/lifecycle_smoke.py "$package_root/install/bin/agmi" --scenario init

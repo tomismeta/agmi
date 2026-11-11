@@ -13,6 +13,7 @@ include = [
     "/Cargo.lock",
     "/build.rs",
     "/src/**/*.rs",
+    "/src/store/migration/schema3.sql",
     "/adapters/hermes.py",
     "/adapters/openclaw.mjs",
     "/defaults/model.toml",
