@@ -15,25 +15,6 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           persist-credentials: false
-      - name: Diagnose fixture network
-        run: |
-          python3 - <<'PY'
-          import os, socket, urllib.request
-          print("Proxy variables present:", [key for key in (
-              "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
-              "http_proxy", "https_proxy", "no_proxy") if os.environ.get(key)])
-          for host in ("archive.ubuntu.com", "security.ubuntu.com"):
-              try:
-                  socket.getaddrinfo(host, 80)
-                  print(host, "host DNS available")
-              except OSError as error:
-                  print(host, "host DNS failed:", error)
-              try:
-                  with urllib.request.urlopen("http://" + host + "/ubuntu/dists/noble/Release", timeout=15) as response:
-                      print(host, "host HTTP status:", response.status)
-              except Exception as error:
-                  print(host, "host HTTP failed:", type(error).__name__)
-          PY
       - name: Install Rust
         run: rustup toolchain install 1.96.0 --profile minimal --component rustfmt --component clippy
       - name: Formatting
@@ -52,27 +33,6 @@ jobs:
         # These boundaries include repeated ELF hashing/copying; use shipped
         # optimization rather than a large unoptimized debug executable.
         run: cargo +1.96.0 build --release --locked
-      - name: Isolated systemd release lifecycle
-        run: |
-          docker build --build-arg HTTP_PROXY --build-arg HTTPS_PROXY --build-arg NO_PROXY \
-            --build-arg http_proxy --build-arg https_proxy --build-arg no_proxy \
-            -f tests/systemd_fixture.Dockerfile -t agmi-systemd-fixture tests
-          name="agmi-systemd-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          trap 'docker rm -f "$name" >/dev/null 2>&1 || true' EXIT
-          docker run -d --name "$name" --privileged --cgroupns=private \
-            --network=none --tmpfs /run --tmpfs /run/lock --tmpfs /tmp:exec,mode=1777 \
-            -v "$PWD:/src:ro" -v "$PWD/target/release/agmi:/input/agmi:ro" \
-            agmi-systemd-fixture
-          timeout 60 docker exec "$name" sh -c \
-            'until systemctl start user@17321.service; do sleep 1; done'
-          docker exec "$name" runuser -u agmi-systemd-fixture -- env \
-            HOME=/home/agmi-systemd-fixture XDG_RUNTIME_DIR=/run/user/17321 \
-            DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/17321/bus \
-            python3 -u /src/tests/installer_smoke.py /input/agmi --isolated-home
-          docker exec "$name" runuser -u agmi-systemd-fixture -- env \
-            HOME=/home/agmi-systemd-fixture XDG_RUNTIME_DIR=/run/user/17321 \
-            DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/17321/bus \
-            python3 -u /src/tests/systemd_smoke.py /input/agmi
       - name: CLI discovery
         run: ./target/debug/agmi commands --json
       - name: Lost-grade cold-restart safety
@@ -124,3 +84,22 @@ jobs:
           cargo +1.96.0 install --path "$package_root/agmi-0.1.1" --locked --root "$package_root/install"
           "$package_root/install/bin/agmi" build-info --manifest
           python3 tests/lifecycle_smoke.py "$package_root/install/bin/agmi" --scenario init
+      - name: Isolated systemd release lifecycle
+        run: |
+          docker build -f tests/systemd_fixture.Dockerfile -t agmi-systemd-fixture tests
+          name="agmi-systemd-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          trap 'docker rm -f "$name" >/dev/null 2>&1 || true' EXIT
+          docker run -d --name "$name" --privileged --cgroupns=private \
+            --network=none --tmpfs /run --tmpfs /run/lock --tmpfs /tmp:exec,mode=1777 \
+            -v "$PWD:/src:ro" -v "$PWD/target/release/agmi:/input/agmi:ro" \
+            agmi-systemd-fixture
+          timeout 60 docker exec "$name" sh -c \
+            'until systemctl start user@17321.service; do sleep 1; done'
+          docker exec "$name" runuser -u agmi-systemd-fixture -- env \
+            HOME=/home/agmi-systemd-fixture XDG_RUNTIME_DIR=/run/user/17321 \
+            DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/17321/bus \
+            python3 -u /src/tests/installer_smoke.py /input/agmi --isolated-home
+          docker exec "$name" runuser -u agmi-systemd-fixture -- env \
+            HOME=/home/agmi-systemd-fixture XDG_RUNTIME_DIR=/run/user/17321 \
+            DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/17321/bus \
+            python3 -u /src/tests/systemd_smoke.py /input/agmi
