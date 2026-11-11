@@ -527,7 +527,9 @@ def changed_epoch_scenario(f):
     f.unknown('answer')
     original = f.dispatched('answer')[0]
     f.rollover(11)
-    f.wait(lambda: f.model_calls('answer') == 2, 'new epoch did not prepare its own answer')
+    f.wait(lambda: any(json.loads(op['request'])['solver']['epoch'] == 11 and op['payload']
+                       for op in f.operations('answer')),
+           'new epoch did not prepare its own answer')
     f.no_more_writes(1)
     f.configure('answer', mode='participation_first', retry_uncertain_answers=True,
                 max_unresolved_operations=2)
@@ -537,7 +539,9 @@ def changed_epoch_scenario(f):
     current = f.dispatched('answer')[1]
     assert json.loads(original['request'])['solver']['epoch'] == 10
     assert json.loads(current['request'])['solver']['epoch'] == 11
-    assert f.model_calls('answer') == 2, 'new epoch reused old inference'
+    # Policy reload retires preparations captured under the previous lane revision.
+    # Verify the epoch-bound artifact, not an incidental number of model launches.
+    assert json.loads(current['payload'])['answer'] == ANSWER + ' Epoch 11.', 'new epoch reused old inference'
     assert not f.rows('SELECT * FROM operation_links WHERE operation_id=?', (current['id'],))
     assert f.risks()[0]['retry_of'] is None, 'old epoch was relabeled as current retry'
     f.preserved(original)
