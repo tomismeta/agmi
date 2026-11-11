@@ -15,6 +15,25 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           persist-credentials: false
+      - name: Diagnose fixture network
+        run: |
+          python3 - <<'PY'
+          import os, socket, urllib.request
+          print("Proxy variables present:", [key for key in (
+              "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+              "http_proxy", "https_proxy", "no_proxy") if os.environ.get(key)])
+          for host in ("archive.ubuntu.com", "security.ubuntu.com"):
+              try:
+                  socket.getaddrinfo(host, 80)
+                  print(host, "host DNS available")
+              except OSError as error:
+                  print(host, "host DNS failed:", error)
+              try:
+                  with urllib.request.urlopen("http://" + host + "/ubuntu/dists/noble/Release", timeout=15) as response:
+                      print(host, "host HTTP status:", response.status)
+              except Exception as error:
+                  print(host, "host HTTP failed:", type(error).__name__)
+          PY
       - name: Install Rust
         run: rustup toolchain install 1.96.0 --profile minimal --component rustfmt --component clippy
       - name: Formatting
@@ -35,7 +54,9 @@ jobs:
         run: cargo +1.96.0 build --release --locked
       - name: Isolated systemd release lifecycle
         run: |
-          docker build --network=host -f tests/systemd_fixture.Dockerfile -t agmi-systemd-fixture tests
+          docker build --build-arg HTTP_PROXY --build-arg HTTPS_PROXY --build-arg NO_PROXY \
+            --build-arg http_proxy --build-arg https_proxy --build-arg no_proxy \
+            -f tests/systemd_fixture.Dockerfile -t agmi-systemd-fixture tests
           name="agmi-systemd-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           trap 'docker rm -f "$name" >/dev/null 2>&1 || true' EXIT
           docker run -d --name "$name" --privileged --cgroupns=private \
