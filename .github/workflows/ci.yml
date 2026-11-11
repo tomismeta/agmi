@@ -35,7 +35,7 @@ jobs:
         run: cargo +1.96.0 build --release --locked
       - name: Isolated systemd release lifecycle
         run: |
-          docker build -f tests/systemd_fixture.Dockerfile -t agmi-systemd-fixture tests
+          docker build --network=host -f tests/systemd_fixture.Dockerfile -t agmi-systemd-fixture tests
           name="agmi-systemd-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           trap 'docker rm -f "$name" >/dev/null 2>&1 || true' EXIT
           docker run -d --name "$name" --privileged --cgroupns=private \
