@@ -301,7 +301,7 @@ pub(super) struct HostAccess {
     authority_epoch: u64,
     sequence: u64,
     wake: Arc<Notify>,
-    lanes: Vec<NativeLane>,
+    lanes: NativeLanes,
     recovery: Vec<Recovery>,
     identity: Option<IdentityRead>,
     permit: Option<IdentityPermit>,

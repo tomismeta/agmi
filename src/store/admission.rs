@@ -18,6 +18,14 @@ pub(crate) struct AdmissionStampSnapshot {
     pub lane_config_revision: String,
 }
 
+pub(crate) struct PreparationInputs<'a> {
+    pub lane: LaneId,
+    pub key: &'a str,
+    pub request: &'a Value,
+    pub retry: Option<(&'a Operation, bool)>,
+    pub policy: &'a Value,
+}
+
 pub(crate) struct EffectCandidate<'a> {
     pub operation: &'a Operation,
     pub stamp: &'a AdmissionStampSnapshot,
@@ -146,12 +154,15 @@ impl Store {
         account: &AccountAdmissionGuard,
         lane_guard: &LaneAdmissionGuard,
         stamp: &AdmissionStampSnapshot,
-        lane: LaneId,
-        key: &str,
-        request: &Value,
-        retry: Option<(&Operation, bool)>,
-        policy: &Value,
+        inputs: PreparationInputs<'_>,
     ) -> Result<Option<Operation>> {
+        let PreparationInputs {
+            lane,
+            key,
+            request,
+            retry,
+            policy,
+        } = inputs;
         self.continuity()?;
         ensure!(
             lane == lane_guard.lane_id(),

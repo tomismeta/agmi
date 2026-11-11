@@ -479,12 +479,7 @@ fn offer_mine(runtime: &mut HostAccess, op: Operation) {
             observation(runtime, LaneId::Mine),
         )
         .unwrap();
-    let NativeLane::Mine(lane) =
-        &mut runtime.lanes[crate::runtime::registry::lane_index(LaneId::Mine)]
-    else {
-        unreachable!()
-    };
-    lane.ready = Some(ready);
+    runtime.lanes.mine.ready = Some(ready);
 }
 
 pub(super) async fn identity_fixture(runtime: &mut HostAccess, listener: &tokio::net::TcpListener) {

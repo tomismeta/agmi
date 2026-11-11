@@ -58,7 +58,7 @@ pub(super) fn target(token: &str, sealed: &Value) -> Result<i64> {
         if historical {
             matches!(source, Some(1 | 2))
         } else {
-            matches!(source, Some(1 | 2 | 3))
+            matches!(source, Some(1..=3))
         },
         "unrecognized sealed source journal format; exact historical recovery implementation required"
     );

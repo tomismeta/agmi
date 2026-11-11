@@ -42,6 +42,13 @@ pub(crate) struct LaneObservationStamp {
     pub(crate) completed_at: i64,
 }
 
+pub(crate) struct LaneObservation<'a> {
+    pub(crate) epoch: u64,
+    pub(crate) answered: bool,
+    pub(crate) fingerprint: &'a str,
+    pub(crate) challenge: &'a Value,
+}
+
 pub(super) fn effect_endpoint(kind: LaneId) -> Endpoint {
     match kind {
         LaneId::Answer => Endpoint::Answer,
@@ -688,21 +695,10 @@ impl Store {
         &self,
         lane: LaneId,
         stamp: LaneObservationStamp,
-        epoch: u64,
-        answered: bool,
-        fingerprint: &str,
-        challenge: &Value,
+        observation: LaneObservation<'_>,
         admission: &AdmissionStampSnapshot,
     ) -> Result<bool> {
-        self.observe_lane_in(
-            lane,
-            stamp,
-            epoch,
-            answered,
-            fingerprint,
-            challenge,
-            Some(admission),
-        )
+        self.observe_lane_in(lane, stamp, observation, Some(admission))
     }
 
     #[cfg(test)]
@@ -710,24 +706,24 @@ impl Store {
         &self,
         lane: LaneId,
         stamp: LaneObservationStamp,
-        epoch: u64,
-        answered: bool,
-        fingerprint: &str,
-        challenge: &Value,
+        observation: LaneObservation<'_>,
     ) -> Result<bool> {
-        self.observe_lane_in(lane, stamp, epoch, answered, fingerprint, challenge, None)
+        self.observe_lane_in(lane, stamp, observation, None)
     }
 
     fn observe_lane_in(
         &self,
         lane: LaneId,
         stamp: LaneObservationStamp,
-        epoch: u64,
-        answered: bool,
-        fingerprint: &str,
-        challenge: &Value,
+        observation: LaneObservation<'_>,
         admission: Option<&AdmissionStampSnapshot>,
     ) -> Result<bool> {
+        let LaneObservation {
+            epoch,
+            answered,
+            fingerprint,
+            challenge,
+        } = observation;
         let LaneObservationStamp {
             authority_epoch,
             generation,
@@ -743,13 +739,12 @@ impl Store {
             bail!("snapshot completion precedes request start");
         }
         let tx = rusqlite::Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
-        if let Some(admission) = admission {
-            if generation != admission.account_generation
+        if let Some(admission) = admission
+            && (generation != admission.account_generation
                 || authority_epoch != admission.authority_epoch
-                || !Self::observation_stamp_matches(&tx, lane, admission)?
-            {
-                return Ok(false);
-            }
+                || !Self::observation_stamp_matches(&tx, lane, admission)?)
+        {
+            return Ok(false);
         }
         let previous: Option<(u64, bool)> = tx
             .query_row(

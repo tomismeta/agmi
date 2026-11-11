@@ -1178,7 +1178,7 @@ mod native {
             {
                 ensure!(
                     if self.migration_only {
-                        matches!(format, 1 | 2 | 3)
+                        matches!(format, 1..=3)
                     } else {
                         complete && format == CURRENT_JOURNAL_FORMAT
                     },

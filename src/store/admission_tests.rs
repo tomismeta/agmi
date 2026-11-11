@@ -70,11 +70,13 @@ impl Fixture {
                 &self.account,
                 gate,
                 &stamp,
-                lane,
-                &format!("{epoch}:fairness"),
-                &json!({"solver":{"epoch":epoch}}),
-                None,
-                &json!({}),
+                PreparationInputs {
+                    lane,
+                    key: &format!("{epoch}:fairness"),
+                    request: &json!({"solver":{"epoch":epoch}}),
+                    retry: None,
+                    policy: &json!({}),
+                },
             )
             .unwrap()
             .unwrap();
@@ -400,7 +402,8 @@ fn rejected_stamps_freshness_and_stale_operation_cas_do_not_spend_a_turn() {
         fixture.prepare(LaneId::Judge, 2),
     ];
     ready[1].deadline = ready[0].deadline + Duration::from_secs(60);
-    let rejections: [(&str, fn(&mut Ready)); 8] = [
+    type Rejection = (&'static str, fn(&mut Ready));
+    let rejections: [Rejection; 8] = [
         ("expired observation", |ready| {
             ready.deadline = Instant::now() - Duration::from_secs(1)
         }),
@@ -608,8 +611,8 @@ fn continuously_eligible_lanes_obey_the_finite_round_starvation_bound() {
             operation
         })
         .collect();
-    let mut last_service = vec![None; LaneId::COUNT];
-    let mut longest_gap = vec![0; LaneId::COUNT];
+    let mut last_service = [None; LaneId::COUNT];
+    let mut longest_gap = [0; LaneId::COUNT];
     let mut dispatches = 0;
     let bound = 2 * LaneId::COUNT - 1;
     let base = Instant::now() + Duration::from_secs(3600);

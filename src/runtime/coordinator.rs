@@ -118,11 +118,9 @@ impl HostAccess {
             return Ok(());
         }
         if !self.permit_current()? {
-            if let Some(kind) = self
-                .lanes
-                .iter()
-                .filter_map(|lane| lane.ready().map(|ready| ready.op.kind))
-                .next()
+            if let Some(kind) = LaneId::ALL
+                .into_iter()
+                .find(|id| self.lanes.ready(*id).is_some())
             {
                 self.start_identity(kind)?;
             }
@@ -143,14 +141,15 @@ impl HostAccess {
     }
     fn arbitrate_lanes(
         &mut self,
-        lanes: &mut [NativeLane],
+        lanes: &mut NativeLanes,
         account_gate: AccountAdmissionGuard,
     ) -> Result<()> {
         let mut gates = Vec::with_capacity(LaneId::COUNT);
         let mut candidates = Vec::with_capacity(LaneId::COUNT);
         for id in LaneId::ALL {
-            let lane = &lanes[crate::runtime::registry::lane_index(id)];
-            let Some(ready) = lane.ready() else { continue };
+            let Some(ready) = lanes.ready(id) else {
+                continue;
+            };
             let mut coordinator_exclusion = if !self.ready_current(ready)? {
                 Some("ready_not_current")
             } else if !self.admission_allowed(&ready.op)? {
@@ -189,9 +188,8 @@ impl HostAccess {
             return Ok(());
         };
         let selected_lane = candidates[selected].operation.kind;
-        let index = crate::runtime::registry::lane_index(selected_lane);
-        let ready = lanes[index]
-            .ready()
+        let ready = lanes
+            .ready(selected_lane)
             .context("selected ready operation missing")?;
         let (_, prior_sequence) = self.store.database_identity()?;
         let next_sequence = prior_sequence
@@ -238,7 +236,9 @@ impl HostAccess {
             "dispatch sequence changed during guarded handoff"
         );
         drop(candidates);
-        let mut ready = lanes[index].take_ready().expect("admitted ready operation");
+        let mut ready = lanes
+            .take_ready(selected_lane)
+            .expect("admitted ready operation");
         ready.op.state = "dispatching".into();
         let gate_index = gates
             .iter()

@@ -485,7 +485,7 @@ fn snapshot(
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
     )?;
     ensure!(
-        matches!(version, 1 | 2 | 3),
+        matches!(version, 1..=3),
         "explicit migration requires source journal format 1, 2 or 3"
     );
     if version == 3 {

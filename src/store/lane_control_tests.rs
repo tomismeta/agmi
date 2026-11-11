@@ -152,11 +152,13 @@ fn prepared(store: &mut Store, config: &Config, lane: LaneId, epoch: u64) -> Ope
             &account,
             &gate,
             &current,
-            lane,
-            &format!("{epoch}:lane-control"),
-            &json!({"solver":{"epoch":epoch},"captured_input":"original"}),
-            None,
-            &json!({"lane_revision":current.lane_config_revision,"captured_policy":"original"}),
+            PreparationInputs {
+                lane,
+                key: &format!("{epoch}:lane-control"),
+                request: &json!({"solver":{"epoch":epoch},"captured_input":"original"}),
+                retry: None,
+                policy: &json!({"lane_revision":current.lane_config_revision,"captured_policy":"original"}),
+            },
         )
         .unwrap()
         .expect("unpaused lane admits preparation");
@@ -439,11 +441,13 @@ fn pause_fences_prepared_effects_without_rewriting_history_or_other_lane_admissi
                         &account,
                         &gates[0],
                         attempted_stamp,
-                        LaneId::Answer,
-                        "10:after-pause",
-                        &json!({"solver":{"epoch":10}}),
-                        None,
-                        &json!({})
+                        PreparationInputs {
+                            lane: LaneId::Answer,
+                            key: "10:after-pause",
+                            request: &json!({"solver":{"epoch":10}}),
+                            retry: None,
+                            policy: &json!({}),
+                        },
                     )
                     .unwrap()
                     .is_none()
@@ -786,11 +790,13 @@ fn stale_lane_observation_cannot_overwrite_current_snapshot_or_sibling_observati
             .record_admission_observation(
                 lane,
                 current,
-                "runtime-original",
-                "open",
-                &[],
-                observed_at,
-                Some(observed_at + 60),
+                AdmissionObservation {
+                    runtime_instance: "runtime-original",
+                    state: "open",
+                    reasons: &[],
+                    observed_at,
+                    valid_until: Some(observed_at + 60),
+                },
             )
             .unwrap();
         store
@@ -817,11 +823,13 @@ fn stale_lane_observation_cannot_overwrite_current_snapshot_or_sibling_observati
             .record_admission_observation(
                 LaneId::Answer,
                 &stale,
-                "stale-writer",
-                "closed",
-                &["stale_write"],
-                observed_at,
-                Some(observed_at + 60),
+                AdmissionObservation {
+                    runtime_instance: "stale-writer",
+                    state: "closed",
+                    reasons: &["stale_write"],
+                    observed_at,
+                    valid_until: Some(observed_at + 60),
+                },
             )
             .unwrap();
         store
@@ -837,11 +845,13 @@ fn stale_lane_observation_cannot_overwrite_current_snapshot_or_sibling_observati
         .record_admission_observation(
             LaneId::Answer,
             &current,
-            "runtime-original",
-            "closed",
-            &["lane_paused"],
-            observed_at,
-            Some(observed_at + 60),
+            AdmissionObservation {
+                runtime_instance: "runtime-original",
+                state: "closed",
+                reasons: &["lane_paused"],
+                observed_at,
+                valid_until: Some(observed_at + 60),
+            },
         )
         .unwrap();
     store

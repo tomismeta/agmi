@@ -1,5 +1,5 @@
 use super::*;
-use crate::store::LaneObservationStamp;
+use crate::store::{LaneObservation, LaneObservationStamp};
 
 pub(in crate::runtime) struct ReadFlight {
     pub(in crate::runtime) key: ReadKey,
@@ -383,10 +383,12 @@ impl HostAccess {
                 started_at: flight.started_at,
                 completed_at: flight.completed_at,
             },
-            challenge.epoch,
-            challenge.answered,
-            &challenge.fingerprint,
-            &response.body,
+            LaneObservation {
+                epoch: challenge.epoch,
+                answered: challenge.answered,
+                fingerprint: &challenge.fingerprint,
+                challenge: &response.body,
+            },
             flight
                 .lane_stamp
                 .as_ref()

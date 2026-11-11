@@ -490,31 +490,21 @@ impl Store {
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let (previous, mut record) = bound_attempt_in(&tx, binding)?;
-        let (state, key, request, generation, result, payload, job, txid, next_at): (
-            String,
-            String,
-            String,
-            i64,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            i64,
-        ) = tx.query_row(
+        let (state, key, request, generation, result, payload, job, txid, next_at) = tx.query_row(
             "SELECT state,work_key,request,generation,result,payload,job_id,txid,next_at
              FROM operations WHERE id=?1",
             [op.id],
             |row| {
                 Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                    row.get(7)?,
-                    row.get(8)?,
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, i64>(8)?,
                 ))
             },
         )?;

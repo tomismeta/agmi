@@ -1430,7 +1430,7 @@ mod tests {
             "winnerProvider":"credential\nprompt", "error":"secret-canary"
         }));
         assert_eq!(facts.model.unwrap().value, "other-model");
-        assert_eq!(facts.fallback_used.unwrap().value, true);
+        assert!(facts.fallback_used.unwrap().value);
         assert!(facts.winner_provider.is_none());
         assert!(facts.prompt_channel.is_none());
     }

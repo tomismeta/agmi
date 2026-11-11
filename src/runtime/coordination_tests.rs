@@ -51,11 +51,7 @@ async fn effect_guard_is_retained_through_bookkeeping_while_recovery_progresses(
     let deferred = runtime.store.operation(op.id).unwrap().unwrap();
     assert_eq!(deferred.state, "prepared");
     assert_eq!(runtime.store.database_identity().unwrap().1, 0);
-    assert!(
-        runtime.lanes[crate::runtime::registry::lane_index(LaneId::Mine)]
-            .ready()
-            .is_some()
-    );
+    assert!(runtime.lanes.ready(LaneId::Mine).is_some());
     drop(busy_lane);
     runtime.arbitrate().unwrap();
     let (effect_stream, _) = accept(&listener).await;
@@ -1020,12 +1016,7 @@ fn offer_mutated_answer(runtime: &mut HostAccess, canonical: &Operation, next_at
     assert_eq!(ready.op.payload, canonical.payload);
     assert_eq!(ready.op.key, canonical.key);
     assert_eq!(ready.op.next_at, canonical.next_at);
-    let NativeLane::Answer(lane) =
-        &mut runtime.lanes[crate::runtime::registry::lane_index(LaneId::Answer)]
-    else {
-        unreachable!()
-    };
-    lane.ready = Some(ready);
+    runtime.lanes.answer.ready = Some(ready);
 }
 
 async fn accept_json(listener: &tokio::net::TcpListener) -> (tokio::net::TcpStream, Value) {

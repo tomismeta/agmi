@@ -15,8 +15,10 @@ mod accounting;
 mod admission;
 mod lane_control;
 mod model_attempt;
-pub(crate) use admission::{AdmissionStampSnapshot, EffectCandidate, OperationBinding};
-pub(crate) use lane_control::LaneAdmissionGuard;
+pub(crate) use admission::{
+    AdmissionStampSnapshot, EffectCandidate, OperationBinding, PreparationInputs,
+};
+pub(crate) use lane_control::{AdmissionObservation, LaneAdmissionGuard};
 pub use lane_control::{LaneControlError, lane_control_status, set_lane_paused};
 use lane_control::{
     LaneGateSet, initialize_lane_state, open_required_lane_gates, provision_lane_gates,
@@ -27,7 +29,7 @@ pub mod migration;
 mod projection;
 mod reads;
 mod schema;
-pub(crate) use reads::{DiscoverySource, LaneObservationStamp, ReadKey};
+pub(crate) use reads::{DiscoverySource, LaneObservation, LaneObservationStamp, ReadKey};
 use schema::initialize_schema;
 #[cfg(test)]
 mod atomic_tests;
@@ -700,7 +702,7 @@ impl AccountLock {
             }
             if binding.writer_inode.is_some() {
                 binding.check_writer(&writer_path, &writer_metadata)?;
-                if !marked && !(adopt && stopped && bytes.is_empty()) {
+                if !(marked || adopt && stopped && bytes.is_empty()) {
                     bail!("permanent writer marker missing; explicit stopped adoption required");
                 }
             } else if !(adopt && stopped && marked) {
@@ -708,13 +710,12 @@ impl AccountLock {
                     "unanchored established writer requires its intact permanent marker and explicit stopped adoption"
                 );
             }
-        } else if !fresh {
-            if !(adopt && stopped)
+        } else if !fresh
+            && (!(adopt && stopped)
                 || !(bytes.is_empty()
-                    || bytes == digest(config.state_dir.as_os_str().as_encoded_bytes()).as_bytes())
-            {
-                bail!("unbound journal requires intact evidence and explicit stopped adoption");
-            }
+                    || bytes == digest(config.state_dir.as_os_str().as_encoded_bytes()).as_bytes()))
+        {
+            bail!("unbound journal requires intact evidence and explicit stopped adoption");
         }
         if !fresh {
             // All authority checks precede writable SQLite setup, routing and recovery.
@@ -934,10 +935,10 @@ impl AccountAdmissionGuard {
                     .as_ref()
                     .is_none_or(|binding| binding.admission_inode.is_none()),
         )?;
-        if let Some(binding) = &binding {
-            if binding.admission_inode.is_some() {
-                binding.check_admission(&path, &file.metadata()?)?;
-            }
+        if let Some(binding) = &binding
+            && binding.admission_inode.is_some()
+        {
+            binding.check_admission(&path, &file.metadata()?)?;
         }
         file.lock()
             .context("cannot acquire account admission gate")?;
@@ -1352,12 +1353,11 @@ impl Store {
                 || lane_control::opened_file(&path.with_extension("admission"), false, false)
                     .is_ok()
         });
-        if let Some(binding) = &binding {
-            if binding.admission_inode.is_some() {
-                let admission_path = path.with_extension("admission");
-                binding
-                    .check_admission(&admission_path, &fs::symlink_metadata(&admission_path)?)?;
-            }
+        if let Some(binding) = &binding
+            && binding.admission_inode.is_some()
+        {
+            let admission_path = path.with_extension("admission");
+            binding.check_admission(&admission_path, &fs::symlink_metadata(&admission_path)?)?;
         }
         let (state, prerequisite) = match binding {
             Some(_) if !unanchored_admission_intact => (
@@ -5178,10 +5178,12 @@ mod tests {
                 started_at: now(),
                 completed_at: now(),
             },
-            epoch,
-            answered,
-            "test",
-            &json!({}),
+            LaneObservation {
+                epoch,
+                answered,
+                fingerprint: "test",
+                challenge: &json!({}),
+            },
         )?;
         // Tests of historical identity repair explicitly retain legacy evidence.
         store.db.execute(

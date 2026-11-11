@@ -1186,10 +1186,10 @@ fn components(status: &Value, health: &Value, at: i64, stale: u64, options: Opti
                     // failures; unrelated recorded history is not a dependency.
                     if !read_only
                         && (complete || (!bound_read && finding.1 == "work_in_progress"))
-                        && !dependency["last_failure_at"]
+                        && dependency["last_failure_at"]
                             .as_i64()
                             .zip(finding.2)
-                            .is_some_and(|(failure, observed)| failure > observed)
+                            .is_none_or(|(failure, observed)| failure <= observed)
                     {
                         continue;
                     }

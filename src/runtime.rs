@@ -27,7 +27,7 @@ pub use host::{
     recovery_authorize, recovery_grants, recovery_inspect, recovery_resolve, recovery_revoke,
     resume, run, status,
 };
-use registry::NativeLane;
+use registry::NativeLanes;
 use services::{AnswerServices, GradeServices, MineServices};
 
 #[derive(Serialize, Deserialize)]

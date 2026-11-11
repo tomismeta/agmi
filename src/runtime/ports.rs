@@ -3,7 +3,7 @@ use crate::config::{AnswerConfig, JudgeConfig};
 use crate::protocol::{AnswerIntent, EffectIntent, GradeIntent, MineIntent};
 use crate::runtime::registry::lane_index;
 use crate::solver::contract::{AnswerTask, GradeTask};
-use crate::store::LaneAdmissionGuard;
+use crate::store::{AdmissionObservation, LaneAdmissionGuard, PreparationInputs};
 
 impl HostAccess {
     pub(in crate::runtime) fn answer_config(&self) -> &AnswerConfig {
@@ -344,11 +344,13 @@ impl HostAccess {
                 &account,
                 &lane,
                 &stamp,
-                LaneId::Answer,
-                key,
-                &original.request,
-                Some((&original, true)),
-                &json!({"lane_revision":stamp.lane_config_revision}),
+                PreparationInputs {
+                    lane: LaneId::Answer,
+                    key,
+                    request: &original.request,
+                    retry: Some((&original, true)),
+                    policy: &json!({"lane_revision":stamp.lane_config_revision}),
+                },
             )?
             .is_some())
     }
@@ -419,11 +421,13 @@ impl HostAccess {
             &account,
             &lane,
             &stamp,
-            LaneId::Judge,
-            &assignment.id,
-            &json!({"assignment":assignment.id,"local_abstention":"required_words_absent"}),
-            None,
-            &json!({"lane_revision":stamp.lane_config_revision}),
+            PreparationInputs {
+                lane: LaneId::Judge,
+                key: &assignment.id,
+                request: &json!({"assignment":assignment.id,"local_abstention":"required_words_absent"}),
+                retry: None,
+                policy: &json!({"lane_revision":stamp.lane_config_revision}),
+            },
         )?
         else {
             return Ok(false);
@@ -522,11 +526,13 @@ impl HostAccess {
                 &account,
                 &lane,
                 &stamp,
-                LaneId::Mine,
-                &key,
-                &serde_json::to_value(input)?,
-                None,
-                &json!({"lane_revision":stamp.lane_config_revision}),
+                PreparationInputs {
+                    lane: LaneId::Mine,
+                    key: &key,
+                    request: &serde_json::to_value(input)?,
+                    retry: None,
+                    policy: &json!({"lane_revision":stamp.lane_config_revision}),
+                },
             )?
             .is_some();
         if begun && !self.config.capabilities.mine.schedule.each_epoch {
@@ -538,8 +544,7 @@ impl HostAccess {
         Ok(begun)
     }
     pub(in crate::runtime) fn record_admission_observations(&self) -> Result<()> {
-        for lane in &self.lanes {
-            let id = lane.id();
+        for id in LaneId::ALL {
             let stamp = self.admission_stamp(id)?;
             let mut reasons = Vec::new();
             if !self.active(id)? {
@@ -552,7 +557,7 @@ impl HostAccess {
                 reasons.push("identity_unverified");
             }
             let mut valid_until = None;
-            if let Some(ready) = lane.ready() {
+            if let Some(ready) = self.lanes.ready(id) {
                 if !self.ready_current(ready)? {
                     reasons.push("ready_stale");
                 }
@@ -584,11 +589,13 @@ impl HostAccess {
             self.store.record_admission_observation(
                 id,
                 &stamp,
-                &self.authority_instance,
-                if reasons.is_empty() { "open" } else { "closed" },
-                &reasons,
-                now(),
-                valid_until,
+                AdmissionObservation {
+                    runtime_instance: &self.authority_instance,
+                    state: if reasons.is_empty() { "open" } else { "closed" },
+                    reasons: &reasons,
+                    observed_at: now(),
+                    valid_until,
+                },
             )?;
         }
         Ok(())

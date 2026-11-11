@@ -356,10 +356,12 @@ fn lane_snapshots_reject_stale_sequences_authority_and_regressed_epoch() {
                     started_at: completed - 10,
                     completed_at: completed,
                 },
-                11,
-                false,
-                "a",
-                &json!({"private":"answer"})
+                LaneObservation {
+                    epoch: 11,
+                    answered: false,
+                    fingerprint: "a",
+                    challenge: &json!({"private":"answer"}),
+                },
             )
             .unwrap()
     );
@@ -374,10 +376,12 @@ fn lane_snapshots_reject_stale_sequences_authority_and_regressed_epoch() {
                     started_at: now(),
                     completed_at: now(),
                 },
-                10,
-                false,
-                "b",
-                &json!({})
+                LaneObservation {
+                    epoch: 10,
+                    answered: false,
+                    fingerprint: "b",
+                    challenge: &json!({}),
+                },
             )
             .unwrap()
     );
@@ -392,10 +396,12 @@ fn lane_snapshots_reject_stale_sequences_authority_and_regressed_epoch() {
                     started_at: now(),
                     completed_at: now(),
                 },
-                12,
-                true,
-                "old",
-                &json!({})
+                LaneObservation {
+                    epoch: 12,
+                    answered: true,
+                    fingerprint: "old",
+                    challenge: &json!({}),
+                },
             )
             .unwrap()
     );
@@ -410,10 +416,12 @@ fn lane_snapshots_reject_stale_sequences_authority_and_regressed_epoch() {
                     started_at: now(),
                     completed_at: now(),
                 },
-                9,
-                true,
-                "old",
-                &json!({})
+                LaneObservation {
+                    epoch: 9,
+                    answered: true,
+                    fingerprint: "old",
+                    challenge: &json!({}),
+                },
             )
             .unwrap()
     );
@@ -429,10 +437,12 @@ fn lane_snapshots_reject_stale_sequences_authority_and_regressed_epoch() {
                     started_at: now(),
                     completed_at: now(),
                 },
-                12,
-                true,
-                "old",
-                &json!({})
+                LaneObservation {
+                    epoch: 12,
+                    answered: true,
+                    fingerprint: "old",
+                    challenge: &json!({}),
+                },
             )
             .unwrap()
     );
@@ -455,10 +465,12 @@ fn lane_snapshots_reject_stale_sequences_authority_and_regressed_epoch() {
                     started_at: now() - 40,
                     completed_at: now() - 30,
                 },
-                11,
-                false,
-                "new",
-                &json!({})
+                LaneObservation {
+                    epoch: 11,
+                    answered: false,
+                    fingerprint: "new",
+                    challenge: &json!({}),
+                },
             )
             .unwrap()
     );

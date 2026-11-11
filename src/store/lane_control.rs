@@ -63,6 +63,14 @@ pub(crate) struct LaneControlSnapshot {
     pub control_revision: i64,
 }
 
+pub(crate) struct AdmissionObservation<'a> {
+    pub(crate) runtime_instance: &'a str,
+    pub(crate) state: &'a str,
+    pub(crate) reasons: &'a [&'a str],
+    pub(crate) observed_at: i64,
+    pub(crate) valid_until: Option<i64>,
+}
+
 pub(super) fn opened_file(path: &Path, writable: bool, create: bool) -> Result<File> {
     let parent = path.parent().context("private file parent missing")?;
     if create {
@@ -759,12 +767,15 @@ impl Store {
         &self,
         lane: LaneId,
         stamp: &AdmissionStampSnapshot,
-        runtime_instance: &str,
-        state: &str,
-        reasons: &[&str],
-        observed_at: i64,
-        valid_until: Option<i64>,
+        observation: AdmissionObservation<'_>,
     ) -> Result<()> {
+        let AdmissionObservation {
+            runtime_instance,
+            state,
+            reasons,
+            observed_at,
+            valid_until,
+        } = observation;
         ensure!(
             matches!(state, "open" | "closed" | "unknown")
                 && reasons.len() <= 16

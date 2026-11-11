@@ -33,7 +33,7 @@ impl HostAccess {
             authority_epoch,
             sequence: 0,
             wake: Arc::new(Notify::new()),
-            lanes: LaneId::ALL.into_iter().map(NativeLane::new).collect(),
+            lanes: NativeLanes::default(),
             recovery: LaneId::ALL
                 .into_iter()
                 .map(|_| Recovery::default())
@@ -343,7 +343,7 @@ impl HostAccess {
     pub(in crate::runtime) fn any_handles(&self) -> bool {
         self.identity.is_some()
             || self.effect.is_some()
-            || self.lanes.iter().any(NativeLane::busy)
+            || self.lanes.busy()
             || self
                 .recovery
                 .iter()
@@ -353,7 +353,7 @@ impl HostAccess {
         self.collect_identity()?;
         self.collect_effect()?;
         let mut lanes = std::mem::take(&mut self.lanes);
-        let result = lanes.iter_mut().try_for_each(|lane| lane.collect(self));
+        let result = lanes.iter_mut().try_for_each(|mut lane| lane.collect(self));
         self.lanes = lanes;
         result
     }
@@ -361,7 +361,7 @@ impl HostAccess {
         self.refresh_idle_identity()?;
         self.store.retry_models(&self.config)?;
         let mut lanes = std::mem::take(&mut self.lanes);
-        let result = lanes.iter_mut().try_for_each(|lane| lane.advance(self));
+        let result = lanes.iter_mut().try_for_each(|mut lane| lane.advance(self));
         self.lanes = lanes;
         result?;
         self.record_admission_observations()?;
@@ -435,7 +435,7 @@ impl HostAccess {
         self.permit = None;
         let mut lanes = std::mem::take(&mut self.lanes);
         let mut result = Ok(());
-        for lane in &mut lanes {
+        for mut lane in lanes.iter_mut() {
             if let Err(error) = lane.stop(self).await {
                 result = Err(error);
                 break;
