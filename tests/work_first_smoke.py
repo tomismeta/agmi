@@ -375,6 +375,9 @@ def completed_draft(f):
 
 
 def restart_scenario(f):
+    # Unlock retained work with a one-shot grant, not a lane revision change,
+    # which correctly retires artifacts captured under the previous policy.
+    f.lanes['answer']['participation']['mode'] = 'manual'
     old, draft = completed_draft(f)
     generation = f.status()['generation']
     child = f.child
@@ -383,18 +386,23 @@ def restart_scenario(f):
     f.start()
     f.cycles(2)
     after = next(row for row in f.operations('answer') if row['id'] == draft['id'])
-    for field in ('id', 'work_key', 'request', 'payload', 'created_at', 'generation', 'state'):
+    for field in ('id', 'work_key', 'request', 'payload', 'created_at', 'generation', 'revision', 'state'):
         assert after[field] == draft[field], ('completed draft changed on restart', field)
     assert f.status()['generation'] == generation
     assert f.model_calls('answer') == 1, 'ordinary restart repeated completed inference'
     f.answer_response, f.receipt_state = 'bound', 'final'
-    f.apply_config({'capabilities': {'answer': {'participation': {'mode': 'participation_first', 'max_unresolved_operations': 2}}}})
+    f.stop()
+    grant = f.invoke('recover', 'authorize', '--epoch', '11', '--kind', 'answer')
+    f.start()
     f.wait(lambda: any(row['id'] == draft['id'] and row['state'] == 'final'
                        for row in f.operations('answer')), 'retained draft did not dispatch and finalize')
     dispatched = f.dispatched('answer')
     assert len(dispatched) == 1 and dispatched[0]['id'] == draft['id'], dispatched
     assert dispatched[0]['payload'] == draft['payload']
     assert f.model_calls('answer') == 1
+    assert f.status()['generation'] == generation
+    assert dispatched[0]['revision'] == draft['revision']
+    assert len(f.risks()) == 1 and f.risks()[0]['manual_grant_id'] == grant['grant_id']
     f.preserved(old)
     return dict(retained_operation_id=draft['id'], answer_inferences=1,
                 unchanged_generation=True, eventual_dispatch=True)
@@ -532,13 +540,19 @@ def challenge_floor_scenario(f, stalled_body=False):
            'hot challenge policy did not shorten the local deadline')
     shortened = f.read_record('answer', 'discovery', 'challenge')
     assert shortened['server_not_before'] == before['server_not_before'], shortened
+    assert shortened['next_at'] == floor, shortened
+    assert f.status()['work']['answer']['next_at'] == floor, 'work timing kept the obsolete retry clock'
     assert restriction in f.restrictions(), 'policy reload changed the shared minimum'
     assert len(f.challenge_requests()) == 1, 'policy reload bypassed the server minimum'
+    authority = f.rows('SELECT authority_epoch FROM runtime_authority')[0]['authority_epoch']
     f.stop()
     f.start()  # Keep generation and the authoritative retry fence intact.
-    f.wait(lambda: f.status()['effective_runtime'] is not None, 'restart did not initialize runtime')
+    f.wait(lambda: f.rows('SELECT authority_epoch FROM runtime_authority')[0]['authority_epoch'] != authority,
+           'restart did not establish a new runtime authority')
     restarted = f.read_record('answer', 'discovery', 'challenge')
     assert restarted['server_not_before'] == before['server_not_before'], restarted
+    assert restarted['next_at'] == floor, restarted
+    assert f.status()['work']['answer']['next_at'] == floor, 'restart restored the obsolete retry clock'
     assert restriction in f.restrictions(), 'restart changed the shared minimum'
     assert time.time() < floor, 'fixture did not restart within the server floor'
     assert len(f.challenge_requests()) == 1, 'restart bypassed the server minimum'
@@ -712,7 +726,7 @@ def read_only_assessment_scenario(f, missing_words=False):
     f.configure()
     f.start()  # Fresh account remains globally paused; ordinary bounded reads continue.
     def assessed(lane):
-        return f.status().get('lane_participation', {}).get(lane, {}).get('assessment', {})
+        return f.status().get('lane_participation', {}).get(lane, {}).get('assessment') or {}
     f.wait(lambda: assessed('judge').get('locally_judgeable') is (not missing_words),
            'read-only judge did not hydrate and assess the candidate')
     f.wait(lambda: assessed('answer').get('observed_opportunities') == 1,
@@ -733,7 +747,7 @@ def read_only_assessment_scenario(f, missing_words=False):
     def refreshed_under_pause():
         lane = f.status().get('lane_participation', {}).get('judge', {})
         return (lane.get('stamp', {}).get('lane_control_revision') == ack['desired']['control_revision']
-                and lane.get('assessment', {}).get('locally_judgeable') is (not missing_words))
+                and (lane.get('assessment') or {}).get('locally_judgeable') is (not missing_words))
     f.wait(refreshed_under_pause, 'lane pause incorrectly stopped read-only assessment')
     f.stop()
     assert f.rows('SELECT COUNT(*) AS n FROM operations')[0]['n'] == 0

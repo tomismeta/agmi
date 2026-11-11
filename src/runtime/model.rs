@@ -559,7 +559,11 @@ impl ModelSlot {
         host.store
             .finish_model_attempt(&work.producer.operation, &op, &completion.evidence, event)
     }
-    async fn cancel(&mut self, host: &mut HostAccess) -> Result<()> {
+    async fn cancel(
+        &mut self,
+        host: &mut HostAccess,
+        deadline: tokio::time::Instant,
+    ) -> Result<()> {
         self.collect(host)?;
         let Some(mut work) = self.work.take() else {
             return Ok(());
@@ -569,7 +573,7 @@ impl ModelSlot {
         match &mut work.stage {
             Stage::Preflight { task, .. } | Stage::Running { task, .. } => {
                 task.abort();
-                let _ = task.await;
+                let _ = tokio::time::timeout_at(deadline, task).await;
             }
             Stage::Pending | Stage::Admitting => {}
         }
@@ -690,14 +694,16 @@ impl HostAccess {
     pub(in crate::runtime) async fn cancel_answer_model(
         &mut self,
         slot: &mut AnswerModelSlot,
+        deadline: tokio::time::Instant,
     ) -> Result<()> {
-        slot.0.cancel(self).await
+        slot.0.cancel(self, deadline).await
     }
     pub(in crate::runtime) async fn cancel_grade_model(
         &mut self,
         slot: &mut GradeModelSlot,
+        deadline: tokio::time::Instant,
     ) -> Result<()> {
-        slot.0.cancel(self).await
+        slot.0.cancel(self, deadline).await
     }
 }
 

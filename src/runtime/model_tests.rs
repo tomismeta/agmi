@@ -477,3 +477,252 @@ async fn committed_launch_with_stale_final_bounds_finishes_once_without_spawning
         );
     }
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shutdown_native_cleanup_keeps_original_deadline_and_effect_gates() {
+    use crate::runtime::host::tests::{accept, offer_mine, reply, request};
+    use std::os::unix::fs::PermissionsExt;
+    // The paused worker is process-wide; never stall other concurrently running tests.
+    const ISOLATED: &str = "AGMI_TEST_ISOLATED_NATIVE_CLEANUP";
+    if std::env::var_os(ISOLATED).is_none() {
+        let output = tokio::time::timeout(
+            Duration::from_secs(30),
+            tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "runtime::host::model::tests::shutdown_native_cleanup_keeps_original_deadline_and_effect_gates",
+                    "--nocapture",
+                ])
+                .env(ISOLATED, "1")
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("isolated cleanup regression exceeded its deadline")
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    for (running, native_finished) in [(false, false), (true, false), (true, true)] {
+        for completed in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut config = Config::default();
+            config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
+            config.runtime.shutdown_seconds = 1;
+            config.capabilities.answer.mode = Mode::Active;
+            config.capabilities.answer.timeouts.model_seconds = 20;
+            config.capabilities.mine.mode = Mode::Active;
+            let (temp, mut host, stop) = fixture_with(config);
+            let marker = temp.path().join("native-owner");
+            let executable = temp.path().join("native");
+            let interpreter = temp.path().join("interpreter");
+            let announced = format!(
+                "#!/bin/sh\nprintf '%s\\n%s\\n' \"$$\" \"$PWD\" > '{}.tmp'\nmv '{}.tmp' '{}'\n",
+                marker.display(),
+                marker.display(),
+                marker.display()
+            );
+            let hanging = format!("{announced}exec sleep 60\n");
+            let terminal = json!({"provider":"openai-codex","model":"different-model","reasoning_effort":"high","run_id":"completed-run","output":"{}"});
+            std::fs::write(
+                &interpreter,
+                if native_finished {
+                    format!("{announced}cat >/dev/null\nprintf '%s' '{terminal}'\n")
+                } else {
+                    hanging.clone()
+                },
+            )
+            .unwrap();
+            std::fs::set_permissions(&interpreter, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let command =
+                serde_json::to_string(&vec![interpreter.to_str().unwrap(), "-I", "-c", "fixture"])
+                    .unwrap();
+            std::fs::write(
+                &executable,
+                if running {
+                    format!("#!/bin/sh\nprintf '%s' '{command}'\n")
+                } else {
+                    hanging
+                },
+            )
+            .unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+            host.config.capabilities.answer.model.executable = executable;
+            std::fs::write(&host.config_path, toml::to_string(&host.config).unwrap()).unwrap();
+            host.reload().unwrap();
+            host.store.runtime_state(&host.config, false).unwrap();
+            identity_fixture(&mut host, &listener).await;
+            let release = crate::solver::pause_native_cleanup_for_test().await;
+            let observation = observation(&host, LaneId::Answer);
+            let mut slot = AnswerModelSlot::default();
+            let task = AnswerTask::new(task_request(&host, LaneId::Answer)).unwrap();
+            assert!(
+                host.begin_answer_model(
+                    &mut slot,
+                    task,
+                    "fingerprint".into(),
+                    "8:shutdown-native",
+                    None,
+                    &observation
+                )
+                .unwrap()
+            );
+            let id = slot.0.work.as_ref().unwrap().op.id;
+            if running {
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while slot.pending_work().is_none() {
+                        slot.0.collect(&mut host).unwrap();
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                let key = slot.pending_work().unwrap().key;
+                slot.0
+                    .launch_matched(
+                        &mut host,
+                        key,
+                        observation.clone(),
+                        observation.stamp.lane_config_revision.clone(),
+                    )
+                    .unwrap();
+                assert!(matches!(
+                    slot.0.work.as_ref().unwrap().stage,
+                    Stage::Running { .. }
+                ));
+            }
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !marker.exists() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            if native_finished {
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        let Stage::Running { task, .. } = &slot.0.work.as_ref().unwrap().stage
+                        else {
+                            panic!("inference collector missing");
+                        };
+                        if task.is_finished() {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("assembled native result waited for filesystem cleanup");
+            }
+            let owner = std::fs::read_to_string(&marker).unwrap();
+            let mut owner = owner.lines();
+            let pid: i32 = owner.next().unwrap().parse().unwrap();
+            let scratch = PathBuf::from(owner.next().unwrap());
+            host.lanes.answer = crate::runtime::answer::AnswerLane::with_model_for_test(slot);
+            let effect = host
+                .store
+                .seed_operation_for_test(
+                    LaneId::Mine,
+                    "8:shutdown-effect",
+                    "prepared",
+                    &json!({"solver":request(LaneId::Mine)}),
+                    host.store.control().unwrap(),
+                    &host.config.lane_revision(LaneId::Mine).unwrap(),
+                )
+                .unwrap();
+            offer_mine(&mut host, effect.clone());
+            host.arbitrate().unwrap();
+            let (stream, _) = accept(&listener).await;
+            stop.send(true).unwrap();
+            let config = host.config.clone();
+            let db = rusqlite::Connection::open(config.state_dir.join("state.sqlite3")).unwrap();
+            let observer = async {
+                tokio::time::timeout(Duration::from_millis(500), async {
+                    loop {
+                        let state: String = db
+                            .query_row("SELECT state FROM operations WHERE id=?1", [id], |row| {
+                                row.get(0)
+                            })
+                            .unwrap();
+                        if state != "generating" {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("native bookkeeping waited for scratch cleanup");
+                assert!(scratch.exists());
+                assert!(AccountAdmissionGuard::try_acquire(&config).is_err());
+                assert!(
+                    crate::store::LaneAdmissionGuard::try_acquire(&config, LaneId::Mine).is_err()
+                );
+                if completed {
+                    reply(stream, 200, None, json!({"ok":true,"attested":1})).await;
+                } else {
+                    tokio::time::sleep(Duration::from_millis(1200)).await;
+                    drop(stream);
+                }
+            };
+            let shutdown = async {
+                let started = tokio::time::Instant::now();
+                tokio::time::timeout(Duration::from_millis(1500), host.shutdown())
+                    .await
+                    .expect("native cleanup extended the original deadline")
+                    .unwrap();
+                assert!(started.elapsed() < Duration::from_millis(1500));
+            };
+            tokio::join!(shutdown, observer);
+            assert_eq!(
+                host.store.operation(effect.id).unwrap().unwrap().state,
+                if completed { "completed" } else { "unknown" }
+            );
+            assert_eq!(
+                host.store.operation(id).unwrap().unwrap().state,
+                if running {
+                    "model_unknown"
+                } else {
+                    "prelaunch_failed"
+                }
+            );
+            let completion = attempt(&host, id)["completion"].clone();
+            if native_finished {
+                assert_eq!(completion["reason_code"], "native_provenance_mismatch");
+                assert_eq!(
+                    completion["cancellation"]["local_process_stop"],
+                    "not_requested"
+                );
+            } else {
+                assert_eq!(completion["reason_code"], "interrupted");
+                assert_eq!(completion["cancellation"]["local_process_stop"], "unknown");
+                assert_eq!(
+                    completion["cancellation"]["remote_run_stop"],
+                    if running { "unknown" } else { "not_requested" }
+                );
+            }
+            assert!(AccountAdmissionGuard::try_acquire(&config).is_ok());
+            assert!(crate::store::LaneAdmissionGuard::try_acquire(&config, LaneId::Mine).is_ok());
+            assert!(
+                scratch.exists(),
+                "blocked deletion was reported as completed"
+            );
+            // SAFETY: this PID came from this test's owned native process.
+            assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+            release.send(()).unwrap();
+            assert!(
+                crate::solver::drain_native_cleanup_until(
+                    tokio::time::Instant::now() + Duration::from_secs(5)
+                )
+                .await
+                .unwrap()
+            );
+            assert!(!scratch.exists());
+        }
+    }
+}

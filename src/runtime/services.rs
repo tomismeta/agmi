@@ -53,8 +53,13 @@ macro_rules! common_services {
             pub(super) fn poll_reconciliation(&mut self) -> Result<()> {
                 self.host.poll_reconciliation(LaneId::$lane)
             }
-            pub(super) async fn cancel_reconciliation(&mut self) -> Result<()> {
-                self.host.cancel_reconciliation(LaneId::$lane).await
+            pub(super) async fn cancel_reconciliation(
+                &mut self,
+                deadline: tokio::time::Instant,
+            ) -> Result<()> {
+                self.host
+                    .cancel_reconciliation(LaneId::$lane, deadline)
+                    .await
             }
             pub(super) fn preparation(&mut self) -> Result<Option<Operation>> {
                 self.host.current_preparation(LaneId::$lane)
@@ -180,8 +185,12 @@ impl AnswerServices<'_> {
     ) -> Result<()> {
         self.host.retire_answer_model(slot, key, reason)
     }
-    pub(super) async fn cancel_model(&mut self, slot: &mut AnswerModelSlot) -> Result<()> {
-        self.host.cancel_answer_model(slot).await
+    pub(super) async fn cancel_model(
+        &mut self,
+        slot: &mut AnswerModelSlot,
+        deadline: tokio::time::Instant,
+    ) -> Result<()> {
+        self.host.cancel_answer_model(slot, deadline).await
     }
 }
 impl GradeServices<'_> {
@@ -268,8 +277,12 @@ impl GradeServices<'_> {
     ) -> Result<()> {
         self.host.retire_grade_model(slot, key, reason)
     }
-    pub(super) async fn cancel_model(&mut self, slot: &mut GradeModelSlot) -> Result<()> {
-        self.host.cancel_grade_model(slot).await
+    pub(super) async fn cancel_model(
+        &mut self,
+        slot: &mut GradeModelSlot,
+        deadline: tokio::time::Instant,
+    ) -> Result<()> {
+        self.host.cancel_grade_model(slot, deadline).await
     }
 }
 impl MineServices<'_> {

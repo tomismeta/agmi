@@ -40,10 +40,10 @@ impl ReadFlight {
     pub(in crate::runtime) fn completed(&self) -> Result<Instant> {
         self.finished.context("read completion timestamp missing")
     }
-    pub(in crate::runtime) async fn abort(&mut self) {
+    pub(in crate::runtime) async fn abort(&mut self, deadline: tokio::time::Instant) {
         self.cancelled = true;
         self.task.abort();
-        let _ = (&mut self.task).await;
+        let _ = tokio::time::timeout_at(deadline, &mut self.task).await;
     }
 }
 
@@ -120,9 +120,13 @@ impl Recovery {
         Ok(())
     }
 
-    pub(in crate::runtime) async fn cancel(&mut self, runtime: &mut HostAccess) -> Result<()> {
+    pub(in crate::runtime) async fn cancel(
+        &mut self,
+        runtime: &mut HostAccess,
+        deadline: tokio::time::Instant,
+    ) -> Result<()> {
         for read in &mut self.reads {
-            read.flight.abort().await;
+            read.flight.abort(deadline).await;
         }
         self.collect(runtime)?;
         for read in self.reads.drain(..) {
@@ -337,10 +341,7 @@ impl HostAccess {
                 )
             }
         };
-        let backoff = self.store.fail_read(key, base, cap, jitter, None)?;
-        if let ReadKey::Discovery { lane, .. } = key {
-            self.store.defer_until(*lane, backoff.next_at)?;
-        }
+        self.store.fail_read(key, base, cap, jitter, None)?;
         Ok(())
     }
 

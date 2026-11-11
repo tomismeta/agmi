@@ -17,7 +17,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 
+mod cleanup;
 pub mod contract;
+use cleanup::Scratch;
+pub(crate) use cleanup::drain_native_cleanup_until;
+#[cfg(test)]
+pub(crate) use cleanup::pause_native_cleanup_for_test;
 mod launch;
 pub use launch::{
     ExecutionDeadline, InferenceFlight, InferenceStart, PendingLaunch, PreflightCompletion,
@@ -124,6 +129,7 @@ impl std::fmt::Display for NativeFailure {
 }
 impl std::error::Error for NativeFailure {}
 
+#[derive(Clone, Copy)]
 enum NativeProtocol {
     Discovery,
     Hermes,
@@ -527,16 +533,17 @@ fn spawn_native(executable: &Path, args: &[String], cwd: &Path) -> Result<OwnedC
     })
 }
 
+#[cfg(test)]
 async fn collect_native(
-    owner: OwnedChild,
+    mut owner: OwnedChild,
     input: Vec<u8>,
     protocol: NativeProtocol,
 ) -> Result<Vec<u8>> {
-    collect_native_evidence(owner, input, protocol, &mut Default::default()).await
+    collect_native_evidence(&mut owner, input, protocol, &mut Default::default()).await
 }
 
 async fn collect_native_evidence(
-    mut owner: OwnedChild,
+    owner: &mut OwnedChild,
     input: Vec<u8>,
     protocol: NativeProtocol,
     evidence: &mut contract::NativeReportedEvidence,
@@ -626,25 +633,6 @@ async fn collect_native_evidence(
     Ok(output)
 }
 
-struct Scratch(PathBuf);
-impl Scratch {
-    fn new() -> Result<Self> {
-        static SERIAL: AtomicU64 = AtomicU64::new(0);
-        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "agmi-model-{}-{timestamp}-{}",
-            std::process::id(),
-            SERIAL.fetch_add(1, Ordering::Relaxed)
-        ));
-        private_directory(&path)?;
-        Ok(Self(path))
-    }
-}
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 fn private_directory(path: &Path) -> Result<()> {
     let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]

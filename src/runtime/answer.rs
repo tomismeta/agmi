@@ -36,6 +36,13 @@ pub(super) struct AnswerLane {
     pub(super) ready: Option<ReadyEffect>,
 }
 impl AnswerLane {
+    #[cfg(test)]
+    pub(in crate::runtime) fn with_model_for_test(model: AnswerModelSlot) -> Self {
+        Self {
+            model,
+            ..Self::default()
+        }
+    }
     pub(super) fn busy(&self) -> bool {
         self.read.is_some() || self.model.busy()
     }
@@ -251,16 +258,20 @@ impl AnswerLane {
         Ok(())
     }
 
-    pub(super) async fn cancel(&mut self, services: &mut AnswerServices<'_>) -> Result<()> {
+    pub(super) async fn cancel(
+        &mut self,
+        services: &mut AnswerServices<'_>,
+        deadline: tokio::time::Instant,
+    ) -> Result<()> {
         if let Some(read) = self.read.as_mut() {
-            read.flight.abort().await;
+            read.flight.abort(deadline).await;
         }
         self.collect(services)?;
         if let Some(read) = self.read.take() {
             services.cancel_read(&read.flight)?;
         }
-        services.cancel_reconciliation().await?;
-        services.cancel_model(&mut self.model).await
+        services.cancel_reconciliation(deadline).await?;
+        services.cancel_model(&mut self.model, deadline).await
     }
 }
 

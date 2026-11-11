@@ -182,11 +182,17 @@ impl PreflightFlight {
     pub fn preflight_started_at(&self) -> i64 {
         self.started_at
     }
-    pub async fn collect(self) -> PreflightCompletion {
+    pub async fn collect(mut self) -> PreflightCompletion {
         let facts = evidence(NativePhase::Preflight, Some(self.started_at), None);
         let deadline = self.deadline;
-        let operation = async move {
-            let bytes = collect_native(self.child, Vec::new(), NativeProtocol::Discovery).await?;
+        let operation = async {
+            let bytes = collect_native_evidence(
+                &mut self.child,
+                Vec::new(),
+                NativeProtocol::Discovery,
+                &mut Default::default(),
+            )
+            .await?;
             let (executable, args, protocol) = match self.model.harness {
                 Harness::Hermes => {
                     let runtime: Vec<String> = serde_json::from_slice(&bytes)
@@ -250,21 +256,27 @@ impl PreflightFlight {
                 !remaining.is_zero(),
                 SolverNotStarted("model_deadline_exceeded")
             );
-            Ok(PendingLaunch {
-                model: self.model,
-                request: self.request,
-                digest: self.digest,
-                input,
-                executable,
-                args,
-                protocol,
-                scratch: self.scratch,
-                deadline: self.execution_deadline,
-                preflight_started_at: self.started_at,
-            })
+            Ok((executable, args, protocol, input))
         };
-        match tokio::time::timeout_at(deadline, operation).await {
-            Ok(Ok(pending)) => PreflightCompletion::Pending(pending),
+        let result = tokio::time::timeout_at(deadline, operation).await;
+        // The child/process group is stopped before its workspace is handed off,
+        // including when collection fails. Cancellation drops self in field order.
+        drop(self.child);
+        match result {
+            Ok(Ok((executable, args, protocol, input))) => {
+                PreflightCompletion::Pending(PendingLaunch {
+                    model: self.model,
+                    request: self.request,
+                    digest: self.digest,
+                    input,
+                    executable,
+                    args,
+                    protocol,
+                    scratch: self.scratch,
+                    deadline: self.execution_deadline,
+                    preflight_started_at: self.started_at,
+                })
+            }
             Ok(Err(error)) => PreflightCompletion::Finished(failed(error, facts)),
             Err(_) => PreflightCompletion::Finished(failed(
                 NativeFailure("model_deadline_exceeded").into(),
@@ -319,7 +331,7 @@ impl InferenceFlight {
     pub fn inference_spawned_at(&self) -> i64 {
         self.spawned_at
     }
-    pub async fn collect(self) -> NativeCompletion {
+    pub async fn collect(mut self) -> NativeCompletion {
         let mut facts = evidence(
             NativePhase::Inference,
             Some(self.pending.preflight_started_at),
@@ -336,11 +348,15 @@ impl InferenceFlight {
             .into(),
             source: EvidenceSource::AdapterContract,
         });
-        let p = self.pending;
+        let p = &mut self.pending;
         let operation = async {
-            let bytes =
-                collect_native_evidence(self.child, p.input, p.protocol, &mut facts.reported)
-                    .await?;
+            let bytes = collect_native_evidence(
+                &mut self.child,
+                std::mem::take(&mut p.input),
+                p.protocol,
+                &mut facts.reported,
+            )
+            .await?;
             let value: Value = serde_json::from_slice(&bytes)
                 .map_err(|_| NativeFailure("native_envelope_invalid"))?;
             let (provider, model, run_id, output) = match p.model.harness {
@@ -407,7 +423,8 @@ impl InferenceFlight {
             ))
         };
         let result = tokio::time::timeout_at(self.deadline.at, operation).await;
-        drop(p.scratch);
+        drop(self.child);
+        drop(self.pending.scratch);
         match result {
             Ok(Ok(artifact)) => {
                 facts.execution = NativeExecution::Completed;

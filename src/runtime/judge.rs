@@ -28,10 +28,16 @@ impl Target {
         }
     }
 }
-struct Inventory {
-    response: Response,
+struct InventorySource {
     observation: Observation,
     completed_at: i64,
+    rows: std::ops::Range<usize>,
+}
+struct Inventory {
+    response: Response,
+    ids: Vec<String>,
+    // Each candidate retains the page's original authority and freshness deadline.
+    sources: [Option<InventorySource>; 4],
     pages: usize,
     offset: u64,
     complete: bool,
@@ -40,6 +46,24 @@ struct Inventory {
     eligible_candidates: usize,
     exclusions: std::collections::BTreeMap<&'static str, usize>,
     target: Option<Target>,
+}
+impl Inventory {
+    fn source(&self, index: usize) -> &InventorySource {
+        self.sources
+            .iter()
+            .flatten()
+            .find(|source| source.rows.contains(&index))
+            .expect("candidate page source")
+    }
+
+    fn candidate_source(&self, id: &str) -> Result<&InventorySource> {
+        let index = self
+            .ids
+            .iter()
+            .position(|candidate| candidate == id)
+            .context("candidate source missing")?;
+        Ok(self.source(index))
+    }
 }
 enum JudgeReadKind {
     Page,
@@ -84,14 +108,14 @@ impl JudgeLane {
         }
         match read.kind {
             JudgeReadKind::Page => {
-                let Some(response) = response else {
+                let Some(mut response) = response else {
                     if let Some(inventory) = self.inventory.as_mut() {
                         inventory.more = false;
                         inventory.usable = false;
                     }
                     return Ok(());
                 };
-                let Ok(ids) = assignment_ids(&response) else {
+                let Ok(mut ids) = assignment_ids(&response) else {
                     services.evaluate_inventory(false)?;
                     if let Some(inventory) = self.inventory.as_mut() {
                         inventory.more = false;
@@ -99,25 +123,37 @@ impl JudgeLane {
                     }
                     return Ok(());
                 };
-                services.evaluate_inventory(true)?;
+                let has_more = response.body["has_more"].as_bool();
                 let rows = response.body["assignments"]
-                    .as_array()
+                    .as_array_mut()
                     .context("assignment rows missing")?;
-                let complete = response.body["has_more"].as_bool() == Some(false);
-                let more = response.body["has_more"].as_bool() == Some(true) && !rows.is_empty();
+                let complete = has_more == Some(false);
+                let more = has_more == Some(true) && !rows.is_empty();
                 if let Some(inventory) = self.inventory.as_mut() {
                     let known: std::collections::HashSet<_> =
-                        assignment_ids(&inventory.response)?.into_iter().collect();
+                        inventory.ids.iter().map(String::as_str).collect();
                     let mut added = 0;
-                    for (id, row) in ids.iter().zip(rows) {
-                        if !known.contains(id) {
+                    for (id, row) in ids.iter().zip(rows.iter_mut()) {
+                        if !known.contains(id.as_str()) {
                             inventory.response.body["assignments"]
                                 .as_array_mut()
                                 .context("inventory rows missing")?
-                                .push(row.clone());
+                                .push(row.take());
                             added += 1;
                         }
                     }
+                    ids.retain(|id| !known.contains(id.as_str()));
+                    drop(known);
+                    inventory.ids.append(&mut ids);
+                    let end = inventory.response.body["assignments"]
+                        .as_array()
+                        .context("inventory rows missing")?
+                        .len();
+                    inventory.sources[inventory.pages] = Some(InventorySource {
+                        observation,
+                        completed_at: read.flight.completed_at,
+                        rows: end - added..end,
+                    });
                     inventory.pages += 1;
                     inventory.offset = inventory.offset.saturating_add(rows.len() as u64);
                     inventory.complete = complete;
@@ -127,8 +163,17 @@ impl JudgeLane {
                     let offset = rows.len() as u64;
                     self.inventory = Some(Inventory {
                         response,
-                        observation,
-                        completed_at: read.flight.completed_at,
+                        ids,
+                        sources: [
+                            Some(InventorySource {
+                                observation,
+                                completed_at: read.flight.completed_at,
+                                rows: 0..offset as usize,
+                            }),
+                            None,
+                            None,
+                            None,
+                        ],
                         pages: 1,
                         offset,
                         complete,
@@ -140,12 +185,36 @@ impl JudgeLane {
                     });
                 }
                 if let Some(inventory) = self.inventory.as_mut()
-                    && inventory.target.as_ref().is_some_and(|target| {
-                        assignment_ids(&inventory.response)
-                            .is_ok_and(|ids| ids.iter().any(|id| id == target.id()))
-                    })
+                    && inventory
+                        .target
+                        .as_ref()
+                        .is_some_and(|target| inventory.ids.iter().any(|id| id == target.id()))
                 {
                     inventory.more = false;
+                }
+                // Bounded and targeted traversals are evidence, not whole-read recovery.
+                if let Some(inventory) = self.inventory.as_ref() {
+                    let mut recovered = inventory.complete && inventory.usable;
+                    for source in inventory.sources.iter().flatten() {
+                        recovered &= services.observation_current(&source.observation)?;
+                    }
+                    if recovered {
+                        services.evaluate_inventory(true)?;
+                    }
+                }
+                if let Some(selected) = self.selected.as_ref()
+                    && services.observation_current(&selected.observation)?
+                {
+                    self.report(
+                        services,
+                        Some(!selected.assignment.words.is_empty()),
+                        selected
+                            .assignment
+                            .words
+                            .is_empty()
+                            .then_some("required_words_absent"),
+                        Some(&selected.assignment.id),
+                    )?;
                 }
             }
             JudgeReadKind::Hydration { id } => {
@@ -157,10 +226,14 @@ impl JudgeLane {
         Ok(())
     }
     fn inventory_current(&self, services: &GradeServices<'_>) -> Result<bool> {
-        match &self.inventory {
-            Some(inventory) => services.observation_current(&inventory.observation),
-            None => Ok(false),
+        if let Some(inventory) = &self.inventory {
+            for source in inventory.sources.iter().flatten() {
+                if services.observation_current(&source.observation)? {
+                    return Ok(true);
+                }
+            }
         }
+        Ok(false)
     }
     fn start_inventory(
         &mut self,
@@ -261,6 +334,28 @@ impl JudgeLane {
                 services.start_identity()?;
             }
         }
+        if let Some(selected) = self.selected.as_ref()
+            && (!services.observation_current(&selected.observation)?
+                || (!self.model.occupied()
+                    && services
+                        .assignment_blocker(&selected.assignment.id)?
+                        .is_some()))
+        {
+            self.selected = None;
+        }
+        // Consume completed inventory before an overdue poll can replace it.
+        // Assessment and bounded hydration are read-only in every non-off mode.
+        if self.read.is_none()
+            && self.selected.is_none()
+            && services.config().mode != Mode::Off
+            && (!self.model.occupied()
+                || self.inventory.as_ref().is_some_and(|inventory| {
+                    matches!(inventory.target.as_ref(), Some(Target::Pending(..)))
+                }))
+        {
+            self.select(services)?;
+        }
+        self.prepare(services)?;
         if self.read.is_none() && self.inventory.as_ref().is_some_and(|i| i.more) {
             let offset = self.inventory.as_ref().expect("paged inventory").offset;
             if let Some(flight) = services.begin_discovery(Some(offset))? {
@@ -274,15 +369,12 @@ impl JudgeLane {
         if self.read.is_none()
             && services.discovery_allowed()?
             && self.inventory.as_ref().is_none_or(|i| i.target.is_none())
+            && (!services.active()? || (self.selected.is_none() && !self.model.occupied()))
             && self.start_inventory(services, None)?
         {
             services.discovered()?;
         }
-        // Assessment and bounded hydration are read-only in every non-off mode.
-        if self.read.is_none() && self.selected.is_none() && services.config().mode != Mode::Off {
-            self.select(services)?;
-        }
-        self.prepare(services)
+        Ok(())
     }
     fn candidates(
         &self,
@@ -292,19 +384,22 @@ impl JudgeLane {
         let Some(inventory) = &self.inventory else {
             return Ok((Vec::new(), exclusions));
         };
-        let ids = assignment_ids(&inventory.response)?;
-        if let Some(target) = &inventory.target {
-            return Ok((
-                ids.into_iter().filter(|id| id == target.id()).collect(),
-                exclusions,
-            ));
-        }
         let rows = inventory.response.body["assignments"]
             .as_array()
             .context("assignment rows missing")?;
         let mut ranked = Vec::new();
-        for (id, row) in ids.into_iter().zip(rows) {
-            if let Some(reason) = services.assignment_blocker(&id)? {
+        for (index, (id, row)) in inventory.ids.iter().zip(rows).enumerate() {
+            if let Some(target) = &inventory.target
+                && id != target.id()
+            {
+                continue;
+            }
+            let source = inventory.source(index);
+            if !services.observation_current(&source.observation)? {
+                *exclusions.entry("observation_stale").or_insert(0) += 1;
+            } else if inventory.target.is_none()
+                && let Some(reason) = services.assignment_blocker(id)?
+            {
                 *exclusions.entry(reason).or_insert(0) += 1;
             } else {
                 ranked.push((
@@ -316,13 +411,17 @@ impl JudgeLane {
             }
         }
         ranked.sort_unstable();
-        Ok((ranked.into_iter().map(|(_, id)| id).collect(), exclusions))
+        Ok((
+            ranked.into_iter().map(|(_, id)| id.clone()).collect(),
+            exclusions,
+        ))
     }
     fn report(
         &self,
         services: &GradeServices<'_>,
         selected: Option<bool>,
         reason: Option<&'static str>,
+        candidate: Option<&str>,
     ) -> Result<()> {
         let Some(inventory) = &self.inventory else {
             return Ok(());
@@ -330,9 +429,21 @@ impl JudgeLane {
         let count = inventory.response.body["assignments"]
             .as_array()
             .map_or(0, Vec::len);
-        services.participation(&inventory.observation, &json!({"source":"validated_assignment_inventory","observed_at":inventory.completed_at,
-            "valid_until":inventory.completed_at.saturating_add(services.config().timeouts.read_http_seconds as i64),
-            "completeness":if inventory.complete && inventory.usable {"complete"} else {"bounded_partial"},
+        let source = match candidate {
+            Some(id) => inventory.candidate_source(id)?,
+            None => inventory.sources[inventory.pages - 1]
+                .as_ref()
+                .context("inventory source missing")?,
+        };
+        let mut complete = inventory.complete && inventory.usable;
+        let mut valid_until = source.observation.admit_before_unix;
+        for source in inventory.sources.iter().flatten() {
+            complete &= services.observation_current(&source.observation)?;
+            valid_until = valid_until.min(source.observation.admit_before_unix);
+        }
+        services.participation(&source.observation, &json!({"source":"validated_assignment_inventory","observed_at":source.completed_at,
+            "valid_until":valid_until,
+            "completeness":if complete {"complete"} else {"bounded_partial"},
             "observed_opportunities":count,"eligible_candidates":inventory.eligible_candidates,"exclusions":inventory.exclusions,"locally_judgeable":selected,
             "assessment_reason":reason,"assessment_creates_model_work":false,"outcome":"unobserved"}))
     }
@@ -346,12 +457,13 @@ impl JudgeLane {
         };
         inventory.eligible_candidates = candidates.len();
         inventory.exclusions = exclusions;
-        if inventory.more {
-            return Ok(());
-        }
         if candidates.is_empty() {
             if let Some(target) = inventory.target.clone() {
-                if inventory.complete && inventory.usable {
+                let mut complete = inventory.complete && inventory.usable;
+                for source in inventory.sources.iter().flatten() {
+                    complete &= services.observation_current(&source.observation)?;
+                }
+                if complete {
                     match target {
                         Target::Prepared(op) => services
                             .retire_unsent(&services.binding(&op)?, "request_no_longer_current")?,
@@ -362,13 +474,15 @@ impl JudgeLane {
                         )?,
                     }
                     self.inventory = None;
+                } else if !inventory.more {
+                    self.inventory = None;
                 }
-            } else {
-                self.report(services, Some(false), Some("excluded_or_unavailable"))?;
+            } else if !inventory.more {
+                self.report(services, Some(false), Some("excluded_or_unavailable"), None)?;
             }
             return Ok(());
         }
-        self.report(services, None, Some("assessment_pending"))?;
+        self.report(services, None, Some("assessment_pending"), None)?;
         for id in candidates {
             let inventory = self.inventory.as_ref().expect("selection inventory");
             match assignment_needs_hydration(&inventory.response, &id) {
@@ -392,7 +506,7 @@ impl JudgeLane {
                 }
                 Err(_) => {
                     services.evaluate_assignment(&id, false)?;
-                    self.report(services, None, Some("assignment_unreadable"))?;
+                    self.report(services, None, Some("assignment_unreadable"), Some(&id))?;
                 }
             }
         }
@@ -404,15 +518,19 @@ impl JudgeLane {
         id: &str,
         hydrated: Option<&Response>,
     ) -> Result<()> {
-        if !self.inventory_current(services)? || services.assignment_excluded(id) {
+        if services.assignment_excluded(id) {
             return Ok(());
         }
         let inventory = self.inventory.as_ref().expect("assignment inventory");
+        let source = inventory.candidate_source(id)?;
+        if !services.observation_current(&source.observation)? {
+            return Ok(());
+        }
         let assignment = match parse_selected_assignment(&inventory.response, id, hydrated) {
             Ok(assignment) => assignment,
             Err(_) => {
                 services.evaluate_assignment(id, false)?;
-                self.report(services, None, Some("assignment_unreadable"))?;
+                self.report(services, None, Some("assignment_unreadable"), Some(id))?;
                 return Ok(());
             }
         };
@@ -433,7 +551,7 @@ impl JudgeLane {
                         self.ready = Some(services.emit_ready(
                             intent,
                             binding,
-                            inventory.observation.clone(),
+                            source.observation.clone(),
                         )?);
                     } else {
                         services.retire_unsent(&binding, "request_no_longer_current")?;
@@ -446,7 +564,7 @@ impl JudgeLane {
                         let decision = match_pending(
                             &assignment,
                             pending,
-                            inventory.observation.clone(),
+                            source.observation.clone(),
                             &services.lane_revision()?,
                             true,
                         );
@@ -462,7 +580,7 @@ impl JudgeLane {
                         if self.model.pending_work().is_some() {
                             self.selected = Some(Selected {
                                 assignment,
-                                observation: inventory.observation.clone(),
+                                observation: source.observation.clone(),
                             });
                             return Ok(());
                         }
@@ -476,10 +594,11 @@ impl JudgeLane {
                 services,
                 Some(judgeable),
                 (!judgeable).then_some("required_words_absent"),
+                Some(id),
             )?;
             self.selected = Some(Selected {
                 assignment,
-                observation: inventory.observation.clone(),
+                observation: source.observation.clone(),
             });
         }
         Ok(())
@@ -497,7 +616,9 @@ impl JudgeLane {
             return Ok(());
         };
         if !services.observation_current(&selected.observation)?
-            || services.assignment_excluded(&selected.assignment.id)
+            || services
+                .assignment_blocker(&selected.assignment.id)?
+                .is_some()
         {
             self.selected = None;
             return Ok(());
@@ -510,26 +631,30 @@ impl JudgeLane {
             return Ok(());
         }
         let task = services.task(&selected.assignment)?;
-        if services.begin_model(
+        // Retain the bound input through preflight and pending admission. The
+        // generating operation belongs to this slot, not a competing attempt.
+        services.begin_model(
             &mut self.model,
             task,
             &selected.assignment.id,
             &selected.observation,
-        )? {
-            self.selected = None;
-        }
+        )?;
         Ok(())
     }
-    pub(super) async fn cancel(&mut self, services: &mut GradeServices<'_>) -> Result<()> {
+    pub(super) async fn cancel(
+        &mut self,
+        services: &mut GradeServices<'_>,
+        deadline: tokio::time::Instant,
+    ) -> Result<()> {
         if let Some(read) = self.read.as_mut() {
-            read.flight.abort().await;
+            read.flight.abort(deadline).await;
         }
         self.collect(services)?;
         if let Some(read) = self.read.take() {
             services.cancel_read(&read.flight)?;
         }
-        services.cancel_reconciliation().await?;
-        services.cancel_model(&mut self.model).await
+        services.cancel_reconciliation(deadline).await?;
+        services.cancel_model(&mut self.model, deadline).await
     }
 }
 fn match_pending(
@@ -569,7 +694,472 @@ pub(super) fn assignment_matches(assignment: &Assignment, request: &SolverReques
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+    use crate::runtime::host::{HostAccess, tests};
     use crate::solver::contract::ModelSelection;
+    use crate::store::now;
+
+    fn paged_inventory(runtime: &HostAccess, count: usize) -> Inventory {
+        let mut sources = [None, None, None, None];
+        let mut rows = Vec::new();
+        for (index, source) in sources.iter_mut().enumerate().take(count) {
+            rows.push(json!({
+                "answer_txid": format!("{:064x}", index + 1),
+                "answer_epoch": 8,
+                "answer": "burning candidate",
+                "words": ["burn"],
+                "pending_meta": {"expires_at_epoch": index + 10},
+            }));
+            *source = Some(InventorySource {
+                observation: tests::observation(runtime, LaneId::Judge),
+                completed_at: now(),
+                rows: index..index + 1,
+            });
+        }
+        Inventory {
+            ids: rows
+                .iter()
+                .map(|row| row["answer_txid"].as_str().unwrap().to_owned())
+                .collect(),
+            response: Response {
+                status: 200,
+                body: json!({"assignments": rows, "has_more": true}),
+                retry_after_seconds: None,
+                read_failure: None,
+            },
+            sources,
+            pages: count,
+            offset: count as u64,
+            complete: false,
+            more: count < 4,
+            usable: true,
+            eligible_candidates: 0,
+            exclusions: Default::default(),
+            target: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_page_is_assessed_before_next_read_and_hydration_cannot_renew_it() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = Config::default();
+        config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
+        config.capabilities.judge.mode = Mode::ReadOnly;
+        let (_temp, mut runtime, _stop) = tests::fixture_with(config);
+        tests::store(&mut runtime)
+            .defer(LaneId::Judge, 3600)
+            .unwrap();
+        let inventory = paged_inventory(&runtime, 1);
+        let original_deadline = inventory.source(0).observation.admit_before;
+        let mut lane = JudgeLane {
+            inventory: Some(inventory),
+            ..Default::default()
+        };
+        let mut services = GradeServices::new(&mut runtime);
+        lane.plan(&mut services).unwrap();
+        let selected = lane
+            .selected
+            .as_ref()
+            .expect("first page assessed immediately");
+        assert_eq!(selected.observation.admit_before, original_deadline);
+        assert!(
+            matches!(
+                lane.read.as_ref().map(|read| &read.kind),
+                Some(JudgeReadKind::Page)
+            ),
+            "assessment must precede the next page, not await the whole traversal"
+        );
+        lane.cancel(
+            &mut services,
+            tokio::time::Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        lane.selected = None;
+        lane.inventory.as_mut().unwrap().more = true;
+        lane.inventory.as_mut().unwrap().response.body["assignments"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("answer_epoch");
+        lane.plan(&mut services).unwrap();
+        assert!(matches!(
+            lane.read.as_ref().map(|read| &read.kind),
+            Some(JudgeReadKind::Hydration { .. })
+        ));
+        lane.cancel(
+            &mut services,
+            tokio::time::Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        let id = format!("{:064x}", 1);
+        let hydration = Response {
+            status: 200,
+            body: json!({"id": id, "body": {
+                "type": "challenge", "epoch": 8, "words": ["burn"],
+                "answer": "burning candidate"
+            }}),
+            retry_after_seconds: None,
+            read_failure: None,
+        };
+        lane.accept_assignment(&mut services, &id, Some(&hydration))
+            .unwrap();
+        assert_eq!(
+            lane.selected.as_ref().unwrap().observation.admit_before,
+            original_deadline,
+            "successful hydration retains its page's deadline"
+        );
+        lane.selected = None;
+        lane.inventory.as_mut().unwrap().sources[0]
+            .as_mut()
+            .unwrap()
+            .observation
+            .admit_before = Instant::now() - Duration::from_secs(1);
+        lane.accept_assignment(&mut services, &id, Some(&hydration))
+            .unwrap();
+        assert!(
+            lane.selected.is_none(),
+            "hydration must not renew an expired page"
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_pages_preserve_each_candidate_deadline_and_cannot_prove_stale_absence() {
+        let mut config = Config::default();
+        config.capabilities.judge.mode = Mode::ReadOnly;
+        config.capabilities.judge.timeouts.read_http_seconds = 15;
+        let (_temp, mut runtime, _stop) = tests::fixture_with(config);
+        let mut inventory = paged_inventory(&runtime, 4);
+        // Four six-second reads: at page four, page one is eighteen seconds old.
+        let current = Instant::now();
+        let wall = now();
+        for (index, source) in inventory.sources.iter_mut().flatten().enumerate() {
+            let age = (3 - index) as u64 * 6;
+            source.completed_at = wall - age as i64;
+            source.observation.admit_before =
+                current - Duration::from_secs(age) + Duration::from_secs(15);
+            source.observation.admit_before_unix = source.completed_at + 15;
+        }
+        inventory.complete = true;
+        let second_deadline = inventory.source(1).observation.admit_before;
+        let mut lane = JudgeLane {
+            inventory: Some(inventory),
+            ..Default::default()
+        };
+        {
+            let mut services = GradeServices::new(&mut runtime);
+            lane.select(&mut services).unwrap();
+        }
+        let selected = lane.selected.as_ref().unwrap();
+        assert_eq!(selected.assignment.id, format!("{:064x}", 2));
+        assert_eq!(selected.observation.admit_before, second_deadline);
+        assert_eq!(
+            lane.inventory
+                .as_ref()
+                .unwrap()
+                .exclusions
+                .get("observation_stale"),
+            Some(&1)
+        );
+        let revision = GradeServices::new(&mut runtime).lane_revision().unwrap();
+        let store = tests::store(&mut runtime);
+        let op = store
+            .seed_operation_for_test(
+                LaneId::Judge,
+                &"f".repeat(64),
+                "prepared",
+                &json!({}),
+                store.control().unwrap(),
+                &revision,
+            )
+            .unwrap();
+        lane.selected = None;
+        lane.inventory.as_mut().unwrap().target = Some(Target::Prepared(op.clone()));
+        lane.select(&mut GradeServices::new(&mut runtime)).unwrap();
+        assert!(
+            lane.inventory.is_none(),
+            "stale absence requires rediscovery"
+        );
+        assert_eq!(
+            tests::store(&mut runtime)
+                .operation(op.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "prepared"
+        );
+    }
+
+    #[tokio::test]
+    async fn selected_candidate_entering_model_cooldown_is_replaced() {
+        let mut config = Config::default();
+        config.capabilities.judge.mode = Mode::ReadOnly;
+        let (_temp, mut runtime, _stop) = tests::fixture_with(config);
+        tests::store(&mut runtime)
+            .defer(LaneId::Judge, 3600)
+            .unwrap();
+        let mut inventory = paged_inventory(&runtime, 2);
+        inventory.more = false;
+        inventory.complete = true;
+        let mut lane = JudgeLane {
+            inventory: Some(inventory),
+            ..Default::default()
+        };
+        lane.select(&mut GradeServices::new(&mut runtime)).unwrap();
+        let first = lane.selected.as_ref().unwrap().assignment.id.clone();
+        let revision = GradeServices::new(&mut runtime).lane_revision().unwrap();
+        let store = tests::store(&mut runtime);
+        let mut op = store
+            .seed_operation_for_test(
+                LaneId::Judge,
+                &first,
+                "generating",
+                &json!({}),
+                store.control().unwrap(),
+                &revision,
+            )
+            .unwrap();
+        op.state = "prelaunch_failed".into();
+        op.next_at = runtime.deadline_now() + 3600;
+        tests::store(&mut runtime)
+            .seed_transition_for_test(&op, "fixture_model_cooldown")
+            .unwrap();
+        lane.plan(&mut GradeServices::new(&mut runtime)).unwrap();
+        assert_eq!(
+            lane.selected.as_ref().unwrap().assignment.id,
+            format!("{:064x}", 2)
+        );
+        assert_eq!(
+            lane.inventory
+                .as_ref()
+                .unwrap()
+                .exclusions
+                .get("model_retry_cooldown"),
+            Some(&1)
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_retries_preserve_inventory_failure_and_can_continue_paging() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = Config::default();
+        config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
+        config.capabilities.judge.mode = Mode::ReadOnly;
+        let (temp, mut runtime, _stop) = tests::fixture_with(config);
+        let config = Config::load(&temp.path().join("config.toml")).unwrap();
+        let page = |index: usize, more: bool| {
+            let inventory = paged_inventory(&runtime, index);
+            json!({"assignments":[inventory.response.body["assignments"][index - 1].clone()],
+                "has_more":more})
+        };
+        let bodies = vec![
+            page(1, true),
+            json!({"assignments":"malformed"}),
+            page(1, true),
+            page(2, true),
+            page(3, true),
+            page(4, true),
+            page(1, true),
+            page(1, false),
+        ];
+        let server = tokio::spawn(async move {
+            for body in bodies {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                assert!(stream.read(&mut request).await.unwrap() > 0);
+                let body = body.to_string();
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        async fn collect_page(lane: &mut JudgeLane, runtime: &mut HostAccess) {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                &mut lane.read.as_mut().expect("page admitted").flight.task,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            lane.collect(&mut GradeServices::new(runtime)).unwrap();
+        }
+        let key = HostAccess::discovery_key(LaneId::Judge);
+        let mut lane = JudgeLane::default();
+        assert!(
+            lane.start_inventory(&mut GradeServices::new(&mut runtime), None)
+                .unwrap()
+        );
+        collect_page(&mut lane, &mut runtime).await;
+        lane.plan(&mut GradeServices::new(&mut runtime)).unwrap();
+        collect_page(&mut lane, &mut runtime).await;
+        assert!(!lane.inventory.as_ref().unwrap().usable);
+        assert_eq!(
+            tests::store(&mut runtime)
+                .read_backoff(&key)
+                .unwrap()
+                .failures,
+            1
+        );
+        // Move only the elapsed retry deadline; keep the failed traversal evidence.
+        let db = rusqlite::Connection::open(config.state_dir.join("state.sqlite3")).unwrap();
+        db.execute(
+            "UPDATE read_state SET local_next_at=?1 WHERE owner='judge' AND purpose='discovery'",
+            [now() - 1],
+        )
+        .unwrap();
+        let failure = tests::store(&mut runtime).read_backoff(&key).unwrap();
+        assert!(
+            lane.start_inventory(&mut GradeServices::new(&mut runtime), None)
+                .unwrap()
+        );
+        for index in 0..4 {
+            collect_page(&mut lane, &mut runtime).await;
+            assert_eq!(
+                tests::store(&mut runtime).read_backoff(&key).unwrap(),
+                failure
+            );
+            if index < 3 {
+                lane.plan(&mut GradeServices::new(&mut runtime)).unwrap();
+                assert!(
+                    lane.read.is_some(),
+                    "retained failure must not deadlock pages"
+                );
+            }
+        }
+        assert!(!lane.inventory.as_ref().unwrap().more);
+        assert!(!lane.inventory.as_ref().unwrap().complete);
+        let revision = GradeServices::new(&mut runtime).lane_revision().unwrap();
+        let store = tests::store(&mut runtime);
+        let op = store
+            .seed_operation_for_test(
+                LaneId::Judge,
+                &format!("{:064x}", 1),
+                "prepared",
+                &json!({}),
+                store.control().unwrap(),
+                &revision,
+            )
+            .unwrap();
+        assert!(
+            lane.start_inventory(
+                &mut GradeServices::new(&mut runtime),
+                Some(Target::Prepared(op))
+            )
+            .unwrap()
+        );
+        collect_page(&mut lane, &mut runtime).await;
+        assert!(!lane.inventory.as_ref().unwrap().more);
+        assert!(!lane.inventory.as_ref().unwrap().complete);
+        assert_eq!(
+            tests::store(&mut runtime).read_backoff(&key).unwrap(),
+            failure
+        );
+        let status = tests::store(&mut runtime).status(&config).unwrap();
+        let discovery = status["reads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|read| read["owner"] == "judge" && read["purpose"] == "discovery")
+            .unwrap();
+        assert_eq!(discovery["failure_category"], "unusable_response");
+        assert!(discovery["last_success_at"].is_null());
+        for (status, category) in [(None, Some("timeout")), (Some(200), None)] {
+            tests::store(&mut runtime)
+                .read_finished(&key, status, category)
+                .unwrap();
+            let category: String = db
+                .query_row(
+                    "SELECT failure_category FROM read_state WHERE owner='judge' AND purpose='discovery'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                category, "timeout",
+                "new failure replaces retained evidence"
+            );
+        }
+        assert!(
+            lane.start_inventory(&mut GradeServices::new(&mut runtime), None)
+                .unwrap()
+        );
+        collect_page(&mut lane, &mut runtime).await;
+        assert!(lane.inventory.as_ref().unwrap().complete);
+        assert_eq!(
+            tests::store(&mut runtime)
+                .read_backoff(&key)
+                .unwrap()
+                .failures,
+            0
+        );
+        let recovered: (Option<String>, Option<i64>) = db
+            .query_row(
+                "SELECT failure_category,last_success_at FROM read_state WHERE owner='judge' AND purpose='discovery'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(recovered.0.is_none());
+        assert!(recovered.1.is_some());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn aggregate_assessment_expires_with_earliest_page_not_selected_or_last_page() {
+        let mut config = Config::default();
+        config.capabilities.judge.mode = Mode::ReadOnly;
+        let (temp, mut runtime, _stop) = tests::fixture_with(config);
+        let config = Config::load(&temp.path().join("config.toml")).unwrap();
+        runtime.heartbeat().unwrap();
+        let mut inventory = paged_inventory(&runtime, 2);
+        inventory.complete = true;
+        inventory.more = false;
+        let earliest = now() + 2;
+        let first = inventory.sources[0].as_mut().unwrap();
+        first.observation.admit_before = Instant::now() + Duration::from_secs(2);
+        first.observation.admit_before_unix = earliest;
+        let last = inventory.sources[1].as_mut().unwrap();
+        last.observation.admit_before = Instant::now() + Duration::from_secs(60);
+        last.observation.admit_before_unix = now() + 60;
+        let candidate = inventory.ids[1].clone();
+        let lane = JudgeLane {
+            inventory: Some(inventory),
+            ..Default::default()
+        };
+        for candidate in [Some(candidate.as_str()), None] {
+            lane.report(
+                &GradeServices::new(&mut runtime),
+                Some(candidate.is_some()),
+                None,
+                candidate,
+            )
+            .unwrap();
+            let status = tests::store(&mut runtime).status(&config).unwrap();
+            let participation = &status["lane_participation"]["judge"];
+            assert_eq!(participation["assessment"]["completeness"], "complete");
+            assert_eq!(participation["assessment"]["valid_until"], earliest);
+            assert_eq!(participation["freshness"], "current_observation");
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let last = &lane.inventory.as_ref().unwrap().source(1).observation;
+        assert!(
+            GradeServices::new(&mut runtime)
+                .observation_current(last)
+                .unwrap()
+        );
+        let status = tests::store(&mut runtime).status(&config).unwrap();
+        assert_eq!(status["lane_participation"]["judge"]["freshness"], "stale");
+    }
+
     #[test]
     fn pending_grade_binds_candidate_history_and_waits_on_observation_expiry() {
         let mut assignment = Assignment {

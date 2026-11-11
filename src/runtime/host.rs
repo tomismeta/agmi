@@ -519,4 +519,4 @@ fn receipt(response: &Response, txid: &str, address: &str) -> Receipt {
 
 #[cfg(test)]
 #[path = "tests.rs"]
-mod tests;
+pub(in crate::runtime) mod tests;

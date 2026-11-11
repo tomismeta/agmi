@@ -215,6 +215,27 @@ impl Store {
             .unwrap_or_default())
     }
 
+    pub(crate) fn discovery_next_at(
+        &self,
+        config: &Config,
+        lane: LaneId,
+        backoff: &ReadBackoff,
+    ) -> Result<i64> {
+        // Failed discovery owns its retry clock. Older journals may also contain
+        // a copy in the lane cadence; that copy must not survive a policy change.
+        let local = if backoff.failures > 0 {
+            backoff.next_at
+        } else {
+            self.next_at(lane)?.max(backoff.next_at)
+        };
+        let endpoint = if lane == LaneId::Judge {
+            Endpoint::Assignments
+        } else {
+            Endpoint::Challenge
+        };
+        Ok(local.max(self.request_not_before(config, endpoint, None)?))
+    }
+
     pub(crate) fn read_started(&self, key: &ReadKey) -> Result<bool> {
         self.continuity()?;
         let tx = self.db.unchecked_transaction()?;
@@ -257,7 +278,9 @@ impl Store {
         }
         let (owner, purpose, resource, _) = self.read_parts(key)?;
         self.db.execute(
-            "UPDATE read_state SET in_flight=0,finished_at=?4,status=?5,failure_category=?6,
+            "UPDATE read_state SET in_flight=0,finished_at=?4,status=?5,
+            failure_category=CASE WHEN ?6 IS NOT NULL THEN ?6
+                WHEN failures>0 THEN failure_category ELSE NULL END,
             last_http_success_at=CASE WHEN ?5>=200 AND ?5<300 THEN ?4 ELSE last_http_success_at END
             WHERE owner=?1 AND purpose=?2 AND resource=?3 AND retired=0",
             params![
@@ -650,15 +673,7 @@ impl Store {
                         DiscoverySource::Challenge
                     },
                 };
-                let endpoint = if lane == LaneId::Judge {
-                    Endpoint::Assignments
-                } else {
-                    Endpoint::Challenge
-                };
-                let next = self
-                    .next_at(lane)?
-                    .max(self.read_backoff(&key)?.next_at)
-                    .max(self.request_not_before(config, endpoint, None)?);
+                let next = self.discovery_next_at(config, lane, &self.read_backoff(&key)?)?;
                 if next > current {
                     deadline = deadline.min(next);
                 }

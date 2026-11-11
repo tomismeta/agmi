@@ -107,14 +107,18 @@ impl MineLane {
         }
         Ok(())
     }
-    pub(super) async fn cancel(&mut self, services: &mut MineServices<'_>) -> Result<()> {
+    pub(super) async fn cancel(
+        &mut self,
+        services: &mut MineServices<'_>,
+        deadline: tokio::time::Instant,
+    ) -> Result<()> {
         if let Some(read) = self.read.as_mut() {
-            read.flight.abort().await;
+            read.flight.abort(deadline).await;
         }
         self.collect(services)?;
         if let Some(read) = self.read.take() {
             services.cancel_read(&read.flight)?;
         }
-        services.cancel_reconciliation().await
+        services.cancel_reconciliation(deadline).await
     }
 }

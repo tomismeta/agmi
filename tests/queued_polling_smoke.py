@@ -124,6 +124,12 @@ def risk_health(f):
                                       'uncertainty_grace_seconds': 0, 'max_unresolved_operations': 2}}}})
     f.wait(lambda: f.status()['work']['judge']['admission']['allowed'],
            'configured judge admission did not reopen')
+    def judge_inventory_assessed():
+        assessment = f.status()['work']['judge']['assessment'] or {}
+        return (assessment.get('completeness') == 'complete'
+                and assessment.get('locally_judgeable') is False)
+    f.wait(judge_inventory_assessed,
+           'judge did not assess retained inventory under the reloaded policy')
     health = f.invoke('health')
     assert health['operational']['status'] == 'clear', health
     assert health['risk']['attention_required'] and health['attention_required']
@@ -224,10 +230,14 @@ def independent_scope(f):
     for epoch in (10, 11):
         if epoch != 10:
             f.rollover(epoch)
-        f.wait(lambda: any(row['owner'] == 'answer' and row['purpose'] == 'job'
-                          and row['server_not_before'] > time.time() + 50
-                          and row['operation_id'] == f.dispatched('answer')[-1]['id']
-                          for row in f.invoke('reads')['reads']),
+        def current_epoch_job_restricted():
+            current_ids = {op['id'] for op in f.dispatched('answer')
+                           if json.loads(op['request'])['solver']['epoch'] == epoch}
+            return any(row['owner'] == 'answer' and row['purpose'] == 'job'
+                       and row['server_not_before'] > time.time() + 50
+                       and row['operation_id'] in current_ids
+                       for row in f.invoke('reads')['reads'])
+        f.wait(current_epoch_job_restricted,
                'valid queued202 did not retain its own job minimum')
     f.answer_response = 'included'
     f.receipt_state = 'included_pending'

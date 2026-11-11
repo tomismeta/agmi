@@ -229,10 +229,14 @@ impl HostAccess {
         self.recovery[index] = recovery;
         result
     }
-    pub(in crate::runtime) async fn cancel_reconciliation(&mut self, lane: LaneId) -> Result<()> {
+    pub(in crate::runtime) async fn cancel_reconciliation(
+        &mut self,
+        lane: LaneId,
+        deadline: tokio::time::Instant,
+    ) -> Result<()> {
         let index = lane_index(lane);
         let mut recovery = std::mem::take(&mut self.recovery[index]);
-        let result = recovery.cancel(self).await;
+        let result = recovery.cancel(self, deadline).await;
         self.recovery[index] = recovery;
         result
     }
@@ -444,6 +448,9 @@ impl HostAccess {
         }
         if self.store.attempted(LaneId::Judge, id)? {
             return Ok(Some("already_attempted"));
+        }
+        if self.store.model_retry_not_before(LaneId::Judge, id)? > self.deadline_now() {
+            return Ok(Some("model_retry_cooldown"));
         }
         if self.store.model_budget_used(LaneId::Judge, id)?
             >= self.model_attempt_limit(LaneId::Judge)?

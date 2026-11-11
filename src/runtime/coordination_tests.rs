@@ -201,7 +201,7 @@ async fn queued_submission_minimum_preserves_binding_and_only_delays_its_job() {
 }
 
 #[tokio::test]
-async fn eligible_assignment_after_cooled_first_candidate_gets_the_model_opportunity() {
+async fn overdue_inventory_is_assessed_before_refresh_and_skips_cooled_candidates() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut config = Config::default();
     config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
@@ -212,11 +212,35 @@ async fn eligible_assignment_after_cooled_first_candidate_gets_the_model_opportu
     let (_temp, mut runtime, _stop) = fixture_with(config);
     let a = "a".repeat(64);
     let b = "b".repeat(64);
+    let c = "c".repeat(64);
+    let mut cooled = runtime
+        .store
+        .seed_operation_for_test(
+            LaneId::Judge,
+            &c,
+            "generating",
+            &json!({"solver":request(LaneId::Judge)}),
+            runtime.store.control().unwrap(),
+            &runtime.config.lane_revision(LaneId::Judge).unwrap(),
+        )
+        .unwrap();
+    cooled.state = "prelaunch_failed".into();
+    cooled.next_at = runtime.deadline_now() + 3600;
+    runtime
+        .store
+        .seed_transition_for_test(&cooled, "fixture_model_cooldown")
+        .unwrap();
+    assert_eq!(
+        runtime.store.model_budget_used(LaneId::Judge, &c).unwrap(),
+        0
+    );
+    assert!(!runtime.store.attempted(LaneId::Judge, &c).unwrap());
     runtime.plan().unwrap();
     let (stream, _) = accept(&listener).await;
     reply(stream, 200, None, json!({"has_more":false,"assignments":[
         {"answer_txid":a,"answer":"candidate-a","pending_meta":{"expires_at_epoch":10}},
-        {"answer_txid":b,"answer_epoch":8,"answer":"candidate-b","words":["burn"],"pending_meta":{"expires_at_epoch":11}}
+        {"answer_txid":c,"answer_epoch":8,"answer":"candidate-c","words":["burn"],"pending_meta":{"expires_at_epoch":11}},
+        {"answer_txid":b,"answer_epoch":8,"answer":"candidate-b","words":["burn"],"pending_meta":{"expires_at_epoch":12}}
     ]})).await;
     collect_until(&mut runtime, |runtime| {
         runtime
@@ -227,6 +251,9 @@ async fn eligible_assignment_after_cooled_first_candidate_gets_the_model_opportu
             && !runtime.any_handles()
     })
     .await;
+    // A successful inventory may take longer than the ordinary poll interval.
+    runtime.store.defer_until(LaneId::Judge, 0).unwrap();
+    assert!(runtime.discovery_allowed(LaneId::Judge).unwrap());
     runtime.plan().unwrap();
     let (stream, path) = accept(&listener).await;
     assert!(path.contains(&a));
@@ -245,6 +272,11 @@ async fn eligible_assignment_after_cooled_first_candidate_gets_the_model_opportu
     runtime.plan().unwrap();
     assert_eq!(runtime.store.attempt_count(LaneId::Judge, &a).unwrap(), 0);
     assert_eq!(runtime.store.attempt_count(LaneId::Judge, &b).unwrap(), 1);
+    assert_eq!(runtime.store.attempt_count(LaneId::Judge, &c).unwrap(), 1);
+    assert_eq!(
+        runtime.assignment_blocker(&c).unwrap(),
+        Some("model_retry_cooldown")
+    );
     assert_eq!(
         runtime
             .store
@@ -471,8 +503,15 @@ async fn captured_native_routes_and_attempt_deadlines_remain_lane_owned() {
         assert_eq!(policy["model_seconds"], seconds);
         assert_eq!(policy["max_attempts_per_work"], 2);
     }
-    runtime.cancel_answer_model(&mut answer).await.unwrap();
-    runtime.cancel_grade_model(&mut judge).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    runtime
+        .cancel_answer_model(&mut answer, deadline)
+        .await
+        .unwrap();
+    runtime
+        .cancel_grade_model(&mut judge, deadline)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -997,7 +1036,13 @@ async fn changed_challenge_retry_creates_a_fresh_typed_model_attempt_without_reu
         attempt["producer"]["request_id"],
         retry.request["solver"]["id"]
     );
-    runtime.cancel_answer_model(&mut slot).await.unwrap();
+    runtime
+        .cancel_answer_model(
+            &mut slot,
+            tokio::time::Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
 }
 
 fn offer_mutated_answer(runtime: &mut HostAccess, canonical: &Operation, next_at: i64) {

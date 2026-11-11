@@ -3047,6 +3047,7 @@ impl Store {
         )?)
     }
 
+    #[cfg(test)]
     pub(crate) fn defer_until(&self, kind: LaneId, deadline: i64) -> Result<()> {
         self.continuity()?;
         self.db.execute(

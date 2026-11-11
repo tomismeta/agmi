@@ -215,16 +215,24 @@ def stop_pending_write(f):
     f.apply_config({'runtime': {'shutdown_seconds': 5}})
     f.start(resume=True)
     f.wait(f.urgent_started.is_set, 'urgent challenge did not overlap pending write', seconds=6)
+    original = f.dispatched('answer')[0]
+    assert original['state'] == 'dispatching' and not f.write_release.is_set()
     f.child.terminate()
     f.wait(lambda: not any(row['in_flight'] for row in
                           f.rows("SELECT * FROM read_state WHERE owner='answer' AND purpose='discovery' AND resource='challenge' AND retired=0")),
            'stop did not finish the urgent read while the write remained pending', seconds=2)
+    assert f.child.poll() is None, 'stop abandoned the pending write before its drain deadline'
+    pending = next(row for row in f.operations('answer') if row['id'] == original['id'])
+    assert pending['state'] == 'dispatching' and pending['job_id'] is None, pending
+    assert not f.read_release.is_set() and not f.write_release.is_set()
     f.write_release.set()
     f.child.wait(timeout=5)
     assert f.child.returncode == 0
-    assert any(row['job_id'] == 'ready-job' for row in f.operations())
+    assert any(row['id'] == original['id'] and row['job_id'] == 'ready-job'
+               for row in f.operations('answer'))
     assert not any(row['in_flight'] for row in f.rows('SELECT * FROM read_state WHERE retired=0'))
     assert len(f.dispatched()) == len(f.writes) == 1
+    assert not f.errors, f.errors
     f.stop()
     return dict(job_id='ready-job', stopped_with_write_pending=True, writes=1)
 

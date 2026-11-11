@@ -162,7 +162,11 @@ impl HostAccess {
     pub(in crate::runtime) fn discovery_allowed(&self, kind: LaneId) -> Result<bool> {
         Ok(!self.stopping()
             && self.config.mode(kind) != Mode::Off
-            && self.store.next_at(kind)? <= self.deadline_now()
+            && self.store.discovery_next_at(
+                &self.config,
+                kind,
+                &self.store.read_backoff(&Self::discovery_key(kind))?,
+            )? <= self.deadline_now()
             && self
                 .once
                 .as_ref()
@@ -413,20 +417,9 @@ impl HostAccess {
     pub(in crate::runtime) async fn shutdown(&mut self) -> Result<()> {
         let deadline =
             tokio::time::Instant::now() + Duration::from_secs(self.config.runtime.shutdown_seconds);
-        while self.any_handles() {
-            self.collect().await?;
-            if !self.any_handles() {
-                break;
-            }
-            let wake = Arc::clone(&self.wake);
-            tokio::select! {
-                _ = wake.notified() => {},
-                _ = tokio::time::sleep_until(deadline) => break,
-            }
-        }
         self.collect().await?;
         if let Some(read) = self.identity.as_mut() {
-            read.flight.abort().await;
+            read.flight.abort(deadline).await;
         }
         self.collect_identity()?;
         if let Some(read) = self.identity.take() {
@@ -436,20 +429,38 @@ impl HostAccess {
         let mut lanes = std::mem::take(&mut self.lanes);
         let mut result = Ok(());
         for mut lane in lanes.iter_mut() {
-            if let Err(error) = lane.stop(self).await {
+            if let Err(error) = lane.stop(self, deadline).await {
                 result = Err(error);
-                break;
             }
         }
         self.lanes = lanes;
-        result?;
+        // Only an already-sent effect needs a drain window. Unrelated reads and
+        // model work have been cancelled without releasing its admission gates.
+        while self.effect.is_some() {
+            self.collect_effect()?;
+            if self.effect.is_none() {
+                break;
+            }
+            let wake = Arc::clone(&self.wake);
+            tokio::select! {
+                _ = wake.notified() => {},
+                _ = tokio::time::sleep_until(deadline) => break,
+            }
+        }
         if let Some(effect) = self.effect.as_mut() {
             effect.task.abort();
-            let _ = (&mut effect.task).await;
+            let _ = tokio::time::timeout_at(deadline, &mut effect.task).await;
         }
         self.collect_effect()?;
         if let Some(effect) = self.effect.take() {
             self.finish_effect(effect, Err(anyhow::anyhow!("shutdown outcome unknown")))?;
+        }
+        // Cleanup cannot delay an assembled effect or its conservative unknown
+        // bookkeeping, and gets only the remainder of the original drain window.
+        let cleanup = crate::solver::drain_native_cleanup_until(deadline).await;
+        result?;
+        if !cleanup? {
+            self.store.event("native_cleanup_deadline", None)?;
         }
         Ok(())
     }
@@ -477,7 +488,13 @@ impl OncePlan {
         let capture = |kind| -> Result<OnceLane> {
             Ok(OnceLane {
                 discovery: runtime.config.mode(kind) != Mode::Off
-                    && runtime.store.next_at(kind)? <= entry_at,
+                    && runtime.store.discovery_next_at(
+                        &runtime.config,
+                        kind,
+                        &runtime
+                            .store
+                            .read_backoff(&HostAccess::discovery_key(kind))?,
+                    )? <= entry_at,
                 model: runtime.config.mode(kind) == Mode::Active,
                 effect: runtime.config.mode(kind) == Mode::Active,
                 recovery: runtime

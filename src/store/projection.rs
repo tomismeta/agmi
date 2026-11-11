@@ -1,4 +1,5 @@
 use super::*;
+use crate::endpoints::Endpoint;
 
 impl Store {
     fn lane_participation_projection(
@@ -328,7 +329,12 @@ impl Store {
                         },
                     });
             let backoff = self.read_backoff(&key)?;
-            let mut next = Some(self.next_at(kind)?.max(backoff.next_at).max(now()));
+            let discovery_at = if matches!(key, ReadKey::Discovery { .. }) {
+                self.discovery_next_at(config, kind, &backoff)?
+            } else {
+                backoff.next_at
+            };
+            let mut next = Some(discovery_at.max(now()));
             let (mut phase, mut reason, mut action) =
                 ("observing", "observation_due", "observe_challenge");
             if kind == LaneId::Judge {
@@ -348,9 +354,9 @@ impl Store {
             if in_flight {
                 reason = "read_in_flight";
                 next = None;
-            } else if backoff.next_at > now() {
+            } else if backoff.next_at > now() || (backoff.failures > 0 && discovery_at > now()) {
                 reason = "read_backoff";
-            } else if self.next_at(kind)? > now() {
+            } else if discovery_at > now() {
                 reason = "cadence";
             }
             if let Some(op) = &op {
@@ -380,6 +386,19 @@ impl Store {
                         phase = "prepared";
                         reason = "fresh_evidence_required";
                         action = "revalidate_request";
+                        // Targeted revalidation bypasses ordinary discovery cadence,
+                        // but not the canonical read retry or API restriction.
+                        let endpoint = if kind == LaneId::Judge {
+                            Endpoint::Assignments
+                        } else {
+                            Endpoint::Challenge
+                        };
+                        next = (!in_flight).then_some(
+                            op.next_at
+                                .max(backoff.next_at)
+                                .max(self.request_not_before(config, endpoint, None)?)
+                                .max(now()),
+                        );
                         if admission["allowed"] == false {
                             phase = "blocked";
                             reason = admission["reason"]
@@ -390,7 +409,9 @@ impl Store {
                             } else {
                                 "await_reconciliation"
                             };
-                            next = admission["not_before"].as_i64();
+                            next = next.and_then(|read_at| {
+                                admission["not_before"].as_i64().map(|at| at.max(read_at))
+                            });
                         }
                     }
                     "dispatching" => {
@@ -550,24 +571,29 @@ impl Store {
                         lane: kind,
                         source: DiscoverySource::Challenge,
                     };
-                    let discovery_at = self.read_backoff(&discovery)?.next_at;
+                    let discovery_backoff = if matches!(key, ReadKey::Discovery { .. }) {
+                        backoff
+                    } else {
+                        self.read_backoff(&discovery)?
+                    };
+                    let discovery_at = self.discovery_next_at(config, kind, &discovery_backoff)?;
                     let discovery_flight: bool = self.db.query_row(
                         "SELECT COALESCE((SELECT in_flight FROM read_state
                         WHERE owner='answer' AND purpose='discovery' AND resource='challenge'),0)",
                         [],
                         |r| r.get(0),
                     )?;
-                    let (mut retry_reason, mut retry_at) = blocker.unwrap_or((
-                        "fresh_evidence_required",
-                        Some(now().max(self.next_at(kind)?)),
-                    ));
+                    let (mut retry_reason, mut retry_at) = blocker
+                        .unwrap_or(("fresh_evidence_required", Some(now().max(discovery_at))));
                     if blocker.is_none() {
                         if observation.as_ref().is_some_and(|o| o["answered"] == true) {
                             retry_reason = "hosted_answer_observed";
                         } else if discovery_flight {
                             retry_reason = "freshness_in_flight";
                             retry_at = None;
-                        } else if discovery_at > now() {
+                        } else if discovery_backoff.next_at > now()
+                            || (discovery_backoff.failures > 0 && discovery_at > now())
+                        {
                             retry_reason = "read_backoff";
                             retry_at = Some(discovery_at);
                         }

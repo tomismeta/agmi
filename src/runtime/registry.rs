@@ -61,11 +61,15 @@ impl NativeLane<'_> {
             Self::Mine(lane) => lane.plan(&mut MineServices::new(host)),
         }
     }
-    pub(super) async fn stop(&mut self, host: &mut HostAccess) -> Result<()> {
+    pub(super) async fn stop(
+        &mut self,
+        host: &mut HostAccess,
+        deadline: tokio::time::Instant,
+    ) -> Result<()> {
         match self {
-            Self::Answer(lane) => lane.cancel(&mut AnswerServices::new(host)).await,
-            Self::Judge(lane) => lane.cancel(&mut GradeServices::new(host)).await,
-            Self::Mine(lane) => lane.cancel(&mut MineServices::new(host)).await,
+            Self::Answer(lane) => lane.cancel(&mut AnswerServices::new(host), deadline).await,
+            Self::Judge(lane) => lane.cancel(&mut GradeServices::new(host), deadline).await,
+            Self::Mine(lane) => lane.cancel(&mut MineServices::new(host), deadline).await,
         }
     }
 }

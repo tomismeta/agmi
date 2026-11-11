@@ -9,7 +9,11 @@ fn response(body: Value) -> Response {
         read_failure: None,
     }
 }
-pub(super) fn fixture_with(
+pub(in crate::runtime) fn store(runtime: &mut HostAccess) -> &mut Store {
+    &mut runtime.store
+}
+
+pub(in crate::runtime) fn fixture_with(
     mut config: Config,
 ) -> (tempfile::TempDir, HostAccess, watch::Sender<bool>) {
     let temp = tempfile::tempdir().unwrap();
@@ -98,7 +102,9 @@ fn seed_bound(runtime: &mut HostAccess, kind: LaneId, key: &str, job: &str) -> O
     .unwrap();
     runtime.store.operation(op.id).unwrap().unwrap()
 }
-async fn accept(listener: &tokio::net::TcpListener) -> (tokio::net::TcpStream, String) {
+pub(in crate::runtime) async fn accept(
+    listener: &tokio::net::TcpListener,
+) -> (tokio::net::TcpStream, String) {
     let (mut stream, _) = listener.accept().await.unwrap();
     let mut bytes = Vec::new();
     let mut buffer = [0; 4096];
@@ -115,7 +121,12 @@ async fn accept(listener: &tokio::net::TcpListener) -> (tokio::net::TcpStream, S
         .to_owned();
     (stream, line)
 }
-async fn reply(mut stream: tokio::net::TcpStream, status: u16, minimum: Option<u64>, body: Value) {
+pub(in crate::runtime) async fn reply(
+    mut stream: tokio::net::TcpStream,
+    status: u16,
+    minimum: Option<u64>,
+    body: Value,
+) {
     let body = body.to_string();
     let retry = minimum
         .map(|seconds| format!("Retry-After: {seconds}\r\n"))
@@ -461,7 +472,7 @@ mod coordination_tests;
 #[path = "regressions.rs"]
 mod regressions;
 
-pub(super) fn observation(runtime: &HostAccess, lane: LaneId) -> Observation {
+pub(in crate::runtime) fn observation(runtime: &HostAccess, lane: LaneId) -> Observation {
     let completed = Instant::now();
     let completed_at = now();
     let seconds = runtime.config.timeouts(lane).read_http_seconds;
@@ -471,7 +482,7 @@ pub(super) fn observation(runtime: &HostAccess, lane: LaneId) -> Observation {
         admit_before_unix: completed_at + seconds as i64,
     }
 }
-fn offer_mine(runtime: &mut HostAccess, op: Operation) {
+pub(in crate::runtime) fn offer_mine(runtime: &mut HostAccess, op: Operation) {
     let ready = runtime
         .mine_ready(
             crate::protocol::MineIntent,
