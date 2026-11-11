@@ -1,5 +1,7 @@
 use sha2::{Digest, Sha256};
 use std::{env, fs, path::PathBuf, process::Command};
+#[path = "src/journal.rs"]
+mod journal;
 
 fn git(args: &[&str]) -> Option<String> {
     let output = Command::new("git").args(args).output().ok()?;
@@ -93,8 +95,9 @@ fn main() {
     let target = env::var("TARGET").expect("Cargo supplies TARGET");
     let profile = env::var("PROFILE").expect("Cargo supplies PROFILE");
     let version = env::var("CARGO_PKG_VERSION").expect("Cargo supplies package version");
+    let journal_schema = journal::CURRENT_JOURNAL_FORMAT.to_string();
     let mut manifest = format!(
-        "build_format=1\npackage_version={version}\ncommit={commit}\nsource_dirty={dirty}\ntarget={target}\nprofile={profile}\njournal_schema=2\nstop_timeout=infinity\nupdate_protocol=1\n"
+        "build_format=1\npackage_version={version}\ncommit={commit}\nsource_dirty={dirty}\ntarget={target}\nprofile={profile}\njournal_schema={journal_schema}\nstop_timeout=infinity\nupdate_protocol=1\n"
     );
     for (key, path) in [
         ("unit_agmi_service_sha256", "deploy/agmi.service"),
@@ -120,7 +123,7 @@ fn main() {
         ("AGMI_BUILD_DIRTY", dirty),
         ("AGMI_BUILD_TARGET", target.as_str()),
         ("AGMI_BUILD_PROFILE", profile.as_str()),
-        ("AGMI_JOURNAL_SCHEMA", "2"),
+        ("AGMI_JOURNAL_SCHEMA", journal_schema.as_str()),
     ] {
         println!("cargo:rustc-env={key}={value}");
     }

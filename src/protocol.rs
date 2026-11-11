@@ -1,7 +1,8 @@
 //! Hosted API compatibility is based on https://minepoa.com/go.md,
 //! https://minepoa.com/openapi.yaml and https://minepoa.com/client/poa.mjs.
 //! HTTP success is not ledger finality. Unknown write outcomes never authorize replay.
-use crate::config::{Config, Mode, WorkKind, safe_segment};
+use crate::capability::LaneId;
+use crate::config::{Config, safe_segment};
 use crate::endpoints::{ApiEndpoints, Endpoint};
 use anyhow::{Result, ensure};
 use reqwest::{
@@ -17,8 +18,76 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+mod transport;
+use std::sync::atomic::{AtomicU64, Ordering};
+pub use transport::{
+    EffectDeadline, HostedResponse, ReadDeadline, RequestContext, RequestMeta, RestrictionBasis,
+    RestrictionEvidence, RestrictionScope,
+};
+
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_TEXT_CHARS: usize = 16384;
+
+/// Role-specific validation tokens; canonical payload ownership remains in the journal.
+pub(crate) struct AnswerIntent(());
+pub(crate) struct GradeIntent(());
+pub(crate) struct MineIntent;
+impl AnswerIntent {
+    pub(crate) fn new(payload: &Value) -> Result<Self> {
+        validate_payload(LaneId::Answer, payload)?;
+        Ok(Self(()))
+    }
+}
+impl GradeIntent {
+    pub(crate) fn new(payload: &Value) -> Result<Self> {
+        validate_payload(LaneId::Judge, payload)?;
+        Ok(Self(()))
+    }
+}
+pub(crate) enum EffectIntent {
+    Answer(AnswerIntent),
+    Grade(GradeIntent),
+    Mine(MineIntent),
+}
+impl EffectIntent {
+    pub(crate) fn lane(&self) -> LaneId {
+        match self {
+            Self::Answer(_) => LaneId::Answer,
+            Self::Grade(_) => LaneId::Judge,
+            Self::Mine(_) => LaneId::Mine,
+        }
+    }
+    pub(crate) fn endpoint(&self) -> Endpoint {
+        match self {
+            Self::Answer(_) => Endpoint::Answer,
+            Self::Grade(_) => Endpoint::Grade,
+            Self::Mine(_) => Endpoint::Mine,
+        }
+    }
+    pub(crate) fn prepare(
+        &self,
+        protocol: &Protocol,
+        payload: &Value,
+        deadline: EffectDeadline,
+        meta: RequestMeta,
+    ) -> Result<impl Future<Output = Result<HostedResponse>> + Send + 'static + use<>> {
+        validate_payload(self.lane(), payload)?;
+        ensure!(
+            protocol.key.is_some() && !protocol.address.is_empty(),
+            "submission requires configured identity"
+        );
+        ensure!(
+            meta.owner == Some(self.lane()),
+            "effect owner does not match typed intent"
+        );
+        let payload = if matches!(self, Self::Mine(_)) {
+            None
+        } else {
+            Some(payload)
+        };
+        protocol.request_query(self.endpoint(), None, payload, None, deadline.0, meta)
+    }
+}
 const HALT_MIDDLEWARE_ERROR: &str = "endpoint temporarily halted — API hardening in progress";
 
 /// Bounded diagnostics only; these categories never establish a write outcome.
@@ -147,13 +216,13 @@ pub(crate) async fn complete_raw_response(request: reqwest::RequestBuilder) -> R
 // Deliberately no Debug: authentication and queued-job identifiers must not enter logs.
 pub struct Protocol {
     client: Client,
-    read_timeout: Duration,
+    credential_reference: String,
+    credential_instance: u64,
     origin: Url,
     api: ApiEndpoints,
     chain: String,
     address: String,
     key: Option<HeaderValue>,
-    modes: [Mode; 3],
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Response {
@@ -201,7 +270,7 @@ pub enum ResponseSource {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DiagnosticEvidence {
     pub stage: ResponseSource,
-    pub route: WorkKind,
+    pub route: LaneId,
     pub status: Option<u16>,
     pub reason: String,
     pub retry_after_seconds: Option<u64>,
@@ -284,30 +353,51 @@ impl Protocol {
         Self::with_key(config, Some(parse_credential(bytes)?))
     }
 
+    /// Reloading an unchanged credential retains its opaque authority instance.
+    pub fn reload(config: &Config, previous: &Self) -> Result<Self> {
+        let mut protocol = Self::new(config)?;
+        if protocol.key == previous.key {
+            protocol.credential_instance = previous.credential_instance;
+        }
+        Ok(protocol)
+    }
+
+    pub fn credential_instance(&self) -> u64 {
+        self.credential_instance
+    }
+
     fn with_key(config: &Config, key: Option<HeaderValue>) -> Result<Self> {
-        let timeout = Duration::from_secs(config.timeouts.http_seconds);
-        let client = private_http_client(
-            timeout,
-            timeout.max(Duration::from_secs(
-                config.timeouts.effective_read_http_seconds(),
-            )),
-        )?;
+        static NEXT_CREDENTIAL_INSTANCE: AtomicU64 = AtomicU64::new(1);
+        // No client total/connect caps: the owning request bounds all phases.
+        let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .no_proxy()
+            .user_agent(concat!("agmi/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .map_err(|_| anyhow::anyhow!("HTTP client initialization failed"))?;
         Ok(Self {
             client,
-            read_timeout: Duration::from_secs(config.timeouts.effective_read_http_seconds()),
+            credential_reference: config
+                .network
+                .credential_file
+                .to_string_lossy()
+                .into_owned(),
+            credential_instance: NEXT_CREDENTIAL_INSTANCE.fetch_add(1, Ordering::Relaxed),
             origin: config.network.origin()?,
             api: config.network.api.clone(),
             chain: config.network.chain.clone(),
             address: config.network.address.clone(),
             key,
-            modes: [
-                config.capabilities.answer,
-                config.capabilities.judge,
-                config.capabilities.mine,
-            ],
         })
     }
-    pub async fn get(&self, endpoint: Endpoint, parameter: Option<&str>) -> Result<Response> {
+    pub async fn get(
+        &self,
+        endpoint: Endpoint,
+        parameter: Option<&str>,
+        deadline: ReadDeadline,
+        meta: RequestMeta,
+    ) -> Result<HostedResponse> {
         ensure!(
             !endpoint.is_effect(),
             "effect endpoint is not a read permission"
@@ -321,57 +411,70 @@ impl Protocol {
                 "read endpoint belongs to a different account"
             );
         }
-        self.request_query(endpoint, parameter, None, None).await
+        self.request_query(endpoint, parameter, None, None, deadline.0, meta)?
+            .await
     }
     /// Pagination is a typed read permission, independent of configured paths.
     /// moving views, not snapshots; aggregation and coverage belong to the owner.
-    pub async fn assignment_page(&self, offset: u64, limit: u64) -> Result<Response> {
+    pub async fn assignment_page(
+        &self,
+        offset: u64,
+        limit: u64,
+        deadline: ReadDeadline,
+        meta: RequestMeta,
+    ) -> Result<HostedResponse> {
         ensure!(
             offset <= 10_000 && (1..=100).contains(&limit),
             "invalid inventory page bounds"
         );
-        self.request_query(Endpoint::Assignments, None, None, Some((offset, limit)))
-            .await
+        self.request_query(
+            Endpoint::Assignments,
+            None,
+            None,
+            Some((offset, limit)),
+            deadline.0,
+            meta,
+        )?
+        .await
     }
     /// Validate synchronously before the caller journals a possible network effect.
-    pub fn prepare_submission<'a>(
-        &'a self,
-        kind: WorkKind,
-        payload: &'a Value,
-    ) -> Result<impl Future<Output = Result<Response>> + 'a> {
-        let index = match kind {
-            WorkKind::Answer => 0,
-            WorkKind::Judge => 1,
-            WorkKind::Mine => 2,
-        };
-        ensure!(
-            self.modes[index] == Mode::Active,
-            "capability is not active"
-        );
+    pub fn prepare_submission(
+        &self,
+        kind: LaneId,
+        payload: &Value,
+        deadline: EffectDeadline,
+        meta: RequestMeta,
+    ) -> Result<impl Future<Output = Result<HostedResponse>> + Send + 'static + use<>> {
         ensure!(
             self.key.is_some() && !self.address.is_empty(),
             "submission requires configured identity"
         );
         validate_payload(kind, payload)?;
+        ensure!(
+            meta.owner == Some(kind),
+            "effect request owner does not match its route"
+        );
         let endpoint = match kind {
-            WorkKind::Answer => Endpoint::Answer,
-            WorkKind::Judge => Endpoint::Grade,
-            WorkKind::Mine => Endpoint::Mine,
+            LaneId::Answer => Endpoint::Answer,
+            LaneId::Judge => Endpoint::Grade,
+            LaneId::Mine => Endpoint::Mine,
         };
-        let body = if kind == WorkKind::Mine {
+        let body = if kind == LaneId::Mine {
             None
         } else {
             Some(payload)
         };
-        Ok(self.request_query(endpoint, None, body, None))
+        self.request_query(endpoint, None, body, None, deadline.0, meta)
     }
-    async fn request_query(
+    fn request_query(
         &self,
         endpoint: Endpoint,
         parameter: Option<&str>,
         payload: Option<&Value>,
         page: Option<(u64, u64)>,
-    ) -> Result<Response> {
+        deadline: Duration,
+        meta: RequestMeta,
+    ) -> Result<impl Future<Output = Result<HostedResponse>> + Send + 'static + use<>> {
         let mut url = self
             .api
             .url(&self.origin, &self.chain, endpoint, parameter)?;
@@ -380,12 +483,12 @@ impl Protocol {
                 .append_pair("offset", &offset.to_string())
                 .append_pair("limit", &limit.to_string());
         }
-        // Hosted mining is effectful despite using GET; it retains the write timeout.
-        let is_read = !endpoint.is_effect();
-        let mut request = self.client.request(endpoint.method(), url);
-        if is_read {
-            request = request.timeout(self.read_timeout);
-        }
+        let context = RequestContext::capture(self, endpoint, parameter, meta);
+        // The complete request timeout also bounds connect and effectful GET mine.
+        let mut request = self
+            .client
+            .request(endpoint.method(), url)
+            .timeout(deadline);
         if endpoint.authenticated() {
             let key = self
                 .key
@@ -396,12 +499,30 @@ impl Protocol {
         if let Some(payload) = payload {
             request = request.json(payload);
         }
+        let request = request
+            .build()
+            .map_err(|_| anyhow::anyhow!("invalid hosted request"))?;
+        Ok(Self::complete_request(
+            self.client.clone(),
+            request,
+            self.key.clone(),
+            context,
+        ))
+    }
+
+    async fn complete_request(
+        client: Client,
+        request: reqwest::Request,
+        key: Option<HeaderValue>,
+        context: RequestContext,
+    ) -> Result<HostedResponse> {
         // Never propagate reqwest errors: they can contain a bearer job URL.
-        let mut response = request
-            .send()
+        let mut response = client
+            .execute(request)
             .await
             .map_err(|error| anyhow::Error::new(request_failure(&error)))?;
         let status = response.status().as_u16();
+        let observed_at = transport::retry_observed_now();
         let header_delay = response
             .headers()
             .get_all(RETRY_AFTER)
@@ -410,11 +531,19 @@ impl Protocol {
             .max();
         // Retain status/backoff even when an upstream error page is empty, broken,
         // oversized or interrupted. A null body cannot establish a write outcome.
-        let unavailable = |failure| Response {
-            status,
-            body: Value::Null,
-            retry_after_seconds: header_delay,
-            read_failure: Some(failure),
+        let assembled = |response| HostedResponse {
+            context: context.clone(),
+            response,
+            observed_at,
+            completed_at: transport::observed_now(),
+        };
+        let unavailable = |failure| {
+            assembled(Response {
+                status,
+                body: Value::Null,
+                retry_after_seconds: header_delay,
+                read_failure: Some(failure),
+            })
         };
         if response
             .content_length()
@@ -442,7 +571,7 @@ impl Protocol {
         let Ok(body) = serde_json::from_slice::<Value>(&bytes) else {
             return Ok(unavailable(ReadFailure::InvalidJson));
         };
-        if let Some(key) = &self.key {
+        if let Some(key) = &key {
             let secret = key
                 .to_str()
                 .map_err(|_| anyhow::anyhow!("invalid internal credential encoding"))?;
@@ -451,12 +580,12 @@ impl Protocol {
             }
         }
         let body_delay = body.get("retry_after_seconds").and_then(Value::as_u64);
-        Ok(Response {
+        Ok(assembled(Response {
             status,
             body,
             retry_after_seconds: max_delay(header_delay, body_delay),
             read_failure: None,
-        })
+        }))
     }
 }
 
@@ -642,12 +771,12 @@ pub(crate) fn has_required_words(answer: &str, words: &[String]) -> bool {
         .all(|word| lower.contains(&word.to_lowercase()))
 }
 
-fn validate_payload(kind: WorkKind, payload: &Value) -> Result<()> {
+fn validate_payload(kind: LaneId, payload: &Value) -> Result<()> {
     let object = payload
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("submission payload must be an object"))?;
     match kind {
-        WorkKind::Answer => {
+        LaneId::Answer => {
             ensure!(object.len() == 1, "answer payload permits only answer");
             let answer = object
                 .get("answer")
@@ -659,7 +788,7 @@ fn validate_payload(kind: WorkKind, payload: &Value) -> Result<()> {
                 "answer is empty or exceeds safety bound"
             );
         }
-        WorkKind::Judge => {
+        LaneId::Judge => {
             ensure!(
                 object.len() == 3,
                 "grade payload permits only assignment, score and reasoning"
@@ -687,7 +816,7 @@ fn validate_payload(kind: WorkKind, payload: &Value) -> Result<()> {
                 "grade reasoning must contain 10..500 characters"
             );
         }
-        WorkKind::Mine => ensure!(object.is_empty(), "mine takes no payload fields"),
+        LaneId::Mine => ensure!(object.is_empty(), "mine takes no payload fields"),
     }
     Ok(())
 }
@@ -773,7 +902,7 @@ fn unknown(reason: &str) -> Outcome {
     }
 }
 
-pub fn classify_source(kind: WorkKind, response: &Response, source: ResponseSource) -> Outcome {
+pub fn classify_source(kind: LaneId, response: &Response, source: ResponseSource) -> Outcome {
     let body = &response.body;
     if response.read_failure.is_some() || !body.is_object() {
         return unknown("response_shape_unknown");
@@ -788,7 +917,7 @@ pub fn classify_source(kind: WorkKind, response: &Response, source: ResponseSour
     }
     let refused_submit = source == ResponseSource::Submit
         && (response.status == 429
-            || (kind != WorkKind::Mine
+            || (kind != LaneId::Mine
                 && response.status == 503
                 && matches!(code, Some("epoch_closing" | HALT_MIDDLEWARE_ERROR))));
     if body.get("state").is_some_and(|state| !state.is_string()) {
@@ -873,7 +1002,7 @@ pub fn classify_source(kind: WorkKind, response: &Response, source: ResponseSour
             .max(1),
         };
     }
-    if kind != WorkKind::Mine && !has_tx {
+    if kind != LaneId::Mine && !has_tx {
         if source == ResponseSource::BoundJob
             && response.status == 408
             && code == Some("job_expired")
@@ -882,15 +1011,15 @@ pub fn classify_source(kind: WorkKind, response: &Response, source: ResponseSour
             return Outcome::Expired;
         }
         let rejected = match kind {
-            WorkKind::Answer => {
+            LaneId::Answer => {
                 response.status == 409
                     && matches!(code, Some("already_answered" | "duplicate_answer"))
             }
-            WorkKind::Judge => {
+            LaneId::Judge => {
                 matches!(response.status, 400 | 403 | 409)
                     && matches!(code, Some("off_panel" | "duplicate_grade"))
             }
-            WorkKind::Mine => false,
+            LaneId::Mine => false,
         };
         if rejected
             && (state.is_none() || (source == ResponseSource::BoundJob && state == Some("done")))
@@ -907,11 +1036,11 @@ pub fn classify_source(kind: WorkKind, response: &Response, source: ResponseSour
             && matches!(response.status, 200 | 400)
         {
             let terminal = match (kind, code) {
-                (WorkKind::Answer, Some("stale_seed")) => Some("stale_seed"),
-                (WorkKind::Answer, Some("challenge answer length out of bounds")) => {
+                (LaneId::Answer, Some("stale_seed")) => Some("stale_seed"),
+                (LaneId::Answer, Some("challenge answer length out of bounds")) => {
                     Some("answer_length")
                 }
-                (WorkKind::Judge, Some("duplicate sealed grade")) => Some("duplicate_sealed_grade"),
+                (LaneId::Judge, Some("duplicate sealed grade")) => Some("duplicate_sealed_grade"),
                 _ => None,
             };
             if let Some(code) = terminal {
@@ -935,7 +1064,7 @@ pub fn classify_source(kind: WorkKind, response: &Response, source: ResponseSour
     {
         return unknown("route_success_missing");
     }
-    if kind == WorkKind::Mine {
+    if kind == LaneId::Mine {
         return if !has_tx
             && body.get("ok") == Some(&Value::Bool(true))
             && body.get("attested").and_then(Value::as_u64).is_some()
@@ -945,7 +1074,7 @@ pub fn classify_source(kind: WorkKind, response: &Response, source: ResponseSour
             unknown("mine_attestation_count_missing")
         };
     }
-    let field = if kind == WorkKind::Answer {
+    let field = if kind == LaneId::Answer {
         "challenge_txid"
     } else {
         "id"
@@ -1002,20 +1131,20 @@ pub(crate) fn failure_category(response: &Response) -> Option<&'static str> {
     }
 }
 
-fn response_error_category(kind: WorkKind, response: &Response) -> Option<&'static str> {
+fn response_error_category(kind: LaneId, response: &Response) -> Option<&'static str> {
     let code = error_code(&response.body)?;
     match (kind, code) {
-        (WorkKind::Answer, "stale_seed") => Some("stale_seed"),
-        (WorkKind::Answer, "challenge answer length out of bounds") => Some("answer_length"),
-        (WorkKind::Judge, "duplicate sealed grade") => Some("duplicate_sealed_grade"),
-        (WorkKind::Judge, "grade queue is full") => Some("grade_queue_full"),
+        (LaneId::Answer, "stale_seed") => Some("stale_seed"),
+        (LaneId::Answer, "challenge answer length out of bounds") => Some("answer_length"),
+        (LaneId::Judge, "duplicate sealed grade") => Some("duplicate_sealed_grade"),
+        (LaneId::Judge, "grade queue is full") => Some("grade_queue_full"),
         (_, "accept queue full") => Some("accept_queue_full"),
         (_, "epoch_closing") => Some("epoch_closing"),
         (_, "job_expired") => Some("job_expired"),
-        (_, HALT_MIDDLEWARE_ERROR) if kind != WorkKind::Mine && response.status == 503 => {
+        (_, HALT_MIDDLEWARE_ERROR) if kind != LaneId::Mine && response.status == 503 => {
             Some("halt_middleware")
         }
-        (WorkKind::Answer, value) => {
+        (LaneId::Answer, value) => {
             let limit = value.strip_prefix("answer surface is at its global ceiling (")?;
             let limit = limit.strip_suffix(" — retry shortly").unwrap_or(limit);
             let number = limit.strip_suffix("/min)")?;
@@ -1028,7 +1157,7 @@ fn response_error_category(kind: WorkKind, response: &Response) -> Option<&'stat
 
 /// Static bounded labels only: never copy arbitrary errors, text or identifiers.
 pub fn response_evidence(
-    kind: WorkKind,
+    kind: LaneId,
     source: ResponseSource,
     response: Option<&Response>,
 ) -> DiagnosticEvidence {
@@ -1368,6 +1497,21 @@ pub fn parse_assignments(response: &Response) -> Result<Vec<Assignment>> {
 mod tests {
     use super::*;
     use serde_json::json;
+    fn meta() -> RequestMeta {
+        RequestMeta {
+            request_id: "request-1".into(),
+            database_id: "journal-1".into(),
+            authority_epoch: 1,
+            owner: Some(LaneId::Answer),
+            operation_id: None,
+            read_key: None,
+            binding_revision: None,
+            dispatch_sequence: None,
+        }
+    }
+    fn read_deadline() -> ReadDeadline {
+        ReadDeadline::seconds(2).unwrap()
+    }
     fn response(status: u16, body: Value) -> Response {
         Response {
             status,
@@ -1383,29 +1527,29 @@ mod tests {
     fn success_is_route_specific_not_just_http_status() {
         let answer = response(200, json!({"ok":true,"challenge_txid":txid()}));
         assert!(matches!(
-            classify_source(WorkKind::Answer, &answer, ResponseSource::Submit),
+            classify_source(LaneId::Answer, &answer, ResponseSource::Submit),
             Outcome::Included { .. }
         ));
         assert!(matches!(
-            classify_source(WorkKind::Judge, &answer, ResponseSource::Submit),
+            classify_source(LaneId::Judge, &answer, ResponseSource::Submit),
             Outcome::Unknown { .. }
         ));
         assert!(matches!(
-            classify_source(WorkKind::Mine, &answer, ResponseSource::Submit),
+            classify_source(LaneId::Mine, &answer, ResponseSource::Submit),
             Outcome::Unknown { .. }
         ));
         let grade = response(200, json!({"ok":true,"id":txid()}));
         assert!(matches!(
-            classify_source(WorkKind::Judge, &grade, ResponseSource::Submit),
+            classify_source(LaneId::Judge, &grade, ResponseSource::Submit),
             Outcome::Included { .. }
         ));
         assert!(matches!(
-            classify_source(WorkKind::Answer, &grade, ResponseSource::Submit),
+            classify_source(LaneId::Answer, &grade, ResponseSource::Submit),
             Outcome::Unknown { .. }
         ));
         assert!(matches!(
             classify_source(
-                WorkKind::Judge,
+                LaneId::Judge,
                 &response(
                     200,
                     json!({"ok":true,"id":"0123456789abcdef0123456789abcdef"})
@@ -1422,11 +1566,7 @@ mod tests {
             json!({"ok":true,"challenge_txid":txid(),"error":"bad_nonce"}),
         ] {
             assert!(matches!(
-                classify_source(
-                    WorkKind::Answer,
-                    &response(200, body),
-                    ResponseSource::Submit
-                ),
+                classify_source(LaneId::Answer, &response(200, body), ResponseSource::Submit),
                 Outcome::Unknown { .. }
             ));
         }
@@ -1435,7 +1575,7 @@ mod tests {
     fn queued_terminal_results_use_original_route() {
         assert_eq!(
             classify_source(
-                WorkKind::Answer,
+                LaneId::Answer,
                 &response(202, json!({"job_id":"safe-id_1"})),
                 ResponseSource::Submit
             ),
@@ -1445,7 +1585,7 @@ mod tests {
         );
         assert_eq!(
             classify_source(
-                WorkKind::Answer,
+                LaneId::Answer,
                 &response(409, json!({"error":"duplicate_in_flight","job_id":"safe"})),
                 ResponseSource::Submit
             ),
@@ -1455,17 +1595,13 @@ mod tests {
         );
         for body in [json!({}), json!({"job_id":"../unsafe"})] {
             assert!(matches!(
-                classify_source(
-                    WorkKind::Answer,
-                    &response(202, body),
-                    ResponseSource::Submit
-                ),
+                classify_source(LaneId::Answer, &response(202, body), ResponseSource::Submit),
                 Outcome::Unknown { .. }
             ));
         }
         assert!(matches!(
             classify_source(
-                WorkKind::Answer,
+                LaneId::Answer,
                 &response(
                     200,
                     json!({"state":"done","ok":true,"challenge_txid":txid()})
@@ -1476,7 +1612,7 @@ mod tests {
         ));
         assert_eq!(
             classify_source(
-                WorkKind::Judge,
+                LaneId::Judge,
                 &response(200, json!({"state":"done","ok":true,"id":txid()})),
                 ResponseSource::BoundJob
             ),
@@ -1484,7 +1620,7 @@ mod tests {
         );
         assert!(matches!(
             classify_source(
-                WorkKind::Judge,
+                LaneId::Judge,
                 &response(409, json!({"state":"done","error":"off_panel"})),
                 ResponseSource::BoundJob
             ),
@@ -1492,7 +1628,7 @@ mod tests {
         ));
         assert!(matches!(
             classify_source(
-                WorkKind::Answer,
+                LaneId::Answer,
                 &response(404, json!({"error":"unknown or expired job id"})),
                 ResponseSource::BoundJob
             ),
@@ -1500,7 +1636,7 @@ mod tests {
         ));
         assert!(matches!(
             classify_source(
-                WorkKind::Answer,
+                LaneId::Answer,
                 &response(408, json!({"state":"expired","error":"job_expired"})),
                 ResponseSource::BoundJob
             ),
@@ -1518,7 +1654,7 @@ mod tests {
             (503, json!({"error":HALT_MIDDLEWARE_ERROR}), 30),
         ] {
             let mut result = response(status, body);
-            for kind in [WorkKind::Answer, WorkKind::Judge] {
+            for kind in [LaneId::Answer, LaneId::Judge] {
                 assert_eq!(
                     classify_source(kind, &result, ResponseSource::Submit),
                     Outcome::Retry {
@@ -1532,21 +1668,21 @@ mod tests {
             }
             result.retry_after_seconds = Some(3600);
             assert_eq!(
-                classify_source(WorkKind::Answer, &result, ResponseSource::Submit),
+                classify_source(LaneId::Answer, &result, ResponseSource::Submit),
                 Outcome::Retry {
                     after_seconds: 3600
                 }
             );
             if status == 429 {
                 assert_eq!(
-                    classify_source(WorkKind::Mine, &result, ResponseSource::Submit),
+                    classify_source(LaneId::Mine, &result, ResponseSource::Submit),
                     Outcome::Retry {
                         after_seconds: 3600
                     }
                 );
             } else {
                 assert!(matches!(
-                    classify_source(WorkKind::Mine, &result, ResponseSource::Submit),
+                    classify_source(LaneId::Mine, &result, ResponseSource::Submit),
                     Outcome::Unknown { .. }
                 ));
             }
@@ -1561,7 +1697,7 @@ mod tests {
         ] {
             assert!(matches!(
                 classify_source(
-                    WorkKind::Answer,
+                    LaneId::Answer,
                     &response(status, json!({"error":code})),
                     ResponseSource::Submit
                 ),
@@ -1573,12 +1709,12 @@ mod tests {
     #[test]
     fn only_exact_halt_middleware_has_authoritative_diagnostic_category() {
         let halted = response(503, json!({"error":HALT_MIDDLEWARE_ERROR}));
-        let evidence = response_evidence(WorkKind::Judge, ResponseSource::Submit, Some(&halted));
+        let evidence = response_evidence(LaneId::Judge, ResponseSource::Submit, Some(&halted));
         assert_eq!(evidence.error_category.as_deref(), Some("halt_middleware"));
         assert_eq!(failure_category(&halted), Some("endpoint_halted"));
         assert_eq!(
             response_evidence(
-                WorkKind::Judge,
+                LaneId::Judge,
                 ResponseSource::Submit,
                 Some(&response(503, json!({"halted":true}))),
             )
@@ -1603,7 +1739,7 @@ mod tests {
             let mut result = response(429, json!({"retry_after_seconds":body}));
             result.retry_after_seconds = header;
             assert_eq!(
-                classify_source(WorkKind::Judge, &result, ResponseSource::Submit),
+                classify_source(LaneId::Judge, &result, ResponseSource::Submit),
                 Outcome::Retry {
                     after_seconds: expected
                 }
@@ -1621,7 +1757,7 @@ mod tests {
                 let mut result = response(status, body);
                 result.read_failure = Some(ReadFailure::Timeout);
                 assert!(matches!(
-                    classify_source(WorkKind::Judge, &result, ResponseSource::Submit),
+                    classify_source(LaneId::Judge, &result, ResponseSource::Submit),
                     Outcome::Unknown { .. }
                 ));
             }
@@ -1632,7 +1768,7 @@ mod tests {
         for count in [0, 7] {
             assert_eq!(
                 classify_source(
-                    WorkKind::Mine,
+                    LaneId::Mine,
                     &response(200, json!({"ok":true,"attested":count})),
                     ResponseSource::Submit
                 ),
@@ -1647,7 +1783,7 @@ mod tests {
             json!({"ok":true,"attested":1,"error":"failed"}),
         ] {
             assert!(matches!(
-                classify_source(WorkKind::Mine, &response(200, body), ResponseSource::Submit),
+                classify_source(LaneId::Mine, &response(200, body), ResponseSource::Submit),
                 Outcome::Unknown { .. }
             ));
         }
@@ -1744,7 +1880,6 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut config = Config::default();
         config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
-        config.timeouts.http_seconds = 2;
         let selected = txid();
         let unavailable = "b".repeat(64);
         let page = response(
@@ -1785,10 +1920,10 @@ mod tests {
         let protocol = Protocol::new(&config).unwrap();
         assert!(assignment_needs_hydration(&page, &txid()).unwrap());
         let tx = protocol
-            .get(Endpoint::ExplorerTx, Some(&txid()))
+            .get(Endpoint::ExplorerTx, Some(&txid()), read_deadline(), meta())
             .await
             .unwrap();
-        let assignment = parse_selected_assignment(&page, &txid(), Some(&tx)).unwrap();
+        let assignment = parse_selected_assignment(&page, &txid(), Some(&tx.response)).unwrap();
         assert_eq!(assignment.epoch, 42);
         assert_eq!(assignment.answer, "selected candidate");
         assert!(assignment.words.is_empty());
@@ -1803,14 +1938,29 @@ mod tests {
             Endpoint::Grade,
             Endpoint::Register,
         ] {
-            assert!(protocol.get(endpoint, None).await.is_err());
+            assert!(
+                protocol
+                    .get(endpoint, None, read_deadline(), meta())
+                    .await
+                    .is_err()
+            );
         }
         for id in ["../mine", "a%2fb", "safe?key=x", "https://other.example/x"] {
-            assert!(protocol.get(Endpoint::Job, Some(id)).await.is_err());
+            assert!(
+                protocol
+                    .get(Endpoint::Job, Some(id), read_deadline(), meta())
+                    .await
+                    .is_err()
+            );
         }
         assert!(
             protocol
-                .get(Endpoint::ExplorerAddress, Some("another-account"))
+                .get(
+                    Endpoint::ExplorerAddress,
+                    Some("another-account"),
+                    read_deadline(),
+                    meta()
+                )
                 .await
                 .is_err()
         );
@@ -1818,37 +1968,44 @@ mod tests {
     #[test]
     fn payload_allowlist_excludes_secret_and_extra_fields() {
         assert!(
-            validate_payload(WorkKind::Answer, &json!({"answer":"text","key":"secret"})).is_err()
+            validate_payload(LaneId::Answer, &json!({"answer":"text","key":"secret"})).is_err()
         );
         assert!(
             validate_payload(
-                WorkKind::Judge,
+                LaneId::Judge,
                 &json!({"assignment":txid(),"score":3,"reasoning":"Substantive mechanism."})
             )
             .is_ok()
         );
         assert!(
             validate_payload(
-                WorkKind::Judge,
+                LaneId::Judge,
                 &json!({"assignment":txid(),"score":4,"reasoning":"Substantive mechanism."})
             )
             .is_err()
         );
-        assert!(validate_payload(WorkKind::Mine, &json!({})).is_ok());
-        assert!(validate_payload(WorkKind::Mine, &json!({"to":"elsewhere"})).is_err());
+        assert!(validate_payload(LaneId::Mine, &json!({})).is_ok());
+        assert!(validate_payload(LaneId::Mine, &json!({"to":"elsewhere"})).is_err());
     }
 
     #[test]
     fn grade_bounds_are_rejected_before_a_network_future_exists() {
         let mut protocol = Protocol::new(&Config::default()).unwrap();
-        protocol.modes = [Mode::Active; 3];
         protocol.key = Some(HeaderValue::from_static("pk_fixture"));
         protocol.address = "configured-account".into();
         for (length, accepted) in [(9, false), (10, true), (500, true), (501, false)] {
             let payload = json!({"assignment":txid(),"score":2,"reasoning":"a".repeat(length)});
             assert_eq!(
                 protocol
-                    .prepare_submission(WorkKind::Judge, &payload)
+                    .prepare_submission(
+                        LaneId::Judge,
+                        &payload,
+                        EffectDeadline::seconds(2).unwrap(),
+                        RequestMeta {
+                            owner: Some(LaneId::Judge),
+                            ..meta()
+                        }
+                    )
                     .is_ok(),
                 accepted
             );
@@ -1903,7 +2060,11 @@ mod tests {
             });
             let mut protocol = Protocol::new(&config).unwrap();
             protocol.key = Some(HeaderValue::from_static("private-test-credential"));
-            let response = protocol.get(Endpoint::Status, None).await.unwrap();
+            let response = protocol
+                .get(Endpoint::Status, None, read_deadline(), meta())
+                .await
+                .unwrap()
+                .response;
             assert_eq!(response.status, status);
             assert_eq!(response.retry_after_seconds, Some(300));
             assert_eq!(response.read_failure, Some(failure));
@@ -1912,7 +2073,7 @@ mod tests {
             assert!(!public.contains("private-test-credential"));
             assert!(!public.contains("127.0.0.1"));
             assert!(matches!(
-                classify_source(WorkKind::Answer, &response, ResponseSource::Submit),
+                classify_source(LaneId::Answer, &response, ResponseSource::Submit),
                 Outcome::Unknown { .. }
             ));
             server.await.unwrap();
@@ -2022,7 +2183,7 @@ mod tests {
             ] {
                 let mut body = indicator;
                 body["error"] = json!(code);
-                for kind in [WorkKind::Answer, WorkKind::Judge, WorkKind::Mine] {
+                for kind in [LaneId::Answer, LaneId::Judge, LaneId::Mine] {
                     assert!(matches!(
                         classify_source(
                             kind,
@@ -2036,17 +2197,13 @@ mod tests {
         }
         for body in [json!({"ok":true}), json!({"success":true})] {
             assert!(matches!(
-                classify_source(
-                    WorkKind::Judge,
-                    &response(429, body),
-                    ResponseSource::Submit
-                ),
+                classify_source(LaneId::Judge, &response(429, body), ResponseSource::Submit),
                 Outcome::Unknown { .. }
             ));
         }
         let duplicate = response(429, json!({"error":"duplicate_in_flight","job_id":"bound"}));
         assert!(matches!(
-            classify_source(WorkKind::Judge, &duplicate, ResponseSource::Submit),
+            classify_source(LaneId::Judge, &duplicate, ResponseSource::Submit),
             Outcome::Queued { .. }
         ));
     }
@@ -2054,21 +2211,16 @@ mod tests {
     #[test]
     fn refusal_contradictions_survive_in_recovery_diagnostics_without_candidates() {
         for (kind, status, code, category) in [
-            (WorkKind::Answer, 429, "rate_limited", "rate_limited"),
-            (WorkKind::Judge, 429, "rate_limited", "rate_limited"),
-            (WorkKind::Mine, 429, "rate_limited", "rate_limited"),
+            (LaneId::Answer, 429, "rate_limited", "rate_limited"),
+            (LaneId::Judge, 429, "rate_limited", "rate_limited"),
+            (LaneId::Mine, 429, "rate_limited", "rate_limited"),
             (
-                WorkKind::Answer,
+                LaneId::Answer,
                 503,
                 HALT_MIDDLEWARE_ERROR,
                 "halt_middleware",
             ),
-            (
-                WorkKind::Judge,
-                503,
-                HALT_MIDDLEWARE_ERROR,
-                "halt_middleware",
-            ),
+            (LaneId::Judge, 503, HALT_MIDDLEWARE_ERROR, "halt_middleware"),
         ] {
             for indicator in [
                 json!({"state":"done"}),
@@ -2114,14 +2266,14 @@ mod tests {
     #[test]
     fn known_engine_rejections_require_bound_terminal_source() {
         for (kind, error, code) in [
-            (WorkKind::Answer, "stale_seed", "stale_seed"),
+            (LaneId::Answer, "stale_seed", "stale_seed"),
             (
-                WorkKind::Answer,
+                LaneId::Answer,
                 "challenge answer length out of bounds",
                 "answer_length",
             ),
             (
-                WorkKind::Judge,
+                LaneId::Judge,
                 "duplicate sealed grade",
                 "duplicate_sealed_grade",
             ),
@@ -2154,11 +2306,11 @@ mod tests {
         }
         let expired = response(408, json!({"state":"expired","error":"job_expired"}));
         assert!(matches!(
-            classify_source(WorkKind::Answer, &expired, ResponseSource::Submit),
+            classify_source(LaneId::Answer, &expired, ResponseSource::Submit),
             Outcome::Unknown { .. }
         ));
         assert_eq!(
-            classify_source(WorkKind::Answer, &expired, ResponseSource::BoundJob),
+            classify_source(LaneId::Answer, &expired, ResponseSource::BoundJob),
             Outcome::Expired
         );
     }
@@ -2190,8 +2342,7 @@ mod tests {
         ] {
             let mut result = response(status, body);
             result.retry_after_seconds = Some(3600);
-            let evidence =
-                response_evidence(WorkKind::Answer, ResponseSource::Submit, Some(&result));
+            let evidence = response_evidence(LaneId::Answer, ResponseSource::Submit, Some(&result));
             assert_eq!(evidence.error_category.as_deref(), Some(category));
             assert_eq!(evidence.retry_after_seconds, Some(3600));
             assert!(
@@ -2200,7 +2351,7 @@ mod tests {
                     .contains("private-canary")
             );
             assert!(matches!(
-                classify_source(WorkKind::Answer, &result, ResponseSource::Submit),
+                classify_source(LaneId::Answer, &result, ResponseSource::Submit),
                 Outcome::Unknown { .. }
             ));
         }
@@ -2214,7 +2365,7 @@ mod tests {
             "answer":"private answer","reasoning":"private reasoning"}),
         );
         let evidence = serde_json::to_string(&response_evidence(
-            WorkKind::Judge,
+            LaneId::Judge,
             ResponseSource::Submit,
             Some(&result),
         ))
@@ -2229,7 +2380,7 @@ mod tests {
         }
         assert!(evidence.contains("contradictory_acceptance"));
         assert_eq!(
-            response_evidence(WorkKind::Answer, ResponseSource::Submit, None).reason,
+            response_evidence(LaneId::Answer, ResponseSource::Submit, None).reason,
             "transport_unknown"
         );
     }
@@ -2243,14 +2394,13 @@ mod tests {
                 "retry_after_seconds":60
             }),
         );
-        let diagnostic =
-            response_evidence(WorkKind::Answer, ResponseSource::Submit, Some(&limited));
+        let diagnostic = response_evidence(LaneId::Answer, ResponseSource::Submit, Some(&limited));
         assert_eq!(
             diagnostic.error_category.as_deref(),
             Some("answer_global_ceiling")
         );
         assert_eq!(
-            classify_source(WorkKind::Answer, &limited, ResponseSource::Submit),
+            classify_source(LaneId::Answer, &limited, ResponseSource::Submit),
             Outcome::Retry { after_seconds: 60 }
         );
         let injected = response(
@@ -2259,8 +2409,7 @@ mod tests {
                 "error":"answer surface is at its global ceiling (private-canary/min)"
             }),
         );
-        let diagnostic =
-            response_evidence(WorkKind::Answer, ResponseSource::Submit, Some(&injected));
+        let diagnostic = response_evidence(LaneId::Answer, ResponseSource::Submit, Some(&injected));
         assert_eq!(diagnostic.error_category.as_deref(), Some("rate_limited"));
         assert!(
             !serde_json::to_string(&diagnostic)
@@ -2350,15 +2499,34 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut config = Config::default();
         config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
-        config.timeouts.http_seconds = 2;
         let mut protocol = Protocol::new(&config).unwrap();
         protocol.key = Some(HeaderValue::from_static("pk_fixture"));
-        assert!(protocol.assignment_page(10_001, 1).await.is_err());
-        assert!(protocol.assignment_page(0, 101).await.is_err());
-        assert!(protocol.assignment_page(0, 0).await.is_err());
         assert!(
             protocol
-                .get(Endpoint::Job, Some("job?offset=10&limit=10"))
+                .assignment_page(10_001, 1, read_deadline(), meta())
+                .await
+                .is_err()
+        );
+        assert!(
+            protocol
+                .assignment_page(0, 101, read_deadline(), meta())
+                .await
+                .is_err()
+        );
+        assert!(
+            protocol
+                .assignment_page(0, 0, read_deadline(), meta())
+                .await
+                .is_err()
+        );
+        assert!(
+            protocol
+                .get(
+                    Endpoint::Job,
+                    Some("job?offset=10&limit=10"),
+                    read_deadline(),
+                    meta()
+                )
                 .await
                 .is_err()
         );
@@ -2387,8 +2555,11 @@ mod tests {
             );
             stream.write_all(reply.as_bytes()).await.unwrap();
         });
-        let page = protocol.assignment_page(10, 10).await.unwrap();
-        assert_eq!(page.body["offset"], 10);
+        let page = protocol
+            .assignment_page(10, 10, read_deadline(), meta())
+            .await
+            .unwrap();
+        assert_eq!(page.response.body["offset"], 10);
         server.await.unwrap();
     }
 
@@ -2461,7 +2632,7 @@ mod tests {
         assert_eq!(candidates.job_id.as_deref(), Some("private-bearer"));
         assert_eq!(candidates.transaction_ids, vec![txid(), "b".repeat(64)]);
         assert!(matches!(
-            classify_source(WorkKind::Answer, &result, ResponseSource::Submit),
+            classify_source(LaneId::Answer, &result, ResponseSource::Submit),
             Outcome::Unknown { .. }
         ));
         assert!(
@@ -2473,7 +2644,7 @@ mod tests {
             .is_err()
         );
         let public = serde_json::to_string(&response_evidence(
-            WorkKind::Answer,
+            LaneId::Answer,
             ResponseSource::Submit,
             Some(&result),
         ))

@@ -1,5 +1,6 @@
 //! Release-set installation. Only host systemd integration is delegated to tools;
 //! filesystem publication, integrity, rendering and cutover belong to this module.
+use crate::journal::CURRENT_JOURNAL_FORMAT;
 use crate::lifecycle::{
     InstallerError, RepairRuntimeError, installer_evidence, installer_preflight_error,
 };
@@ -483,6 +484,11 @@ mod native {
         Ok(sums)
     }
     fn validate_release(release: &Path, id: &str) -> Result<()> {
+        validate_release_metadata(release, id, false)
+    }
+
+    // Legacy metadata is inspection-only for the retained current release.
+    fn validate_release_metadata(release: &Path, id: &str, retained: bool) -> Result<()> {
         ensure!(valid_id(id), "invalid release identity");
         ensure!(
             fs::symlink_metadata(release)?.is_dir(),
@@ -528,7 +534,8 @@ mod native {
             "unknown source dirty marker"
         );
         ensure!(
-            metadata(&manifest, "journal_schema")? == "2",
+            metadata(&manifest, "journal_schema")?.parse::<i64>()? == CURRENT_JOURNAL_FORMAT
+                || (retained && matches!(metadata(&manifest, "journal_schema")?, "2" | "3")),
             "incompatible journal schema"
         );
         ensure!(
@@ -553,6 +560,25 @@ mod native {
         );
         Ok(())
     }
+    fn activation_schema(
+        installed: &str,
+        candidate: &str,
+        migration_only: bool,
+        stopped: bool,
+    ) -> Result<()> {
+        let installed: i64 = installed.parse()?;
+        let candidate: i64 = candidate.parse()?;
+        ensure!(
+            candidate == CURRENT_JOURNAL_FORMAT
+                && if migration_only {
+                    stopped && matches!(installed, 2 | 3)
+                } else {
+                    installed == CURRENT_JOURNAL_FORMAT
+                },
+            "journal crossing requires explicit stopped format2/3-to-current migration-only activation; downgrades are forbidden"
+        );
+        Ok(())
+    }
 
     struct Request<'a> {
         action: &'a str,
@@ -560,6 +586,7 @@ mod native {
         digest: Option<&'a str>,
         expected_release: Option<&'a str>,
         stopped: bool,
+        migration_only: bool,
     }
     impl<'a> Request<'a> {
         fn parse(arguments: &'a [String]) -> Result<Self> {
@@ -571,6 +598,7 @@ mod native {
                 digest: None,
                 expected_release: None,
                 stopped: action == "install",
+                migration_only: false,
             };
             let mut rest = arguments[2..].iter();
             let mut stopped_seen = false;
@@ -589,6 +617,12 @@ mod native {
                         let expected = rest.next().context("missing expected release")?;
                         ensure!(valid_id(expected), "invalid expected release");
                         request.expected_release = Some(expected);
+                    }
+                    "--migration-only"
+                        if matches!(action, "install" | "activate" | "update")
+                            && !request.migration_only =>
+                    {
+                        request.migration_only = true;
                     }
                     "--stopped" if matches!(action, "activate" | "update") && !stopped_seen => {
                         stopped_seen = true;
@@ -613,6 +647,10 @@ mod native {
                 ),
                 _ => anyhow::bail!("invalid installer action"),
             }
+            ensure!(
+                !request.migration_only || request.stopped,
+                "migration-only requires stopped activation"
+            );
             Ok(request)
         }
     }
@@ -633,6 +671,9 @@ mod native {
         }
         if request.stopped && request.action == "update" {
             command.arg("--stopped");
+        }
+        if request.migration_only {
+            command.arg("--migration-only");
         }
         if let Some(expected) = request.expected_release {
             command.args(["--expected-release", expected]);
@@ -692,12 +733,20 @@ mod native {
         Ok(envelope["data"].take())
     }
 
+    #[derive(serde::Serialize)]
+    struct BootstrapRecovery {
+        disable_command_succeeded: bool,
+        definitions_restored: bool,
+        manager_reload_succeeded: bool,
+    }
+
     struct Installation {
         home: PathBuf,
         root: PathBuf,
         bin: PathBuf,
         units: PathBuf,
         config: PathBuf,
+        state_dir: Option<PathBuf>,
         systemctl: PathBuf,
         analyze: PathBuf,
         phase: &'static str,
@@ -706,8 +755,10 @@ mod native {
         service: &'static str,
         failure: &'static str,
         stop_on_failure: bool,
+        migration_only: bool,
         lock: Option<InstallLock>,
         output: String,
+        bootstrap_recovery: Option<BootstrapRecovery>,
         #[cfg(test)]
         proc_root: PathBuf,
     }
@@ -719,6 +770,7 @@ mod native {
                 bin: home.join(".local/bin"),
                 units: home.join(".config/systemd/user"),
                 config: home.join(".config/agmi/config.toml"),
+                state_dir: None,
                 home,
                 systemctl: "systemctl".into(),
                 analyze: "systemd-analyze".into(),
@@ -728,8 +780,10 @@ mod native {
                 service: "unknown",
                 failure: "preparation_failed",
                 stop_on_failure: false,
+                migration_only: false,
                 lock: None,
                 output: String::new(),
+                bootstrap_recovery: None,
                 #[cfg(test)]
                 proc_root: "/proc".into(),
             })
@@ -737,7 +791,8 @@ mod native {
         fn evidence(&self, success: bool) -> Value {
             installer_evidence(Some(
                 &json!({"stage":self.phase,"staging":self.staging,"activation":self.activation,
-                "service":self.service,"failure_code":if success { "none" } else { self.failure }}),
+                "service":self.service,"failure_code":if success { "none" } else { self.failure },
+                "bootstrap_recovery":self.bootstrap_recovery}),
             ))
         }
         fn systemctl(&self, arguments: &[&str], cancellable: bool) -> Result<Output> {
@@ -830,6 +885,96 @@ mod native {
             ensure!(!failed, "cannot stop every unit");
             Ok(())
         }
+        fn verify_stopped(&self) -> Result<()> {
+            for unit in ["agmi.service", "agmi-health.service", "agmi-health.timer"] {
+                let state = self.property(unit, "ActiveState", true)?;
+                ensure!(
+                    matches!(state.as_str(), "inactive" | "failed"),
+                    "unit did not stop"
+                );
+            }
+            ensure!(
+                self.property("agmi.service", "MainPID", true)? == "0",
+                "stopped runtime still owns a process"
+            );
+            Ok(())
+        }
+        fn verify_autostart_disabled(&self) -> Result<()> {
+            for unit in ["agmi.service", "agmi-health.timer"] {
+                ensure!(
+                    matches!(
+                        self.property(unit, "UnitFileState", true)?.as_str(),
+                        "disabled" | "linked" | "linked-runtime"
+                    ),
+                    "boot activation remains enabled"
+                );
+            }
+            Ok(())
+        }
+        fn disable_autostart(&mut self) -> Result<()> {
+            let mut targets: [Option<PathBuf>; UNITS.len()] = Default::default();
+            for ((unit, _, _), target) in UNITS.iter().zip(&mut targets) {
+                let definition = self.units.join(unit);
+                *target = match fs::symlink_metadata(&definition) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        Some(fs::read_link(&definition)?)
+                    }
+                    Ok(_) => None,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => return Err(error.into()),
+                };
+            }
+            let disabled = self.control(&["disable", "agmi.service", "agmi-health.timer"]);
+            // systemd can remove definition links even when disable fails.
+            // Restore their original targets before reporting failure or cancellation.
+            let mut restored = Ok(());
+            for ((unit, _, _), target) in UNITS.iter().zip(&targets) {
+                let Some(target) = target else {
+                    continue;
+                };
+                let definition = self.units.join(unit);
+                let result = match fs::symlink_metadata(&definition) {
+                    Ok(metadata)
+                        if metadata.file_type().is_symlink()
+                            && fs::read_link(&definition).as_ref().ok() == Some(target) =>
+                    {
+                        Ok(())
+                    }
+                    Ok(_) => Err(std::io::Error::other(
+                        "unit definition changed during disable",
+                    )),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        symlink(target, &definition)
+                    }
+                    Err(error) => Err(error),
+                };
+                restored = restored.and(result.map_err(anyhow::Error::from));
+            }
+            restored = restored.and(sync_directory(&self.units));
+            let reloaded = self.systemctl(&["daemon-reload"], false);
+            let reload_succeeded = reloaded
+                .as_ref()
+                .is_ok_and(|output| output.status.success());
+            for ((unit, _, _), target) in UNITS.iter().zip(&targets) {
+                if let Some(target) = target
+                    && fs::read_link(self.units.join(unit)).as_ref().ok() != Some(target)
+                {
+                    restored = Err(anyhow::anyhow!("unit definition changed during reload"));
+                }
+            }
+            self.bootstrap_recovery = Some(BootstrapRecovery {
+                disable_command_succeeded: disabled.is_ok(),
+                definitions_restored: restored.is_ok(),
+                manager_reload_succeeded: reload_succeeded,
+            });
+            if restored.is_err() || !reload_succeeded {
+                self.failure = "bootstrap_recovery_failed";
+            }
+            disabled?;
+            restored?;
+            ensure!(reload_succeeded, "cannot reload restored unit definitions");
+            self.verify_autostart_disabled()
+        }
         fn loaded(&self, id: &str) -> Result<()> {
             self.loaded_cancellable(id, true)
         }
@@ -865,8 +1010,11 @@ mod native {
             );
             Ok(())
         }
-        fn prepare(&mut self) -> Result<InstallLock> {
-            for path in [&self.root, &self.bin, &self.units] {
+        fn prepare(&mut self, activation: bool) -> Result<InstallLock> {
+            for path in std::iter::once(&self.root)
+                .chain(activation.then_some(&self.bin))
+                .chain(activation.then_some(&self.units))
+            {
                 fs::DirBuilder::new()
                     .recursive(true)
                     .mode(0o700)
@@ -922,9 +1070,37 @@ mod native {
             );
             Ok(())
         }
-        fn space_checks(&mut self, binary: &Path, incoming_kib: u64) -> Result<()> {
+        fn space_checks(
+            &mut self,
+            binary: &Path,
+            incoming_kib: u64,
+            activation: bool,
+        ) -> Result<()> {
             use std::fmt::Write;
             self.failure = "configuration_invalid";
+            // Only the retained binary interprets its legacy config, and only
+            // to report the state path. No runtime or journal command is run.
+            let retained_binary;
+            let binary = if self.migration_only {
+                let selected = fs::read_link(self.root.join("current"))?;
+                let id = selected.to_str().context("invalid retained release")?;
+                let release = self.root.join(id);
+                validate_release_metadata(&release, id, true)?;
+                ensure!(
+                    matches!(
+                        metadata(
+                            &fs::read_to_string(release.join("MANIFEST"))?,
+                            "journal_schema"
+                        )?,
+                        "2" | "3"
+                    ),
+                    "migration-only requires a retained format2 or format3 release"
+                );
+                retained_binary = release.join("agmi");
+                retained_binary.as_path()
+            } else {
+                binary
+            };
             let result = capture(
                 Command::new(binary)
                     .arg("--config")
@@ -978,13 +1154,37 @@ mod native {
                 "binding",
                 &mut self.output,
             )?;
-            Self::space_at(&self.bin, RESERVE_KIB + MARGIN_KIB, "cli", &mut self.output)?;
-            Self::space_at(
-                &self.units,
-                RESERVE_KIB + MARGIN_KIB,
-                "units",
-                &mut self.output,
-            )?;
+            // Bin/unit headroom belongs to activation alone; staging checks
+            // only the release store, state and binding headroom.
+            if activation {
+                Self::space_at(&self.bin, RESERVE_KIB + MARGIN_KIB, "cli", &mut self.output)?;
+                Self::space_at(
+                    &self.units,
+                    RESERVE_KIB + MARGIN_KIB,
+                    "units",
+                    &mut self.output,
+                )?;
+            }
+            self.state_dir = Some(canonical_state);
+            Ok(())
+        }
+        fn verify_journal_activation(&self) -> Result<()> {
+            let state = self
+                .state_dir
+                .as_deref()
+                .context("configured state path not inspected")?;
+            if let Some((format, complete)) =
+                crate::store::migration::activation_journal_format(state)?
+            {
+                ensure!(
+                    if self.migration_only {
+                        matches!(format, 1 | 2 | 3)
+                    } else {
+                        complete && format == CURRENT_JOURNAL_FORMAT
+                    },
+                    "existing journal requires explicit stopped migration-only activation and local migration; it is not a fresh installation"
+                );
+            }
             Ok(())
         }
         fn stage(&mut self, binary: &Path, expected: &str) -> Result<String> {
@@ -1014,7 +1214,7 @@ mod native {
                 let staged_binary = staging.path.join("agmi");
                 copy_candidate(binary, &staged_binary, expected)?;
                 fs::set_permissions(&staged_binary, fs::Permissions::from_mode(0o755))?;
-                self.space_checks(&staged_binary, units_kib)?;
+                self.space_checks(&staged_binary, units_kib, false)?;
                 self.failure = "release_invalid";
                 let embedded = manifest_output(&staged_binary).map_err(|error| {
                     if error
@@ -1113,6 +1313,7 @@ mod native {
             Ok(())
         }
         fn activate(&mut self, id: &str, request: &Request<'_>) -> Result<()> {
+            self.bootstrap_recovery = None;
             self.phase = "activation_preflight";
             self.failure = "release_invalid";
             // Held by run's InstallLock through staging and cutover. A release
@@ -1125,7 +1326,9 @@ mod native {
             }
             let release = self.root.join(id);
             validate_release(&release, id)?;
-            self.space_checks(&release.join("agmi"), 0)?;
+            self.space_checks(&release.join("agmi"), 0, true)?;
+            self.failure = "journal_incompatible";
+            self.verify_journal_activation()?;
             self.verify_units(&release)?;
             self.failure = "release_invalid";
             let current = self.root.join("current");
@@ -1136,15 +1339,22 @@ mod native {
                     valid_id(previous),
                     "current is not a versioned release pointer"
                 );
-                validate_release(&self.root.join(previous), previous)?;
+                validate_release_metadata(&self.root.join(previous), previous, true)?;
                 let old = fs::read_to_string(self.root.join(previous).join("MANIFEST"))?;
                 let new = fs::read_to_string(release.join("MANIFEST"))?;
-                ensure!(
-                    metadata(&old, "journal_schema")? == metadata(&new, "journal_schema")?,
-                    "journal migration is incompatible"
-                );
+                activation_schema(
+                    metadata(&old, "journal_schema")?,
+                    metadata(&new, "journal_schema")?,
+                    request.migration_only,
+                    request.stopped,
+                )?;
                 self.output
                     .push_str(&format!("retained_previous_release={previous}\n"));
+            } else {
+                ensure!(
+                    !request.migration_only,
+                    "migration-only requires an installed format2 or format3 release"
+                );
             }
             self.failure = "unit_invalid";
             for (unit, _, _) in UNITS {
@@ -1162,11 +1372,9 @@ mod native {
             self.activation = "in_progress";
             self.stop_on_failure = true;
             self.stop_units(true)?;
-            let pid = self.property("agmi.service", "MainPID", true)?;
-            ensure!(
-                pid.is_empty() || pid == "0",
-                "previous runtime did not stop"
-            );
+            self.verify_stopped()?;
+            self.failure = "journal_incompatible";
+            self.verify_journal_activation()?;
             self.service = "stopped";
             self.phase = "switching";
             self.failure = "switch_failed";
@@ -1183,6 +1391,13 @@ mod native {
             }
             sync_directory(&self.bin)?;
             sync_directory(&self.units)?;
+            if request.migration_only {
+                self.phase = "stopping";
+                self.failure = "stop_failed";
+                self.disable_autostart()?;
+                self.phase = "switching";
+                self.failure = "switch_failed";
+            }
             checkpoint()?;
             self.activation = "unknown";
             replace_link(Path::new(id), &current)?;
@@ -1194,9 +1409,14 @@ mod native {
             self.loaded(id)?;
             self.activation = "loaded_verified";
             if request.stopped {
-                if request.action == "install" {
+                if request.migration_only {
+                    self.failure = "stop_failed";
+                    self.verify_autostart_disabled()?;
+                    self.output.push_str("Migration bootstrap disabled boot activation. After local migration, explicitly enable/start services; participation still requires resume.\n");
+                } else if request.action == "install" {
                     self.control(&["enable", "agmi.service", "agmi-health.timer"])?;
                 }
+                self.verify_stopped()?;
             } else {
                 self.phase = "starting";
                 self.failure = "start_failed";
@@ -1231,7 +1451,7 @@ mod native {
             self.failure = "service_failed";
             match action {
                 "stop" => self.stop_units(true)?,
-                "disable" => self.control(&["disable", "agmi.service", "agmi-health.timer"])?,
+                "disable" => self.disable_autostart()?,
                 "start" | "restart" | "enable" => {
                     let id = fs::read_link(self.root.join("current"))?;
                     let id = id.to_str().context("invalid installed release")?;
@@ -1816,6 +2036,7 @@ mod native {
         let _cancellation = InstallerCancellation::acquire()?;
         let mut installation =
             Installation::new(std::env::var_os("HOME").context("HOME unavailable")?.into())?;
+        installation.migration_only = request.migration_only;
         // Keep all owned input and lock paths alive until post-switch cleanup is done.
         let mut private = None;
         let result = (|| -> Result<Option<Value>> {
@@ -1857,7 +2078,7 @@ mod native {
                 installation.failure = "manager_context_mismatch";
                 installation.manager_context()?;
             }
-            installation.lock = Some(installation.prepare()?);
+            installation.lock = Some(installation.prepare(request.action != "stage")?);
             if let Some(expected) = request.expected_release {
                 installation.failure = "release_invalid";
                 ensure!(
@@ -1865,7 +2086,7 @@ mod native {
                     "selected release changed before staging"
                 );
             }
-            if request.action == "install" {
+            if request.action == "install" && !request.migration_only {
                 installation.fresh()?;
             }
             if request.action == "service" {
@@ -1942,6 +2163,91 @@ mod native {
         static TEST_SERIAL: Mutex<()> = Mutex::new(());
 
         #[test]
+        fn schema_crossing_requires_exact_explicit_stopped_forward_pair() {
+            let current = CURRENT_JOURNAL_FORMAT.to_string();
+            for installed in ["1", "2", "3", &current, "99"] {
+                for candidate in ["1", "2", "3", &current, "99"] {
+                    for migration_only in [false, true] {
+                        for stopped in [false, true] {
+                            let allowed = if migration_only {
+                                matches!(installed, "2" | "3") && candidate == current && stopped
+                            } else {
+                                installed == current && candidate == current
+                            };
+                            assert_eq!(
+                                activation_schema(installed, candidate, migration_only, stopped)
+                                    .is_ok(),
+                                allowed,
+                                "{installed}->{candidate}, migration={migration_only}, stopped={stopped}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn actual_journal_not_release_pointer_defines_fresh_compatibility() -> Result<()> {
+            let temp = OwnedPath::directory(&std::env::temp_dir(), "agmi-journal-policy")?;
+            let state = temp.path.join("state");
+            fs::create_dir(&state)?;
+            fs::set_permissions(&state, fs::Permissions::from_mode(0o700))?;
+            let mut installation = Installation::new(temp.path.clone())?;
+            installation.state_dir = Some(state.clone());
+            assert!(installation.verify_journal_activation().is_ok());
+            let path = state.join("state.sqlite3");
+            let db = rusqlite::Connection::open(&path)?;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+            db.execute_batch(
+                "CREATE TABLE control(singleton INTEGER PRIMARY KEY, version INTEGER);
+                INSERT INTO control VALUES(1,3);",
+            )?;
+            assert!(installation.verify_journal_activation().is_err());
+            installation.migration_only = true;
+            assert!(installation.verify_journal_activation().is_ok());
+            db.execute("UPDATE control SET version=?1", [CURRENT_JOURNAL_FORMAT])?;
+            assert!(installation.verify_journal_activation().is_err());
+            installation.migration_only = false;
+            assert!(installation.verify_journal_activation().is_ok());
+            db.execute_batch(
+                "CREATE TABLE capability_migration(singleton INTEGER PRIMARY KEY, phase TEXT);
+                INSERT INTO capability_migration VALUES(1,'journal_ready');",
+            )?;
+            assert!(installation.verify_journal_activation().is_err());
+            db.execute("UPDATE capability_migration SET phase='complete'", [])?;
+            assert!(installation.verify_journal_activation().is_ok());
+            db.execute("UPDATE control SET version=99", [])?;
+            for migration_only in [false, true] {
+                installation.migration_only = migration_only;
+                assert!(installation.verify_journal_activation().is_err());
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn migration_request_is_explicit_and_stopped() {
+            let id = format!("r-{}", "a".repeat(64));
+            let mut args = vec!["activate".into(), id, "--migration-only".into()];
+            assert!(Request::parse(&args).is_err());
+            args.push("--stopped".into());
+            assert!(Request::parse(&args).unwrap().migration_only);
+            args.push("--migration-only".into());
+            assert!(Request::parse(&args).is_err());
+            let args = vec![
+                "stage".into(),
+                "/candidate".into(),
+                "--sha256".into(),
+                "a".repeat(64),
+                "--migration-only".into(),
+            ];
+            assert!(Request::parse(&args).is_err());
+            let mut args = args;
+            args[0] = "install".into();
+            let request = Request::parse(&args).unwrap();
+            assert!(request.migration_only && request.stopped);
+        }
+
+        #[test]
         fn expected_release_fence_refuses_before_any_cutover() -> Result<()> {
             let home = tempfile::tempdir()?;
             let mut installation = Installation::new(home.path().to_owned())?;
@@ -1991,7 +2297,7 @@ mod native {
         }
         fn candidate(path: &Path, state: &Path, dirty: &str) -> Result<String> {
             let mut manifest = format!(
-                "build_format=1\ncommit={}\nsource_dirty={dirty}\njournal_schema=2\nstop_timeout=infinity\n",
+                "build_format=1\ncommit={}\nsource_dirty={dirty}\njournal_schema={CURRENT_JOURNAL_FORMAT}\nstop_timeout=infinity\n",
                 "a".repeat(40)
             );
             for (_, key, template) in UNITS {
@@ -2013,6 +2319,349 @@ mod native {
                 assert!(!name.to_string_lossy().starts_with(".stage."));
                 assert!(!name.to_string_lossy().starts_with(".agmi-link."));
             }
+            Ok(())
+        }
+        #[test]
+        fn migration_bootstrap_requires_durable_disabled_boot_intent() -> Result<()> {
+            let _serial = TEST_SERIAL.lock().unwrap();
+            let _cancellation = InstallerCancellation::acquire()?;
+            let temporary = OwnedPath::directory(&std::env::temp_dir(), "agmi-bootstrap-test")?;
+            let home = temporary.path.join("home");
+            fs::create_dir(&home)?;
+            let state = home.join("state-not-created");
+            let binary = temporary.path.join("candidate");
+            let expected = candidate(&binary, &state, "clean")?;
+            let verifier = temporary.path.join("verify");
+            write_file(&verifier, b"#!/bin/sh\nexit 0\n", 0o700)?;
+            let mut installation = Installation::new(home)?;
+            installation.analyze = verifier;
+            installation.lock = Some(installation.prepare(true)?);
+            let id = installation.stage(&binary, &expected)?;
+            let release = installation.root.join(&id);
+
+            let old_binary = fs::read_to_string(&binary)?.replace(
+                &format!("journal_schema={CURRENT_JOURNAL_FORMAT}\n"),
+                "journal_schema=2\n",
+            );
+            let old_digest = format!("{:x}", Sha256::digest(old_binary.as_bytes()));
+            let old_id = format!("r-{old_digest}");
+            let old_release = installation.root.join(&old_id);
+            fs::create_dir(&old_release)?;
+            write_file(&old_release.join("agmi"), old_binary.as_bytes(), 0o700)?;
+            for (unit, _, template) in UNITS {
+                write_file(
+                    &old_release.join(unit),
+                    template.replace("@AGMI_RELEASE_ID@", &old_id).as_bytes(),
+                    0o600,
+                )?;
+            }
+            let old_manifest = fs::read_to_string(release.join("MANIFEST"))?
+                .replace(
+                    &format!("journal_schema={CURRENT_JOURNAL_FORMAT}\n"),
+                    "journal_schema=2\n",
+                )
+                .replace(&id, &old_id)
+                .replace(&expected, &old_digest);
+            write_file(
+                &old_release.join("MANIFEST"),
+                old_manifest.as_bytes(),
+                0o600,
+            )?;
+            write_file(
+                &old_release.join("SHA256SUMS"),
+                checksums(&old_release)?.as_bytes(),
+                0o600,
+            )?;
+            let current = installation.root.join("current");
+            symlink(&old_id, &current)?;
+            for (unit, _, _) in UNITS {
+                symlink(current.join(unit), installation.units.join(unit))?;
+            }
+            let mut boot_links = Vec::new();
+            for (unit, target) in [
+                ("agmi.service", "default.target.wants"),
+                ("agmi-health.timer", "timers.target.wants"),
+            ] {
+                let directory = installation.units.join(target);
+                fs::create_dir(&directory)?;
+                let link = directory.join(unit);
+                symlink(installation.units.join(unit), &link)?;
+                boot_links.push(link);
+            }
+            for (unit, _, _) in UNITS {
+                fs::write(temporary.path.join(format!("manager-{unit}")), "loaded\n")?;
+            }
+            let control = temporary.path.join("systemctl");
+            write_file(
+                &control,
+                format!(
+                    r#"#!/bin/sh
+root={}
+units="$root/home/.config/systemd/user"
+current="$root/home/.local/share/agmi/releases/current"
+[ "$1" = --user ] || exit 94
+shift
+case "$1" in
+show)
+  case "$3" in
+  --property=LoadState) cat "$root/manager-$2";;
+  --property=ActiveState) printf 'inactive\n';;
+  --property=FragmentPath) printf '%s/%s\n' "$units" "$2";;
+  --property=MainPID) printf '0\n';;
+  --property=DropInPaths) printf '\n';;
+  --property=TimeoutStopUSec) printf 'infinity\n';;
+  --property=Description) printf 'fixture [release=%s]\n' "$(readlink "$current")";;
+  --property=UnitFileState)
+    if [ -L "$units/default.target.wants/$2" ] || [ -L "$units/timers.target.wants/$2" ]; then
+      printf 'enabled\n'
+    else
+      printf 'linked\n'
+    fi;;
+  *) exit 95;;
+  esac;;
+disable)
+  [ ! -e "$root/refuse-disable" ] || exit 0
+  shift
+  for unit in "$@"; do
+    rm -f "$units/$unit" "$units/default.target.wants/$unit" "$units/timers.target.wants/$unit"
+    printf 'not-found\n' > "$root/manager-$unit"
+    [ ! -e "$root/partial-disable" ] || exit 1
+  done
+  if [ -e "$root/replace-definition" ]; then
+    ln -s "$root/operator-owned.service" "$units/agmi.service"
+    [ ! -e "$root/replace-fails" ] || exit 1
+  fi
+  if [ -e "$root/break-definitions" ]; then
+    mv "$units" "$units.saved"
+    : > "$units"
+    exit 1
+  fi
+  if [ -e "$root/cancel-disable" ]; then
+    kill -TERM "$PPID"
+    exit 1
+  fi;;
+daemon-reload)
+  [ ! -e "$root/fail-reload" ] || exit 1
+  if [ -e "$root/replace-on-reload" ]; then
+    rm -f "$units/agmi.service"
+    ln -s "$root/operator-owned.service" "$units/agmi.service"
+  fi
+  for unit in agmi.service agmi-health.service agmi-health.timer; do
+    if [ -f "$units/$unit" ]; then
+      printf 'loaded\n' > "$root/manager-$unit"
+    else
+      printf 'not-found\n' > "$root/manager-$unit"
+    fi
+  done;;
+stop) exit 0;;
+*) exit 96;;
+esac
+"#,
+                    quoted(&temporary.path)
+                )
+                .as_bytes(),
+                0o700,
+            )?;
+            installation.systemctl = control;
+            installation.migration_only = true;
+            let request = Request {
+                action: "activate",
+                target: &id,
+                digest: None,
+                expected_release: None,
+                stopped: true,
+                migration_only: true,
+            };
+            let refusal = temporary.path.join("refuse-disable");
+            fs::write(&refusal, [])?;
+            assert!(installation.activate(&id, &request).is_err());
+            assert_eq!(fs::read_link(&current)?, Path::new(&old_id));
+            assert!(boot_links.iter().all(|path| path.is_symlink()));
+
+            fs::remove_file(refusal)?;
+            // Failed legacy backup must precede any boot-intent mutation.
+            let launcher = installation.bin.join("agmi");
+            fs::remove_file(&launcher)?;
+            fs::create_dir(&launcher)?;
+            assert!(installation.activate(&id, &request).is_err());
+            assert_eq!(fs::read_link(&current)?, Path::new(&old_id));
+            assert!(boot_links.iter().all(|path| path.is_symlink()));
+            fs::remove_dir(&launcher)?;
+            symlink(current.join("agmi"), &launcher)?;
+
+            // A manager may remove definitions before reporting failure.
+            let partial = temporary.path.join("partial-disable");
+            fs::write(&partial, [])?;
+            assert!(installation.activate(&id, &request).is_err());
+            assert_eq!(fs::read_link(&current)?, Path::new(&old_id));
+            for (unit, _, _) in UNITS {
+                let definition = installation.units.join(unit);
+                assert_eq!(fs::read_link(&definition)?, current.join(unit));
+                assert!(definition.is_file());
+                assert_eq!(installation.property(unit, "LoadState", false)?, "loaded");
+            }
+            assert!(!boot_links[0].is_symlink());
+            assert!(boot_links[1].is_symlink());
+            fs::remove_file(&partial)?;
+
+            // One definition uses a relative target. Disable snapshots must preserve
+            // its exact bytes through restore instead of canonicalizing them.
+            let relative_unit = "agmi-health.timer";
+            let relative_target = {
+                let mut target = PathBuf::new();
+                for _ in installation
+                    .units
+                    .strip_prefix(&installation.home)?
+                    .components()
+                {
+                    target.push("..");
+                }
+                target.push(current.strip_prefix(&installation.home)?);
+                target.push(relative_unit);
+                target
+            };
+            fs::remove_file(installation.units.join(relative_unit))?;
+            symlink(&relative_target, installation.units.join(relative_unit))?;
+            let expected_definition = |unit: &str| -> PathBuf {
+                if unit == relative_unit {
+                    relative_target.clone()
+                } else {
+                    current.join(unit)
+                }
+            };
+            installation.service("disable")?;
+            assert_eq!(
+                fs::read_link(installation.units.join(relative_unit))?,
+                relative_target
+            );
+            assert!(installation.units.join(relative_unit).is_file());
+            assert_eq!(
+                installation.evidence(false)["bootstrap_recovery"]["definitions_restored"],
+                true
+            );
+
+            let replacement = temporary.path.join("operator-owned.service");
+            fs::write(&replacement, "operator-owned definition")?;
+            for (marker, disable_fails) in [
+                ("replace-definition", false),
+                ("replace-definition", true),
+                ("replace-on-reload", false),
+            ] {
+                let marker = temporary.path.join(marker);
+                let failed = temporary.path.join("replace-fails");
+                fs::write(&marker, [])?;
+                if disable_fails {
+                    fs::write(&failed, [])?;
+                }
+                assert!(installation.service("disable").is_err());
+                assert_eq!(fs::read_link(&current)?, Path::new(&old_id));
+                let evidence = installation.evidence(false);
+                assert_eq!(evidence["failure_code"], "bootstrap_recovery_failed");
+                assert_eq!(
+                    evidence["bootstrap_recovery"]["disable_command_succeeded"],
+                    !disable_fails
+                );
+                assert_eq!(
+                    evidence["bootstrap_recovery"]["definitions_restored"],
+                    false
+                );
+                assert_eq!(
+                    fs::read_link(installation.units.join("agmi.service"))?,
+                    replacement
+                );
+                for unit in ["agmi-health.service", "agmi-health.timer"] {
+                    assert_eq!(
+                        fs::read_link(installation.units.join(unit))?,
+                        expected_definition(unit)
+                    );
+                }
+                fs::remove_file(marker)?;
+                if disable_fails {
+                    fs::remove_file(failed)?;
+                }
+                fs::remove_file(installation.units.join("agmi.service"))?;
+                symlink(
+                    current.join("agmi.service"),
+                    installation.units.join("agmi.service"),
+                )?;
+            }
+
+            for disable_fails in [false, true] {
+                let reload_failure = temporary.path.join("fail-reload");
+                fs::write(&reload_failure, [])?;
+                if disable_fails {
+                    fs::write(&partial, [])?;
+                }
+                let result = installation.activate(&id, &request);
+                fs::remove_file(reload_failure)?;
+                if disable_fails {
+                    fs::remove_file(&partial)?;
+                }
+                assert!(result.is_err());
+                assert_eq!(fs::read_link(&current)?, Path::new(&old_id));
+                let evidence = installation.evidence(false);
+                assert_eq!(evidence["failure_code"], "bootstrap_recovery_failed");
+                assert_eq!(
+                    evidence["bootstrap_recovery"],
+                    json!({
+                        "disable_command_succeeded": !disable_fails,
+                        "definitions_restored": true,
+                        "manager_reload_succeeded": false
+                    })
+                );
+                assert_eq!(
+                    installation.property("agmi.service", "LoadState", false)?,
+                    "not-found"
+                );
+                assert!(installation.units.join("agmi.service").is_file());
+            }
+
+            let broken_definitions = temporary.path.join("break-definitions");
+            fs::write(&broken_definitions, [])?;
+            let result = installation.activate(&id, &request);
+            fs::remove_file(broken_definitions)?;
+            fs::remove_file(&installation.units)?;
+            fs::rename(
+                installation.units.with_file_name("user.saved"),
+                &installation.units,
+            )?;
+            assert!(result.is_err());
+            assert_eq!(fs::read_link(&current)?, Path::new(&old_id));
+            let evidence = installation.evidence(false);
+            assert_eq!(evidence["failure_code"], "bootstrap_recovery_failed");
+            assert_eq!(
+                evidence["bootstrap_recovery"],
+                json!({
+                    "disable_command_succeeded": false,
+                    "definitions_restored": false,
+                    "manager_reload_succeeded": true
+                })
+            );
+            assert_eq!(
+                installation.property("agmi.service", "LoadState", false)?,
+                "not-found"
+            );
+
+            let cancellation = temporary.path.join("cancel-disable");
+            fs::write(&cancellation, [])?;
+            let result = installation.activate(&id, &request);
+            let cancelled = CANCELLED.swap(0, Ordering::Relaxed);
+            fs::remove_file(cancellation)?;
+            assert!(result.is_err());
+            assert_ne!(cancelled, 0);
+            assert_eq!(fs::read_link(&current)?, Path::new(&old_id));
+            for (unit, _, _) in UNITS {
+                assert!(installation.units.join(unit).is_file());
+                assert_eq!(installation.property(unit, "LoadState", false)?, "loaded");
+            }
+
+            installation.activate(&id, &request)?;
+            assert_eq!(fs::read_link(&current)?, Path::new(&id));
+            assert_eq!(installation.service, "stopped");
+            assert_eq!(installation.activation, "loaded_verified");
+            drop(installation);
+            assert!(boot_links.iter().all(|path| !path.is_symlink()));
+            assert!(!state.exists());
             Ok(())
         }
 
@@ -2040,7 +2689,7 @@ mod native {
             let mut installation = Installation::new(home.clone())?;
             installation.analyze = verifier.clone();
             installation.systemctl = temporary.path.join("must-not-contact-a-manager");
-            installation.lock = Some(installation.prepare()?);
+            installation.lock = Some(installation.prepare(false)?);
             let owner = fs::read_to_string(installation.root.join(".install-lock/owner"))?;
             assert_eq!(owner.trim(), std::process::id().to_string());
             let busy = InstallLock::acquire(&installation.root)
@@ -2074,8 +2723,8 @@ mod native {
                     .all(|line| Path::new(line).starts_with(&release))
             );
             assert!(!exists(&installation.root.join("current"))?);
-            assert!(!exists(&installation.bin.join("agmi"))?);
-            assert!(fs::read_dir(&installation.units)?.next().is_none());
+            assert!(!exists(&installation.bin)?);
+            assert!(!exists(&installation.units)?);
             assert!(!state.exists());
             assert_eq!(
                 fs::read(&private_input)?,
@@ -2154,6 +2803,8 @@ mod native {
             // Fail after the single pointer switch. Drop must stop every unit
             // even under cancellation, while it still owns the installation lock;
             // it must never restore the old pointer or touch private inputs.
+            drop(installation.lock.take());
+            installation.lock = Some(installation.prepare(true)?);
             let events = temporary.path.join("systemd-events");
             let control = temporary.path.join("systemctl-fixture");
             let lock_path = installation.root.join(".install-lock/owner");
@@ -2228,6 +2879,7 @@ esac
                 digest: None,
                 expected_release: None,
                 stopped: true,
+                migration_only: false,
             };
             fs::write(&active_state, "activating")?;
             assert!(installation.activate(&id, &request).is_err());
@@ -2271,7 +2923,7 @@ esac
             let home = directory.join("home");
             fs::create_dir(&home)?;
             let mut installation = Installation::new(home)?;
-            installation.lock = Some(installation.prepare()?);
+            installation.lock = Some(installation.prepare(true)?);
             fs::create_dir_all(installation.config.parent().unwrap())?;
             write_file(
                 &installation.config,

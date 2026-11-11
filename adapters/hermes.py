@@ -12,10 +12,23 @@ import json
 import logging
 import os
 import sys
+import re
 from pathlib import Path
 
 STARTED = False
 PRELAUNCH_CODE = 78
+REPORTED = {}
+
+
+def identifier(value):
+    return value if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_.:/-]{1,256}", value) else None
+
+
+def capture(agent):
+    return {"provider": identifier(agent.provider), "model": identifier(agent.model),
+            "run_id": identifier(agent.session_id),
+            "reasoning_effort": identifier(agent.reasoning_config.get("effort")),
+            "fallback_used": False if not agent._fallback_chain else None, "tool_count": len(agent.tools)}
 
 
 class NativeFailure(Exception):
@@ -24,7 +37,7 @@ class NativeFailure(Exception):
 
 
 def main():
-    global STARTED, PRELAUNCH_CODE
+    global STARTED, PRELAUNCH_CODE, REPORTED
     payload = json.load(sys.stdin)
     tree = ast.parse(sys.argv[1])
     roots = []
@@ -89,11 +102,13 @@ def main():
                 raise RuntimeError("model route mismatch")
             if agent.reasoning_config != {"enabled": True, "effort": payload["reasoning"]}:
                 raise RuntimeError("reasoning setting changed")
+            REPORTED = capture(agent)
             STARTED = True
             # Policy uses the inspected native privileged channel. The user
             # message contains only the envelope; this is not semantic validation
             # or a claim that model prompt injection is solved.
             result = agent.run_conversation(payload["prompt"], system_message=payload["policy"])
+            REPORTED = capture(agent)
             if (result.get("completed") is not True or result.get("partial")
                     or result.get("interrupted") or result.get("failed")):
                 raise NativeFailure("incomplete")
@@ -102,9 +117,7 @@ def main():
             output = result.get("final_response")
             if not isinstance(output, str) or len(output.encode("utf-8")) > 65536:
                 raise NativeFailure("output")
-            envelope = {"provider": agent.provider, "model": agent.model,
-                        "run_id": agent.session_id, "reasoning_effort": payload["reasoning"],
-                        "output": output}
+            envelope = {**REPORTED, "output": output}
         finally:
             if agent is not None:
                 agent.close()
@@ -126,5 +139,5 @@ if __name__ == "__main__":
                 kind = "timeout"
             elif isinstance(error, (asyncio.CancelledError, KeyboardInterrupt)):
                 kind = "cancelled"
-            print(json.dumps({"ok": False, "error": {"kind": kind}}))
+            print(json.dumps({"ok": False, **REPORTED, "error": {"kind": kind}}))
         raise SystemExit(1 if STARTED else PRELAUNCH_CODE)

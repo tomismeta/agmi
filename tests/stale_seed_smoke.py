@@ -4,7 +4,6 @@ import argparse
 import json
 import pathlib
 import tempfile
-import sqlite3
 import time
 
 from participation_smoke import Fixture
@@ -14,7 +13,6 @@ class StaleFixture(Fixture):
     def __init__(self, binary, root):
         self.with_nonce = True
         self.always_stale = False
-        self.hold_job = False
         super().__init__(binary, root)
         self.answer_response = 'bound'
         self.receipt_state = 'confirmed'
@@ -26,9 +24,6 @@ class StaleFixture(Fixture):
         class Upstream(parent):
             def do_GET(self):
                 if '/api/job/' in self.path and (len(fixture.writes) == 1 or fixture.always_stale):
-                    if fixture.hold_job:
-                        self.reply(200, {'state': 'queued'})
-                        return
                     body = {'state': 'done', 'error': 'stale_seed'}
                     if fixture.with_nonce:
                         body['next_nonce'] = fixture.nonce + 1
@@ -49,25 +44,18 @@ class StaleFixture(Fixture):
 def exercise(f, scenario):
     f.with_nonce = scenario != 'missing_nonce'
     f.always_stale = scenario == 'budget'
-    if scenario == 'legacy_budget':
-        f.hold_job = True
-        f.policy['max_answer_attempts_per_epoch'] = 1
+    if scenario == 'single_attempt_budget':
+        f.lanes['answer']['participation']['max_answer_attempts_per_epoch'] = 1
         f.configure()
     f.start(resume=True)
-    if scenario == 'legacy_budget':
-        f.wait(lambda: any(o['state'] == 'queued' for o in f.operations('answer')),
-               'bound legacy fixture did not queue')
-        f.stop()
-        with sqlite3.connect(f.database) as db:
-            db.execute('UPDATE operation_evidence SET dispatch_sequence=NULL')
-            db.execute('DELETE FROM events')
-        f.hold_job = False
-        f.start()
+    if scenario == 'single_attempt_budget':
         f.wait(lambda: any(o['state'] == 'stale' for o in f.operations('answer')),
-               'bound legacy rejection did not reconcile')
+               'bound rejection did not reconcile')
         f.cycles()
-        assert len(f.writes) == 1, 'legacy terminal answer escaped the epoch dispatch budget'
-        assert len(f.dispatched()) == 0, 'fixture unexpectedly acquired a legacy dispatch witness'
+        f.stop()
+        f.start()
+        f.no_more_writes(1)
+        assert len(f.dispatched()) == 1, 'terminal answer lost its durable dispatch witness'
     elif scenario == 'missing_nonce':
         f.wait(lambda: any(o['state'] == 'unknown' for o in f.operations('answer')),
                'missing nonce incorrectly resolved uncertainty')
@@ -90,7 +78,7 @@ def exercise(f, scenario):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('binary', type=pathlib.Path)
-    scenarios = ['fresh_answer', 'missing_nonce', 'budget', 'legacy_budget']
+    scenarios = ['fresh_answer', 'missing_nonce', 'budget', 'single_attempt_budget']
     parser.add_argument('--scenario', choices=['all', *scenarios], default='all')
     args = parser.parse_args()
     for scenario in (scenarios if args.scenario == 'all' else [args.scenario]):

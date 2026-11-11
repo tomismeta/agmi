@@ -98,9 +98,11 @@ if args[0] == 'show':
         print('loaded' if (home / '.config/systemd/user' / args[1]).exists() else 'not-found')
     elif prop == 'ActiveState':
         if (root / 'state-query-failed').exists(): raise SystemExit(1)
-        print('inactive')
+        print('active' if (root / ('active-' + args[1])).exists() else 'inactive')
     elif prop == 'FragmentPath': print(home / '.config/systemd/user' / args[1])
     elif prop == 'MainPID': print('0')
+    elif prop == 'UnitFileState':
+        print('enabled' if (root / ('enabled-' + args[1])).exists() else 'linked')
     elif prop == 'DropInPaths': print('')
     elif prop == 'TimeoutStopUSec': print('infinity')
     elif prop == 'Description':
@@ -110,7 +112,17 @@ elif args[0] == 'is-active': raise SystemExit(3)
 elif args[0] == 'daemon-reload':
     (root / 'reload-entered').touch()
     while (root / 'block-reload').exists(): time.sleep(0.01)
-elif args[0] not in ('stop', 'enable', 'disable'):
+elif args[0] == 'stop':
+    if not (root / 'refuse-stop').exists():
+        (root / ('active-' + args[1])).unlink(missing_ok=True)
+elif args[0] == 'enable':
+    for unit in args[1:]: (root / ('enabled-' + unit)).touch()
+elif args[0] == 'disable':
+    if not (root / 'refuse-disable').exists():
+        for unit in args[1:]:
+            (root / ('enabled-' + unit)).unlink(missing_ok=True)
+            (home / '.config/systemd/user' / unit).unlink(missing_ok=True)
+else:
     raise AssertionError(args)
 '''
     for name in ('systemctl', 'systemd-analyze'):
@@ -170,6 +182,11 @@ elif args[0] not in ('stop', 'enable', 'disable'):
     assert not (home / '.local/bin/agmi').is_symlink()
     assert not state.exists()
     assert all(call[0] == 'systemd-analyze' for call in calls()), 'Stage contacted a user manager'
+    if isolated_home is None:
+        # Fresh-home stage-only owns the release store alone: activation-owned
+        # bin/unit directories must never appear from staging.
+        assert not (home / '.local/bin').exists(), 'Stage-only created activation-owned bin directory'
+        assert not (home / '.config/systemd/user').exists(), 'Stage-only created activation-owned unit directory'
     assert not list(temporary.iterdir()), 'Incoming delegation left private executables behind'
     error = cli('install', '--stage-only', '--binary', str(candidate), '--sha256', trusted, success=False)
     assert error['details']['failure_code'] == 'digest_mismatch'
@@ -221,6 +238,8 @@ elif args[0] not in ('stop', 'enable', 'disable'):
     assert error['details']['failure_code'] == 'missing_prerequisite', error
     lock.rmdir()
     cli('update', '--release', first_id, '--stopped')
+    assert (home / '.local/bin/agmi').is_symlink(), 'Activation did not publish the CLI link'
+    assert (home / '.config/systemd/user/agmi.service').is_symlink(), 'Activation did not publish unit definitions'
     status_tools = root / 'status-tools'
     status_tools.mkdir(mode=0o700)
     (status_tools / 'systemctl').symlink_to(tools / 'systemctl')
@@ -235,6 +254,78 @@ elif args[0] not in ('stop', 'enable', 'disable'):
     assert not any(call[2] == 'stop' for call in calls()[before:])
     assert os.readlink(releases / 'current') == first_id
     (root / 'state-query-failed').unlink()
+
+    # Retained schema2 is executable metadata only, never an ordinary candidate.
+    # Construct a checksum-consistent legacy release; this is not a journal or a
+    # simulated migration. The real installer performs all validation/cutover.
+    embedded = subprocess.run([str(binary), 'build-info', '--manifest'],
+                              capture_output=True, text=True, check=True).stdout.rstrip('\n')
+    current_schema = dict(line.split('=', 1) for line in embedded.splitlines())['journal_schema']
+    assert current_schema not in ('1', '2', '3'), 'fixture requires current executable'
+    legacy_embedded = embedded.replace('journal_schema=' + current_schema + '\n', 'journal_schema=2\n')
+    legacy_binary = root / 'legacy-metadata'
+    legacy_binary.write_text('#!' + sys.executable + '\nimport sys\n'
+                             'if sys.argv[1:] == ["build-info", "--manifest"]:\n'
+                             '    print(' + repr(legacy_embedded) + ')\n'
+                             'elif sys.argv[1:] == ["--config", ' + repr(str(config)) + ', "config", "state-path"]:\n'
+                             '    print(' + repr(str(state)) + ')\n'
+                             'else:\n    raise SystemExit(91)\n')
+    legacy_binary.chmod(0o700)
+    legacy_hash = digest(legacy_binary)
+    legacy_id = 'r-' + legacy_hash
+    legacy_config = ('state_dir = ' + json.dumps(str(state)) + '\n[capabilities]\n'
+                     'answer = "read_only"\njudge = "read_only"\nmine = "read_only"\n').encode()
+    config.write_bytes(legacy_config)
+    legacy = releases / legacy_id
+    legacy.mkdir(mode=0o700)
+    shutil.copy2(legacy_binary, legacy / 'agmi')
+    artifacts = ['agmi', 'agmi.service', 'agmi-health.service', 'agmi-health.timer', 'MANIFEST']
+    for unit in artifacts[1:4]:
+        (legacy / unit).write_text((releases / first_id / unit).read_text().replace(first_id, legacy_id))
+    (legacy / 'MANIFEST').write_text(legacy_embedded + '\nrelease_id=' + legacy_id
+                                   + '\nbinary_sha256=' + legacy_hash + '\n')
+    (legacy / 'SHA256SUMS').write_text(''.join(digest(legacy / name) + '  ' + name + '\n'
+                                            for name in artifacts))
+    (releases / 'current').unlink()
+    (releases / 'current').symlink_to(legacy_id)
+    before = len(calls())
+    cli('update', '--release', first_id, '--stopped', success=False)
+    assert os.readlink(releases / 'current') == legacy_id
+    assert not any(call[2] == 'stop' for call in calls()[before:])
+    for unit in ('agmi.service', 'agmi-health.timer'):
+        (root / ('active-' + unit)).touch()
+        (root / ('enabled-' + unit)).touch()
+    (root / 'refuse-stop').touch()
+    error = cli('update', '--release', first_id, '--stopped', '--migration-only', success=False)
+    assert error['installation']['failure_code'] == 'stop_failed'
+    assert os.readlink(releases / 'current') == legacy_id
+    (root / 'refuse-stop').unlink()
+    (root / 'reject-units').touch()
+    cli('update', '--release', first_id, '--stopped', '--migration-only', success=False)
+    assert os.readlink(releases / 'current') == legacy_id
+    (root / 'reject-units').unlink()
+    (root / 'refuse-disable').touch()
+    error = cli('update', '--release', first_id, '--stopped', '--migration-only', success=False)
+    assert error['installation']['failure_code'] == 'stop_failed'
+    assert os.readlink(releases / 'current') == legacy_id
+    assert len(list(root.glob('enabled-*'))) == 2
+    (root / 'refuse-disable').unlink()
+    before = len(calls())
+    result = cli('update', '--release', first_id, '--stopped', '--migration-only')
+    assert result['installation']['activation'] == 'loaded_verified'
+    assert result['installation']['service'] == 'stopped'
+    assert os.readlink(releases / 'current') == first_id
+    assert not any(call[2] in ('start', 'restart', 'enable') for call in calls()[before:])
+    assert not any(root.glob('active-*'))
+    assert not any(root.glob('enabled-*')), 'bootstrap left automatic boot activation enabled'
+    for extra in ([], ['--migration-only']):
+        cli('update', '--release', legacy_id, '--stopped', *extra, success=False)
+        assert os.readlink(releases / 'current') == first_id
+    assert config.read_bytes() == legacy_config and not state.exists()
+    config.write_bytes(original_config)
+    print(json.dumps({'scenario': 'explicit_stopped_schema2_to_current',
+                      'no_autostart': True, 'boot_activation_disabled': True, 'downgrade_rejected': True,
+                      'failed_stop_disable_and_unit_verification_rejected': True}))
 
     # Interrupt an actual public update after selection, while its systemd child
     # is blocked. Every catchable old trap signal must retain current and stop

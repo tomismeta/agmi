@@ -129,7 +129,7 @@ export async function callGatewayFromCli(...args) {
   return {
     status: 'ok', runId: args[2].idempotencyKey,
     result: {
-      payloads: [{text: '{"native":"final artifact"}'}],
+      payloads: expected.case === 'invalid_output' ? [{text: {secret: 'must-not-retain'}}] : [{text: '{"native":"final artifact"}'}],
       meta: {
         agentMeta: {provider: 'openai', model: 'fixture-model'},
         requestShaping: {thinking: 'high'}, aborted: false,
@@ -193,7 +193,7 @@ class HermesContract(unittest.TestCase):
         self.assertFalse(marker.exists())
         self.assertEqual(json.loads(result.stdout), dict(
             provider='openai-codex', model='fixture-model', run_id='isolated-native-session',
-            reasoning_effort='high', output=FINAL))
+            reasoning_effort='high', fallback_used=False, tool_count=0, output=FINAL))
         self.assertEqual([e['event'] for e in events],
                          ['bootstrap', 'resolve', 'db_open', 'construct', 'run', 'agent_close', 'db_close'])
         self.assertEqual(events[1], dict(event='resolve', requested='openai-codex', target_model='fixture-model'))
@@ -271,7 +271,14 @@ class HermesContract(unittest.TestCase):
             with self.subTest(case=case):
                 result, events = self.invoke(case)
                 self.assertEqual(result.returncode, 1)
-                self.assertEqual(json.loads(result.stdout), {'ok': False, 'error': {'kind': kind}})
+                envelope = json.loads(result.stdout)
+                self.assertFalse(envelope['ok'])
+                self.assertEqual(envelope['error'], {'kind': kind})
+                self.assertEqual(envelope['provider'], 'unexpected' if case == 'provenance' else 'openai-codex')
+                self.assertEqual(envelope['model'], 'unexpected' if case == 'model_provenance' else 'fixture-model')
+                self.assertEqual(envelope['run_id'], 'isolated-native-session')
+                self.assertNotIn(SECRET.encode(), result.stdout)
+                self.assertNotIn('output', envelope)
                 self.assertEqual([e['event'] for e in events][-3:], ['run', 'agent_close', 'db_close'])
         result, _ = self.invoke(final='é' * 32768)
         self.assertEqual(result.returncode, 0)
@@ -340,6 +347,21 @@ class OpenclawContract(unittest.TestCase):
         self.assertGreater(len(encoded(payload)), 1024 * 1024)
         self.assertLessEqual(len(encoded(payload)), MAX_WIRE)
         self.assert_native_call(payload, self.invoke(payload))
+
+    def test_invalid_output_preserves_sourced_native_facts(self):
+        payload = dict(model='openai/fixture-model', reasoning='high', timeout_seconds=13,
+                       prompt='fixture prompt', case='invalid_output')
+        result = self.invoke(payload)
+        self.assertEqual(result.returncode, 1)
+        envelope = json.loads(result.stdout)
+        self.assertEqual(envelope['error'], {'kind': 'error_payload'})
+        self.assertEqual(envelope['provider'], 'openai')
+        self.assertEqual(envelope['model'], 'fixture-model')
+        self.assertEqual(envelope['reasoning'], 'high')
+        self.assertFalse(envelope['fallbackUsed'])
+        self.assertTrue(envelope['runId'])
+        self.assertNotIn('final', envelope)
+        self.assertNotIn(b'must-not-retain', result.stdout)
 
     def test_exact_encoded_boundary(self):
         payload = dict(model='openai/fixture-model', reasoning='high', timeout_seconds=13, prompt='')

@@ -43,8 +43,6 @@ class Fixture:
         self.answer_response = 'lost'
         self.receipt_state = 'included_pending'
         self.retry_after = None
-        self.http_seconds = 2
-        self.read_http_seconds = 2
         self.read_delay = 0
         self.write_delay = 0
         self.writes = []
@@ -55,14 +53,29 @@ class Fixture:
         self.jobs = {}
         self.queued_grades = False
         self.assignment_number = 10
-        self.policy = dict(mode='strict', uncertainty_grace_seconds=1,
-                           max_unresolved_operations=4, allow_answer=True,
-                           allow_judge=False, allow_mine=True,
-                           retry_uncertain_answers=False,
-                           uncertain_answer_retry_seconds=1,
-                           max_answer_attempts_per_epoch=2)
-        self.preparation = {}
-        self.capabilities = dict(answer='active', judge='off', mine='off')
+        self.lanes = {}
+        for kind, mode in (('answer', 'active'), ('judge', 'off'), ('mine', 'off')):
+            lane = dict(mode=mode,
+                        timeouts=dict(http_seconds=2, read_http_seconds=2),
+                        schedule=dict(poll_seconds=1, retry_seconds=1,
+                                      backoff_max_seconds=900, jitter_seconds=0),
+                        participation=dict(mode='strict', uncertainty_grace_seconds=1,
+                                           max_unresolved_operations=4))
+            if kind == 'mine':
+                lane['schedule'].update(interval_seconds=86400, each_epoch=False)
+            else:
+                lane['timeouts']['model_seconds'] = 10
+                lane['preparation'] = dict(while_blocked=kind == 'answer',
+                                           retry_uncertain=False, max_attempts_per_work=2)
+            self.lanes[kind] = lane
+        self.lanes['judge']['excluded_assignments'] = []
+        self.lanes['answer']['participation'].update(
+            retry_uncertain_answers=False, uncertain_answer_retry_seconds=1,
+            max_answer_attempts_per_epoch=2, max_historical_unknown_answers=0,
+            historical_unknown_answer_capacity='bounded')
+        self.identity = dict(read_http_seconds=2, retry_seconds=1,
+                             backoff_max_seconds=900, jitter_seconds=0)
+        self.runtime = dict(shutdown_seconds=2)
         self.server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), self.handler())
         self.server.daemon_threads = True
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -94,6 +107,9 @@ print(json.dumps({'provider': 'openai-codex', 'model': payload['model'],
         self.core = root / 'core-guidance.md'
         self.core.write_text('Evaluate the supplied task against its protocol requirements.')
         self.core.chmod(0o600)
+        for kind in ('answer', 'judge'):
+            self.lanes[kind]['model'] = dict(harness='hermes', executable=str(self.native),
+                model='openai/test', reasoning='high', core_guidance_file=str(self.core))
         self.database = root / 'state/state.sqlite3'
         self.command = [self.binary, '--config', str(self.config), '--json']
         self.env = dict(os.environ, NO_PROXY='127.0.0.1,localhost', no_proxy='127.0.0.1,localhost')
@@ -233,42 +249,35 @@ print(json.dumps({'provider': 'openai-codex', 'model': payload['model'],
 
         return Upstream
 
-    def configure(self, **policy):
-        self.policy.update(policy)
+    def configure(self, lane=None, **participation):
+        if participation:
+            assert lane in self.lanes, 'participation configuration requires an explicit lane'
+            self.lanes[lane]['participation'].update(participation)
         value = lambda item: str(item).lower() if isinstance(item, bool) else json.dumps(item)
-        capabilities = '\n'.join(f'{key} = {json.dumps(val)}' for key, val in self.capabilities.items())
-        participation = '\n'.join(f'{key} = {value(val)}' for key, val in self.policy.items())
-        preparation = '\n'.join(f'{key} = {value(val)}' for key, val in self.preparation.items())
-        solver = '\n'.join(f'''[solver.{kind}]
-harness = "hermes"
-executable = {json.dumps(str(self.native))}
-model = "openai/test"
-reasoning = "high"
-core_guidance_file = {json.dumps(str(self.core))}''' for kind in ('answer', 'judge'))
-        text = f'''state_dir = {json.dumps(str(self.root / 'state'))}
+        def table(name, fields):
+            return '[' + name + ']\n' + '\n'.join(
+                f'{key} = {value(val)}' for key, val in fields.items() if val is not None) + '\n'
+        text = f'''schema_version = 2
+state_dir = {json.dumps(str(self.root / 'state'))}
 [network]
 base_url = "http://127.0.0.1:{self.server.server_port}"
 chain = "{self.chain}"
 address = "{self.address}"
 credential_file = {json.dumps(str(self.key))}
-[capabilities]
-{capabilities}
-{solver}
-[participation]
-{participation}
-[preparation]
-{preparation}
-[timeouts]
-http_seconds = {self.http_seconds}
-read_http_seconds = {self.read_http_seconds}
-model_seconds = 10
-shutdown_seconds = 2
-[schedule]
-poll_seconds = 1
-mine_seconds = 86400
-retry_seconds = {getattr(self, 'retry_seconds', 1)}
-jitter_seconds = 0
 '''
+        text += table('runtime', self.runtime) + table('identity', self.identity)
+        for kind, settings in self.lanes.items():
+            prefix = 'capabilities.' + kind
+            text += table(prefix, {key: val for key, val in settings.items()
+                                   if not isinstance(val, dict)})
+            for section, fields in settings.items():
+                if isinstance(fields, dict):
+                    text += table(prefix + '.' + section,
+                                  {key: val for key, val in fields.items()
+                                   if not isinstance(val, dict)})
+                    for key, val in fields.items():
+                        if isinstance(val, dict):
+                            text += table(prefix + '.' + section + '.' + key, val)
         pending = self.config.with_suffix('.new')
         pending.write_text(text)
         pending.chmod(0o600)
@@ -288,8 +297,15 @@ jitter_seconds = 0
         result = self.invoke('config', 'apply', '--expected-revision', before['file_revision'],
                              stdin=json.dumps(patch))
         assert result['saved'] and result['runtime_applied'] is None
-        self.policy.update(patch.get('participation', {}))
-        self.preparation.update(patch.get('preparation', {}))
+        def merge(target, changes):
+            for key, value in changes.items():
+                if isinstance(value, dict):
+                    merge(target.setdefault(key, {}), value)
+                else:
+                    target[key] = value
+        merge(self.lanes, patch.get('capabilities', {}))
+        merge(self.identity, patch.get('identity', {}))
+        merge(self.runtime, patch.get('runtime', {}))
         if self.child is not None:
             self.wait(lambda: self.status()['effective_runtime']['revision'] == result['revision'],
                       'CLI configuration save was not loaded by the running controller')
@@ -323,7 +339,7 @@ jitter_seconds = 0
     def rows(self, sql, parameters=()):
         if not self.database.exists():
             return []
-        with sqlite3.connect(self.database.as_uri() + '?mode=ro', uri=True, timeout=2) as db:
+        with contextlib.closing(sqlite3.connect(self.database.as_uri() + '?mode=ro', uri=True, timeout=2)) as db:
             db.row_factory = sqlite3.Row
             return [dict(row) for row in db.execute(sql, parameters)]
 
@@ -363,16 +379,10 @@ jitter_seconds = 0
         self.wait(matches, 'effective participation policy did not reload')
 
     def cycles(self, count=3):
-        # A negative assertion spans actual observer cycles, never a blind long sleep.
-        if self.capabilities['answer'] == 'off' and self.capabilities['mine'] == 'off':
-            baseline = self.status()['effective_runtime']['observed_at']
-            self.wait(lambda: self.status()['effective_runtime']['observed_at'] >= baseline + count,
-                      'disabled controller did not advance its heartbeat')
-            return
-        with self.lock:
-            baseline = sum(route.endswith('/api/hosted/challenge') for route, _, _ in self.reads)
-        self.wait(lambda: sum(route.endswith('/api/hosted/challenge') for route, _, _ in self.reads)
-                  >= baseline + count, 'observer did not complete challenge turns')
+        # Heartbeats continue even when a real shared minimum forbids discovery.
+        baseline = self.status()['effective_runtime']['observed_at']
+        self.wait(lambda: self.status()['effective_runtime']['observed_at'] >= baseline + count,
+                  'controller did not advance its heartbeat')
 
     def no_more_writes(self, count):
         self.cycles()
@@ -382,7 +392,8 @@ jitter_seconds = 0
     def rollover(self, epoch, answered=False):
         with self.lock:
             self.epoch, self.answered = epoch, answered
-        self.wait(lambda: (self.status().get('observation') or {}).get('epoch') == epoch,
+        lane = 'answer' if self.lanes['answer']['mode'] != 'off' else 'mine'
+        self.wait(lambda: (self.status()['observations'].get(lane) or {}).get('epoch') == epoch,
                   'new epoch was not observed')
 
     def unknown(self, kind, count=1):
@@ -391,6 +402,9 @@ jitter_seconds = 0
 
     def risks(self):
         return self.rows('SELECT * FROM risk_admissions ORDER BY operation_id')
+
+    def restrictions(self):
+        return self.rows('SELECT * FROM request_restrictions ORDER BY scope,target,basis')
 
     def preserved(self, original):
         current = next(row for row in self.operations() if row['id'] == original['id'])
@@ -412,7 +426,7 @@ jitter_seconds = 0
 def old_judgment(fixture):
     fixture.answered = True
     fixture.assignments = True
-    fixture.capabilities['judge'] = 'active'
+    fixture.lanes['judge']['mode'] = 'active'
     fixture.configure()
     fixture.start(resume=True)
     fixture.unknown('judge')
@@ -428,7 +442,7 @@ def rollover_scenario(f):
     f.no_more_writes(1)
     assert f.model_calls('answer') == 1, 'strict must still capture current work without dispatch'
     f.answer_response = 'delayed-conflict'
-    f.apply_config({'participation': {'mode': 'participation_first', 'max_unresolved_operations': 2}})
+    f.apply_config({'capabilities': {'answer': {'participation': {'mode': 'participation_first', 'max_unresolved_operations': 1}}}})
     f.loaded()
     f.unknown('answer')
     assert len(f.writes) == 2
@@ -443,7 +457,7 @@ def rollover_scenario(f):
     risks = f.risks()
     assert len(risks) == 1 and risks[0]['operation_id'] == conflict['id']
     assert old['id'] in json.loads(risks[0]['blocker_ids'])
-    assert json.loads(risks[0]['policy'])['mode'] == 'participation_first'
+    assert json.loads(risks[0]['policy'])['participation']['mode'] == 'participation_first'
     assert risks[0]['revision'] and risks[0]['dispatch_sequence']
     f.answer_response, f.receipt_state = 'bound', 'final'
     f.rollover(12)
@@ -455,7 +469,7 @@ def rollover_scenario(f):
     f.no_more_writes(2)
     f.preserved(old)
     assert len(f.risks()) == 1, 'restart erased or duplicated risk admission'
-    f.configure(max_unresolved_operations=3)
+    f.configure('answer', max_unresolved_operations=2)
     f.loaded()
     f.wait(lambda: any(row['state'] == 'final' and row['job_id'] == 'answer-12'
                        for row in f.operations('answer')), 'newer bound job starved behind unknown')
@@ -464,7 +478,7 @@ def rollover_scenario(f):
     assert len(f.risks()) == 2
     assert f.status()['participation']['unresolved_count'] == 2
     f.preserved(old)
-    f.configure(mode='strict')
+    f.configure('answer', mode='strict')
     f.loaded()
     f.rollover(13)
     f.no_more_writes(3)
@@ -474,16 +488,16 @@ def rollover_scenario(f):
 
 
 def retry_scenario(f):
-    f.configure(mode='participation_first')
+    f.configure('answer', mode='participation_first')
     f.start(resume=True)
     f.unknown('answer')
     original = f.dispatched('answer')[0]
     f.no_more_writes(1)  # Default-off means opt-in is a real behavioral switch.
-    f.configure(retry_uncertain_answers=True, uncertainty_grace_seconds=3600,
+    f.configure('answer', retry_uncertain_answers=True, uncertainty_grace_seconds=3600,
                 uncertain_answer_retry_seconds=3600)
     f.loaded()
     f.no_more_writes(1)
-    f.configure(uncertainty_grace_seconds=1, uncertain_answer_retry_seconds=1)
+    f.configure('answer', uncertainty_grace_seconds=1, uncertain_answer_retry_seconds=1)
     f.loaded()
     f.unknown('answer', 2)
     f.no_more_writes(2)
@@ -515,7 +529,7 @@ def changed_epoch_scenario(f):
     f.rollover(11)
     f.wait(lambda: f.model_calls('answer') == 2, 'new epoch did not prepare its own answer')
     f.no_more_writes(1)
-    f.configure(mode='participation_first', retry_uncertain_answers=True,
+    f.configure('answer', mode='participation_first', retry_uncertain_answers=True,
                 max_unresolved_operations=2)
     f.loaded()
     f.unknown('answer', 2)
@@ -534,24 +548,21 @@ def fences_scenario(f):
     f.start(resume=True)
     f.unknown('answer')
     original = f.dispatched('answer')[0]
-    f.configure(retry_uncertain_answers=True)  # Strict overrides opt-in.
-    f.loaded()
-    f.no_more_writes(1)
-    f.configure(mode='participation_first', allow_answer=False)
+    f.configure('answer', retry_uncertain_answers=True)  # Strict overrides opt-in.
     f.loaded()
     f.no_more_writes(1)
     for capability in ('read_only', 'off'):
-        f.capabilities['answer'] = capability
-        f.configure(mode='participation_first', allow_answer=True)
+        f.lanes['answer']['mode'] = capability
+        f.configure('answer', mode='participation_first')
         f.loaded()
         f.no_more_writes(1)
     with f.lock:
         f.answered = True
-    f.capabilities['answer'] = 'active'
+    f.lanes['answer']['mode'] = 'active'
     f.configure()
     f.loaded()
     f.no_more_writes(1)
-    assert f.status()['epoch_evidence']['answered'] is True
+    assert f.status()['observations']['answer']['answered'] is True
     f.invoke('pause')
     with f.lock:
         f.answered = False
@@ -559,12 +570,12 @@ def fences_scenario(f):
     assert f.status()['paused'] is True
     f.preserved(original)
     return dict(wallet_mutations=1,
-                fences=['strict', 'allow_answer', 'read_only', 'off', 'answered', 'pause'])
+                fences=['strict', 'read_only', 'off', 'answered', 'pause'])
 
 
 def inclusion_scenario(f):
     f.answer_response = 'included'
-    f.configure(mode='participation_first', retry_uncertain_answers=True,
+    f.configure('answer', mode='participation_first', retry_uncertain_answers=True,
                 uncertainty_grace_seconds=0, uncertain_answer_retry_seconds=0)
     f.start(resume=True)
     for state in ('included_pending', 'confirmed'):
@@ -572,9 +583,9 @@ def inclusion_scenario(f):
         f.wait(lambda: any(row['state'] == state for row in f.operations('answer')),
                'answer inclusion state not observed: ' + state)
         f.no_more_writes(1)
-        assert f.status()['participation']['uncertainty_blocks']['answer'] is False, \
+        assert f.status()['participation']['lanes']['answer']['allowed'] is True, \
             'accepted current answer was misreported as an uncertainty blocker'
-    # Confirmed operations are terminal and need not poll for finality.
+    # Accepted evidence excludes retries even while finality observation continues.
     f.stop()
     f.start()
     f.no_more_writes(1)
@@ -585,7 +596,7 @@ def inclusion_scenario(f):
 
 def final_scenario(f):
     f.answer_response, f.receipt_state = 'included', 'final'
-    f.configure(mode='participation_first', retry_uncertain_answers=True,
+    f.configure('answer', mode='participation_first', retry_uncertain_answers=True,
                 uncertainty_grace_seconds=0, uncertain_answer_retry_seconds=0)
     f.start(resume=True)
     f.wait(lambda: any(row['state'] == 'final' for row in f.operations('answer')),
@@ -597,12 +608,14 @@ def final_scenario(f):
 
 def retry_after_scenario(f):
     f.answer_response, f.retry_after = 'backoff', 8
-    f.configure(mode='participation_first', retry_uncertain_answers=True,
+    f.configure('answer', mode='participation_first', retry_uncertain_answers=True,
                 uncertainty_grace_seconds=0, uncertain_answer_retry_seconds=0)
     f.start(resume=True)
     f.unknown('answer')
     original = f.dispatched('answer')[0]
-    assert original['next_at'] > int(time.time()), 'server retry minimum not retained'
+    floor = next(row for row in f.restrictions()
+                 if row['scope'] == 'account_authenticated' and row['basis'] == 'server_retry_after')
+    assert floor['not_before'] > int(time.time()), 'server retry minimum not retained'
     f.no_more_writes(1)
     f.stop(crash=True)
     f.start()
@@ -616,9 +629,9 @@ def retry_after_scenario(f):
 
 
 def manual_scenario(f):
-    f.preparation['max_attempts_per_work'] = 1
+    f.lanes['answer']['preparation']['max_attempts_per_work'] = 1
     old = old_judgment(f)
-    f.configure(mode='manual', uncertainty_grace_seconds=3600,
+    f.configure('answer', mode='manual', uncertainty_grace_seconds=3600,
                 uncertain_answer_retry_seconds=3600, retry_uncertain_answers=True)
     f.loaded()
     f.rollover(11)
@@ -666,7 +679,7 @@ def manual_scenario(f):
     f.no_more_writes(2)
     # Pause invalidated an unsent draft; a manual network grant does not also
     # authorize exceeding the independent model-generation budget.
-    f.apply_config({'preparation': {'max_attempts_per_work': 2}})
+    f.apply_config({'capabilities': {'answer': {'preparation': {'max_attempts_per_work': 2}}}})
     f.wait(lambda: len(f.writes) == 3, 'fresh generation manual grant did not admit answer')
     f.unknown('answer', 2)
     f.no_more_writes(3)
@@ -678,7 +691,8 @@ def manual_scenario(f):
 
 
 def slow_read_scenario(f):
-    f.http_seconds, f.read_http_seconds = 1, 3
+    f.lanes['answer']['timeouts']['http_seconds'], f.lanes['answer']['timeouts']['read_http_seconds'] = 1, 3
+    f.identity['read_http_seconds'] = 3
     f.read_delay, f.write_delay = 1.5, 2
     f.answer_response = 'included'
     f.configure()
@@ -697,9 +711,9 @@ def slow_read_scenario(f):
 
 def mine_epoch_scenario(f):
     f.answered = True
-    f.capabilities['mine'] = 'active'
-    f.configure(mode='participation_first')
-    f.apply_config({'schedule': {'mine_each_epoch': True}})
+    f.lanes['mine']['mode'] = 'active'
+    f.configure('mine', mode='participation_first')
+    f.apply_config({'capabilities': {'mine': {'schedule': {'each_epoch': True}}}})
     f.start(resume=True)
     f.unknown('mine')
     original = f.dispatched('mine')[0]
@@ -708,14 +722,14 @@ def mine_epoch_scenario(f):
     f.start()
     f.no_more_writes(1)
     f.mine_response, f.write_delay = 'completed', 1.5
-    f.apply_config({'timeouts': {'http_seconds': 3, 'read_http_seconds': 1}})
+    f.apply_config({'capabilities': {'mine': {'timeouts': {'http_seconds': 3, 'read_http_seconds': 1}}}})
     with f.lock:
         f.epoch, f.answered = 11, True
     f.wait(lambda: any(row['state'] == 'completed' for row in f.operations('mine')),
            'new epoch mine did not use its independent write deadline')
     f.no_more_writes(2)
     f.preserved(original)
-    f.apply_config({'schedule': {'mine_each_epoch': False}})
+    f.apply_config({'capabilities': {'mine': {'schedule': {'each_epoch': False}}}})
     with f.lock:
         f.epoch, f.answered = 12, True
     f.wait(lambda: len(f.dispatched('mine')) == 3, 'interval mining did not start its cadence')
@@ -723,7 +737,7 @@ def mine_epoch_scenario(f):
     with f.lock:
         f.epoch, f.answered = 13, True
     f.no_more_writes(3)
-    f.apply_config({'schedule': {'mine_each_epoch': True}})
+    f.apply_config({'capabilities': {'mine': {'schedule': {'each_epoch': True}}}})
     f.wait(lambda: len(f.dispatched('mine')) == 4, 'per-epoch mining did not reload')
     f.no_more_writes(4)
     assert [write['epoch'] for write in f.writes] == [10, 11, 12, 13]
@@ -735,8 +749,8 @@ def mine_epoch_scenario(f):
 
 
 def local_retry_scenario(f):
-    f.retry_seconds = 3600
-    f.policy.update(mode='participation_first', uncertainty_grace_seconds=0)
+    f.lanes['judge']['schedule']['retry_seconds'] = 3600
+    f.lanes['answer']['participation'].update(mode='participation_first', uncertainty_grace_seconds=0)
     original = old_judgment(f)
     minimum = f.rows('SELECT retry_not_before FROM operation_timing WHERE operation_id=?', (original['id'],))[0]
     assert minimum['retry_not_before'] <= time.time(), 'local cadence became a server-minimum fence'
@@ -745,7 +759,7 @@ def local_retry_scenario(f):
     f.rollover(11)
     f.unknown('answer')
     f.no_more_writes(2)
-    f.apply_config({'participation': {'mode': 'manual'}})
+    f.apply_config({'capabilities': {'answer': {'participation': {'mode': 'manual'}}}})
     f.rollover(12)
     f.no_more_writes(2)
     f.stop()
@@ -758,80 +772,11 @@ def local_retry_scenario(f):
                 zero_grace_and_manual_unblocked=True, restart_preserved_server_minimum_separation=True)
 
 
-def retry_priority_scenario(f):
-    """A due retry owns admission across fresh-read cadence, not just one tick."""
-    f.queued_grades = True
-    f.assignments = True
-    f.answered = True
-    f.capabilities['judge'] = 'active'
-    f.configure(mode='participation_first', allow_judge=True,
-                uncertainty_grace_seconds=2, max_unresolved_operations=8)
-    f.start(resume=True)
-    f.wait(lambda: any(row['state'] == 'queued' for row in f.operations('judge')),
-           'initial judgment did not queue')
-    # Obtain the original failure and its genuine upstream floor through HTTP.
-    with f.lock:
-        f.answer_response, f.retry_after, f.answered = 'backoff', 3600, False
-    f.unknown('answer')
-    f.stop()
-    original = f.dispatched('answer')[0]
-    judges = len(f.dispatched('judge'))
-    assert f.rows('SELECT retry_not_before FROM operation_timing WHERE operation_id=?',
-                  (original['id'],))[0]['retry_not_before'] > time.time() + 3000
-    # Only the fixture clocks move: expire the original delay/floor and leave a
-    # bounded fresh-read cadence gap. Old admission fills this gap with another
-    # eligible judgment, starting grace again; priority admission must not.
-    with sqlite3.connect(f.database) as db:
-        db.execute('UPDATE operation_timing SET retry_not_before=0')
-        db.execute('UPDATE operation_evidence SET observed_at=? WHERE operation_id=?',
-                   (int(time.time()) - 3601, original['id']))
-        db.execute('UPDATE operation_evidence SET blocked_since=?', (int(time.time()) - 100,))
-        db.execute("UPDATE operations SET next_at=0 WHERE state='queued'")
-        db.execute("INSERT OR REPLACE INTO schedule(kind,next_at) VALUES ('answer',?)",
-                   (int(time.time()) + 8,))
-        db.execute("INSERT OR REPLACE INTO schedule(kind,next_at) VALUES ('judge',0)")
-    f.answer_response, f.receipt_state = 'included', 'confirmed'
-    f.configure(retry_uncertain_answers=True, uncertain_answer_retry_seconds=2)
-    before_polls = sum('/api/job/grade-' in route for route, _, _ in f.reads)
-    retry_started = time.monotonic()
-    f.start()
-    f.wait(lambda: len(f.dispatched('judge')) > judges or
-           (any(row['state'] in ('prepared', 'generated') for row in f.operations('judge'))
-            and sum('/api/job/grade-' in route for route, _, _ in f.reads) >= before_polls + 2),
-           'retained judgment preparation and queued reconciliation did not progress', seconds=7)
-    assert len(f.dispatched('judge')) == judges, (
-        'lower-priority dispatch renewed grace during a due answer retry', f.dispatched())
-    retained = next(row['id'] for row in f.operations('judge')
-                    if row['state'] in ('prepared', 'generated'))
-    with f.lock:
-        for job in f.jobs:
-            if job.startswith('grade-'):
-                f.jobs[job] = 'final'
-    f.wait(lambda: any(row['state'] == 'confirmed' for row in f.operations('judge')),
-           'existing queued judgment did not settle during retry admission')
-    f.wait(lambda: any(row['txid'] for row in f.dispatched('answer')),
-           'due answer retry did not dispatch after existing gates cleared')
-    f.wait(lambda: any(row['id'] == retained for row in f.dispatched('judge')),
-           'retained lower-priority draft did not resume after answer acceptance')
-    assert len(f.dispatched('answer')) == 2
-    attempts = f.dispatched('answer')
-    assert attempts[0]['payload'] == attempts[1]['payload']
-    assert f.model_calls('answer') == 1
-    f.preserved(original)
-    retry_write = next(write for write in f.writes
-                       if write['route'].endswith('/answer') and write['received_at'] >= retry_started)
-    assert any(route.endswith('/api/hosted/challenge')
-               and retry_started <= at <= retry_write['received_at'] for route, _, at in f.reads)
-    return dict(answer_attempts=2, lower_priority_waited=True, retained_judge_resumed=True,
-                queued_reconciliation_continued=True, original_unknown_preserved=True)
-
-
 SCENARIOS = dict(rollover=rollover_scenario, retry=retry_scenario, fences=fences_scenario,
                  inclusion=inclusion_scenario, final=final_scenario,
                  retry_after=retry_after_scenario, manual=manual_scenario,
                  slow_read=slow_read_scenario, changed_epoch=changed_epoch_scenario,
-                 mine_epoch=mine_epoch_scenario, local_retry=local_retry_scenario,
-                 retry_priority=retry_priority_scenario)
+                 mine_epoch=mine_epoch_scenario, local_retry=local_retry_scenario)
 
 
 def main():

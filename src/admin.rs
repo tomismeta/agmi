@@ -1,6 +1,7 @@
 //! Local, private administration. No journal initialization, provider or network calls.
+use crate::capability::LaneId;
 use crate::config::{Config, resolve_path, validate_guidance_bytes};
-use crate::store::{AccountLock, AdmissionGuard, Store, admin_identity_initialized};
+use crate::store::{AccountAdmissionGuard, AccountLock, Store, admin_identity_initialized};
 use anyhow::Result;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -102,11 +103,12 @@ impl DirectoryLock {
         if blocking {
             file.lock().map_err(|_| io_error())?;
         } else {
-            file.try_lock().map_err(|_| {
-                error(
+            file.try_lock().map_err(|failure| match failure {
+                std::fs::TryLockError::WouldBlock => error(
                     "admin_busy",
                     "Another administration command owns the target directory; retry.",
-                )
+                ),
+                std::fs::TryLockError::Error(_) => io_error(),
             })?;
         }
         Ok(Self {
@@ -143,6 +145,27 @@ pub fn lock_config_directory(path: &Path) -> Result<ConfigDirectoryGuard> {
     Ok(ConfigDirectoryGuard {
         _lock: DirectoryLock::acquire(&path, true)?,
     })
+}
+
+/// Acquire the source directory before lane admission, sharing its finite deadline.
+pub fn lock_config_directory_until(
+    path: &Path,
+    deadline: std::time::Instant,
+) -> Result<ConfigDirectoryGuard> {
+    let path = absolute_target(path)?;
+    loop {
+        match DirectoryLock::acquire(&path, false) {
+            Ok(lock) => return Ok(ConfigDirectoryGuard { _lock: lock }),
+            Err(error) if error_code(&error) == Some("admin_busy") => {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(error);
+                }
+                std::thread::sleep(remaining.min(std::time::Duration::from_millis(10)));
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 fn regular(metadata: &fs::Metadata, private: bool) -> Result<()> {
     if !metadata.is_file() || metadata.file_type().is_symlink() {
@@ -217,11 +240,37 @@ fn immutable_changed(old: &Config, new: &Config) -> bool {
         || old.network.credential_file != new.network.credential_file
         || old.state_dir != new.state_dir
 }
+fn check_identity_change(old: &Config, new: &Config) -> Result<()> {
+    if !immutable_changed(old, new) {
+        return Ok(());
+    }
+    if admin_identity_initialized(old).map_err(|_| {
+        error(
+            "admin_identity_unavailable",
+            "Cannot verify existing account identity; no changes saved.",
+        )
+    })? || admin_identity_initialized(new).map_err(|_| {
+        error(
+            "admin_identity_unavailable",
+            "Cannot verify candidate account identity; no changes saved.",
+        )
+    })? {
+        return Err(error(
+            "admin_identity_immutable",
+            "Initialized account, origin, chain, credential reference and state directory cannot be changed.",
+        ));
+    }
+    Ok(())
+}
+
 fn identity_guard(
     old: &Config,
     new: &Config,
     dry_run: bool,
-) -> Result<(Vec<AdmissionGuard>, Option<AccountLock>)> {
+) -> Result<(Vec<AccountAdmissionGuard>, Option<AccountLock>)> {
+    // Reject an initialized identity change before opening a candidate account gate.
+    // Recheck under the ordered guards: an initially fresh identity may become bound.
+    check_identity_change(old, new)?;
     let mut guards = Vec::new();
     if !dry_run {
         let key = |config: &Config| {
@@ -240,12 +289,14 @@ fn identity_guard(
             if config.network.address.is_empty() || (index == 1 && old_key == new_key) {
                 continue;
             }
-            guards.push(AdmissionGuard::acquire(config).map_err(|_| {
-                error(
-                    "admin_identity_unavailable",
-                    "Cannot establish the account identity boundary.",
-                )
-            })?);
+            guards.push(
+                AccountAdmissionGuard::for_provisioning(config).map_err(|_| {
+                    error(
+                        "admin_identity_unavailable",
+                        "Cannot establish the account identity boundary.",
+                    )
+                })?,
+            );
         }
     }
     let mut writer = None;
@@ -260,25 +311,7 @@ fn identity_guard(
             store.routing_change_allowed(new)?;
         }
     }
-    if !immutable_changed(old, new) {
-        return Ok((guards, writer));
-    }
-    if admin_identity_initialized(old).map_err(|_| {
-        error(
-            "admin_identity_unavailable",
-            "Cannot verify existing account identity; no changes saved.",
-        )
-    })? || admin_identity_initialized(new).map_err(|_| {
-        error(
-            "admin_identity_unavailable",
-            "Cannot verify candidate account identity; no changes saved.",
-        )
-    })? {
-        return Err(error(
-            "admin_identity_immutable",
-            "Initialized account, origin, chain, credential reference and state directory cannot be changed.",
-        ));
-    }
+    check_identity_change(old, new)?;
     Ok((guards, writer))
 }
 fn guidance_target(config_path: &Path, config: &Config, target: &Path) -> Result<PathBuf> {
@@ -309,11 +342,12 @@ fn guidance_target(config_path: &Path, config: &Config, target: &Path) -> Result
     }
     Ok(target)
 }
-fn validate_complete(path: &Path, config: &mut Config) -> Result<()> {
+pub(crate) fn validate_complete(path: &Path, config: &mut Config) -> Result<()> {
     config.validate().map_err(|_| invalid())?;
+    let path = absolute_target(path)?;
     let load = |target: &Option<PathBuf>, core: bool| -> Result<std::sync::Arc<str>> {
         if let Some(target) = target {
-            let target = guidance_target(path, config, target)?;
+            let target = guidance_target(&path, config, target)?;
             let bytes = read_optional(&target, true)?.ok_or_else(|| {
                 error(
                     "admin_guidance_missing",
@@ -329,17 +363,24 @@ fn validate_complete(path: &Path, config: &mut Config) -> Result<()> {
             Ok(std::sync::Arc::from(""))
         }
     };
-    let answer = load(&config.solver.answer.guidance_file, false)?;
-    let judge = load(&config.solver.judge.guidance_file, false)?;
-    let answer_core = load(&config.solver.answer.core_guidance_file, true)?;
-    let judge_core = load(&config.solver.judge.core_guidance_file, true)?;
-    config.solver.answer.guidance = answer;
-    config.solver.judge.guidance = judge;
-    config.solver.answer.core_guidance = answer_core;
-    config.solver.judge.core_guidance = judge_core;
+    let answer = load(&config.capabilities.answer.model.guidance_file, false)?;
+    let judge = load(&config.capabilities.judge.model.guidance_file, false)?;
+    let answer_core = load(&config.capabilities.answer.model.core_guidance_file, true)?;
+    let judge_core = load(&config.capabilities.judge.model.core_guidance_file, true)?;
+    config.capabilities.answer.model.guidance = answer;
+    config.capabilities.judge.model.guidance = judge;
+    config.capabilities.answer.model.core_guidance = answer_core;
+    config.capabilities.judge.model.core_guidance = judge_core;
     config.validate_core_guidance().map_err(|_| invalid())?;
     config.guidance_loaded = true;
     Ok(())
+}
+
+fn mutation_fence(config: &Config) -> Result<()> {
+    crate::store::migration::ensure_no_pending(config).map_err(|_| error(
+        "admin_migration_blocked",
+        "Cannot mutate configuration or guidance while migration is incomplete or its state cannot be verified.",
+    ))
 }
 struct Temporary(PathBuf);
 impl Drop for Temporary {
@@ -378,24 +419,31 @@ pub(crate) fn persist(path: &Path, bytes: &[u8]) -> Result<()> {
 fn defaults() -> Value {
     let mut value =
         serde_json::to_value(Config::default()).expect("Config serialization is infallible");
-    value["timeouts"]["read_http_seconds"] = Value::Null;
-    value["schedule"]["challenge_retry_seconds"] = Value::Null;
-    value["schedule"]["challenge_backoff_max_seconds"] = Value::Null;
-    value["schedule"]["assignments_retry_seconds"] = Value::Null;
-    value["schedule"]["assignments_backoff_max_seconds"] = Value::Null;
-    value["schedule"]["queued_job_polling"] = Value::Null;
-    value["solver"]["answer"]["guidance_file"] = Value::Null;
-    value["solver"]["judge"]["guidance_file"] = Value::Null;
-    value["solver"]["answer"]["core_guidance_file"] = Value::Null;
-    value["solver"]["judge"]["core_guidance_file"] = Value::Null;
-    value["excluded_judging_assignments"] = json!([]);
+    for lane in LaneId::ALL.map(LaneId::as_str) {
+        let schedule = &mut value["capabilities"][lane]["schedule"];
+        schedule["discovery_retry_seconds"] = Value::Null;
+        schedule["discovery_backoff_max_seconds"] = Value::Null;
+        schedule["queued_job_polling"] = Value::Null;
+    }
+    for lane in crate::capability::DESCRIPTORS
+        .iter()
+        .filter(|descriptor| descriptor.model_task.is_some())
+        .map(|descriptor| descriptor.id.as_str())
+    {
+        let model = &mut value["capabilities"][lane]["model"];
+        model["guidance_file"] = Value::Null;
+        model["core_guidance_file"] = Value::Null;
+    }
     value
 }
 fn patch_shape() -> Value {
     let mut shape = defaults();
     // Optional objects have no enabled default, but their fields still belong
     // to the patch allowlist. Config validation owns types and bounds.
-    shape["schedule"]["queued_job_polling"] = json!({"initial_seconds":1,"max_seconds":1});
+    for lane in LaneId::ALL.map(LaneId::as_str) {
+        shape["capabilities"][lane]["schedule"]["queued_job_polling"] =
+            json!({"initial_seconds":1,"max_seconds":1});
+    }
     shape
 }
 fn describe(path: &str, value: &Value, settings: &mut Vec<Value>) {
@@ -414,29 +462,26 @@ fn describe(path: &str, value: &Value, settings: &mut Vec<Value>) {
         Value::Bool(_) => "boolean",
         Value::Number(_) => "integer",
         Value::Array(_) => "array<string>",
-        Value::Null if path == "schedule.queued_job_polling" => "object|null",
+        Value::Null if path.ends_with(".schedule.queued_job_polling") => "object|null",
         Value::Null
-            if matches!(
-                path,
-                "timeouts.read_http_seconds"
-                    | "schedule.challenge_retry_seconds"
-                    | "schedule.challenge_backoff_max_seconds"
-                    | "schedule.assignments_retry_seconds"
-                    | "schedule.assignments_backoff_max_seconds"
-            ) =>
+            if path.ends_with(".schedule.discovery_retry_seconds")
+                || path.ends_with(".schedule.discovery_backoff_max_seconds") =>
         {
             "integer|null"
         }
         Value::Null => "string|null",
         _ => "string",
     };
-    let choices = if path.starts_with("capabilities.") {
+    let choices = if matches!(
+        path,
+        "capabilities.answer.mode" | "capabilities.judge.mode" | "capabilities.mine.mode"
+    ) {
         json!(["active", "read_only", "off"])
     } else if path.ends_with(".harness") {
         json!(["hermes", "openclaw"])
-    } else if path == "participation.mode" {
+    } else if path.ends_with(".participation.mode") {
         json!(["strict", "participation_first", "manual"])
-    } else if path == "participation.historical_unknown_answer_capacity" {
+    } else if path == "capabilities.answer.participation.historical_unknown_answer_capacity" {
         json!(["bounded", "accepted_linked"])
     } else {
         Value::Null
@@ -458,7 +503,7 @@ fn describe(path: &str, value: &Value, settings: &mut Vec<Value>) {
             "constraint": "Trust edits authorize credential delivery to the configured origin; the bound origin must remain trusted, except explicit HTTP loopback development origins."
         });
     }
-    if path == "schedule.queued_job_polling" {
+    if path.ends_with(".schedule.queued_job_polling") {
         setting["properties"] = json!({
             "initial_seconds":{"type":"integer","minimum":1},
             "max_seconds":{"type":"integer","minimum":1}
@@ -466,13 +511,23 @@ fn describe(path: &str, value: &Value, settings: &mut Vec<Value>) {
         setting["required"] = json!(["initial_seconds", "max_seconds"]);
         setting["constraint"] = json!("initial_seconds <= max_seconds; null disables the policy");
     }
+    if path == "schema_version" {
+        setting["required"] = json!(true);
+        setting["enum"] = json!([2]);
+    }
     settings.push(setting);
 }
 pub fn schema() -> Value {
     let defaults = defaults();
     let mut settings = Vec::new();
     describe("", &defaults, &mut settings);
-    json!({"schema":"agmi.config.v1","settings":settings,"defaults":defaults,
+    json!({"schema":"agmi.config.v2","settings":settings,"defaults":defaults,
+        "capabilities":crate::capability::DESCRIPTORS,
+        "control":{"configuration":"desired_saved_only","fence_acknowledged":false,
+            "inspection":"lane show <lane>","pause":"lane pause <lane> --expected-control <control-token>",
+            "resume":"lane resume <lane> --expected-control <control-token>",
+            "token_source":"desired.control_token","token_is_file_revision":false,
+            "mine_model_route":false},
         "guidance":{"layers":["core","user"],"default_layer":"user",
             "core":"Required nonempty core_guidance_file for active answer/judge routes; no embedded fallback.",
             "user":"Optional guidance_file; voice and preferences subordinate to core guidance.",
@@ -527,7 +582,8 @@ pub fn show(path: &Path) -> Result<Value> {
     let bytes = config_bytes(&path)?;
     let config = parse(source_path, &bytes)?;
     Ok(json!({"config":config,"file_revision":digest(&bytes),
-        "revision":config.optional_revision().map_err(|_| invalid())?,"guidance_validation":"not_loaded"}))
+        "revision":config.optional_revision().map_err(|_| invalid())?,"guidance_validation":"not_loaded",
+        "configuration_state":"desired_saved","runtime_application":"unverified","fence_acknowledged":false}))
 }
 pub fn apply(
     path: &Path,
@@ -548,6 +604,7 @@ pub fn apply(
     let old_revision = digest(&old_bytes);
     check_revision(expected_revision, &old_revision)?;
     let old = parse(source_path, &old_bytes)?;
+    mutation_fence(&old)?;
     let mut value = raw_config(&old_bytes)?;
     merge(&mut value, patch);
     let bytes = encode(value)?;
@@ -555,6 +612,8 @@ pub fn apply(
     validate_complete(&path, &mut candidate)?;
     let revision = candidate.revision().map_err(|_| invalid())?;
     let _identity = identity_guard(&old, &candidate, dry_run)?;
+    mutation_fence(&old)?;
+    mutation_fence(&candidate)?;
     if !dry_run {
         persist(&path, &bytes)?;
     }
@@ -562,13 +621,14 @@ pub fn apply(
         json!({"saved":!dry_run,"dry_run":dry_run,"file_revision":if dry_run { old_revision.clone() } else { digest(&bytes) },
         "previous_file_revision":old_revision,"candidate_file_revision":digest(&bytes),"revision":revision,
         "runtime_applied":null,"runtime_application":"unverified",
-        "note":"Configuration is canonicalized on save. Runtime status reports the effective loaded revision; dry-run validates a snapshot only."}),
+        "fence_acknowledged":false,
+        "note":"Saved desired configuration only, not a lane admission fence. Runtime status reports the effective loaded revision; dry-run validates a snapshot only."}),
     )
 }
 fn model<'a>(config: &'a Config, kind: &str) -> Result<&'a crate::config::ModelConfig> {
     match kind {
-        "answer" => Ok(&config.solver.answer),
-        "judge" => Ok(&config.solver.judge),
+        "answer" => Ok(&config.capabilities.answer.model),
+        "judge" => Ok(&config.capabilities.judge.model),
         _ => Err(invalid()),
     }
 }
@@ -627,6 +687,7 @@ pub fn guidance_show(path: &Path, kind: &str, layer: &str) -> Result<Value> {
         "status":if !configured { "unconfigured" } else if guidance.is_none() { "missing" } else { "present" },
         "guidance_revision":guidance.as_ref().map(|b| digest(b)).unwrap_or_else(|| "missing".into()),
         "config_file_revision":digest(&bytes),"content":content,
+        "configuration_state":"desired_saved","runtime_application":"unverified","fence_acknowledged":false,
         "note":"Private guidance content; never forward to public events. Unconfigured content, if present, is an inactive conventional file."}),
     )
 }
@@ -651,6 +712,8 @@ pub fn guidance_set(
     let bytes = config_bytes(&path)?;
     check_revision(expected_config_revision, &digest(&bytes))?;
     let config = parse(source_path, &bytes)?;
+    let _identity = identity_guard(&config, &config, dry_run)?;
+    mutation_fence(&config)?;
     config.validate().map_err(|_| invalid())?;
     let (target, configured) = selected_target(&path, &config, kind, layer)?;
     let _guidance_lock = lock.additional(&target)?;
@@ -664,8 +727,8 @@ pub fn guidance_set(
         None
     } else {
         let mut value = raw_config(&bytes)?;
-        let mut patch = json!({"solver":{}});
-        patch["solver"][kind] = json!({(field):conventional_guidance(kind, layer)});
+        let mut patch = json!({"capabilities":{}});
+        patch["capabilities"][kind] = json!({"model":{(field):conventional_guidance(kind, layer)}});
         merge(&mut value, patch);
         let next = encode(value)?;
         parse(source_path, &next)?
@@ -692,6 +755,7 @@ pub fn guidance_set(
         "candidate_guidance_revision":digest(content_bytes),"config_file_revision":digest(current_config),
         "candidate_config_file_revision":digest(next_config.as_ref().unwrap_or(&bytes)),
         "configured":configured || !dry_run,"runtime_applied":null,"runtime_application":"unverified",
+        "fence_acknowledged":false,
         "note":"Private guidance saved locally only; runtime status reports the effective loaded revision."}),
     )
 }
@@ -699,6 +763,149 @@ pub fn guidance_set(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schema_exposes_only_typed_lane_fields() {
+        let schema = schema();
+        assert_eq!(schema["schema"], "agmi.config.v2");
+        let defaults = &schema["defaults"];
+        assert_eq!(defaults["schema_version"], 2);
+        for old in [
+            "solver",
+            "timeouts",
+            "schedule",
+            "preparation",
+            "participation",
+            "excluded_judging_assignments",
+        ] {
+            assert!(defaults.get(old).is_none());
+        }
+        assert!(defaults["capabilities"]["mine"].get("model").is_none());
+        assert!(
+            defaults["capabilities"]["mine"]
+                .get("preparation")
+                .is_none()
+        );
+        let settings = schema["settings"].as_array().unwrap();
+        let setting = |path: &str| settings.iter().find(|s| s["path"] == path).unwrap();
+        assert_eq!(setting("schema_version")["required"], true);
+        assert_eq!(setting("schema_version")["enum"], json!([2]));
+        assert_eq!(
+            setting("capabilities.judge.mode")["enum"],
+            json!(["active", "read_only", "off"])
+        );
+        assert_eq!(
+            setting("capabilities.judge.participation.mode")["enum"],
+            json!(["strict", "participation_first", "manual"])
+        );
+        assert!(setting("capabilities.judge.model.model")["enum"].is_null());
+        for lane in ["answer", "judge", "mine"] {
+            assert_eq!(
+                setting(&format!("capabilities.{lane}.timeouts.read_http_seconds"))["type"],
+                "integer"
+            );
+            assert_eq!(
+                setting(&format!(
+                    "capabilities.{lane}.schedule.discovery_retry_seconds"
+                ))["type"],
+                "integer|null"
+            );
+            assert_eq!(
+                setting(&format!("capabilities.{lane}.schedule.queued_job_polling"))["type"],
+                "object|null"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_patch_is_lane_local_and_null_preserves_required_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let config = Config {
+            state_dir: dir.path().join("state"),
+            ..Config::default()
+        };
+        fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+        let revision = file_revision(&path).unwrap();
+        apply(&path, &revision, br#"{"capabilities":{"answer":{"schedule":{"retry_seconds":17,"discovery_retry_seconds":5,"queued_job_polling":{"initial_seconds":2,"max_seconds":9}}}}}"#, false).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.capabilities.answer.schedule.retry_seconds, 17);
+        assert_eq!(loaded.capabilities.judge.schedule.retry_seconds, 180);
+        assert_eq!(loaded.capabilities.mine.schedule.retry_seconds, 180);
+        assert_eq!(
+            loaded.capabilities.answer.schedule.discovery_retry_seconds,
+            Some(5)
+        );
+        let revision = file_revision(&path).unwrap();
+        apply(&path, &revision, br#"{"capabilities":{"answer":{"schedule":{"discovery_retry_seconds":null,"queued_job_polling":null}}}}"#, false).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(
+            loaded.capabilities.answer.schedule.discovery_retry_seconds,
+            None
+        );
+        assert_eq!(loaded.capabilities.answer.schedule.queued_job_polling, None);
+        assert_eq!(loaded.capabilities.answer.schedule.retry_seconds, 17);
+        let revision = file_revision(&path).unwrap();
+        for patch in [
+            br#"{"schema_version":null}"#.as_slice(),
+            br#"{"schema_version":1}"#.as_slice(),
+            br#"{"capabilities":{"mine":{"model":{}}}}"#.as_slice(),
+            br#"{"capabilities":{"judge":{"participation":{"retry_uncertain_answers":true}}}}"#.as_slice(),
+            br#"{"schedule":{"retry_seconds":1}}"#.as_slice(),
+            br#"{"capabilities":{"answer":{"schedule":{"queued_job_polling":{"initial_seconds":2}}}}}"#.as_slice(),
+        ] {
+            assert!(apply(&path, &revision, patch, false).is_err());
+            assert_eq!(file_revision(&path).unwrap(), revision);
+        }
+        assert!(guidance_show(&path, "mine", "user").is_err());
+    }
+
+    #[test]
+    fn pending_migration_blocks_mutations_but_not_private_reads() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let state = dir.path().join("state");
+        fs::create_dir(&state).unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+        let journal = state.join("state.sqlite3");
+        let db = rusqlite::Connection::open(&journal).unwrap();
+        db.execute_batch("CREATE TABLE capability_migration(singleton INTEGER PRIMARY KEY, phase TEXT NOT NULL,token TEXT NOT NULL,sealed TEXT NOT NULL); INSERT INTO capability_migration VALUES(1,'journal_ready','private-token-canary','{}');").unwrap();
+        fs::set_permissions(&journal, fs::Permissions::from_mode(0o600)).unwrap();
+        let config = Config {
+            state_dir: state,
+            ..Config::default()
+        };
+        fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+        let revision = file_revision(&path).unwrap();
+        assert!(show(&path).is_ok());
+        assert!(guidance_show(&path, "answer", "user").is_ok());
+        for dry_run in [false, true] {
+            let error = apply(
+                &path,
+                &revision,
+                br#"{"runtime":{"shutdown_seconds":20}}"#,
+                dry_run,
+            )
+            .unwrap_err();
+            assert_eq!(error_code(&error), Some("admin_migration_blocked"));
+            assert!(!error.to_string().contains("private-token-canary"));
+            assert!(
+                guidance_set(
+                    &path,
+                    "answer",
+                    "user",
+                    &revision,
+                    "missing",
+                    b"private guidance",
+                    dry_run
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(file_revision(&path).unwrap(), revision);
+        assert!(!dir.path().join("answer-guidance.md").exists());
+    }
 
     #[test]
     fn schema_distinguishes_identity_routing_and_trust_changes() {
@@ -755,7 +962,11 @@ mod tests {
     fn guidance_layers_are_discoverable_and_updated_independently() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        fs::write(&path, toml::to_string(&Config::default()).unwrap()).unwrap();
+        let config = Config {
+            state_dir: dir.path().join("state"),
+            ..Config::default()
+        };
+        fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
         assert_eq!(schema()["guidance"]["layers"], json!(["core", "user"]));
         for kind in ["answer", "judge"] {
             for layer in ["core", "user"] {
@@ -805,19 +1016,19 @@ mod tests {
         }
         let loaded = Config::load(&path).unwrap();
         assert_eq!(
-            &*loaded.solver.answer.core_guidance,
+            &*loaded.capabilities.answer.model.core_guidance,
             "answer core private instructions"
         );
         assert_eq!(
-            &*loaded.solver.answer.guidance,
+            &*loaded.capabilities.answer.model.guidance,
             "answer user private instructions"
         );
         assert_eq!(
-            &*loaded.solver.judge.core_guidance,
+            &*loaded.capabilities.judge.model.core_guidance,
             "judge core private instructions"
         );
         assert_eq!(
-            &*loaded.solver.judge.guidance,
+            &*loaded.capabilities.judge.model.guidance,
             "judge user private instructions"
         );
         let current = guidance_show(&path, "answer", "core").unwrap();

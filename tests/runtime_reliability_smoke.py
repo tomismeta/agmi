@@ -47,20 +47,8 @@ class RuntimeFixture(Fixture):
         self.evidence_started = threading.Event()
         self.evidence_release = threading.Event()
         self.hydrated_words = None
-        self.model_seconds = 10
-        self.exclusions = []
         self.errors = []
         super().__init__(binary, root)
-
-    def configure(self, **policy):
-        super().configure(**policy)
-        text = self.config.read_text().replace('model_seconds = 10',
-                                              f'model_seconds = {self.model_seconds}')
-        text = 'excluded_judging_assignments = ' + json.dumps(self.exclusions) + '\n' + text
-        pending = self.config.with_suffix('.new')
-        pending.write_text(text)
-        pending.chmod(0o600)
-        pending.replace(self.config)
 
     def handler(self):
         base = super().handler()
@@ -149,7 +137,9 @@ def missing_words(f, hydrated=False, empty=False):
     if hydrated:
         del bad['answer_epoch']
     f.inventory = [bad, assignment(GOOD, 1000)]
-    f.capabilities = dict(answer='off', judge='active', mine='off')
+    f.lanes['answer']['mode'] = 'off'
+    f.lanes['judge']['mode'] = 'active'
+    f.lanes['mine']['mode'] = 'off'
     f.configure()
     f.start(resume=True)
     f.wait(lambda: any(row['state'] == 'abstained' and row['work_key'] == BAD
@@ -161,35 +151,38 @@ def missing_words(f, hydrated=False, empty=False):
     assert len(bad_rows) == 1 and bad_rows[0]['state'] == 'abstained', bad_rows
     assert len(f.dispatched('judge')) == 1 and f.model_calls('judge') == 1
     assert all(write['body']['assignment'] == GOOD for write in f.writes)
-    assert not any(row['scope'] in ('assignments', 'assignment_evidence') and row['failures']
-                   for row in f.rows('SELECT * FROM read_backoff'))
+    assert not any(row['owner'] == 'judge' and row['purpose'] in ('discovery', 'assignment') and row['failures']
+                   for row in f.rows('SELECT * FROM read_state WHERE retired=0'))
     return dict(abstained=BAD, submitted=GOOD, model_calls=1, hydrated=hydrated)
 
 
 def write_floor(f):
     f.write_behavior = 'floor'
-    f.http_seconds = 1
-    f.configure(mode='participation_first', uncertainty_grace_seconds=0)
+    f.lanes['answer']['timeouts']['http_seconds'] = 1
+    f.configure('answer', mode='participation_first', uncertainty_grace_seconds=0)
     f.start(resume=True)
     f.wait(f.headers_sent.is_set, 'server headers were not sent')
+    assert not f.restrictions(), 'unassembled headers provisionally published shared authority'
     f.unknown('answer')
     original = f.dispatched('answer')[0]
-    timing = f.rows('SELECT retry_not_before FROM operation_timing WHERE operation_id=?',
-                    (original['id'],))[0]['retry_not_before']
-    assert timing >= original['created_at'] + 60, ('received Retry-After floor was lost', timing, original)
-    f.rollover(11)
-    f.wait(lambda: any(row['state'] == 'generated' for row in f.operations('answer')),
-           'next epoch did not prepare behind the retained floor')
+    restriction = next(row for row in f.restrictions()
+                       if row['scope'] == 'account_authenticated' and row['basis'] == 'server_retry_after')
+    timing = restriction['not_before']
+    assert timing >= original['created_at'] + 60, ('received Retry-After floor was lost', restriction)
+    f.epoch = 11
     f.no_more_writes(1)
-    assert f.status()['work']['answer']['reason'] == 'retained_retry_minimum'
+    admission = f.status()['work']['answer']['admission']
+    assert admission['reason'] == 'shared_server_restriction' and admission['not_before'] == timing, admission
+    assert f.status()['observations']['answer']['epoch'] == 10
+    assert len(f.operations('answer')) == 1, 'shared floor permitted fresh authenticated discovery'
     f.preserved(original)
     return dict(retained_retry_not_before=timing, writes=len(f.writes), old_unknown_preserved=True)
 
 
 def write_capture(f, stop=False):
     f.write_behavior = 'capture'
-    f.http_seconds = 8
-    f.read_http_seconds = 15
+    f.lanes['answer']['timeouts']['http_seconds'] = 8
+    f.lanes['answer']['timeouts']['read_http_seconds'] = 15
     f.configure()
     f.start(resume=True)
     f.wait(f.urgent_started.is_set, 'urgent challenge did not overlap the write', seconds=6)
@@ -208,7 +201,7 @@ def write_capture(f, stop=False):
         f.stop()
     assert time.monotonic() - started < 5
     assert len(f.writes) == len(f.dispatched()) == 1
-    assert not any(row['in_flight'] for row in f.rows('SELECT * FROM read_observations'))
+    assert not any(row['in_flight'] for row in f.rows('SELECT * FROM read_state WHERE retired=0'))
     assert not f.errors, f.errors
     return dict(job_id='ready-job', capture_before_read_release=True,
                 admission_released=True, stop=stop, writes=1)
@@ -216,28 +209,28 @@ def write_capture(f, stop=False):
 
 def stop_pending_write(f):
     f.write_behavior = 'capture'
-    f.http_seconds = 8
-    f.read_http_seconds = 15
+    f.lanes['answer']['timeouts']['http_seconds'] = 8
+    f.lanes['answer']['timeouts']['read_http_seconds'] = 15
     f.configure()
-    f.apply_config({'timeouts': {'shutdown_seconds': 5}})
+    f.apply_config({'runtime': {'shutdown_seconds': 5}})
     f.start(resume=True)
     f.wait(f.urgent_started.is_set, 'urgent challenge did not overlap pending write', seconds=6)
     f.child.terminate()
     f.wait(lambda: not any(row['in_flight'] for row in
-                          f.rows("SELECT * FROM read_observations WHERE scope='challenge'")),
+                          f.rows("SELECT * FROM read_state WHERE owner='answer' AND purpose='discovery' AND resource='challenge' AND retired=0")),
            'stop did not finish the urgent read while the write remained pending', seconds=2)
     f.write_release.set()
     f.child.wait(timeout=5)
     assert f.child.returncode == 0
     assert any(row['job_id'] == 'ready-job' for row in f.operations())
-    assert not any(row['in_flight'] for row in f.rows('SELECT * FROM read_observations'))
+    assert not any(row['in_flight'] for row in f.rows('SELECT * FROM read_state WHERE retired=0'))
     assert len(f.dispatched()) == len(f.writes) == 1
     f.stop()
     return dict(job_id='ready-job', stopped_with_write_pending=True, writes=1)
 
 
 def model_timeout(f, inference=False):
-    f.model_seconds = 1
+    f.lanes['answer']['timeouts']['model_seconds'] = 1
     if inference:
         interpreter = f.root / 'fixture-python'
         text = interpreter.read_text().replace("artifact =", "import time\ntime.sleep(5)\nartifact =", 1)
@@ -257,39 +250,44 @@ def model_timeout(f, inference=False):
 
 
 def inventory_selection(f, partial=False, page_failure=False):
-    f.capabilities = dict(answer='off', judge='active', mine='off')
+    f.lanes['answer']['mode'] = 'off'
+    f.lanes['judge']['mode'] = 'active'
+    f.lanes['mine']['mode'] = 'off'
     f.inventory = [assignment(BAD, 20)] if partial else []
-    f.exclusions = [BAD]
+    f.lanes['judge']['excluded_assignments'] = [BAD]
     f.partial, f.page_failure = partial, page_failure
     f.configure()
     f.start(resume=True)
-    reason = 'read_backoff' if page_failure else 'no_eligible_in_observed_inventory'
-    f.wait(lambda: f.status()['work']['judge']['reason'] == reason,
-           'selection did not publish the bounded observed-inventory reason', seconds=8)
-    selection = f.status()['work']['judge']['selection']
-    assert selection['eligible'] is False
-    assert selection['inventory_complete'] is not partial
-    assert selection['observed_count'] == int(partial)
-    assert selection['evidence'] == 'observed_inventory_only'
+    f.wait(lambda: (f.status()['work']['judge'].get('assessment') or {}).get('locally_judgeable') is False,
+           'judge did not publish bounded observed-inventory evidence', seconds=8)
+    assessment = f.status()['work']['judge']['assessment']
+    assert assessment['locally_judgeable'] is False
+    assert assessment['completeness'] == ('bounded_partial' if partial else 'complete')
+    assert assessment['observed_opportunities'] == int(partial)
     if page_failure:
-        read = next(row for row in f.status()['reads'] if row['scope'] == 'assignments')
-        floor = f.rows("SELECT server_not_before FROM read_observations WHERE scope='assignments'")[0]['server_not_before']
+        read = next(row for row in f.status()['reads'] if row['owner'] == 'judge' and row['purpose'] == 'discovery' and row['resource'] == 'assignments')
+        restriction = next(row for row in f.restrictions()
+                           if row['scope'] == 'account_authenticated' and row['basis'] == 'server_retry_after')
+        floor = restriction['not_before']
         assert floor >= int(time.time()) + 50
-        assert f.status()['work']['judge']['next_at'] >= floor
-        assert read['next_at'] >= floor
+        assert f.status()['work']['judge']['admission']['not_before'] >= floor
+        assert read['server_not_before'] == 0
     f.stop()
-    assert f.status()['work']['judge']['selection'] == selection
+    assert f.status()['work']['judge']['assessment'] == assessment
+    assert f.status()['lane_participation']['judge']['freshness'] == 'stopped'
     assert not f.writes and not f.operations('judge') and not f.model_calls('judge')
-    return dict(reason=reason, selection=selection, persisted_after_stop=True)
+    return dict(shared_retry_floor=page_failure, assessment=assessment, persisted_after_stop=True)
 
 
 def inventory_generation(f):
-    f.capabilities = dict(answer='off', judge='active', mine='off')
+    f.lanes['answer']['mode'] = 'off'
+    f.lanes['judge']['mode'] = 'active'
+    f.lanes['mine']['mode'] = 'off'
     f.inventory = []
     f.hold_inventory = True
-    f.read_http_seconds = 15
+    f.lanes['judge']['timeouts']['read_http_seconds'] = 15
     f.configure()
-    f.apply_config({'schedule': {'poll_seconds': 30}})
+    f.apply_config({'capabilities': {'judge': {'schedule': {'poll_seconds': 30}}}})
     f.start(resume=True)
     f.wait(f.inventory_started.is_set, 'inventory request did not start')
     old_generation = f.status()['generation']
@@ -298,34 +296,37 @@ def inventory_generation(f):
     assert f.status()['generation'] > old_generation
     f.inventory_release.set()
     f.wait(lambda: not any(row['in_flight'] for row in
-                          f.rows("SELECT * FROM read_observations WHERE scope='assignments'")),
+                          f.rows("SELECT * FROM read_state WHERE owner='judge' AND purpose='discovery' AND resource='assignments' AND retired=0")),
            'inventory response did not finish')
     f.stop()
-    assert f.status()['work']['judge']['selection'] is None
+    assert f.status()['work']['judge']['assessment'] is None
     assert not f.writes and not f.model_calls('judge')
     return dict(pre_pause_inventory_discarded=True, writes=0)
 
 
 def unjudgeable_selection(f):
-    f.capabilities = dict(answer='off', judge='active', mine='off')
+    f.lanes['answer']['mode'] = 'off'
+    f.lanes['judge']['mode'] = 'active'
+    f.lanes['mine']['mode'] = 'off'
     bad = assignment(BAD, 20)
     bad['words'] = []
     f.inventory = [bad]
     f.configure()
-    f.apply_config({'schedule': {'poll_seconds': 30}})
+    f.apply_config({'capabilities': {'judge': {'schedule': {'poll_seconds': 30}}}})
     f.start(resume=True)
     f.wait(lambda: any(row['state'] == 'abstained' for row in f.operations('judge')),
            'unjudgeable seat was not abstained')
     work = f.status()['work']['judge']
     f.stop()
-    assert work['selection']['eligible'] is False, work
-    assert work['reason'] == 'no_eligible_in_observed_inventory', work
+    assert work['assessment']['locally_judgeable'] is False, work
     assert not f.writes and not f.model_calls('judge')
     return dict(unjudgeable_not_eligible=True, model_calls=0)
 
 
 def hydration_policy(f, pause=False, usable=False):
-    f.capabilities = dict(answer='off', judge='active', mine='off')
+    f.lanes['answer']['mode'] = 'off'
+    f.lanes['judge']['mode'] = 'active'
+    f.lanes['mine']['mode'] = 'off'
     bad = assignment(BAD, 20)
     del bad['words']
     del bad['answer_epoch']
@@ -333,7 +334,7 @@ def hydration_policy(f, pause=False, usable=False):
     f.hold_evidence = True
     if usable:
         f.hydrated_words = ['clock', 'bridge']
-    f.read_http_seconds = 15
+    f.lanes['judge']['timeouts']['read_http_seconds'] = 15
     f.configure()
     f.start(resume=True)
     f.wait(f.evidence_started.is_set, 'hydration did not start')
@@ -341,21 +342,20 @@ def hydration_policy(f, pause=False, usable=False):
         f.invoke('pause')
         f.invoke('resume')
     else:
-        f.apply_config({'excluded_judging_assignments': [BAD]})
+        f.apply_config({'capabilities': {'judge': {'excluded_assignments': [BAD]}}})
         f.loaded()
     f.evidence_release.set()
     if pause:
         f.wait(lambda: not any(row['in_flight'] for row in
-                              f.rows("SELECT * FROM read_observations WHERE scope='assignment_evidence'")),
+                              f.rows("SELECT * FROM read_state WHERE owner='judge' AND purpose='assignment' AND retired=0")),
                'hydration did not finish')
     else:
-        f.wait(lambda: f.rows('SELECT * FROM assignment_selection'),
-               'post-hydration selection did not finish')
-        assert f.status()['work']['judge']['selection']['eligible'] is False
+        f.wait(lambda: (f.status()['work']['judge'].get('assessment') or {}).get('locally_judgeable') is False,
+               'post-hydration assessment did not finish')
     f.stop()
     assert not f.operations('judge') and not f.model_calls('judge')
     f.hydrated_words = ['clock', 'bridge']
-    f.apply_config({'excluded_judging_assignments': []})
+    f.apply_config({'capabilities': {'judge': {'excluded_assignments': []}}})
     f.start()
     f.wait(lambda: len(f.dispatched('judge')) == 1,
            'fresh eligible evidence remained poisoned by an old abstention')
@@ -367,19 +367,20 @@ def hydration_policy(f, pause=False, usable=False):
 def oldest_diagnostic(f):
     f.answered = True
     f.assignments = True
-    f.capabilities['judge'] = 'active'
-    f.configure(mode='participation_first', allow_judge=True, uncertainty_grace_seconds=0)
+    f.lanes['judge']['mode'] = 'active'
+    f.lanes['judge']['participation'].update(mode='participation_first', uncertainty_grace_seconds=0)
+    f.configure('answer', mode='participation_first', uncertainty_grace_seconds=0)
     f.start(resume=True)
     f.unknown('judge')
     old = f.dispatched('judge')[0]
     f.wait(lambda: int(time.time()) >= old['created_at'] + 9, 'old uncertainty did not age')
-    f.configure(uncertainty_grace_seconds=8)
+    f.configure('answer', uncertainty_grace_seconds=8)
     f.loaded()
     f.rollover(11)
     f.unknown('answer')
     recent = f.dispatched('answer')[0]
     f.rollover(12)
-    f.wait(lambda: f.status()['work']['answer']['reason'] == 'uncertainty_grace',
+    f.wait(lambda: f.status()['work']['answer']['reason'] == 'account_uncertainty_grace',
            'recent uncertainty did not fence prepared current work', seconds=6)
     status = f.status()
     assert status['oldest_unresolved_operation'] == old['id']

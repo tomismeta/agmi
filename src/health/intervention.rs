@@ -73,16 +73,19 @@ fn timestamp(value: &Value) -> Option<i64> {
     value.as_i64().filter(|time| *time >= 0)
 }
 
-fn read<'a>(status: &'a Value, scope: &str) -> Option<&'a Value> {
-    let mut rows = status["reads"]
-        .as_array()?
-        .iter()
-        .filter(|row| row["scope"] == scope);
-    let row = rows.next()?;
-    rows.next().is_none().then_some(row)
+fn read<'a>(status: &'a Value, name: &str, work: &Value, purpose: &str) -> Option<&'a Value> {
+    match purpose {
+        "identity" => super::api::identity(status),
+        "job" | "receipt" => {
+            super::api::bound(status, work).filter(|row| row["purpose"] == purpose)
+        }
+        "assignment" => super::api::keyed(status, &work["read_key"])
+            .filter(|row| row["purpose"] == "assignment"),
+        _ => super::api::discovery(status, name),
+    }
 }
 
-fn read_failed(row: &Value) -> bool {
+pub(super) fn read_failed(row: &Value) -> bool {
     timestamp(&row["last_failure_at"]).is_some_and(|failure| {
         timestamp(&row["last_success_at"]).is_none_or(|success| {
             failure > success
@@ -100,136 +103,96 @@ fn read_auth_failed(row: &Value, at: i64, stale: u64) -> bool {
 }
 
 fn mode<'a>(status: &'a Value, name: &str) -> Option<&'a str> {
-    status["effective_runtime"]["capabilities"][name].as_str()
+    super::lane_mode(status, name)
 }
 
 fn controller(status: &Value, at: i64, stale: Option<u64>) -> (Option<bool>, Finding<'static>) {
     if status["initialized"] == false {
-        return (
-            Some(false),
-            Finding::blocked("not_initialized", "initialize_controller"),
-        );
+        return (Some(false), core_reason("not_initialized"));
     }
     if status["initialized"] != true {
-        return (None, Finding::unknown("local_evidence_unavailable"));
+        return (None, core_reason("local_evidence_unavailable"));
     }
-    for (blocked, reason, action) in [
+    if status["migration"]["pending"] == true {
+        return (Some(false), core_reason("migration_pending"));
+    }
+    for (blocked, reason) in [
         (
             status["identity_matches_config"] == false,
             "identity_mismatch",
-            "repair_config",
         ),
         (
             status["network_routing"]["matches_config"] == false,
             "api_routing_mismatch",
-            "repair_config",
         ),
         (
             status["effective_runtime"]["reload_blocked"] == true,
             "config_reload_rejected",
-            "repair_config",
         ),
-        (
-            status["controller_stopped"] == true,
-            "controller_stopped",
-            "start_controller",
-        ),
+        (status["controller_stopped"] == true, "controller_stopped"),
     ] {
         if blocked {
-            return (Some(false), Finding::blocked(reason, action));
+            return (Some(false), core_reason(reason));
         }
     }
     let observed = timestamp(&status["effective_runtime"]["observed_at"]);
-    if observed.is_some_and(|time| time > at)
-        || timestamp(&status["observation"]["observed_at"]).is_some_and(|time| time > at)
-    {
-        return (None, Finding::unknown("clock_regressed"));
+    if observed.is_some_and(|time| time > at) {
+        return (None, core_reason("clock_regressed"));
     }
     let Some(stale) = stale else {
-        return (None, Finding::unknown("effective_policy_unavailable"));
+        return (None, core_reason("effective_policy_unavailable"));
     };
     if observed.is_none() {
-        return (None, Finding::unknown("controller_unobserved"));
+        return (None, core_reason("controller_unobserved"));
     }
     if !fresh(observed, at, stale) {
-        return (None, Finding::unknown("controller_stale"));
+        return (None, core_reason("controller_stale"));
     }
     if status["identity_matches_config"].as_bool().is_none()
         || status["paused"].as_bool().is_none()
         || status["controller_stopped"].as_bool().is_none()
     {
-        return (None, Finding::unknown("controller_evidence_unavailable"));
+        return (None, core_reason("controller_evidence_unavailable"));
     }
-    (
-        Some(true),
-        Finding {
-            progress: "idle",
-            status: "none_required",
-            reason: "controller_recent",
-            action: "none",
-            next_at: None,
-        },
-    )
+    (Some(true), core_reason("controller_recent"))
 }
 
-/// A configured reconciliation path can release capacity, but its success is not
-/// promised. Count only operations the canonical accountant says consume it.
+/// Store decides how much must clear and which rows count. Health only assesses
+/// whether those exact blockers have a bound recovery path, never its success.
 fn release_path<'a>(
     status: &'a Value,
     name: &str,
-    all: bool,
+    detail: &'a Value,
     at: i64,
     stale: u64,
     timing: &WorkTiming,
 ) -> Finding<'a> {
+    let Some(needed) = detail["required_release"]
+        .as_u64()
+        .filter(|needed| *needed > 0)
+    else {
+        return Finding::unknown("release_evidence_unavailable");
+    };
+    let Some(ids) = detail["blocker_ids"].as_array() else {
+        return Finding::unknown("release_evidence_unavailable");
+    };
     let Some(rows) = status["pending_work"].as_array() else {
         return Finding::unknown("reconciliation_evidence_unavailable");
     };
-    let participation = &status["participation"];
-    let needed = if all {
-        participation["unresolved_count"].as_u64()
-    } else {
-        participation["active_unresolved_count"]
-            .as_u64()
-            .zip(
-                participation["policy"]["max_unresolved_operations"]
-                    .as_u64()
-                    .map(|limit| {
-                        if name == "answer" {
-                            limit
-                        } else {
-                            limit.saturating_sub(
-                                participation["policy"]["answer_reserved_slots"]
-                                    .as_u64()
-                                    .unwrap_or(0),
-                            )
-                        }
-                    }),
-            )
-            .map(|(active, limit)| active.saturating_add(1).saturating_sub(limit))
-    };
-    let Some(needed) = needed.filter(|needed| *needed > 0) else {
-        return Finding::unknown("capacity_evidence_unavailable");
-    };
-    let mut automatic = 0;
-    let mut uncertain = 0;
+    if !matches!(detail["scope"].as_str(), Some("lane" | "account")) {
+        return Finding::unknown("release_evidence_unavailable");
+    }
+    let mut automatic = 0_u64;
+    let mut uncertain = 0_u64;
     let mut authentication_blocked = false;
     let mut next: Option<i64> = None;
-    for row in rows.iter().filter(|row| {
-        matches!(
-            row["state"].as_str(),
-            Some("dispatching" | "queued" | "unknown" | "included_pending")
-        )
-    }) {
-        if !all {
-            match row["capacity_counted"].as_bool() {
-                Some(false) => continue,
-                None => {
-                    uncertain += 1;
-                    continue;
-                }
-                Some(true) => {}
-            }
+    for id in ids {
+        let Some(row) = rows.iter().find(|row| row["operation_id"] == *id) else {
+            uncertain += 1;
+            continue;
+        };
+        if detail["scope"] == "lane" && row["kind"] != name {
+            return Finding::unknown("release_evidence_unavailable");
         }
         if ["created_at", "updated_at"]
             .iter()
@@ -238,15 +201,16 @@ fn release_path<'a>(
             uncertain += 1;
             continue;
         }
-        let bound = matches!(
-            row["reconciliation_scope"].as_str(),
-            Some("receipt" | "job")
-        );
-        let dispatching = row["state"] == "dispatching" && timing.issue(row, at).is_none();
-        if bound
-            && let Some(dependency) = row["reconciliation_scope"]
-                .as_str()
-                .and_then(|scope| read(status, scope))
+        let bound = matches!(row["read_key"]["purpose"].as_str(), Some("job" | "receipt"))
+            && row["binding_revision"].as_i64().is_some()
+            && row["read_key"]["owner"] == row["kind"]
+            && row["read_key"]["resource"].as_str().is_some();
+        let dependency = super::api::bound(status, row);
+        if bound && dependency.is_none() && status["reads_truncated"] == true {
+            uncertain += 1;
+            continue;
+        }
+        if let Some(dependency) = dependency
             && read_failed(dependency)
             && matches!(dependency["status"].as_u64(), Some(401 | 403))
         {
@@ -257,15 +221,18 @@ fn release_path<'a>(
             }
             continue;
         }
+        // Captured HTTP deadline, not the candidate lane's timeout, determines
+        // whether another lane still has a live dispatch.
+        let dispatching = row["state"] == "dispatching"
+            && row["http_deadline"]
+                .as_i64()
+                .is_some_and(|deadline| at <= deadline.saturating_add(timing.shutdown as i64));
         if bound || dispatching {
             automatic += 1;
             let deadline = [
                 timestamp(&row["next_at"]),
                 timestamp(&row["retry_not_before"]),
-                row["reconciliation_scope"]
-                    .as_str()
-                    .and_then(|scope| read(status, scope))
-                    .and_then(|read| timestamp(&read["next_at"])),
+                dependency.and_then(|read| timestamp(&read["next_at"])),
             ]
             .into_iter()
             .flatten()
@@ -274,19 +241,19 @@ fn release_path<'a>(
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (a, b) => a.or(b),
             };
-        } else if row.get("reconciliation_scope").is_none() || row["state"] == "dispatching" {
+        } else if row.get("read_key").is_none() || row["state"] == "dispatching" {
             uncertain += 1;
         }
     }
     if automatic >= needed {
         Finding::automatic("bound_reconciliation_pending", "await_reconciliation", next)
-    } else if automatic + uncertain >= needed {
+    } else if automatic + uncertain >= needed || detail["blocker_ids_truncated"] == true {
         Finding::unknown("reconciliation_evidence_unavailable")
     } else if authentication_blocked {
         Finding::blocked("reconciliation_authentication_failed", "review_credentials")
     } else {
         Finding::blocked(
-            if all {
+            if detail["scope"] == "account" {
                 "unbound_uncertainty"
             } else {
                 "no_automatic_capacity_release"
@@ -296,71 +263,10 @@ fn release_path<'a>(
     }
 }
 
-fn policy_wait<'a>(
-    status: &'a Value,
-    name: &str,
-    work: &'a Value,
-    detail: &'a Value,
-    at: i64,
-    stale: u64,
-    timing: &WorkTiming,
-) -> Finding<'a> {
-    let reason = detail["reason"]
-        .as_str()
-        .unwrap_or("retry_evidence_unavailable");
-    let policy = &status["participation"]["policy"];
-    if status["participation"]["policy_source"] != "effective" {
-        return Finding::unknown("participation_policy_unavailable");
-    }
-    if policy["mode"] == "strict" {
-        return release_path(status, name, true, at, stale, timing);
-    }
-    if policy["mode"] == "manual" {
-        let granted = detail["manual_authorized"]
-            .as_bool()
-            .or(work["manual_authorized"].as_bool());
-        if granted != Some(true) {
-            let recovery = release_path(status, name, true, at, stale, timing);
-            return if recovery.status == "automatic_recovery" {
-                recovery
-            } else if granted == Some(false) {
-                Finding::blocked("manual_authorization_required", "authorize")
-            } else {
-                Finding::unknown("manual_authorization_unobserved")
-            };
-        }
-    } else if policy["mode"] != "participation_first" {
-        return Finding::unknown("participation_policy_unavailable");
-    }
-    let allowed = match name {
-        "answer" => "allow_answer",
-        "judge" => "allow_judge",
-        _ => "allow_mine",
-    };
-    if policy[allowed] == false {
-        return Finding::blocked("participation_disabled", "review_participation_policy");
-    }
-    if policy[allowed] != true {
-        return Finding::unknown("participation_policy_unavailable");
-    }
-    if matches!(
-        reason,
-        "uncertainty_grace" | "retained_retry_minimum" | "uncertain_answer_retry_delay"
-    ) && timestamp(&detail["next_at"]).is_none()
-    {
-        return Finding::unknown("retry_deadline_unavailable");
-    }
-    Finding::automatic(
-        reason,
-        "await_retry_eligibility",
-        timestamp(&detail["next_at"]),
-    )
-}
-
 fn blocker<'a>(
     status: &'a Value,
     name: &str,
-    work: &'a Value,
+    _work: &'a Value,
     detail: &'a Value,
     at: i64,
     stale: u64,
@@ -368,44 +274,35 @@ fn blocker<'a>(
 ) -> Option<Finding<'a>> {
     let reason = detail["reason"].as_str()?;
     Some(match reason {
-        "uncertainty_grace" | "retained_retry_minimum" | "uncertain_answer_retry_delay" => {
-            policy_wait(status, name, work, detail, at, stale, timing)
+        "lane_unresolved_capacity" | "account_uncertainty" => {
+            release_path(status, name, detail, at, stale, timing)
         }
-        "unresolved_capacity" | "answer_capacity_reserved" => {
-            if status["participation"]["policy"]["mode"] == "manual" {
-                let policy = policy_wait(status, name, work, detail, at, stale, timing);
-                if policy.status != "automatic_recovery" {
-                    return Some(policy);
-                }
-            }
-            release_path(
-                status,
-                name,
-                status["participation"]["policy"]["mode"] == "strict",
-                at,
-                stale,
-                timing,
-            )
-        }
-        "strict_uncertainty" => release_path(status, name, true, at, stale, timing),
         "manual_authorization_required" => {
-            let recovery = release_path(status, name, true, at, stale, timing);
+            let recovery = release_path(status, name, detail, at, stale, timing);
             if recovery.status == "automatic_recovery" {
                 recovery
             } else {
                 Finding::blocked(reason, "authorize")
             }
         }
-        "participation_disabled"
-        | "uncertain_retry_disabled"
-        | "answer_attempt_budget_exhausted" => {
+        "account_uncertainty_grace"
+        | "shared_server_restriction"
+        | "retained_legacy_floor"
+        | "operation_retry_minimum"
+        | "operation_backoff"
+        | "uncertain_answer_retry_delay" => {
+            if let Some(next) = timestamp(&detail["not_before"]).or(timestamp(&detail["next_at"])) {
+                Finding::automatic(reason, "await_retry_eligibility", Some(next))
+            } else {
+                Finding::unknown("retry_deadline_unavailable")
+            }
+        }
+        "uncertain_retry_disabled" | "answer_attempt_budget_exhausted" => {
             Finding::blocked(reason, "review_participation_policy")
         }
-        "generation_changed" => {
-            Finding::automatic(reason, "discard_unsent", timestamp(&detail["next_at"]))
-        }
+        "generation_changed" => Finding::automatic(reason, "discard_unsent", None),
         "effect_in_flight" => {
-            Finding::automatic(reason, "await_effect", timestamp(&detail["next_at"]))
+            Finding::automatic(reason, "await_effect", timestamp(&detail["not_before"]))
         }
         _ => return None,
     })
@@ -452,26 +349,18 @@ fn lane<'a>(
         "read_receipt" => Some("receipt"),
         "await_identity" => Some("identity"),
         _ if reason == "identity_backoff" => Some("identity"),
-        _ if name == "judge"
-            && phase == Some("observing")
-            && (work["selection"].is_null()
-                || work["selection"]["observed_count"]
-                    .as_u64()
-                    .is_some_and(|count| count > 0)) =>
-        {
-            Some("assignment_evidence")
-        }
+        _ if work["read_key"]["purpose"] == "assignment" => Some("assignment"),
         _ => None,
     };
     for dependency in std::iter::once(scope).chain(bound_scope) {
-        if read(status, dependency).is_some_and(|row| {
+        if read(status, name, work, dependency).is_some_and(|row| {
             ["started_at", "last_success_at", "last_failure_at"]
                 .iter()
                 .any(|field| timestamp(&row[*field]).is_some_and(|time| time > at))
         }) {
             return Finding::unknown("clock_regressed");
         }
-        if let Some(row) = read(status, dependency)
+        if let Some(row) = read(status, name, work, dependency)
             && dependency != "identity"
             && read_failed(row)
             && matches!(row["status"].as_u64(), Some(401 | 403))
@@ -499,6 +388,17 @@ fn lane<'a>(
         ) {
             return Finding::unknown("in_flight_outcome_overdue");
         }
+        if !read_only && super::model_awaiting_admission(pending) {
+            return match super::model_overdue(pending, at, timing.poll, timing.model) {
+                Some(false) => Finding::automatic(
+                    "model_launch_awaiting_admission",
+                    "await_model_admission",
+                    timestamp(&pending["pending_execution_deadline"]),
+                ),
+                Some(true) => Finding::unknown("pending_model_execution_expired"),
+                None => Finding::unknown("model_deadline_unavailable"),
+            };
+        }
     }
     if !read_only && matches!(phase, Some("preparing" | "generating" | "dispatching")) {
         return Finding {
@@ -510,30 +410,31 @@ fn lane<'a>(
         };
     }
     let observed = if name == "judge" {
-        timestamp(&work["selection"]["observed_at"])
+        timestamp(&work["assessment"]["observed_at"])
     } else {
-        timestamp(&status["observation"]["observed_at"])
+        timestamp(&super::observation(status, name)["observed_at"])
     };
     if observed.is_some_and(|time| time > at) {
         return Finding::unknown("clock_regressed");
     }
     let complete = fresh(observed, at, stale)
         && match name {
-            "answer" => status["epoch_evidence"]["answered"] == true,
+            "answer" => super::observation(status, name)["answered"] == true,
             "judge" => {
-                work["selection"]["inventory_complete"] == true
-                    && work["selection"]["eligible"] == false
+                super::assessment_fresh(&work["assessment"], at, stale)
+                    && work["assessment"]["completeness"] == "complete"
+                    && work["assessment"]["locally_judgeable"] == false
             }
             _ => {
                 phase == Some("completed")
-                    && status["observation"]["epoch"].as_u64().is_some()
-                    && work["operation_epoch"] == status["observation"]["epoch"]
+                    && super::observation(status, name)["epoch"].as_u64().is_some()
+                    && work["operation_epoch"] == super::observation(status, name)["epoch"]
             }
         };
     if complete
         && !read_only
         && phase != Some("blocked")
-        && status["participation"]["uncertainty_blocks"][name] == false
+        && status["work"][name]["admission"]["allowed"] == true
     {
         return Finding {
             progress: if name == "judge" { "idle" } else { "complete" },
@@ -550,7 +451,27 @@ fn lane<'a>(
     // A bound original can be reconciled even when policy forbids a distinct
     // risk-admitted retry. Never equate disabling retries with disabling reads.
     if !read_only && matches!(action, "read_job" | "read_receipt") {
-        return Finding::automatic("bound_reconciliation_pending", action, next);
+        let purpose = if action == "read_job" {
+            "job"
+        } else {
+            "receipt"
+        };
+        if work["read_key"]["owner"] != name
+            || work["read_key"]["purpose"] != purpose
+            || work["binding_revision"].as_i64().is_none()
+            || work["read_key"]["resource"].as_str().is_none()
+        {
+            return Finding::unknown("reconciliation_evidence_unavailable");
+        }
+        let dependency = super::api::bound(status, work);
+        if dependency.is_none() && status["reads_truncated"] == true {
+            return Finding::unknown("reconciliation_evidence_truncated");
+        }
+        let due = [next, dependency.and_then(|row| timestamp(&row["next_at"]))]
+            .into_iter()
+            .flatten()
+            .max();
+        return Finding::automatic("bound_reconciliation_pending", action, due);
     }
     let model = &work["model"];
     if !read_only && model.is_object() {
@@ -593,13 +514,15 @@ fn lane<'a>(
             }
             match model["retry_eligible"].as_bool() {
                 Some(true) => {
-                    if let Some(finding) =
-                        blocker(status, name, work, &work["admission"], at, stale, timing)
-                    {
-                        return finding;
-                    }
-                    if status["participation"]["uncertainty_blocks"][name] == true {
-                        return Finding::unknown("admission_recovery_unproven");
+                    if super::lane_policy(status, name)["preparation"]["while_blocked"] != true {
+                        if let Some(finding) =
+                            blocker(status, name, work, &work["admission"], at, stale, timing)
+                        {
+                            return finding;
+                        }
+                        if work["admission"]["allowed"] != true {
+                            return Finding::unknown("admission_recovery_unproven");
+                        }
                     }
                     return Finding::automatic(
                         "model_retry_eligible",
@@ -623,6 +546,10 @@ fn lane<'a>(
         } else {
             Finding::unknown("model_retry_evidence_unavailable")
         };
+    }
+    if !read_only && work["admission"]["allowed"] == false {
+        return blocker(status, name, work, &work["admission"], at, stale, timing)
+            .unwrap_or_else(|| Finding::unknown("admission_recovery_unproven"));
     }
     let retry = &work["retry"];
     if !read_only && retry.is_object() {
@@ -653,18 +580,15 @@ fn lane<'a>(
         if action == "authoritative_recovery" {
             return Finding::blocked("unbound_outcome_requires_evidence", "inspect_operations");
         }
-        if status["participation"]["uncertainty_blocks"][name] == true || phase == Some("blocked") {
+        if status["work"][name]["admission"]["allowed"] == false || phase == Some("blocked") {
             return Finding::unknown("admission_recovery_unproven");
         }
-        if status["participation"]["uncertainty_blocks"][name]
-            .as_bool()
-            .is_none()
-        {
+        if work["admission"]["allowed"].as_bool().is_none() {
             return Finding::unknown("admission_evidence_unavailable");
         }
     }
     for dependency in std::iter::once(scope).chain(bound_scope) {
-        if let Some(row) = read(status, dependency) {
+        if let Some(row) = read(status, name, work, dependency) {
             if timestamp(&row["started_at"]).is_some_and(|time| time > at)
                 || timestamp(&row["last_failure_at"]).is_some_and(|time| time > at)
                 || timestamp(&row["last_success_at"]).is_some_and(|time| time > at)
@@ -673,7 +597,7 @@ fn lane<'a>(
             }
             if row["state"] == "in_flight" {
                 if timestamp(&row["started_at"])
-                    .zip(super::cycle_floor(&status["effective_runtime"]["policy"]))
+                    .zip(super::cycle_floor(status, name))
                     .is_some_and(|(started, limit)| at.saturating_sub(started) as u64 > limit)
                 {
                     return Finding::unknown("read_outcome_overdue");
@@ -729,17 +653,22 @@ fn identity_work_retry_at(status: &Value, at: i64, stale: u64) -> Option<i64> {
                 return None;
             }
             let work = &status["work"][name];
+            let stale = super::cycle_floor(status, name)?.max(stale);
             let next = timestamp(&work["next_at"])?;
             let eligible = match work["phase"].as_str() {
                 Some("prepared") => true,
                 Some("observing") if name == "judge" => {
-                    work["selection"]["eligible"] == true
-                        && fresh(timestamp(&work["selection"]["observed_at"]), at, stale)
+                    work["assessment"]["locally_judgeable"] == true
+                        && super::assessment_fresh(&work["assessment"], at, stale)
                 }
                 Some("observing") => {
-                    status["observation"]["epoch"].as_u64().is_some()
-                        && fresh(timestamp(&status["observation"]["observed_at"]), at, stale)
-                        && (name == "mine" || status["epoch_evidence"]["answered"] == false)
+                    super::observation(status, name)["epoch"].as_u64().is_some()
+                        && fresh(
+                            timestamp(&super::observation(status, name)["observed_at"]),
+                            at,
+                            stale,
+                        )
+                        && (name == "mine" || super::observation(status, name)["answered"] == false)
                 }
                 _ => false,
             };
@@ -753,7 +682,7 @@ fn identity_recovery(status: &Value, at: i64, stale: u64) -> Option<Finding<'sta
     if identity.verified() == Some(true) || identity.rejected() {
         return None;
     }
-    let finding = if let Some(row) = read(status, "identity") {
+    let finding = if let Some(row) = super::api::identity(status) {
         if ["started_at", "last_failure_at", "last_success_at"]
             .iter()
             .any(|field| timestamp(&row[*field]).is_some_and(|time| time > at))
@@ -762,7 +691,8 @@ fn identity_recovery(status: &Value, at: i64, stale: u64) -> Option<Finding<'sta
         } else if row["state"] == "in_flight" {
             match timestamp(&row["started_at"]) {
                 Some(started)
-                    if super::cycle_floor(&status["effective_runtime"]["policy"])
+                    if status["effective_runtime"]["policy"]["identity"]["read_http_seconds"]
+                        .as_u64()
                         .is_some_and(|limit| at.saturating_sub(started) as u64 <= limit) =>
                 {
                     Finding::automatic(identity.reason(), "await_identity", None)
@@ -785,42 +715,20 @@ fn identity_recovery(status: &Value, at: i64, stale: u64) -> Option<Finding<'sta
 }
 
 pub(super) fn project(status: &Value, options: Options, at: i64) -> (Value, Value) {
-    let policy = &status["effective_runtime"]["policy"];
-    let floor = super::cycle_floor(policy);
+    let floor = super::controller_floor(status);
     let stale = floor.map(|floor| options.stale_seconds.max(floor));
-    let timing = WorkTiming {
-        http: policy["timeouts"]["http_seconds"].as_u64().unwrap_or(0),
-        shutdown: policy["timeouts"]["shutdown_seconds"].as_u64().unwrap_or(0),
-        poll: policy["schedule"]["poll_seconds"].as_u64().unwrap_or(0),
-        model: policy["timeouts"]["model_seconds"]
-            .as_u64()
-            .and_then(|model| {
-                Some(
-                    model
-                        .saturating_add(policy["timeouts"]["shutdown_seconds"].as_u64()?)
-                        .saturating_add(policy["schedule"]["poll_seconds"].as_u64()?)
-                        .saturating_add(policy["schedule"]["jitter_seconds"].as_u64()?)
-                        .saturating_add(1),
-                )
-            }),
-        pending: options.work_seconds.max(floor.unwrap_or(0)),
-    };
     let (ready, controller) = controller(status, at, stale);
     let observed = timestamp(&status["effective_runtime"]["observed_at"]);
     let current = stale.map(|stale| fresh(observed, at, stale));
     let mut work = status["work"]
         .as_object()
         .map_or_else(|| json!({}), |work| Value::Object(work.clone()));
-    let rank = |status: &str| match status {
-        "operator_required" => 3,
-        "undetermined" => 2,
-        "automatic_recovery" => 1,
-        _ => 0,
-    };
     let identity = (ready == Some(true) && status["paused"] == false)
-        .then(|| identity_recovery(status, at, stale.unwrap_or(0)))
+        .then(|| identity_recovery(status, at, options.stale_seconds))
         .flatten();
     for name in LANES {
+        let lane_stale =
+            super::cycle_floor(status, name).map(|floor| options.stale_seconds.max(floor));
         let mut finding = if mode(status, name) == Some("off") {
             Finding {
                 progress: "idle",
@@ -829,7 +737,7 @@ pub(super) fn project(status: &Value, options: Options, at: i64) -> (Value, Valu
                 action: "none",
                 next_at: None,
             }
-        } else if ready != Some(true) {
+        } else if ready != Some(true) && controller.reason != "controller_stopped" {
             Finding {
                 progress: controller.progress,
                 status: controller.status,
@@ -839,9 +747,19 @@ pub(super) fn project(status: &Value, options: Options, at: i64) -> (Value, Valu
             }
         } else if !matches!(mode(status, name), Some("active" | "read_only")) {
             Finding::unknown("effective_mode_unavailable")
+        } else if let Some(timing) = super::work_timing(status, name, options) {
+            lane(status, name, at, lane_stale.unwrap_or(0), &timing)
         } else {
-            lane(status, name, at, stale.unwrap_or(0), &timing)
+            Finding::unknown("effective_policy_unavailable")
         };
+        // Preserve independently known lane blockers through a verified restart.
+        // Stop-only recommendations can then be qualified without losing them.
+        if controller.reason == "controller_stopped"
+            && rank(finding.status) < rank(controller.status)
+            && mode(status, name) != Some("off")
+        {
+            finding = Finding::blocked("controller_stopped", "start_controller");
+        }
         if mode(status, name) == Some("active")
             && let Some(identity) = &identity
             && (rank(identity.status) > rank(finding.status)
@@ -873,75 +791,217 @@ pub(super) fn project(status: &Value, options: Options, at: i64) -> (Value, Valu
                 )
         );
         let evidence_at = if name == "judge" {
-            timestamp(&work[name]["selection"]["observed_at"])
+            timestamp(&work[name]["assessment"]["observed_at"])
         } else {
-            timestamp(&status["observation"]["observed_at"])
+            timestamp(&super::observation(status, name)["observed_at"])
         };
-        work[name]["intervention"]["observation_fresh"] =
-            json!(stale.map(|stale| fresh(evidence_at, at, stale)));
+        work[name]["intervention"]["observation_fresh"] = json!(lane_stale.map(|stale| {
+            if name == "judge" {
+                super::assessment_fresh(&work[name]["assessment"], at, stale)
+            } else {
+                fresh(evidence_at, at, stale)
+            }
+        }));
     }
-    // A reservation is a dependency, not itself evidence that the answer can run.
-    for name in ["judge", "mine"] {
-        if ready == Some(true)
-            && mode(status, name) == Some("active")
-            && status["paused"] == false
-            && status["work"][name]["reason"] == "answer_retry_reserved"
-        {
-            let answer = &work["answer"]["intervention"];
-            let finding = match answer["status"].as_str() {
-                Some("automatic_recovery" | "none_required")
-                    if work["answer"]["progress"] != "complete" =>
-                {
-                    Finding::automatic(
-                        "answer_retry_reserved",
-                        "await_answer_retry",
-                        timestamp(&answer["next_at"]),
-                    )
-                }
-                Some("operator_required") => {
-                    Finding::blocked("answer_retry_blocked", "inspect_answer_retry")
-                }
-                _ => Finding::unknown("answer_retry_progress_unproven"),
-            };
-            work[name]["progress"] = json!(finding.progress);
-            work[name]["intervention"] = finding.value(observed, current);
-            work[name]["intervention"]["observation_fresh"] = json!(stale.map(|stale| {
-                let evidence = if name == "judge" {
-                    timestamp(&work[name]["selection"]["observed_at"])
-                } else {
-                    timestamp(&status["observation"]["observed_at"])
-                };
-                fresh(evidence, at, stale)
-            }));
-        }
+    let core = controller.value(observed, current);
+    let mut root = core.clone();
+    root["controller"] = json!({"ready":ready,"reason":controller.reason,"observed_at":observed,
+        "evidence_fresh":current,"process_identity":"unverified"});
+    reduce(
+        &mut root,
+        &work,
+        &core,
+        &status["effective_runtime"]["policy"]["capabilities"],
+        &status["paused"],
+    );
+    (work, root)
+}
+
+fn rank(status: &str) -> u8 {
+    match status {
+        "operator_required" => 3,
+        "undetermined" => 2,
+        "automatic_recovery" => 1,
+        _ => 0,
     }
-    let mut root = controller.value(observed, current);
+}
+
+fn select(root: &mut Value, finding: &Value) {
+    for field in ["status", "reason", "next_action", "next_at"] {
+        root[field] = finding[field].clone();
+    }
+}
+
+/// Core first, then stable lane order. Qualifications always precede CLI actions.
+fn reduce(root: &mut Value, work: &Value, core: &Value, modes: &Value, paused: &Value) {
+    select(root, core);
     for name in LANES {
         let lane = &work[name]["intervention"];
         if rank(lane["status"].as_str().unwrap_or("undetermined"))
             > rank(root["status"].as_str().unwrap_or("undetermined"))
         {
-            root = lane.clone();
+            select(root, lane);
         }
+        root["lanes"][name] = lane["status"].clone();
     }
-    let active = LANES
-        .iter()
-        .any(|name| mode(status, name) == Some("active"));
-    let modes_known = LANES.iter().all(|name| mode(status, name).is_some());
-    root["unattended"] = match root["status"].as_str() {
-        Some("operator_required") => json!(false),
-        Some("undetermined") => Value::Null,
-        _ if !modes_known => Value::Null,
-        _ => json!(ready == Some(true) && active && status["paused"] == false),
+    let active = LANES.iter().any(|name| modes[name]["mode"] == "active");
+    let known = LANES.iter().all(|name| {
+        matches!(
+            modes[name]["mode"].as_str(),
+            Some("active" | "read_only" | "off")
+        )
+    });
+    root["unattended"] = if root["status"] == "operator_required"
+        || root["controller"]["ready"] == false
+        || *paused == true
+        || (known && !active)
+    {
+        json!(false)
+    } else if root["status"] == "undetermined" || !known || root["controller"]["ready"].is_null() {
+        Value::Null
+    } else {
+        json!(root["controller"]["ready"] == true && active && *paused == false)
     };
-    if !active && modes_known && root["status"] == "none_required" {
+    if !active && known && root["status"] == "none_required" {
         root["reason"] = json!("no_active_capabilities");
     }
-    root["controller"] = json!({"ready":ready,"reason":controller.reason,"observed_at":observed,
-        "evidence_fresh":current,"process_identity":"unverified"});
-    root["lanes"] = json!({"answer":work["answer"]["intervention"]["status"],
-        "judge":work["judge"]["intervention"]["status"],"mine":work["mine"]["intervention"]["status"]});
-    (work, root)
+}
+
+fn core_reason(reason: &str) -> Finding<'_> {
+    match reason {
+        "controller_recent" => Finding {
+            progress: "idle",
+            status: "none_required",
+            reason,
+            action: "none",
+            next_at: None,
+        },
+        "not_initialized" => Finding::blocked(reason, "initialize_controller"),
+        "migration_pending" => Finding::blocked(reason, "complete_migration"),
+        "identity_mismatch" | "api_routing_mismatch" | "config_reload_rejected" => {
+            Finding::blocked(reason, "repair_config")
+        }
+        "controller_stopped" => Finding::blocked(reason, "start_controller"),
+        "state_disk_space_low" => Finding::blocked(reason, "inspect_state_filesystem"),
+        "state_disk_space_unavailable" => {
+            let mut finding = Finding::unknown(reason);
+            finding.action = "inspect_state_filesystem";
+            finding
+        }
+        _ => Finding::unknown(reason),
+    }
+}
+
+fn core_finding(controller: &Value) -> Value {
+    core_reason(
+        controller["reason"]
+            .as_str()
+            .unwrap_or("local_evidence_unavailable"),
+    )
+    .value(
+        timestamp(&controller["observed_at"]),
+        controller["evidence_fresh"].as_bool(),
+    )
+}
+
+pub(super) fn qualify_disk(report: &mut Value, code: &str) {
+    let low = code == "state_disk_space_low";
+    let root = &mut report["intervention"];
+    let core = &mut root["controller"];
+    // A measurement is not a new controller observation. Known core blockers
+    // retain their evidence; low disk precedes an otherwise equivalent start.
+    if core["ready"] != false || (low && core["reason"] == "controller_stopped") {
+        core["ready"] = if low { json!(false) } else { Value::Null };
+        core["reason"] = json!(code);
+    }
+    let core = core_finding(&root["controller"]);
+    let mut root = report["intervention"].take();
+    reduce(
+        &mut root,
+        &report["work"],
+        &core,
+        &report["effective_capabilities"],
+        &report["paused"],
+    );
+    root["next_action"] = json!("inspect_state_filesystem");
+    root["next_at"] = Value::Null;
+    report["intervention"] = root;
+}
+
+pub(super) fn qualify_restoration(report: &mut Value) {
+    let reason = "runtime_restored_observation_pending";
+    if report["intervention"]["controller"]["reason"] == "controller_stopped" {
+        report["intervention"]["controller"]["ready"] = Value::Null;
+        report["intervention"]["controller"]["reason"] = json!(reason);
+    }
+    for name in LANES {
+        if report["work"][name]["intervention"]["reason"] == "controller_stopped" {
+            let mode = report["effective_capabilities"][name]["mode"].as_str();
+            let finding = if mode == Some("off") {
+                Finding {
+                    progress: "idle",
+                    status: "none_required",
+                    reason: "capability_off",
+                    action: "none",
+                    next_at: None,
+                }
+            } else if mode == Some("active") && report["paused"] == true {
+                Finding::blocked("admission_paused", "resume")
+            } else if mode == Some("active")
+                && report["lane_controls"][name]["desired"]["paused"] == true
+            {
+                Finding::blocked("lane_paused", "resume")
+            } else {
+                Finding::unknown(reason)
+            };
+            report["work"][name]["progress"] = json!(finding.progress);
+            report["work"][name]["intervention"] = finding.value(None, None);
+            report["work"][name]["intervention"]["observation_fresh"] = Value::Null;
+        }
+        if report["work"][name]["next_action"] == "start_controller" {
+            for field in ["next_action", "reason", "next_at"] {
+                report["work"][name][field] = report["work"][name]["intervention"][field].clone();
+            }
+        }
+    }
+    let disk = report["issues"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .find_map(|code| match code {
+            "state_disk_space_low" => Some("state_disk_space_low"),
+            "state_disk_space_unavailable" => Some("state_disk_space_unavailable"),
+            _ => None,
+        });
+    if let Some(code) = disk {
+        qualify_disk(report, code);
+    } else {
+        let mut root = report["intervention"].take();
+        let core = core_finding(&root["controller"]);
+        reduce(
+            &mut root,
+            &report["work"],
+            &core,
+            &report["effective_capabilities"],
+            &report["paused"],
+        );
+        report["intervention"] = root;
+    }
+}
+
+pub(super) fn qualify_repair_failure(report: &mut Value) {
+    let action = if report["intervention"]["next_action"] == "inspect_state_filesystem" {
+        "inspect_state_filesystem"
+    } else {
+        "inspect_repair_failure"
+    };
+    select(
+        &mut report["intervention"],
+        &Finding::blocked("doctor_repair_unavailable", action).value(None, None),
+    );
+    report["intervention"]["unattended"] = json!(false);
+    report["attention_required"] = json!(true);
 }
 
 #[cfg(test)]
@@ -949,30 +1009,11 @@ mod tests {
     use super::*;
 
     fn fixture() -> Value {
-        let mut config = crate::config::Config::default();
-        config.participation.mode = crate::config::ParticipationMode::ParticipationFirst;
-        config.participation.allow_judge = true;
-        config.participation.retry_uncertain_answers = true;
-        let mut status = json!({
-            "initialized":true,"paused":false,"controller_stopped":false,
-            "identity_matches_config":true,"hosted_identity_verified":true,
-            "hosted_identity":{"status":"verified","observed_at":10000,
-                "last_verified_at":10000,"rejection":null,"legacy_failure":false},
-            "effective_runtime":{"observed_at":10000,"reload_blocked":false,
-                "capabilities":{"answer":"active","judge":"active","mine":"active"},
-                "policy":{"timeouts":config.timeouts,"schedule":config.schedule,
-                    "preparation":config.preparation}},
-            "observation":{"observed_at":10000,"epoch":7},"epoch_evidence":{"answered":false},
-            "participation":{"policy_source":"effective","policy":config.participation,
-                "unresolved_count":0,"active_unresolved_count":0,
-                "uncertainty_blocks":{"answer":false,"judge":false,"mine":false}},
-            "pending_work":[],"reads":[],"work":{}
-        });
-        for name in LANES {
-            status["work"][name] = json!({"phase":"observing","reason":"cadence",
-                "next_action":if name == "judge" { "observe_assignments" } else { "observe_challenge" },
-                "next_at":10020});
-        }
+        let (_, _, mut status) = crate::health::tests::fixture();
+        status["observations"]["answer"]["answered"] = json!(false);
+        status["work"]["answer"]["phase"] = json!("observing");
+        status["work"]["judge"]["assessment"]["locally_judgeable"] = json!(true);
+        status["work"]["mine"]["phase"] = json!("observing");
         status
     }
 
@@ -980,240 +1021,37 @@ mod tests {
         project(status, Options::default(), 10000)
     }
 
-    #[test]
-    fn identity_recovery_requires_a_real_retained_retry_or_live_read() {
-        for state in [
-            "unavailable",
-            "invalid_response",
-            "legacy_unknown",
-            "unobserved",
-        ] {
-            let mut status = fixture();
-            status["hosted_identity"]["status"] = json!(state);
-            // A stale compatibility flag is not canonical rejection evidence.
-            status["hosted_identity_verified"] = json!(false);
-            let (work, root) = projection(&status);
-            assert_eq!(root["status"], "undetermined");
-            assert_eq!(root["unattended"], Value::Null);
-            assert_eq!(work["answer"]["intervention"]["next_at"], Value::Null);
-            status["reads"] = json!([{"scope":"identity","state":"idle",
-                "last_failure_at":10000,"failure_category":"timeout","next_at":10030}]);
-            let (work, root) = projection(&status);
-            assert_eq!(root["status"], "automatic_recovery");
-            for name in LANES {
-                assert_eq!(work[name]["intervention"]["next_action"], "await_identity");
-                assert_eq!(work[name]["intervention"]["next_at"], 10030);
-            }
-            status["reads"][0]["state"] = json!("in_flight");
-            status["reads"][0]["started_at"] = json!(9999);
-            let (work, _) = projection(&status);
-            assert_eq!(
-                work["answer"]["intervention"]["status"],
-                "automatic_recovery"
-            );
-            assert_eq!(work["answer"]["intervention"]["next_at"], Value::Null);
-            status["reads"][0]["started_at"] = json!(1);
-            assert_eq!(projection(&status).1["status"], "undetermined");
-            status["reads"][0]["state"] = json!("idle");
-            status["reads"][0]["next_at"] = json!(9999);
-            assert_eq!(projection(&status).1["status"], "undetermined");
-        }
+    fn queued(id: i64, lane: &str) -> Value {
+        json!({"operation_id":id,"kind":lane,"state":"queued","binding_revision":1,"next_at":10020,
+            "read_key":{"owner":lane,"purpose":"job","resource":format!("{id}:1")}})
+    }
+
+    fn block(
+        status: &mut Value,
+        lane: &str,
+        reason: &str,
+        scope: &str,
+        ids: &[i64],
+        required: u64,
+    ) {
+        status["work"][lane]["admission"] = json!({"allowed":false,"reason":reason,
+            "scope":scope,"blocker_ids":ids,"required_release":required,"not_before":null});
     }
 
     #[test]
-    fn identity_uncertainty_remains_visible_after_current_work_completes() {
+    fn truncated_blocker_evidence_never_proves_recovery_impossible() {
         let mut status = fixture();
-        status["hosted_identity"]["status"] = json!("unavailable");
-        status["epoch_evidence"]["answered"] = json!(true);
-        status["work"]["answer"]["phase"] = json!("answered");
-        status["work"]["mine"]["phase"] = json!("completed");
-        status["work"]["mine"]["operation_epoch"] = json!(7);
-        status["work"]["judge"]["selection"] = json!({
-            "observed_at":10000,"inventory_complete":true,"eligible":false
-        });
-        for scheduled in [false, true] {
-            if scheduled {
-                status["reads"] = json!([{"scope":"identity","state":"idle",
-                    "last_failure_at":10000,"failure_category":"timeout","next_at":10030}]);
-            }
-            let (work, root) = projection(&status);
-            // The retained deadline is a floor, not a scheduled identity job.
-            assert_eq!(root["status"], "undetermined");
-            assert_eq!(root["unattended"], Value::Null);
-            for (name, progress) in [
-                ("answer", "complete"),
-                ("judge", "idle"),
-                ("mine", "complete"),
-            ] {
-                assert_eq!(work[name]["progress"], progress);
-                assert_eq!(work[name]["intervention"]["status"], "undetermined");
-            }
-        }
-        // Pending work supplies a real revalidation path; its own schedule can
-        // be later than the identity floor.
-        status["work"]["judge"] = json!({"phase":"prepared",
-            "reason":"identity_backoff","next_action":"revalidate_assignment","next_at":10040});
-        let (work, root) = projection(&status);
-        assert_eq!(root["status"], "automatic_recovery");
-        assert_eq!(root["unattended"], true);
-        assert_eq!(root["next_at"], 10040);
-        assert_eq!(work["answer"]["progress"], "complete");
-        assert_eq!(work["mine"]["progress"], "complete");
-    }
-
-    #[test]
-    fn identity_backoff_does_not_hide_independent_operator_fences() {
-        let mut status = fixture();
-        status["hosted_identity"]["status"] = json!("unavailable");
-        status["reads"] = json!([{"scope":"identity","state":"idle",
-            "last_failure_at":10000,"failure_category":"timeout","next_at":10030}]);
-        status["work"]["answer"]["model"] = json!({
-            "current_route":true,"failure_category":"native_auth_unavailable"
-        });
-        let (work, root) = projection(&status);
-        assert_eq!(
-            work["answer"]["intervention"]["reason"],
-            "model_authentication_failed"
+        block(
+            &mut status,
+            "answer",
+            "account_uncertainty",
+            "account",
+            &[1],
+            2,
         );
-        assert_eq!(root["status"], "operator_required");
-        status["work"]["answer"]["model"] = Value::Null;
-        status["work"]["answer"]["admission"] = json!({"reason":"manual_authorization_required"});
-        let (work, root) = projection(&status);
-        assert_eq!(work["answer"]["intervention"]["next_action"], "authorize");
-        assert_eq!(root["status"], "operator_required");
-    }
-
-    #[test]
-    fn retained_identity_rejection_survives_timeout_until_matching_verification() {
-        for (rejection, action) in [
-            ("authentication_failed", "review_credentials"),
-            ("identity_mismatch", "repair_config"),
-        ] {
-            let mut status = fixture();
-            status["hosted_identity"]["status"] = json!("unavailable");
-            status["hosted_identity"]["rejection"] = json!(rejection);
-            status["reads"] = json!([{"scope":"identity","state":"idle",
-                "last_failure_at":10000,"failure_category":"timeout","next_at":10030}]);
-            let (work, root) = projection(&status);
-            assert_eq!(root["status"], "operator_required");
-            for name in LANES {
-                assert_eq!(work[name]["intervention"]["next_action"], action);
-                assert_eq!(work[name]["intervention"]["next_at"], Value::Null);
-            }
-            status["hosted_identity"]["status"] = json!("verified");
-            status["hosted_identity"]["rejection"] = Value::Null;
-            status["reads"] = json!([]);
-            assert_ne!(projection(&status).1["status"], "operator_required");
-        }
-    }
-
-    #[test]
-    fn missing_identity_object_is_uncertain_and_read_only_lanes_are_not_escalated() {
-        let mut status = fixture();
-        status.as_object_mut().unwrap().remove("hosted_identity");
-        for legacy in [json!(true), json!(false), Value::Null] {
-            status["hosted_identity_verified"] = legacy;
-            let (work, _) = projection(&status);
-            assert_eq!(work["answer"]["intervention"]["status"], "undetermined");
-        }
-        status["hosted_identity"] =
-            json!({"status":"unavailable","rejection":"authentication_failed"});
-        status["effective_runtime"]["capabilities"]["judge"] = json!("read_only");
-        status["effective_runtime"]["capabilities"]["mine"] = json!("off");
-        let (work, _) = projection(&status);
-        assert_eq!(work["judge"]["intervention"]["status"], "none_required");
-        assert_eq!(work["mine"]["intervention"]["status"], "none_required");
-        status["paused"] = json!(true);
-        assert_eq!(
-            projection(&status).0["answer"]["intervention"]["reason"],
-            "admission_paused"
-        );
-        status["initialized"] = json!(false);
-        assert_eq!(projection(&status).1["reason"], "not_initialized");
-    }
-
-    #[test]
-    fn grace_is_automatic_not_manual_even_while_admission_is_closed() {
-        let mut status = fixture();
-        for name in LANES {
-            status["work"][name] = json!({"phase":"blocked","reason":"uncertainty_grace",
-                "next_action":"await_reconciliation","next_at":10100});
-            status["participation"]["uncertainty_blocks"][name] = json!(true);
-        }
-        let (work, root) = projection(&status);
-        for name in LANES {
-            assert_eq!(work[name]["progress"], "waiting");
-            assert_eq!(work[name]["intervention"]["status"], "automatic_recovery");
-            assert_eq!(work[name]["intervention"]["next_at"], 10100);
-            assert_eq!(work[name]["phase"], "blocked");
-        }
-        assert_eq!(root["unattended"], true);
-        status["participation"]["policy"]["mode"] = json!("manual");
-        for name in LANES {
-            status["work"][name]["manual_authorized"] = json!(false);
-        }
-        assert_eq!(projection(&status).1["unattended"], false);
-        assert_eq!(
-            projection(&status).0["answer"]["intervention"]["reason"],
-            "manual_authorization_required"
-        );
-    }
-
-    #[test]
-    fn future_uncertain_retry_requires_policy_and_grant_evidence() {
-        let mut status = fixture();
-        status["work"]["answer"] = json!({"phase":"unknown","next_action":"authoritative_recovery",
-            "retry":{"policy_eligible":false,"reason":"uncertain_answer_retry_delay",
-                "next_action":"await_retry_eligibility","next_at":10200,"requires_fresh_eligibility":true}});
-        let (work, _) = projection(&status);
-        assert_eq!(
-            work["answer"]["intervention"]["status"],
-            "automatic_recovery"
-        );
-        assert_eq!(work["answer"]["intervention"]["next_at"], 10200);
-        assert_eq!(
-            work["answer"]["intervention"]["requires_fresh_eligibility"],
-            true
-        );
-        status["participation"]["policy"]["mode"] = json!("manual");
-        assert_eq!(
-            projection(&status).0["answer"]["intervention"]["status"],
-            "undetermined"
-        );
-        status["work"]["answer"]["retry"]["manual_authorized"] = json!(false);
-        assert_eq!(
-            projection(&status).0["answer"]["intervention"]["status"],
-            "operator_required"
-        );
-        status["work"]["answer"]["retry"]["manual_authorized"] = json!(true);
-        assert_eq!(
-            projection(&status).0["answer"]["intervention"]["status"],
-            "automatic_recovery"
-        );
-    }
-
-    #[test]
-    fn unbound_capacity_cannot_be_mistaken_for_an_automatic_wait() {
-        let mut status = fixture();
-        status["participation"]["policy"]["max_unresolved_operations"] = json!(1);
-        status["participation"]["active_unresolved_count"] = json!(1);
-        status["participation"]["unresolved_count"] = json!(1);
-        status["work"]["answer"] = json!({"phase":"blocked","reason":"unresolved_capacity",
-            "next_action":"await_reconciliation","next_at":null});
-        status["pending_work"] = json!([{"kind":"mine","state":"unknown","capacity_counted":true,
-            "reconciliation_scope":null,"next_at":10020}]);
-        let (work, root) = projection(&status);
-        assert_eq!(
-            work["answer"]["intervention"]["status"],
-            "operator_required"
-        );
-        assert_eq!(root["unattended"], false);
-        status["pending_work"][0]["reconciliation_scope"] = json!("job");
-        assert_eq!(
-            projection(&status).0["answer"]["intervention"]["status"],
-            "automatic_recovery"
-        );
-        status["pending_work"][0]["capacity_counted"] = Value::Null;
+        status["work"]["answer"]["admission"]["blocker_ids_truncated"] = json!(true);
+        status["pending_work"] =
+            json!([{"operation_id":1,"kind":"judge","state":"unknown","read_key":null}]);
         assert_eq!(
             projection(&status).0["answer"]["intervention"]["status"],
             "undetermined"
@@ -1221,222 +1059,217 @@ mod tests {
     }
 
     #[test]
-    fn capacity_release_requires_usable_reconciliation_authentication() {
+    fn truncated_read_history_does_not_hide_a_possible_authentication_block() {
         let mut status = fixture();
-        status["participation"]["policy"]["max_unresolved_operations"] = json!(1);
-        status["participation"]["active_unresolved_count"] = json!(1);
-        status["participation"]["unresolved_count"] = json!(1);
-        status["work"]["mine"] = json!({"phase":"blocked","reason":"unresolved_capacity"});
-        status["pending_work"] = json!([{"kind":"answer","state":"queued","capacity_counted":true,
-            "reconciliation_scope":"job","next_at":10020}]);
-        status["reads"] = json!([{"scope":"job","status":401,"last_failure_at":9990,
-            "last_success_at":null,"failures":1,"next_at":10100}]);
-        assert_eq!(
-            projection(&status).0["mine"]["intervention"]["status"],
-            "operator_required"
+        block(
+            &mut status,
+            "answer",
+            "account_uncertainty",
+            "account",
+            &[1],
+            1,
         );
-        assert_eq!(projection(&status).1["unattended"], false);
+        status["pending_work"] = json!([queued(1, "judge")]);
+        status["reads_truncated"] = json!(true);
+        assert_eq!(
+            projection(&status).0["answer"]["intervention"]["status"],
+            "undetermined"
+        );
+        status["work"]["answer"]["next_action"] = json!("read_job");
+        status["work"]["answer"]["read_key"] = queued(2, "answer")["read_key"].clone();
+        status["work"]["answer"]["binding_revision"] = json!(1);
+        assert_eq!(
+            projection(&status).0["answer"]["intervention"]["reason"],
+            "reconciliation_evidence_truncated"
+        );
+    }
+
+    #[test]
+    fn release_requirement_and_blocker_membership_come_only_from_store() {
+        let mut status = fixture();
+        status["pending_work"] = json!([queued(1,"answer"),queued(2,"judge"),
+            {"operation_id":3,"kind":"answer","state":"unknown","read_key":null}]);
+        block(
+            &mut status,
+            "answer",
+            "lane_unresolved_capacity",
+            "lane",
+            &[1, 3],
+            2,
+        );
+        assert_eq!(
+            projection(&status).0["answer"]["intervention"]["reason"],
+            "no_automatic_capacity_release"
+        );
+        status["work"]["answer"]["admission"]["required_release"] = json!(1);
+        let recovery = projection(&status).0["answer"]["intervention"].clone();
+        assert_eq!(recovery["status"], "automatic_recovery");
+        assert_eq!(recovery["evidence"], "local_only_not_a_success_guarantee");
+        block(
+            &mut status,
+            "answer",
+            "lane_unresolved_capacity",
+            "lane",
+            &[2],
+            1,
+        );
+        assert_eq!(
+            projection(&status).0["answer"]["intervention"]["status"],
+            "undetermined"
+        );
+    }
+
+    #[test]
+    fn strict_account_uncertainty_spans_lanes_without_consuming_their_allowance() {
+        let mut status = fixture();
+        status["pending_work"] = json!([queued(1, "judge")]);
+        block(
+            &mut status,
+            "answer",
+            "account_uncertainty",
+            "account",
+            &[1],
+            1,
+        );
+        status["work"]["answer"]["admission"]["own_remaining"] = json!(4);
+        let (work, _) = projection(&status);
+        assert_eq!(
+            work["answer"]["intervention"]["status"],
+            "automatic_recovery"
+        );
+        assert_eq!(work["answer"]["admission"]["own_remaining"], 4);
+        status["pending_work"][0]["read_key"] = Value::Null;
+        assert_eq!(
+            projection(&status).0["answer"]["intervention"]["reason"],
+            "unbound_uncertainty"
+        );
+    }
+
+    #[test]
+    fn authentication_and_backoff_are_exact_operation_binding_dependencies() {
+        let mut status = fixture();
+        status["pending_work"] = json!([queued(1, "answer"), queued(2, "answer")]);
+        status["reads"] = json!([
+            {"owner":"answer","purpose":"job","resource":"1:1","binding_revision":1,
+                "last_failure_at":9999,"status":401,"next_at":12000},
+            {"owner":"answer","purpose":"job","resource":"2:1","binding_revision":1,
+                "last_success_at":9999,"status":200,"next_at":10030}
+        ]);
+        block(
+            &mut status,
+            "answer",
+            "lane_unresolved_capacity",
+            "lane",
+            &[2],
+            1,
+        );
+        let (work, _) = projection(&status);
+        assert_eq!(
+            work["answer"]["intervention"]["status"],
+            "automatic_recovery"
+        );
+        assert_eq!(work["answer"]["intervention"]["next_at"], 10030);
+        block(
+            &mut status,
+            "answer",
+            "lane_unresolved_capacity",
+            "lane",
+            &[1],
+            1,
+        );
+        assert_eq!(
+            projection(&status).0["answer"]["intervention"]["reason"],
+            "reconciliation_authentication_failed"
+        );
         status["reads"][0]["last_failure_at"] = json!(1);
         assert_eq!(
-            projection(&status).0["mine"]["intervention"]["status"],
+            projection(&status).0["answer"]["intervention"]["status"],
             "undetermined"
         );
-        status["reads"][0]["status"] = json!(503);
-        status["reads"][0]["last_failure_at"] = json!(9990);
+        status["pending_work"][0]["binding_revision"] = json!(2);
+        status["pending_work"][0]["read_key"]["resource"] = json!("1:2");
         assert_eq!(
-            projection(&status).0["mine"]["intervention"]["status"],
+            projection(&status).0["answer"]["intervention"]["status"],
             "automatic_recovery"
         );
     }
 
     #[test]
-    fn stale_authentication_preserves_uncertainty_for_direct_and_alternative_reads() {
+    fn direct_recovery_needs_binding_and_combines_only_its_own_due_time() {
         let mut status = fixture();
-        status["work"]["answer"] = json!({"phase":"queued","next_action":"read_job"});
-        status["reads"] = json!([{"scope":"job","status":401,"last_failure_at":1,
-            "last_success_at":null,"failures":1}]);
-        assert_eq!(
-            projection(&status).0["answer"]["intervention"]["status"],
-            "undetermined"
-        );
-        status["reads"][0]["last_success_at"] = json!(10000);
-        assert_eq!(
-            projection(&status).0["answer"]["intervention"]["status"],
-            "automatic_recovery"
-        );
-        status["reads"][0]["last_success_at"] = Value::Null;
-        status["reads"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!({"scope":"receipt","status":403,
-            "last_failure_at":9999,"last_success_at":null,"failures":1}));
-        status["work"]["mine"] = json!({"phase":"blocked","reason":"unresolved_capacity"});
-        status["participation"]["policy"]["max_unresolved_operations"] = json!(2);
-        status["participation"]["policy"]["answer_reserved_slots"] = json!(0);
-        status["participation"]["active_unresolved_count"] = json!(2);
-        status["pending_work"] = json!([
-            {"state":"queued","capacity_counted":true,"reconciliation_scope":"job"},
-            {"state":"queued","capacity_counted":true,"reconciliation_scope":"receipt"}]);
-        assert_eq!(
-            projection(&status).0["mine"]["intervention"]["status"],
-            "undetermined"
-        );
-        status["participation"]["policy"]["max_unresolved_operations"] = json!(1);
-        assert_eq!(
-            projection(&status).0["mine"]["intervention"]["status"],
-            "operator_required"
-        );
-    }
-
-    #[test]
-    fn unrelated_assignment_model_failure_does_not_block_new_judgments() {
-        let mut status = fixture();
-        status["work"]["judge"]["selection"] = json!({"observed_at":10000,
-            "inventory_complete":true,"eligible":true,"observed_count":2});
-        status["work"]["judge"]["model"] = json!({"scope":"historical_assignment",
-            "current_route":true,"state":"model_unknown","retry_eligible":false,
-            "budget_used":2,"budget_limit":2,"failure_category":null});
-        assert_eq!(
-            projection(&status).0["judge"]["intervention"]["status"],
-            "automatic_recovery"
-        );
-        status["work"]["judge"]["model"]["failure_category"] = json!("native_auth_unavailable");
-        assert_eq!(
-            projection(&status).0["judge"]["intervention"]["status"],
-            "operator_required"
-        );
-        status["work"]["judge"]["model"]["current_route"] = json!(false);
-        assert_eq!(
-            projection(&status).0["judge"]["intervention"]["status"],
-            "automatic_recovery"
-        );
-    }
-
-    #[test]
-    fn model_retry_does_not_hide_capacity_block_or_bound_original_recovery() {
-        let mut status = fixture();
-        status["participation"]["policy"]["max_unresolved_operations"] = json!(1);
-        status["participation"]["active_unresolved_count"] = json!(1);
-        status["participation"]["unresolved_count"] = json!(1);
-        status["participation"]["uncertainty_blocks"]["answer"] = json!(true);
-        status["pending_work"] = json!([{"kind":"judge","state":"unknown",
-            "capacity_counted":true,"reconciliation_scope":null}]);
-        status["work"]["answer"]["admission"] = json!({"reason":"unresolved_capacity"});
-        status["work"]["answer"]["model"] = json!({"scope":"current_work",
-            "state":"model_unknown","retry_eligible":true,"budget_used":1,"budget_limit":2});
-        assert_eq!(
-            projection(&status).0["answer"]["intervention"]["status"],
-            "operator_required"
-        );
         status["work"]["answer"]["phase"] = json!("queued");
         status["work"]["answer"]["next_action"] = json!("read_job");
-        status["work"]["answer"]["model"]["budget_used"] = json!(2);
-        status["work"]["answer"]["model"]["retry_eligible"] = json!(false);
         assert_eq!(
             projection(&status).0["answer"]["intervention"]["status"],
-            "automatic_recovery"
+            "undetermined"
         );
-    }
-
-    #[test]
-    fn capacity_release_must_be_large_enough_to_admit_work() {
-        let mut status = fixture();
-        status["participation"]["policy"]["max_unresolved_operations"] = json!(1);
-        status["participation"]["active_unresolved_count"] = json!(2);
-        status["work"]["answer"] = json!({"phase":"blocked","reason":"unresolved_capacity"});
-        status["pending_work"] = json!([
-            {"kind":"mine","state":"queued","capacity_counted":true,"reconciliation_scope":"job"},
-            {"kind":"judge","state":"unknown","capacity_counted":true,"reconciliation_scope":null}
+        status["work"]["answer"]["read_key"] = queued(1, "answer")["read_key"].clone();
+        status["work"]["answer"]["binding_revision"] = json!(1);
+        status["reads"] = json!([
+            {"owner":"answer","purpose":"job","resource":"2:1","binding_revision":1,
+                "last_failure_at":9999,"status":403,"next_at":12000},
+            {"owner":"answer","purpose":"job","resource":"1:1","binding_revision":1,
+                "last_success_at":9999,"next_at":10100}
         ]);
         assert_eq!(
-            projection(&status).0["answer"]["intervention"]["status"],
-            "operator_required"
+            projection(&status).0["answer"]["intervention"]["next_at"],
+            10100
         );
     }
 
     #[test]
-    fn strict_prepared_retry_can_wait_for_bound_original_reconciliation() {
+    fn canonical_manual_and_restriction_decisions_are_not_reinterpreted() {
         let mut status = fixture();
-        status["participation"]["policy"]["mode"] = json!("strict");
-        status["participation"]["unresolved_count"] = json!(1);
-        status["pending_work"] = json!([{"kind":"answer","state":"queued",
-            "reconciliation_scope":"job","next_at":10020}]);
-        status["work"]["answer"] = json!({"phase":"prepared","next_action":"revalidate_challenge",
-            "retry":{"reason":"strict_uncertainty","policy_eligible":false}});
+        block(
+            &mut status,
+            "judge",
+            "manual_authorization_required",
+            "account",
+            &[],
+            0,
+        );
         assert_eq!(
-            projection(&status).0["answer"]["intervention"]["status"],
+            projection(&status).0["judge"]["intervention"]["next_action"],
+            "authorize"
+        );
+        status["work"]["judge"]["retry"] = json!({"policy_eligible":true,
+            "reason":"fresh_evidence_required","next_action":"revalidate_assignment","next_at":10020});
+        assert_eq!(
+            projection(&status).0["judge"]["intervention"]["next_action"],
+            "authorize"
+        );
+        status["work"]["judge"]["admission"] = json!({"allowed":true,"reason":null});
+        assert_eq!(
+            projection(&status).0["judge"]["intervention"]["status"],
             "automatic_recovery"
         );
-        status["pending_work"][0]["reconciliation_scope"] = Value::Null;
-        assert_eq!(
-            projection(&status).0["answer"]["intervention"]["status"],
-            "operator_required"
-        );
-    }
-
-    #[test]
-    fn stopped_stale_missing_and_future_controllers_never_promise_unattended_work() {
-        let mut status = fixture();
-        status["controller_stopped"] = json!(true);
-        assert_eq!(projection(&status).1["unattended"], false);
-        assert_eq!(projection(&status).1["controller"]["ready"], false);
-        status["controller_stopped"] = json!(false);
-        for observed in [json!(1), Value::Null, json!(10001)] {
-            status["effective_runtime"]["observed_at"] = observed;
-            let (work, root) = projection(&status);
-            assert_eq!(root["unattended"], Value::Null);
-            for name in LANES {
-                assert_eq!(work[name]["intervention"]["status"], "undetermined");
-            }
+        status["work"]["judge"]["retry"] = Value::Null;
+        for reason in [
+            "account_uncertainty_grace",
+            "shared_server_restriction",
+            "retained_legacy_floor",
+        ] {
+            block(&mut status, "judge", reason, "account", &[], 0);
+            assert_eq!(
+                projection(&status).0["judge"]["intervention"]["status"],
+                "undetermined"
+            );
+            status["work"]["judge"]["admission"]["not_before"] = json!(10100);
+            let (work, _) = projection(&status);
+            assert_eq!(work["judge"]["intervention"]["reason"], reason);
+            assert_eq!(work["judge"]["intervention"]["next_at"], 10100);
+            assert_ne!(work["answer"]["intervention"]["reason"], reason);
         }
     }
 
     #[test]
-    fn completed_answer_requires_fresh_observation_not_just_a_heartbeat() {
+    fn model_uncertainty_budget_and_current_route_errors_remain_separate() {
         let mut status = fixture();
-        status["epoch_evidence"]["answered"] = json!(true);
-        status["work"]["answer"]["phase"] = json!("answered");
-        assert_eq!(projection(&status).0["answer"]["progress"], "complete");
-        status["observation"]["observed_at"] = json!(1);
-        let (work, _) = projection(&status);
-        assert_eq!(work["answer"]["progress"], "waiting");
-        assert_eq!(work["answer"]["intervention"]["observation_fresh"], false);
-        assert_eq!(work["answer"]["phase"], "answered");
-        status["observation"]["observed_at"] = json!(10001);
+        status["work"]["answer"]["model"] = json!({"state":"model_unknown","budget_used":1,
+            "budget_limit":2,"retry_eligible":true,"scope":"current_work","current_route":true});
         assert_eq!(
-            projection(&status).0["answer"]["intervention"]["status"],
-            "undetermined"
-        );
-    }
-
-    #[test]
-    fn historical_uncertainty_is_not_an_operator_blocker() {
-        let mut status = fixture();
-        status["epoch_evidence"]["answered"] = json!(true);
-        status["work"]["answer"]["phase"] = json!("answered");
-        status["participation"]["unresolved_count"] = json!(5);
-        status["participation"]["historical_unknown_answer_count"] = json!(5);
-        status["pending_work"] = json!([{"kind":"answer","state":"unknown","created_at":1,
-            "capacity_counted":false,"reconciliation_scope":null}]);
-        status["operations"] =
-            json!([{"kind":"judge","state":"superseded_model_unknown","count":1}]);
-        let before = status.clone();
-        let (work, root) = projection(&status);
-        assert_eq!(work["answer"]["progress"], "complete");
-        assert_eq!(work["answer"]["intervention"]["status"], "none_required");
-        assert_eq!(root["unattended"], true);
-        assert_eq!(status, before);
-    }
-
-    #[test]
-    fn model_recovery_needs_remaining_budget_and_known_retry_policy() {
-        let mut status = fixture();
-        status["work"]["answer"]["model"] = json!({"state":"model_unknown",
-            "budget_used":1,"budget_limit":2,"retry_eligible":true,"failure_category":null,
-            "scope":"current_work","current_route":true});
-        assert_eq!(
-            projection(&status).0["answer"]["intervention"]["status"],
-            "automatic_recovery"
+            projection(&status).0["answer"]["intervention"]["reason"],
+            "model_retry_eligible"
         );
         status["work"]["answer"]["model"]["budget_used"] = json!(2);
         assert_eq!(
@@ -1459,85 +1292,79 @@ mod tests {
             projection(&status).0["answer"]["intervention"]["reason"],
             "model_authentication_failed"
         );
-    }
-
-    #[test]
-    fn read_backoff_and_bound_reconciliation_have_real_automatic_paths() {
-        let mut status = fixture();
-        status["reads"] = json!([{"scope":"assignments","state":"idle","last_failure_at":10000,
-            "status":429,"next_at":10100}]);
-        assert_eq!(
-            projection(&status).0["judge"]["intervention"]["next_at"],
-            10100
-        );
-        status["reads"][0]["state"] = json!("in_flight");
-        assert_eq!(projection(&status).0["judge"]["progress"], "working");
-        status["work"]["answer"] = json!({"phase":"queued","next_action":"read_job","next_at":10100,
-            "retry":{"policy_eligible":false,"reason":"strict_uncertainty"}});
-        assert_eq!(
-            projection(&status).0["answer"]["intervention"]["status"],
-            "automatic_recovery"
-        );
-        status["work"]["answer"]["next_action"] = json!("authoritative_recovery");
-        status["participation"]["unresolved_count"] = json!(1);
-        status["pending_work"] = json!([{"kind":"answer","state":"unknown",
-            "reconciliation_scope":null}]);
-        assert_eq!(
-            projection(&status).0["answer"]["intervention"]["status"],
+        status["work"]["judge"]["model"] = json!({"scope":"historical_assignment","current_route":false,
+            "state":"model_unknown","budget_used":2,"budget_limit":2,"retry_eligible":false});
+        assert_ne!(
+            projection(&status).0["judge"]["intervention"]["status"],
             "operator_required"
         );
     }
 
     #[test]
-    fn off_read_only_and_pause_do_not_authorize_participation() {
+    fn model_preparation_permission_does_not_claim_effect_admission() {
+        let mut status = fixture();
+        block(
+            &mut status,
+            "answer",
+            "account_uncertainty",
+            "account",
+            &[1],
+            1,
+        );
+        status["pending_work"] =
+            json!([{"operation_id":1,"kind":"judge","state":"unknown","read_key":null}]);
+        status["work"]["answer"]["model"] = json!({"state":"model_unknown","budget_used":1,
+            "budget_limit":2,"retry_eligible":true,"scope":"current_work"});
+        assert_eq!(
+            projection(&status).0["answer"]["intervention"]["next_action"],
+            "retry_model"
+        );
+        assert_eq!(
+            projection(&status).0["answer"]["admission"]["allowed"],
+            false
+        );
+        status["effective_runtime"]["policy"]["capabilities"]["answer"]["preparation"]["while_blocked"] =
+            json!(false);
+        assert_eq!(
+            projection(&status).0["answer"]["intervention"]["reason"],
+            "unbound_uncertainty"
+        );
+    }
+
+    #[test]
+    fn uncertain_identity_needs_real_read_or_scheduled_work_not_a_success_promise() {
+        let mut status = fixture();
+        status["hosted_identity"]["status"] = json!("unavailable");
+        assert_eq!(projection(&status).1["unattended"], Value::Null);
+        status["reads"] = json!([{"owner":"account","purpose":"identity","resource":"identity",
+            "last_failure_at":9999,"failure_category":"timeout","next_at":10030}]);
+        assert_eq!(
+            projection(&status).0["answer"]["intervention"]["next_at"],
+            10030
+        );
+        status["hosted_identity"]["rejection"] = json!("authentication_failed");
+        assert_eq!(projection(&status).1["unattended"], false);
+        status["hosted_identity"]["rejection"] = Value::Null;
+        status["reads"][0]["state"] = json!("in_flight");
+        status["reads"][0]["started_at"] = json!(1);
+        assert_eq!(projection(&status).1["status"], "undetermined");
+    }
+
+    #[test]
+    fn off_pause_and_stale_controller_preserve_recovery_diagnostics_without_permission() {
         let mut status = fixture();
         status["paused"] = json!(true);
-        status["effective_runtime"]["capabilities"]["judge"] = json!("read_only");
-        status["effective_runtime"]["capabilities"]["mine"] = json!("off");
+        status["effective_runtime"]["policy"]["capabilities"]["judge"]["mode"] = json!("read_only");
+        status["effective_runtime"]["policy"]["capabilities"]["mine"]["mode"] = json!("off");
         let (work, root) = projection(&status);
         assert_eq!(work["answer"]["intervention"]["next_action"], "resume");
-        assert_eq!(work["judge"]["progress"], "idle");
         assert_eq!(work["judge"]["intervention"]["status"], "none_required");
         assert_eq!(work["mine"]["intervention"]["status"], "none_required");
         assert_eq!(root["unattended"], false);
-    }
-
-    #[test]
-    fn observing_lane_uses_canonical_admission_not_a_generic_manual_guess() {
-        let mut status = fixture();
-        status["participation"]["uncertainty_blocks"]["judge"] = json!(true);
-        status["work"]["judge"]["admission"] =
-            json!({"reason":"uncertainty_grace","next_at":10120});
-        let (work, _) = projection(&status);
-        assert_eq!(work["judge"]["phase"], "observing");
-        assert_eq!(
-            work["judge"]["intervention"]["status"],
-            "automatic_recovery"
-        );
-        assert_eq!(work["judge"]["intervention"]["next_at"], 10120);
-        status["work"]["judge"]["admission"]["next_at"] = Value::Null;
-        assert_eq!(
-            projection(&status).0["judge"]["intervention"]["status"],
-            "undetermined"
-        );
-    }
-
-    #[test]
-    fn reservation_does_not_invent_an_answer_recovery_path() {
-        let mut status = fixture();
-        status["work"]["answer"] = json!({"phase":"unknown","next_action":"authoritative_recovery",
-            "retry":{"policy_eligible":false,"reason":"uncertain_retry_disabled"}});
-        status["work"]["judge"] = json!({"phase":"blocked","reason":"answer_retry_reserved",
-            "admission_reservation":{"active":true}});
-        assert_eq!(
-            projection(&status).0["judge"]["intervention"]["status"],
-            "operator_required"
-        );
-        status["work"]["answer"]["retry"]["policy_eligible"] = json!(true);
-        status["work"]["answer"]["retry"]["reason"] = json!("fresh_evidence_required");
-        assert_eq!(
-            projection(&status).0["judge"]["intervention"]["status"],
-            "automatic_recovery"
-        );
+        status["paused"] = json!(false);
+        for observed in [json!(1), json!(10001), Value::Null] {
+            status["effective_runtime"]["observed_at"] = observed;
+            assert_eq!(projection(&status).1["unattended"], Value::Null);
+        }
     }
 }

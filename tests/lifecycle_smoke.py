@@ -138,7 +138,11 @@ def init(f):
         assert all(not action['authorization_required'] for action in commands if action['argv'][3:] in (['config', 'check'], ['health']))
         assert not (target / 'state/state.sqlite3').exists()
         text = config.read_text()
-        assert 'read_only' in text and not any(secret in text for secret in SECRETS)
+        assert not any(secret in text for secret in SECRETS)
+        initialized = f.cli(config, ['config', 'show'])['config']
+        assert initialized['schema_version'] == 2
+        assert all(initialized['capabilities'][lane]['mode'] == 'read_only'
+                   for lane in ('answer', 'judge', 'mine'))
         private_tree(target)
         assert (f.key if mode == 'file' else target / 'credential').read_text() == OLD
         before = snapshot(f.root)

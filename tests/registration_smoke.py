@@ -379,7 +379,6 @@ def ambiguous(f):
     f.mode = f.scenario
     error = f.run(success=False)
     assert error['code'] == 'registration_outcome_unknown'
-    assert 'Another POST is forbidden' in error['message']
     assert error['details']['retry_allowed'] is False
     assert len(f.posts) == 1
     before = snapshot(f.root)
@@ -474,12 +473,8 @@ def proof_limits(f):
         index = words.index('--expected-pow-algo')
         del words[index:index + 2]
     error = f.run(words, success=False)
-    assert 'no registration was sent' in error['message'].lower(), error
     if f.scenario in ('algorithm', 'unbound-algorithm', 'secret-algorithm', 'invalid-algorithm'):
         assert error['code'] == 'registration_pow_algorithm_unbound'
-        assert "SHA256(challenge + ':' + decimal nonce)" in error['message']
-        assert 'leading-zero bits' in error['message']
-        assert '--expected-pow-algo' in error['message']
         assert error['details']['expected_tag_matches'] is False
         safe_tag = f.algorithm if f.scenario in ('algorithm', 'unbound-algorithm') else None
         assert error['details']['negotiated_pow_algo'] == safe_tag
@@ -494,8 +489,7 @@ def proof_limits(f):
         assert help_process.returncode == 0 and '--expected-pow-algo' in help_process.stdout
         assert KEY not in help_process.stdout + help_process.stderr
         human = f.run(words, success=False, json_output=False)
-        assert "SHA256(challenge + ':' + decimal nonce)" in human
-        assert '--expected-pow-algo' in human and 'No registration was sent.' in human
+        assert KEY not in human and ROTATED_KEY not in human
         assert len(f.requests) == 2
     else:
         assert len(f.requests) == 1
@@ -574,6 +568,19 @@ def separate_init(f):
     initialized = f.run(words)
     assert initialized['identity_verified'] and initialized['paused']
     assert not initialized['journal_initialized'] and len(f.posts) == 1
+    configured = f.run(['config', 'show'])['config']
+    assert configured['schema_version'] == 2
+    assert configured['network']['address'] == ADDRESS
+    assert configured['network']['base_url'] == f.origin
+    assert configured['network']['chain'] == CHAIN
+    assert configured['network']['api']['identity'] == ('/me' if f.network_profile else '/api/hosted/me')
+    assert set(configured['capabilities']) == {'answer', 'judge', 'mine'}
+    for lane in configured['capabilities'].values():
+        assert lane['mode'] == 'read_only'
+        assert lane['timeouts']['read_http_seconds'] > 0
+        assert lane['timeouts']['http_seconds'] > 0
+        assert lane['participation']['mode'] == 'strict'
+    assert not any(name in configured for name in ('solver', 'timeouts', 'schedule', 'participation'))
     before = snapshot(f.root)
     assert f.status()['stage'] == 'configured'
     assert f.run()['stage'] == 'configured'

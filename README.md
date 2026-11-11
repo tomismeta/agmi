@@ -9,14 +9,16 @@
 
 Rust infrastructure for MinePOA: answer challenges, judge assigned answers and attest through the mining API. Models produce content; agmi owns scheduling, durable state and submissions. Each instance keeps its own identity, credentials and history.
 
+**Unreleased source change:** this branch uses configuration schema 2 and journal format 4. Released v0.1.1 uses the earlier layout; existing installations require [explicit stopped migration](docs/OPERATIONS.md#atomic-capability-migration), not a normal update.
+
 ```mermaid
 flowchart LR
-    G["Your guidance + model settings"] --> A["agmi"]
-    A -->|"Task + guidance"| H["Hermes / OpenClaw"]
-    H -->|"Answer / judgment"| A
-    A -->|"Read tasks · submit work"| P["MinePOA"]
-    P -->|"Tasks · outcomes"| A
-    A --- S["Private journal"]
+    A["Answer lane"] <--> AH["Answer harness / model"]
+    J["Judge lane"] <--> JH["Judge harness / model"]
+    A --> G["Shared effect gate + journal"]
+    J --> G
+    M["Model-free mining lane"] --> G
+    G -->|"Submissions"| P["MinePOA"]
 ```
 
 ## Install the CLI
@@ -35,6 +37,13 @@ agmi --help
 Put Cargo's binary directory (normally `~/.cargo/bin`) on `PATH`. This installs only the CLI—not services, native harnesses or authentication. Linux [service installation and updates](docs/OPERATIONS.md#supervision) are separate explicit commands; a fresh service install stays stopped and never resumes participation.
 
 Both installation methods require a separately installed, authenticated [Hermes or OpenClaw runtime](docs/OPERATIONS.md#native-model-routes) for answer/judge work, including compatible Python or Node.js.
+
+The CLI runs as your user; no root/admin access or background service is required.
+agmi does not install, patch or reconfigure Hermes/OpenClaw. Explicit model runs use
+your separately authenticated runtime, which may write its own sessions, caches or
+authentication-refresh data; this is not a sandbox. Linux supervision uses user
+services; enabling logout-independent operation may require administrator-approved
+user lingering.
 
 Version **0.1.1** is not published to crates.io; `publish = false` remains intentional. Use a release binary, this source workflow or the [local package workflow](docs/OPERATIONS.md#verification-and-publication), not `cargo install agmi`.
 
@@ -79,18 +88,21 @@ Edit that file or use [revision-checked configuration](docs/OPERATIONS.md#agent-
 
 ### Choose how your agent participates
 
-Answer and judge routes are configured independently; they can use different harnesses, models, reasoning levels and guidance.
+Answering, judging and mining own their modes, timing, scheduling and unresolved-work allowances. Each can be paused independently. Answer and judge also own separate harnesses, models, reasoning, guidance and preparation budgets. Identity and same-account effect safety remain shared.
 
-| Lever | Configuration | What it changes |
+| Lever | Setting or command | What it changes |
 | --- | --- | --- |
-| Runtime and model | `solver.answer` / `solver.judge`: `harness`, `executable`, `model`, `reasoning` | Which native agent produces each artifact; supported settings depend on the harness. |
-| Your perspective | Each route's `guidance_file` | Your expertise, voice, preferred approaches and reviewing style. |
-| Task instructions | Each route's `core_guidance_file` | Answer requirements or judging rubric; keep these intact when personalizing. |
-| Participation | `capabilities.answer`, `.judge`, `.mine` | `off`, `read_only` or `active`, independently. |
-| Timing and cost | `schedule`, `timeouts`, `preparation` | Polling/mining cadence, wait limits and draft-attempt budget; extra model attempts can cost quota. |
-| Uncertain outcomes | `participation` | Whether new work may proceed despite unresolved submissions; strict is the default. |
+| Runtime and model | `capabilities.answer.model` / `capabilities.judge.model`: `harness`, `executable`, `model`, `reasoning` | Which native agent produces each artifact; mining has no model. |
+| Your perspective | Each model route's `guidance_file` | Your expertise, voice, preferred approaches and reviewing style. |
+| Task instructions | Each model route's `core_guidance_file` | Answer requirements or judging rubric; keep these intact when personalizing. |
+| Participation | `capabilities.<lane>.mode` | `off`, `read_only` or `active`, independently. |
+| Pause one lane | `lane show`, `lane pause`, `lane resume` | A token-checked admission override; sibling lanes keep their own controls. |
+| Timing and cost | Each lane's `schedule`, `timeouts`; answer/judge `preparation` | Independent cadence, deadlines and model-attempt budgets. |
+| Uncertain outcomes | Each lane's `participation` | Own-lane capacity plus its policy for account-wide unresolved effects; strict is the default. |
 
 See the [annotated configuration](examples/config.toml) for exact fields. Model, guidance and normal scheduling changes hot-reload for new attempts; in-flight work retains its captured settings. Account and network-routing changes have separate safety restrictions.
+
+Use `agmi lane show judge --json` to obtain `desired.control_token`, then pass it to `agmi lane pause judge --expected-control "$CONTROL_TOKEN"`. Resume uses the latest token and removes only that override: it does not change modes, grant retries or prove admission open. [Lane controls and acknowledgement limits](docs/OPERATIONS.md#lane-controls).
 
 ### Make submissions your own
 
@@ -119,16 +131,20 @@ Guidance is sent to the selected model and saved with private attempt state: **n
 To enable all capabilities and per-epoch attestation, update the existing tables:
 
 ```toml
-[capabilities]
-answer = "active"
-judge = "active"
-mine = "active"
+[capabilities.answer]
+mode = "active"
 
-[schedule]
-mine_each_epoch = true
+[capabilities.judge]
+mode = "active"
+
+[capabilities.mine]
+mode = "active"
+
+[capabilities.mine.schedule]
+each_epoch = true
 ```
 
-Other settings retain their defaults. Review [participation risk policy](docs/OPERATIONS.md#configurable-uncertainty-policy) deliberately; strict is the default. Optional `accepted_linked` accounting retains original unknowns and accepts accumulating historical risk, not proof that old requests failed.
+Other settings retain their defaults. Separate capacity is not separate wallet authority: review each lane's [participation risk policy](docs/OPERATIONS.md#configurable-uncertainty-policy). Strict remains the default. Optional answer-only `accepted_linked` accounting retains original unknowns and accepts accumulating historical risk, not proof that old requests failed.
 
 ```sh
 agmi config check
@@ -139,19 +155,28 @@ agmi resume
 agmi run
 ```
 
-The first bounded run initializes paused state, not live readiness. Resume does not change capability modes. For unattended Linux operation, use [install/service/update](docs/OPERATIONS.md#supervision) instead of the foreground process.
+The first bounded run initializes paused state, not live readiness. `--once` takes a finite entry-time plan; it does not wait for future retry deadlines or continuously replenish work. Resume does not change capability modes. For unattended Linux operation, use [install/service/update](docs/OPERATIONS.md#supervision) instead of the foreground process.
 
 ## Inspect and administer
 
-```sh
-agmi doctor
-agmi status --json
-agmi health --json
-agmi reads --json
-agmi logs --follow
-```
+| Need | Command |
+| --- | --- |
+| Current work, controls and retained risk | `agmi status` |
+| Readiness of the core and each lane; meaningful exit status | `agmi health` |
+| What to do next, what can wait, and eligible repairs | `agmi doctor` |
+| Recorded API reads or process logs | `agmi reads` / `agmi logs --follow` |
 
-`healthy` and the health command's exit status describe operational readiness. Unresolved outcomes remain visible through `warnings`, `attention_required` and `risk`; a progressing, unblocked agent can be healthy with warnings. Blocked admission, stale evidence and overdue work still fail health.
+Add `--json` for structured agent evidence. Default diagnostics are compact; use
+`agmi lane show <lane>` for detailed controls and their current token.
+Unknown/stale admission is not permission, even when a lane's component is `ok`.
+
+`healthy` and the health exit status describe readiness under the selected checks.
+Unresolved outcomes remain visible as risk/warnings; healthy can still mean
+attention is required. `--expect-participation false` explicitly permits intentional
+pause/read-only operation, not accounting faults, stopped controllers or current-work
+failures. Disk faults belong to the core, not every lane.
+
+`status.lane_participation` distinguishes sourced answer/judge opportunity assessments, model attempts and recorded operation outcomes. Read-only assessments can hydrate judging evidence without inference or submissions. Missing, partial, stale or stopped evidence remains explicit; these counts do not establish grading correctness, payment or finality.
 
 `doctor` gives separate answer/judge/mine progress and distinguishes automatic
 waiting from operator intervention or insufficient evidence. `agmi doctor --repair`
@@ -174,6 +199,8 @@ and pause intent. They retain compatible rollback binaries and never rewind jour
 history. An untagged or newer build is not replaced merely because it shares a
 version number with an older published release. Update, repair and participation
 readiness are reported separately. [Update guarantees and limits](docs/OPERATIONS.md#stable-release-updates).
+
+Ordinary updates do not convert configuration or journal schemas. The [migration-only bootstrap](docs/OPERATIONS.md#atomic-capability-migration) stays stopped and never repairs, converts or resumes participation automatically.
 
 Use `agmi <command> --help` for examples and effects, or `agmi --json commands`
 for agent-facing discovery. `agmi completions bash`, `zsh` or `fish` prints a shell

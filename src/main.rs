@@ -2,7 +2,8 @@ mod cli_error;
 
 use agmi::{
     admin,
-    config::{Config, NetworkConfig, WorkKind},
+    capability::LaneId,
+    config::{Config, NetworkConfig},
     doctor, health, lifecycle, logs, registration, runtime, update,
 };
 use anyhow::{Context, Result};
@@ -22,7 +23,7 @@ const SCHEMA: &str = "agmi.cli.v1";
     version,
     about = "Agents Gonna Mine It.",
     long_about = "Reliable, configurable MinePOA participation. New installations are paused; diagnostics never submit work.",
-    after_help = "EVERYDAY WORKFLOW\n  agmi status                 Inspect local participation\n  agmi doctor                 Distinguish automatic waits from intervention\n  agmi doctor --repair        Explicitly authorize eligible guarded repairs\n  agmi logs --follow          Follow sanitized local events\n  agmi update --check         Check latest stable without changes\n  agmi update                 Update, then diagnose readiness\n  agmi update --repair        Update and authorize guarded repairs\n\nUpdates preserve configuration, guidance, credentials and pause intent.\nUnknown submissions are never replayed or erased by maintenance.\nUse agmi <command> --help for examples and agmi --json commands for effect metadata."
+    after_help = "EVERYDAY WORKFLOW\n  agmi health                 Check core and individual lane health\n  agmi status                 Inspect local participation evidence\n  agmi doctor                 Distinguish automatic waits from intervention\n  agmi doctor --repair        Explicitly authorize eligible guarded repairs\n  agmi logs --follow          Follow sanitized local events\n  agmi update --check         Check latest stable without changes\n  agmi update                 Update, then diagnose readiness\n  agmi update --repair        Update and authorize guarded repairs\n\nUpdates preserve configuration, guidance, credentials and pause intent.\nUnknown submissions are never replayed or erased by maintenance.\nUse agmi <command> --help for examples and agmi --json commands for effect metadata."
 )]
 struct Cli {
     /// Local TOML configuration. Credentials are referenced, never embedded.
@@ -108,6 +109,9 @@ enum Command {
         /// Publish a verified release only; never select, enable, stop or start units.
         #[arg(long)]
         stage_only: bool,
+        /// Select the current journal format over supported older formats; stays stopped.
+        #[arg(long, conflicts_with = "stage_only")]
+        migration_only: bool,
         #[arg(long)]
         dry_run: bool,
     },
@@ -136,6 +140,9 @@ enum Command {
         /// Leave the service stopped after activation; never changes pause intent.
         #[arg(long)]
         stopped: bool,
+        /// Verified supported-old-format bootstrap; disables boot activation, never starts or repairs.
+        #[arg(long, requires = "stopped", conflicts_with_all = ["check", "repair"])]
+        migration_only: bool,
         /// Show the update/repair plan without applying changes.
         #[arg(long)]
         dry_run: bool,
@@ -204,6 +211,14 @@ enum Command {
         #[command(subcommand)]
         command: GuidanceCommand,
     },
+    /// Inspect or fence one lane independently of its configured mode.
+    #[command(
+        after_help = "EXAMPLES\n  agmi lane show answer\n  agmi --json lane pause answer --expected-control <control-token>\n  agmi lane resume answer --expected-control <current-control-token> --wait-seconds 30\n\nRead desired.control_token from lane show before each change. This token is not a\nconfig file revision. A current-token no-op does not advance control revision.\nPause acknowledges a local admission fence, not remote cancellation or settlement.\nAlready-started native work and remote jobs may continue; dispatch uncertainty is\nreported separately. Resume removes only this lane override, grants no retry right,\nand does not prove admission open. Desired configuration, journal closure and runtime\nobservations are distinct. --wait-seconds bounds lock/write acquisition (1..=300,\ndefault 30), not stalled OS I/O or a remote completion deadline. No model or guidance\nfiles are loaded by lane commands."
+    )]
+    Lane {
+        #[command(subcommand)]
+        command: LaneCommand,
+    },
     /// Durably prevent new submissions and model work.
     Pause,
     /// Explicitly resume configured capabilities (does not change their modes).
@@ -233,6 +248,50 @@ enum Command {
     Agents,
     /// Discover commands and their effects.
     Commands,
+}
+
+fn lane_parser() -> clap::builder::PossibleValuesParser {
+    clap::builder::PossibleValuesParser::new(LaneId::ALL.map(LaneId::as_str))
+}
+
+fn model_lane_parser() -> clap::builder::PossibleValuesParser {
+    clap::builder::PossibleValuesParser::new(
+        agmi::capability::DESCRIPTORS
+            .iter()
+            .filter(|descriptor| descriptor.model_task.is_some())
+            .map(|descriptor| descriptor.id.as_str())
+            .collect::<Vec<_>>(),
+    )
+}
+
+#[derive(Subcommand)]
+enum LaneCommand {
+    /// Read desired control, authoritative closure and sourced runtime observation.
+    Show {
+        #[arg(value_parser = lane_parser())]
+        lane: String,
+    },
+    /// Commit a local fence against new preflight, inference and effect admission.
+    Pause {
+        #[arg(value_parser = lane_parser())]
+        lane: String,
+        /// Opaque desired.control_token returned by lane show; not file_revision.
+        #[arg(long)]
+        expected_control: String,
+        /// Acquisition deadline only; stalled OS I/O is not a hard wall-clock bound.
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=300))]
+        wait_seconds: u64,
+    },
+    /// Remove only this override; neither grants retries nor proves admission open.
+    Resume {
+        #[arg(value_parser = lane_parser())]
+        lane: String,
+        #[arg(long)]
+        expected_control: String,
+        /// Acquisition deadline only; stalled OS I/O is not a hard wall-clock bound.
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=300))]
+        wait_seconds: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -312,7 +371,7 @@ enum RecoveryCommand {
     Authorize {
         #[arg(long)]
         epoch: u64,
-        #[arg(long, value_parser = ["answer", "judge", "mine"])]
+        #[arg(long, value_parser = lane_parser())]
         kind: String,
     },
     /// List manual grant history without network or journal writes.
@@ -351,7 +410,7 @@ enum RecoveryCommand {
 enum OperationsCommand {
     /// Newest-first stable pagination; next_before continues the filtered list.
     List {
-        #[arg(long, value_parser = ["answer", "judge", "mine"])]
+        #[arg(long, value_parser = lane_parser())]
         kind: Option<String>,
         #[arg(long)]
         state: Option<String>,
@@ -362,13 +421,11 @@ enum OperationsCommand {
     },
 }
 
-fn work_kind(kind: &str) -> WorkKind {
-    match kind {
-        "answer" => WorkKind::Answer,
-        "judge" => WorkKind::Judge,
-        "mine" => WorkKind::Mine,
-        _ => unreachable!("clap validates work kind"),
-    }
+fn work_kind(kind: &str) -> LaneId {
+    LaneId::ALL
+        .into_iter()
+        .find(|lane| lane.as_str() == kind)
+        .expect("clap validates registered lane")
 }
 
 #[derive(Subcommand)]
@@ -390,20 +447,74 @@ enum ConfigCommand {
     Show,
     /// Validate configuration and guidance without network requests or model calls.
     Check,
+    /// Explicit local configuration/journal conversion; never submits network work.
+    Migrate {
+        #[command(subcommand)]
+        command: MigrationCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum MigrationCommand {
+    /// Preview a JSON proposal from stdin; retain its request and token for apply.
+    #[command(after_help = r#"INPUT
+  {"caps":{"answer":2,"judge":1,"mine":1}}
+  {"candidate_toml":"schema_version = 2\n..."}
+  {}
+
+These are operator-selected examples, not recommended risk limits.
+Legacy initial authority adoption additionally requires "adopt_legacy":true.
+An unchanged current-shape configuration with a format-3 journal accepts {}.
+Conversion requires a stopped controller and durable global pause. The preview
+token binds target_journal_format; a sealed migration is never silently retargeted.
+Keep the returned request and token together. Apply reads that request from stdin;
+changed or unproven exposure additionally requires --accept-risk-change TOKEN.
+Preview and apply make no network or model calls; migration never resumes participation."#)]
+    Preview,
+    /// Apply the preview's request JSON from stdin; conversion remains paused.
+    Apply {
+        #[arg(long)]
+        expected_token: String,
+        /// Required only for changed/unproven exposure; must equal the preview token.
+        #[arg(long)]
+        accept_risk_change: Option<String>,
+    },
+    /// Finish the exact sealed target; historical target 3 still needs a separate current-format migration.
+    #[command(
+        after_help = "Resume never resumes participation or retargets a seal. A recognized historical target-3 seal finishes its original conversion unchanged, remains paused, and reports further_migration_required=true. Then explicitly preview and apply a separate format-3-to-current conversion before running. Inspect config migrate status for recovery_supported, recovery_prerequisite and preserved history. Unsupported recovery refuses without rewriting evidence."
+    )]
+    Resume {
+        #[arg(long)]
+        state_dir: PathBuf,
+        #[arg(long)]
+        expected_token: String,
+    },
+    /// Inspect recovery support, prerequisites and preserved migration history without loading configuration.
+    Status {
+        #[arg(long)]
+        state_dir: PathBuf,
+    },
+    /// Print private sealed inputs to stdout for explicit conflict recovery.
+    Export {
+        #[arg(long)]
+        state_dir: PathBuf,
+        #[arg(long)]
+        expected_token: String,
+    },
 }
 
 #[derive(Subcommand)]
 enum GuidanceCommand {
     /// Private output includes guidance text and revision tokens.
     Show {
-        #[arg(long, value_parser = ["answer", "judge"])]
+        #[arg(long, value_parser = model_lane_parser())]
         kind: String,
         #[arg(long, default_value = "user", value_parser = ["core", "user"])]
         layer: String,
     },
     /// Atomically set private UTF-8 guidance from stdin; missing means create-only.
     Set {
-        #[arg(long, value_parser = ["answer", "judge"])]
+        #[arg(long, value_parser = model_lane_parser())]
         kind: String,
         #[arg(long, default_value = "user", value_parser = ["core", "user"])]
         layer: String,
@@ -439,7 +550,7 @@ fn config_path(cli: &Cli) -> Result<PathBuf> {
 
 fn health_prerequisite(code: &'static str) -> Value {
     json!({
-        "contract_version":1,"components":health::unknown_components(),
+        "contract_version":2,"components":health::unknown_components(),
         "healthy":false,"attention_required":true,"issues":[code],"warnings":[],
         "readiness":"prerequisites_missing","evidence":"local_only",
         "operational":{"status":"unknown","issues":[code]},
@@ -452,9 +563,9 @@ fn health_prerequisite(code: &'static str) -> Value {
 fn doctor_prerequisite(code: &'static str, repair: bool) -> Value {
     let mut report = health_prerequisite(code);
     report["repair_requested"] = json!(repair);
-    report["repair_outcome"] = json!("failed");
+    report["repair_outcome"] = json!(if repair { "failed" } else { "not_requested" });
     report["repairs"] = json!({"eligible":[],"ineligible":[],"applied":[],"skipped":[],
-        "failure":code,"restoration":{"manager_action":"none","runtime":"unchanged"}});
+        "failure":if repair {Some(code)} else {None},"restoration":{"manager_action":"none","runtime":"unchanged"}});
     report
 }
 
@@ -488,8 +599,8 @@ fn discovery() -> Value {
         {"name":"identity resume","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":"only with --confirm","confirmation_flag":"--confirm","purpose":"nonmutating plan or explicit local-only publication from retained successful registration evidence; never repeats proof work or registration"},
         {"name":"init","network_reads":true,"network_writes":false,"local_writes":"unless --dry-run","purpose":"existing identity only; --account and --api-key-file, --key-stdin or --key-prompt; never registers or resumes"},
         {"name":"credentials rotate","network_reads":true,"network_writes":false,"local_writes":"credential only unless --dry-run","purpose":"requires initialized, paused, stopped account; verifies replacement identity; file/stdin/hidden prompt"},
-        {"name":"install","network_reads":false,"network_writes":false,"local_writes":"unless --dry-run","purpose":"--binary local-path --sha256 trusted-digest; fresh install stages, activates stopped and enables; --stage-only only publishes a verified release and never selects/enables/stops/starts; neither initializes/resumes"},
-        {"name":"update","network_reads":"latest stable metadata/assets unless explicit local source","network_writes":false,"model_calls":false,"local_writes":"unless --check or --dry-run","confirmation_flag":"--repair for guarded refusal recovery","purpose":"default: verified latest stable update then read-only doctor; --check nonmutating; --repair explicitly adds guarded repair; local --binary/--sha256 and retained --release preserved; configuration, guidance, credentials and pause unchanged; restored runtime may resume authorized participation"},
+        {"name":"install","network_reads":false,"network_writes":false,"local_writes":"unless --dry-run","purpose":"--binary local-path --sha256 trusted-digest; fresh install selects stopped; --stage-only only publishes; --migration-only permits supported older journal formats to current, disables boot activation, stays stopped and never converts state"},
+        {"name":"update","network_reads":"latest stable metadata/assets unless explicit local source","network_writes":false,"model_calls":false,"local_writes":"unless --check or --dry-run","confirmation_flag":"--repair for guarded refusal recovery","purpose":"verified same-format update then doctor; --migration-only --stopped requires an explicit verified source, permits supported older journal formats to current, disables boot activation and never starts, repairs or converts state; configuration, guidance, credentials and pause unchanged"},
         {"name":"service","network_reads":false,"network_writes":false,"local_writes":"unless status or --dry-run","purpose":"status/start/stop/restart/enable/disable; does not resume participation"},
         {"name":"run","network_reads":true,"model_calls":"active capabilities only","network_writes":"active capabilities and resumed state only","local_writes":true},
         {"name":"status","network_reads":false,"network_writes":false,"purpose":"local state and blockers"},
@@ -502,14 +613,22 @@ fn discovery() -> Value {
         {"name":"config state-path","network_writes":false,"local_writes":false,"purpose":"plain absolute state path without opening journal"},
         {"name":"config schema","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":false,"purpose":"setting types, defaults and immutable boundaries; no config required"},
         {"name":"config apply","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":"unless --dry-run","purpose":"nested JSON merge patch on stdin; --expected-revision from config show.file_revision"},
+        {"name":"config migrate preview","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":false,"private_output":true,"purpose":"JSON proposal on stdin; explicit per-lane caps/candidate for legacy sources, or {} for unchanged current-shape config with format-3 journal; requires stopped durable global pause; snapshot token binds target_journal_format","target_journal_format":agmi::journal::CURRENT_JOURNAL_FORMAT},
+        {"name":"config migrate apply","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":true,"private_output":true,"purpose":"preview request JSON on stdin; --expected-token and, when required, matching --accept-risk-change token; converts only the token-bound target while stopped and remains paused"},
+        {"name":"config migrate resume","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":true,"purpose":"--state-dir and --expected-token; finishes only the exact sealed target; recognized historical target3 returns further_migration_required=true and requires separate 3-to-current preview/apply; never resumes participation or retargets evidence"},
+        {"name":"config migrate status","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":false,"purpose":"--state-dir; recovery_supported, recovery_prerequisite and preserved history without loading conflicting configuration"},
+        {"name":"config migrate export","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":false,"private_output":true,"purpose":"--state-dir and --expected-token; privately export sealed inputs for explicit conflict recovery"},
         {"name":"guidance show","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":false,"private_output":true,"purpose":"--kind answer|judge --layer core|user (default user); private text and revision tokens"},
         {"name":"guidance set","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":"unless --dry-run","private_output":true,"purpose":"UTF-8 stdin; --kind, --layer core|user, --expected-config-revision and --expected-revision; missing means create-only"},
         {"name":"build-info","network_writes":false,"local_writes":false,"purpose":"compiled release identity; --manifest emits installer manifest verbatim"},
         {"name":"pause","network_writes":false,"local_writes":true},
         {"name":"resume","network_writes":false,"local_writes":true,"purpose":"authorize configured capabilities"},
+        {"name":"lane show","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":false,"purpose":"<lane>; read desired.control_token, journal closure, sourced runtime admission observation and dispatch uncertainty; metadata-only configuration"},
+        {"name":"lane pause","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":true,"purpose":"<lane> --expected-control <control-token> [--wait-seconds 30]; commit local admission fence only; no cancellation, settlement or uncertainty erasure"},
+        {"name":"lane resume","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":true,"purpose":"<lane> --expected-control <control-token> [--wait-seconds 30]; remove only lane pause override; no retry authority or proof of open admission"},
         {"name":"recover-model","network_writes":false,"local_writes":true,"purpose":"allow regeneration of model-only work; requires stopped writer"},
         {"name":"recover inspect","network_reads":false,"network_writes":false,"local_writes":false,"purpose":"private captured operation and evidence; may contain payload/model text"},
-        {"name":"recover adopt","network_reads":false,"network_writes":false,"local_writes":true,"purpose":"stopped-writer intact journal migration"},
+        {"name":"recover adopt","network_reads":false,"network_writes":false,"local_writes":true,"purpose":"stopped-writer anchoring of compatible intact state; legacy schema conversion uses config migrate"},
         {"name":"recover resolve","network_reads":true,"network_writes":false,"local_writes":true,"purpose":"verify already-bound terminal evidence; --operation ID --refusal --dry-run is local-only and nonmutating; --refusal --apply TOKEN retires the reviewed refusal while stopped without network calls or replay"},
         {"name":"recover authorize","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":true,"purpose":"stopped-writer one-dispatch manual participation grant; --epoch N --kind answer|judge|mine"},
         {"name":"recover grants","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":false,"purpose":"paginated grant history; --limit N --before ID"},
@@ -517,11 +636,13 @@ fn discovery() -> Value {
         {"name":"operations list","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":false,"purpose":"sanitized paginated operation IDs, state, epoch, timing and linkage; --kind --state --before --limit"},
         {"name":"logs","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":false,"purpose":"sanitized local events; --follow streams retained tail then new IDs, stopping on retention gaps or journal replacement"},
         {"name":"completions","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":false,"purpose":"print Bash, Zsh or Fish completions from command definitions; never installs shell files"},
-        {"name":"agents","network_writes":false,"model_calls":false},
+        {"name":"agents","network_reads":false,"network_writes":false,"local_writes":false,"model_calls":false,"purpose":"independent desired answer/judge harness, model and guidance references; mine has no model route; not effective or native-reported evidence"},
         {"name":"commands","network_writes":false,"local_writes":false}
-    ],"capabilities":["answer","judge","mine"],"modes":["active","read_only","off"],
+    ],"capabilities":LaneId::ALL,"lane_descriptors":agmi::capability::DESCRIPTORS,"modes":["active","read_only","off"],
         "participation_modes":["strict","participation_first","manual"],
-        "limits":["Local pause cannot retract dispatched requests or stop server-side auto-mining.","A timeout does not prove a submission failed.","Hosted registration returns its API key once. Remote creation followed by a crash before durable private response capture can permanently lose the key; uncertain attempts are never automatically resubmitted."],
+        "lane_control":{"token_source":"lane show <lane>: desired.control_token","expected_flag":"--expected-control","wait_seconds":{"default":30,"minimum":1,"maximum":300,"scope":"acquisition_not_stalled_os_io"},"fence_scope":"local_admission","resume_proves_open":false,"config_save_is_fence":false},
+        "fairness":{"policy":"served_in_round","eligibility_before_preference":true,"successful_opportunity_bound":2 * LaneId::COUNT - 1,"bound_scope":"continuously eligible lane; successful effect opportunities, not wall-clock time"},
+        "limits":["Lane pause acknowledges a local admission fence; already-started native work and remote jobs may continue. Unsettled dispatch intent is reported, not repaired.","A timeout does not prove a submission failed.","Journal not_closed means only that pause controls do not close admission. Runtime observations may be stale or unknown; resume never fabricates open admission.","Hosted registration returns its API key once. Remote creation followed by a crash before durable private response capture can permanently lose the key; uncertain attempts are never automatically resubmitted."],
         "output_contract":{"json_schema":SCHEMA,"next_actions":"typed_actions_with_argv_not_shell",
             "raw_exception":"build-info --manifest is raw manifest text even with --json",
             "logs_follow":"with --json, one log_event envelope per event; retention gaps and journal replacement fail explicitly",
@@ -680,6 +801,7 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
             binary,
             sha256,
             stage_only,
+            migration_only,
             dry_run,
         } => {
             anyhow::ensure!(
@@ -700,18 +822,16 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
                     "Installer uses only ~/.config/agmi/config.toml; --config is unsupported. No installer was started."
                 )
             );
-            return Ok((
-                "install",
-                lifecycle::installer(
-                    &[
-                        if *stage_only { "stage" } else { "install" }.into(),
-                        binary.to_string_lossy().into_owned(),
-                        "--sha256".into(),
-                        sha256.clone(),
-                    ],
-                    *dry_run,
-                )?,
-            ));
+            let mut arguments = vec![
+                if *stage_only { "stage" } else { "install" }.into(),
+                binary.to_string_lossy().into_owned(),
+                "--sha256".into(),
+                sha256.clone(),
+            ];
+            if *migration_only {
+                arguments.push("--migration-only".into());
+            }
+            return Ok(("install", lifecycle::installer(&arguments, *dry_run)?));
         }
         Command::Update {
             release,
@@ -721,6 +841,7 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
             check,
             repair,
             stopped,
+            migration_only,
             dry_run,
         } => {
             anyhow::ensure!(
@@ -742,6 +863,7 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
                         check: *check,
                         repair: *repair,
                         stopped: *stopped,
+                        migration_only: *migration_only,
                         dry_run: *dry_run,
                     },
                 )
@@ -772,6 +894,52 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
         return Ok(("config_init", initialize(&path)?));
     }
     match &cli.command {
+        Command::Config {
+            command: ConfigCommand::Migrate { command },
+        } => {
+            use agmi::store::migration;
+            return match command {
+                MigrationCommand::Preview => {
+                    let input = serde_json::from_slice(&administration_input()?)
+                        .context("invalid migration proposal JSON")?;
+                    Ok(("config_migrate_preview", migration::preview(&path, &input)?))
+                }
+                MigrationCommand::Apply {
+                    expected_token,
+                    accept_risk_change,
+                } => {
+                    let input = serde_json::from_slice(&administration_input()?)
+                        .context("invalid migration proposal JSON")?;
+                    Ok((
+                        "config_migrate_apply",
+                        migration::apply(
+                            &path,
+                            &input,
+                            expected_token,
+                            accept_risk_change.as_deref(),
+                        )?,
+                    ))
+                }
+                MigrationCommand::Resume {
+                    state_dir,
+                    expected_token,
+                } => Ok((
+                    "config_migrate_resume",
+                    migration::resume(&path, state_dir, expected_token)?,
+                )),
+                MigrationCommand::Status { state_dir } => {
+                    Ok(("config_migrate_status", migration::status(state_dir)?))
+                }
+                MigrationCommand::Export {
+                    state_dir,
+                    expected_token,
+                } => {
+                    let mut data = migration::export(state_dir, expected_token)?;
+                    data["private"] = json!(true);
+                    Ok(("config_migrate_export", data))
+                }
+            };
+        }
         Command::Run { once } => {
             runtime::run(&path, *once).await?;
             return Ok(("run", json!({"stopped":true})));
@@ -825,7 +993,22 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
     }
     // Use the same lock order as config apply: source directory, then admission.
     // Keep the source snapshot stable until a control command establishes binding.
+    let lane_deadline = match &cli.command {
+        Command::Lane { command } => {
+            let seconds = match command {
+                LaneCommand::Show { .. } => 30,
+                LaneCommand::Pause { wait_seconds, .. }
+                | LaneCommand::Resume { wait_seconds, .. } => *wait_seconds,
+            };
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(seconds))
+        }
+        _ => None,
+    };
     let _configuration_guard = match &cli.command {
+        Command::Lane { .. } => Some(admin::lock_config_directory_until(
+            &path,
+            lane_deadline.expect("lane acquisition deadline"),
+        )?),
         Command::Pause
         | Command::Resume
         | Command::RecoverModel
@@ -869,6 +1052,35 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
         }
     };
     match &cli.command {
+        Command::Lane { command } => match command {
+            LaneCommand::Show { lane } => Ok((
+                "lane_show",
+                agmi::store::lane_control_status(&config, work_kind(lane))?,
+            )),
+            LaneCommand::Pause {
+                lane,
+                expected_control,
+                ..
+            }
+            | LaneCommand::Resume {
+                lane,
+                expected_control,
+                ..
+            } => {
+                let paused = matches!(command, LaneCommand::Pause { .. });
+                let deadline = lane_deadline.expect("lane acquisition deadline");
+                Ok((
+                    if paused { "lane_pause" } else { "lane_resume" },
+                    agmi::store::set_lane_paused(
+                        &config,
+                        work_kind(lane),
+                        paused,
+                        expected_control,
+                        deadline,
+                    )?,
+                ))
+            }
+        },
         Command::Config {
             command: ConfigCommand::StatePath,
         } => Ok(("config_state_path", json!({"path":config.state_dir}))),
@@ -978,7 +1190,11 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
         } => Ok(("logs", runtime::events(&config, usize::from(*limit))?)),
         Command::Agents => Ok((
             "agents",
-            json!({"routes":config.solver,"revision":config.optional_revision()?,"verified":false,"note":"Configured routes only; this command does not invoke models or inspect auth secrets or guidance contents."}),
+            json!({"routes":LaneId::ALL.into_iter().filter_map(|lane| config.model(lane).map(|model| (lane.as_str(), model))).collect::<std::collections::BTreeMap<_, _>>(),
+                "configuration_state":"desired_saved","runtime_application":"unverified","fence_acknowledged":false,
+                "revision":config.optional_revision()?,"verified":false,
+                "lane_descriptors":agmi::capability::DESCRIPTORS,
+                "note":"Desired routes only; inspect status for effective loaded routes and operations for sourced native reports. Mine has no model or guidance route. No harness, authentication secret or guidance content is inspected."}),
         )),
         Command::Config {
             command: ConfigCommand::Check,
@@ -1002,7 +1218,11 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
         | Command::Logs { follow: true, .. }
         | Command::Guidance { .. }
         | Command::Config {
-            command: ConfigCommand::Schema | ConfigCommand::Show | ConfigCommand::Apply { .. },
+            command:
+                ConfigCommand::Schema
+                | ConfigCommand::Show
+                | ConfigCommand::Apply { .. }
+                | ConfigCommand::Migrate { .. },
         }
         | Command::Config {
             command: ConfigCommand::Init,
@@ -1044,13 +1264,7 @@ async fn main() {
                     json!({"schema":SCHEMA,"ok":false,"type":"error","error":error})
                 );
             } else {
-                eprintln!(
-                    "agmi: {} [{}] {}",
-                    error["message"].as_str().unwrap_or("Invalid arguments"),
-                    error["code"].as_str().unwrap_or("invalid_arguments"),
-                    error["details"]
-                );
-                eprintln!("Next: {}", error["next_actions"]);
+                cli_error::human_error(&error);
             }
             std::process::exit(2);
         }
@@ -1167,7 +1381,12 @@ async fn main() {
                             | RecoveryCommand::Resolve { .. }
                     }
                     | Command::Config {
-                        command: ConfigCommand::Init | ConfigCommand::Apply { .. }
+                        command: ConfigCommand::Init
+                            | ConfigCommand::Apply { .. }
+                            | ConfigCommand::Migrate {
+                                command: MigrationCommand::Apply { .. }
+                                    | MigrationCommand::Resume { .. },
+                            }
                     }
                     | Command::Guidance {
                         command: GuidanceCommand::Set { .. }
@@ -1204,13 +1423,7 @@ async fn main() {
                     json!({"schema":SCHEMA,"ok":false,"type":"error","error":error})
                 );
             } else {
-                eprintln!(
-                    "agmi: {} [{}] {}",
-                    error["message"].as_str().unwrap_or("Operation failed"),
-                    error["code"].as_str().unwrap_or("operation_failed"),
-                    error["details"]
-                );
-                eprintln!("Next: {}", error["next_actions"]);
+                cli_error::human_error(&error);
             }
             std::process::exit(1);
         }

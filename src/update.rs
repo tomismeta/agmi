@@ -49,6 +49,7 @@ pub struct Options<'a> {
     pub dry_run: bool,
     pub repair: bool,
     pub stopped: bool,
+    pub migration_only: bool,
     /// Internal incoming-installer fence; not a release-selection override.
     pub expected_release: Option<&'a str>,
 }
@@ -90,12 +91,14 @@ struct Identity {
     update_protocol: u64,
 }
 impl Identity {
-    fn parse(text: &str, published: bool) -> Result<Self> {
+    fn parse(text: &str, published: bool, retained: bool) -> Result<Self> {
         let map = fields(text)?;
         let get = |key| map.get(key).copied().context("missing identity field");
         ensure!(get("build_format")? == "1", "unsupported build format");
         ensure!(
-            get("journal_schema")? == "2" && get("stop_timeout")? == "infinity",
+            (get("journal_schema")?.parse::<i64>()? == crate::journal::CURRENT_JOURNAL_FORMAT
+                || (retained && matches!(get("journal_schema")?, "2" | "3")))
+                && get("stop_timeout")? == "infinity",
             "incompatible release policy"
         );
         let version = Version::parse(get("package_version")?)?;
@@ -578,7 +581,7 @@ fn outcome(report: &mut Value, success: bool, status: &str, reason: &str) {
 fn installed() -> Result<(installer::InstalledIdentity, Identity)> {
     let current =
         installer::installed_identity().map_err(|_| failure("update_installation_unverified"))?;
-    let identity = Identity::parse(&current.manifest, false)
+    let identity = Identity::parse(&current.manifest, false, true)
         .map_err(|_| failure("update_installed_identity_invalid"))?;
     Ok((current, identity))
 }
@@ -908,6 +911,14 @@ pub async fn run(_config_path: &Path, options: Options<'_>) -> Result<Value> {
         failure("update_invalid_arguments")
     );
     ensure!(
+        !options.migration_only
+            || (options.stopped
+                && (options.binary.is_some() || options.release.is_some())
+                && !options.check
+                && !options.repair),
+        failure("update_invalid_arguments")
+    );
+    ensure!(
         !options.check
             || !(options.release.is_some()
                 || options.binary.is_some()
@@ -954,6 +965,9 @@ pub async fn run(_config_path: &Path, options: Options<'_>) -> Result<Value> {
         if options.stopped {
             arguments.push("--stopped".into());
         }
+        if options.migration_only {
+            arguments.push("--migration-only".into());
+        }
         if let Some(expected) = options.expected_release {
             arguments.extend(["--expected-release".into(), expected.into()]);
         }
@@ -961,6 +975,7 @@ pub async fn run(_config_path: &Path, options: Options<'_>) -> Result<Value> {
         if install(&mut report, &arguments, options.dry_run)
             && !options.dry_run
             && options.expected_release.is_none()
+            && !options.migration_only
         {
             diagnose(&mut report, options.repair).await;
         }
@@ -1010,8 +1025,8 @@ pub async fn run(_config_path: &Path, options: Options<'_>) -> Result<Value> {
         build_info.as_bytes(),
         &checksum(&sums, "BUILD-INFO.txt").map_err(|_| failure("update_metadata_invalid"))?,
     )?;
-    let published =
-        Identity::parse(&build_info, true).map_err(|_| failure("update_manifest_invalid"))?;
+    let published = Identity::parse(&build_info, true, false)
+        .map_err(|_| failure("update_manifest_invalid"))?;
     ensure!(
         published.version == version,
         failure("update_manifest_invalid")
@@ -1356,6 +1371,7 @@ mod tests {
             dry_run: false,
             repair: false,
             stopped: false,
+            migration_only: false,
             expected_release: None,
         };
         let initial = report(&options, "github_latest_stable");
@@ -1384,6 +1400,7 @@ mod tests {
             dry_run: false,
             repair: false,
             stopped: false,
+            migration_only: false,
             expected_release: None,
         };
         let mut result = report(&options, "test");
@@ -1605,18 +1622,36 @@ mod tests {
         );
         assert!(
             Identity::parse(
-                &manifest.replace("journal_schema=2", "journal_schema=3"),
+                &manifest.replace(
+                    &format!("journal_schema={}", crate::journal::CURRENT_JOURNAL_FORMAT),
+                    "journal_schema=2",
+                ),
+                false,
                 false
             )
             .is_err()
         );
+        for schema in ["2", "3"] {
+            let retained = manifest.replace(
+                &format!("journal_schema={}", crate::journal::CURRENT_JOURNAL_FORMAT),
+                &format!("journal_schema={schema}"),
+            );
+            assert!(Identity::parse(&retained, false, true).is_ok());
+            assert!(Identity::parse(&retained, false, false).is_err());
+        }
         assert!(
-            Identity::parse(&manifest.replace("binary_sha256=", "not_a_digest="), false).is_err()
+            Identity::parse(
+                &manifest.replace("binary_sha256=", "not_a_digest="),
+                false,
+                false
+            )
+            .is_err()
         );
-        assert!(Identity::parse(&(manifest.clone() + "target=other\n"), false).is_err());
+        assert!(Identity::parse(&(manifest.clone() + "target=other\n"), false, false).is_err());
         assert!(
             Identity::parse(
                 &manifest.replace("stop_timeout=infinity", "stop_timeout=30"),
+                false,
                 false
             )
             .is_err()
@@ -1632,6 +1667,7 @@ mod tests {
             dry_run: false,
             repair: true,
             stopped: false,
+            migration_only: false,
             expected_release: None,
         };
         let mut report = report(&options, "test");
@@ -1683,6 +1719,7 @@ mod tests {
                 dry_run: true,
                 repair: true,
                 stopped: false,
+                migration_only: false,
                 expected_release: None,
             },
         )

@@ -49,8 +49,8 @@ class EndpointFixture(WorkFixture):
         self.bound_job_outcome = 'final'
         super().__init__(*args)
 
-    def configure(self, **policy):
-        super().configure(**policy)
+    def configure(self, lane=None, **participation):
+        super().configure(lane, **participation)
         text = self.config.read_text()
         # This is intentionally a direct stopped/running config-file edit, not
         # config apply: the journal gate must defend every configuration source.
@@ -154,7 +154,8 @@ def final_answer(f):
 
 def routes_scenario(f):
     final_answer(f)
-    f.capabilities.update(answer='off', mine='read_only')
+    f.lanes['answer']['mode'] = 'off'
+    f.lanes['mine']['mode'] = 'read_only'
     f.mine_response = 'completed'
     f.configure()
     f.loaded()
@@ -162,14 +163,15 @@ def routes_scenario(f):
     assert not f.dispatched('mine')
     assert not any(row['endpoint'] == 'mine' for row in f.wire_requests), \
         'a GET-shaped custom mine route bypassed write permission'
-    f.capabilities['mine'] = 'active'
+    f.lanes['mine']['mode'] = 'active'
     f.configure()
     f.loaded()
     f.wait(lambda: any(row['state'] == 'completed' for row in f.operations('mine')),
            'permitted custom mine route was not dispatched')
-    f.capabilities.update(mine='off', judge='active')
+    f.lanes['mine']['mode'] = 'off'
+    f.lanes['judge']['mode'] = 'active'
     f.assignments = True
-    f.configure(allow_judge=True)
+    f.configure()
     f.loaded()
     f.unknown('judge')
     f.stop()
@@ -287,11 +289,11 @@ def drained_scenario(f):
     final_answer(f)
     f.challenge_fault = 'http_status'
     f.challenge_retry_after = 8
-    f.wait(lambda: (f.read_record('challenge') or {}).get('server_not_before', 0) > time.time(),
-           'challenge server minimum was not journaled')
+    f.wait(lambda: any(row['scope'] == 'account_authenticated' and row['not_before'] > time.time()
+                       for row in f.restrictions()), 'challenge server minimum was not journaled')
     f.stop()
     assert all(row['state'] not in OUTSTANDING for row in f.operations())
-    old_floor = f.read_record('challenge')
+    old_floor = next(row for row in f.restrictions() if row['scope'] == 'account_authenticated')
     baseline = len(f.wire_requests)
     writes = len(f.writes)
     f.chain_path = '/fixture-v2/networks/{chain}'
@@ -304,9 +306,7 @@ def drained_scenario(f):
     f.start()
     f.loaded()
     # Rebinding is allowed only when drained; it must not erase a server floor.
-    current_floor = f.read_record('challenge')
-    assert current_floor['server_not_before'] >= old_floor['server_not_before'], current_floor
-    assert current_floor['retained_conservative_floor'] >= old_floor['retained_conservative_floor']
+    assert old_floor in f.restrictions(), 'drained route change erased the shared server minimum'
     f.wait(lambda: len(f.writes) > writes, 'drained profile change never made fresh progress', seconds=25)
     f.wait(lambda: any(row['state'] == 'final' and row['job_id'] == 'answer-' + str(f.epoch)
                        for row in f.operations('answer')), 'new-profile answer did not resolve')
@@ -319,7 +319,7 @@ def drained_scenario(f):
     for row in new_requests:
         assert row['path'].startswith('/fixture-v2/networks/' + f.chain + '/'), row
         if row['endpoint'] == 'challenge':
-            assert row['wall_time'] >= old_floor['server_not_before'], \
+            assert row['wall_time'] >= old_floor['not_before'], \
                 ('route change bypassed server minimum', row, old_floor)
     f.assert_wire_contract()
     return dict(drained_profile_change_allowed=True, fresh_identity_and_challenge=True,

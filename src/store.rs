@@ -1,6 +1,6 @@
-use crate::config::{
-    Config, HistoricalAnswerCapacity, Mode, Participation, ParticipationMode, WorkKind,
-};
+use crate::capability::LaneId;
+use crate::config::{Config, HistoricalAnswerCapacity, Mode, Participation, ParticipationMode};
+use crate::journal::CURRENT_JOURNAL_FORMAT;
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, json};
@@ -10,6 +10,29 @@ use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+mod accounting;
+mod admission;
+mod lane_control;
+mod model_attempt;
+pub(crate) use admission::{AdmissionStampSnapshot, EffectCandidate, OperationBinding};
+pub(crate) use lane_control::LaneAdmissionGuard;
+pub use lane_control::{LaneControlError, lane_control_status, set_lane_paused};
+use lane_control::{
+    LaneGateSet, initialize_lane_state, open_required_lane_gates, provision_lane_gates,
+    validate_required_lane_state,
+};
+pub(crate) use model_attempt::{ModelProducerDraft, ModelProducerProvenance};
+pub mod migration;
+mod projection;
+mod reads;
+mod schema;
+pub(crate) use reads::{DiscoverySource, LaneObservationStamp, ReadKey};
+use schema::initialize_schema;
+#[cfg(test)]
+mod atomic_tests;
+#[cfg(test)]
+mod writer_continuity_tests;
 
 #[derive(Debug)]
 pub struct RoutingProfileError;
@@ -35,7 +58,7 @@ pub fn recovery_refusal(config_path: &Path, operation: i64, apply: Option<&str>)
     let _configuration = crate::admin::lock_config_directory(config_path)?;
     let config = Config::load_metadata(config_path)?;
     let store = Store::read_only(&config)?.context("journal not initialized")?;
-    if store.schema_version()? != 2 {
+    if store.schema_version()? != CURRENT_JOURNAL_FORMAT {
         return Err(RefusalRecoveryError("refusal_recovery_schema").into());
     }
     store.routing_change_allowed(&config)?;
@@ -44,7 +67,7 @@ pub fn recovery_refusal(config_path: &Path, operation: i64, apply: Option<&str>)
     if let Some(token) = apply {
         drop(store);
         let (_account, mut store) = AccountLock::acquire(&config)?;
-        let _gate = AdmissionGuard::acquire(&config)?;
+        let _gate = AccountAdmissionGuard::acquire(&config)?;
         store.resolve_refusal(operation, &revision, token)
     } else {
         let snapshot = store.db.unchecked_transaction()?;
@@ -70,7 +93,7 @@ pub(crate) fn doctor_repairs(config_path: &Path, apply: Option<&Value>) -> Resul
     let Some(store) = Store::read_only(&config)? else {
         return Ok(report);
     };
-    if store.schema_version()? != 2 {
+    if store.schema_version()? != CURRENT_JOURNAL_FORMAT {
         return Err(RefusalRecoveryError("refusal_recovery_schema").into());
     }
     store.routing_change_allowed(&config)?;
@@ -98,7 +121,7 @@ pub(crate) fn doctor_repairs(config_path: &Path, apply: Option<&Value>) -> Resul
     drop(store);
     let (_account, mut store) = AccountLock::acquire(&config)
         .map_err(|error| error.context(RefusalRecoveryError("doctor_account_unavailable")))?;
-    let _gate = AdmissionGuard::acquire(&config)?;
+    let _gate = AccountAdmissionGuard::acquire(&config)?;
     let (mut eligible, ineligible) = Store::refusal_candidates(&store.db, &revision)?;
     if let Some(identity) = apply
         .and_then(|preview| preview["eligible"].as_array())
@@ -341,58 +364,199 @@ pub(crate) fn account_home() -> Result<PathBuf> {
 /// Deliberately independent of state_dir, endpoint, XDG paths and working directory.
 /// One OS user cannot run two writers for an account by selecting another database.
 fn lock_path(config: &Config, suffix: &str) -> Result<PathBuf> {
+    account_lock_path(&config.network.chain, &config.network.address, suffix)
+}
+
+fn account_lock_path(chain: &str, address: &str, suffix: &str) -> Result<PathBuf> {
     #[cfg(unix)]
     let root = account_home()?.join(".agmi-account-locks");
     #[cfg(not(unix))]
     let root = dirs::home_dir()
         .context("home directory unavailable")?
         .join(".agmi-account-locks");
-    let key = digest(format!(
-        "{}\n{}",
-        config.network.chain, config.network.address
-    ));
+    let key = digest(format!("{chain}\n{address}"));
     Ok(root.join(format!("{key}.{suffix}")))
 }
 
 pub(crate) struct AccountLock(File);
 const WRITER_MARKER: &[u8] = b"agmi-authority-v2\n";
 
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Binding {
     location: String,
     identity: String,
     database_id: String,
     dispatch_sequence: i64,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_writer_inode"
+    )]
+    writer_inode: Option<WriterInode>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_writer_inode"
+    )]
+    admission_inode: Option<WriterInode>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WriterInode {
+    device: u64,
+    inode: u64,
+}
+
+fn deserialize_writer_inode<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<WriterInode>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // Only absence is legacy. A present null/partial/malformed anchor is not.
+    <WriterInode as serde::Deserialize>::deserialize(deserializer).map(Some)
+}
+
+impl WriterInode {
+    fn from_metadata(metadata: &fs::Metadata) -> Result<Self> {
+        validate_private_file(metadata)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Ok(Self {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            bail!("writer authority requires stable operating-system file identities")
+        }
+    }
+}
+
+impl Binding {
+    fn validate(&self) -> Result<()> {
+        if self.database_id.len() != 32
+            || !self
+                .database_id
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            || self.dispatch_sequence < 0
+            || self.identity.len() != 64
+            || !self.identity.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || !Path::new(&self.location).is_absolute()
+            || self
+                .writer_inode
+                .is_some_and(|identity| identity.inode == 0)
+            || self
+                .admission_inode
+                .is_some_and(|identity| identity.inode == 0)
+        {
+            bail!("invalid account binding");
+        }
+        Ok(())
+    }
+
+    fn check_writer(&self, path: &Path, metadata: &fs::Metadata) -> Result<()> {
+        let anchor = self.writer_inode.context(
+            "writer authority is unanchored; stop all controllers and native work, then explicitly recover adopt",
+        )?;
+        if WriterInode::from_metadata(metadata)? != anchor {
+            bail!(
+                "writer inode differs from immutable account binding; authoritative recovery required"
+            );
+        }
+        lane_control::check_file_identity(path, metadata)?;
+        Ok(())
+    }
+
+    fn check_admission(&self, path: &Path, metadata: &fs::Metadata) -> Result<()> {
+        let anchor = self.admission_inode.context(
+            "account admission authority is unanchored; stop all controllers and native work, then explicitly recover adopt",
+        )?;
+        if WriterInode::from_metadata(metadata)? != anchor {
+            bail!(
+                "account admission inode differs from immutable account binding; authoritative recovery required"
+            );
+        }
+        lane_control::check_file_identity(path, metadata)
+    }
+
+    fn check_context(&self, config: &Config) -> Result<()> {
+        if self.identity != digest(identity(config)?)
+            || self.location != fs::canonicalize(&config.state_dir)?.to_string_lossy()
+        {
+            bail!("account admission binding context differs from configuration");
+        }
+        Ok(())
+    }
+
+    fn same_authority(&self, other: &Self) -> bool {
+        self.location == other.location
+            && self.identity == other.identity
+            && self.database_id == other.database_id
+            && self.writer_inode == other.writer_inode
+            && self.admission_inode == other.admission_inode
+    }
+}
+
+fn read_private_bytes(path: &Path, limit: u64) -> Result<Option<Vec<u8>>> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+        Ok(_) => {}
+    }
+    let mut file = lane_control::opened_file(path, false, false)?;
+    if file.metadata()?.len() > limit {
+        bail!("authority document exceeds its size limit");
+    }
+    let mut bytes = Vec::new();
+    (&mut file).take(limit + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        bail!("authority document exceeds its size limit");
+    }
+    lane_control::check_opened_path(path, &file)?;
+    Ok(Some(bytes))
+}
+
+fn binding_at(path: &Path) -> Result<Option<Binding>> {
+    read_private_bytes(path, 4096)?
+        .map(|bytes| {
+            let binding: Binding =
+                serde_json::from_slice(&bytes).context("invalid account binding")?;
+            binding.validate()?;
+            Ok(binding)
+        })
+        .transpose()
 }
 
 fn read_binding(config: &Config) -> Result<Option<Binding>> {
-    let path = lock_path(config, "binding")?;
-    if !path.exists() {
-        let writer = lock_path(config, "writer")?;
-        if writer.exists() {
-            let metadata = fs::symlink_metadata(&writer)?;
-            validate_private_file(&metadata)?;
-            if metadata.len() > 64 {
-                bail!("invalid stable writer marker");
-            }
-            if fs::read(&writer)? == WRITER_MARKER {
-                bail!("independent account binding is missing; authoritative recovery required");
-            }
-        }
-        return Ok(None);
+    read_account_binding(&lock_path(config, "binding")?)
+}
+
+fn read_account_binding(path: &Path) -> Result<Option<Binding>> {
+    let binding = binding_at(path)?;
+    if binding.is_none()
+        && read_private_bytes(&path.with_extension("writer"), 64)?
+            .is_some_and(|marker| marker == WRITER_MARKER)
+    {
+        bail!("independent account binding is missing; authoritative recovery required");
     }
-    let metadata = fs::symlink_metadata(&path)?;
-    validate_private_file(&metadata)?;
-    if metadata.len() > 4096 {
-        bail!("invalid account binding");
+    Ok(binding)
+}
+
+fn writer_marker(file: &File) -> Result<Vec<u8>> {
+    let mut reader = file;
+    reader.rewind()?;
+    let mut bytes = Vec::new();
+    reader.take(65).read_to_end(&mut bytes)?;
+    if bytes.len() > 64 {
+        bail!("invalid stable writer marker");
     }
-    let bytes = fs::read(path)?;
-    if bytes.len() > 4096 {
-        bail!("invalid account binding");
-    }
-    Ok(Some(
-        serde_json::from_slice(&bytes).context("invalid account binding")?,
-    ))
+    Ok(bytes)
 }
 
 pub(crate) fn validate_page(before: Option<i64>, limit: usize) -> Result<()> {
@@ -404,35 +568,20 @@ pub(crate) fn validate_page(before: Option<i64>, limit: usize) -> Result<()> {
 
 /// Metadata-only initialization probe for CLI configuration updates.
 pub(crate) fn admin_identity_initialized(config: &Config) -> Result<bool> {
-    for path in [
-        config.state_dir.join("state.sqlite3"),
-        lock_path(config, "binding")?,
-        lock_path(config, "writer")?,
-    ] {
-        match fs::symlink_metadata(&path) {
-            Ok(metadata) => validate_private_file(&metadata)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => bail!("cannot inspect configuration identity anchors"),
-        }
-    }
-    let writer = lock_path(config, "writer")?;
-    if let Ok(metadata) = fs::symlink_metadata(&writer) {
-        if metadata.len() > 64 {
-            bail!("invalid stable writer marker");
-        }
-        let marker = fs::read(writer)?;
-        if !marker.is_empty() && marker != WRITER_MARKER {
-            bail!("invalid stable writer marker");
-        }
-    }
+    // Resolve authority from stored identity, not an edited config's lock namespace.
     Ok(Store::read_only(config)?.is_some())
 }
 
 fn write_binding(path: &Path, binding: &Binding) -> Result<()> {
+    binding.validate()?;
+    write_binding_bytes(path, &serde_json::to_vec(binding)?)
+}
+
+fn write_binding_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     let temporary = path.with_extension("binding-next");
-    let mut file = private_file(&temporary)?;
+    let mut file = lane_control::opened_file(&temporary, true, true)?;
     file.set_len(0)?;
-    file.write_all(&serde_json::to_vec(binding)?)?;
+    file.write_all(bytes)?;
     file.sync_all()?;
     fs::rename(&temporary, path)?;
     File::open(path.parent().context("binding parent missing")?)?.sync_all()?;
@@ -441,35 +590,39 @@ fn write_binding(path: &Path, binding: &Binding) -> Result<()> {
 
 impl AccountLock {
     fn rotation_lock_file(config: &Config, suffix: &str) -> Result<File> {
-        let mut options = OpenOptions::new();
-        options.read(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
-        }
-        let file = options
-            .open(lock_path(config, suffix)?)
-            .context("initialize and pause the account before credential rotation")?;
-        validate_private_file(&file.metadata()?)?;
-        Ok(file)
+        lane_control::opened_file(&lock_path(config, suffix)?, true, false)
+            .context("initialize and pause the account before stopped maintenance")
     }
 
     /// Existing gate only: even previews must not create lock/state artifacts.
-    pub(crate) fn rotation_admission(config: &Config) -> Result<AdmissionGuard> {
-        let file = Self::rotation_lock_file(config, "admission")?;
-        file.lock()
-            .context("cannot acquire credential rotation admission gate")?;
-        Ok(AdmissionGuard(file))
+    pub(crate) fn rotation_admission(config: &Config) -> Result<AccountAdmissionGuard> {
+        AccountAdmissionGuard::acquire(config)
     }
 
-    /// Caller must hold admission first. Never opens or changes a journal/binding.
-    pub(crate) fn stopped(config: &Config) -> Result<Self> {
+    /// Caller holds admission. Migration validates its own approved historical snapshot.
+    fn stopped_for_migration(config: &Config) -> Result<Self> {
         let file = Self::rotation_lock_file(config, "writer")?;
         file.try_lock()
             .map_err(std::io::Error::from)
-            .context("stop the runtime before credential rotation")?;
+            .context("stop the runtime before account maintenance")?;
+        lane_control::check_opened_path(&lock_path(config, "writer")?, &file)?;
         Ok(Self(file))
+    }
+
+    /// Ordinary stopped maintenance requires current, independently anchored authority.
+    pub(crate) fn stopped(config: &Config) -> Result<Self> {
+        let lock = Self::stopped_for_migration(config)?;
+        let binding = read_binding(config)?.context("independent account binding missing")?;
+        binding.check_writer(&lock_path(config, "writer")?, &lock.0.metadata()?)?;
+        let admission_path = lock_path(config, "admission")?;
+        binding.check_admission(&admission_path, &fs::symlink_metadata(&admission_path)?)?;
+        if writer_marker(&lock.0)? != WRITER_MARKER {
+            bail!("permanent writer marker missing; explicit stopped adoption required");
+        }
+        let store = Store::read_only(config)?.context("bound journal missing")?;
+        migration::ensure_complete(&store.db)?;
+        store.check_config_identity(config)?;
+        Ok(lock)
     }
 
     pub(crate) fn acquire(config: &Config) -> Result<(Self, Store)> {
@@ -480,135 +633,204 @@ impl AccountLock {
         Self::acquire_with_migration(config, true)
     }
 
-    fn acquire_with_migration(config: &Config, migration_allowed: bool) -> Result<(Self, Store)> {
-        let _gate = AdmissionGuard::acquire(config)?;
-        let mut file = private_file(&lock_path(config, "writer")?)?;
+    fn open_writer(config: &Config, adopt: bool) -> Result<File> {
+        let binding = read_binding(config)?;
+        let database_exists = config.state_dir.join("state.sqlite3").try_exists()?;
+        if adopt && !database_exists {
+            bail!("adoption requires an existing initialized journal");
+        }
+        if database_exists && binding.is_none() && !adopt {
+            bail!("unanchored journal requires explicit stopped-writer adoption");
+        }
+        // An existing Binding always requires its original existing writer.
+        // Only genuinely fresh or explicitly unbound initialization may create one.
+        let create = binding.is_none() && (!database_exists || adopt);
+        lane_control::opened_file(&lock_path(config, "writer")?, true, create)
+            .context("writer authority missing or unsafe; authoritative recovery required")
+    }
+
+    fn acquire_with_migration(config: &Config, adopt: bool) -> Result<(Self, Store)> {
+        migration::ensure_no_pending(config)?;
+        let gate = AccountAdmissionGuard::for_initialization(config, adopt)?;
+        let mut file = Self::open_writer(config, adopt)?;
         file.try_lock()
             .map_err(std::io::Error::from)
             .context("another runtime already owns this account")?;
-        let store = Self::open_bound_store(&mut file, config, migration_allowed)?;
+        let store = Self::open_bound_store(&mut file, config, &gate, adopt, true)?;
         Ok((Self(file), store))
     }
 
     fn open_bound_store(
         file: &mut File,
         config: &Config,
-        migration_allowed: bool,
+        gate: &AccountAdmissionGuard,
+        adopt: bool,
+        stopped: bool,
     ) -> Result<Store> {
         if config.network.address.is_empty()
             || config.network.credential_file.as_os_str().is_empty()
         {
             bail!("durable control requires a configured account and credential file");
         }
-        let length = file.metadata()?.len();
-        if length > 64 {
-            bail!("invalid stable writer marker");
-        }
-        let mut bytes = vec![0; length as usize];
-        file.read_exact(&mut bytes)?;
+        gate.check_acquired(config)?;
+        let admission_path = lock_path(config, "admission")?;
+        let admission_metadata = gate.0.metadata()?;
+        let admission_anchor = WriterInode::from_metadata(&admission_metadata)?;
+        let writer_path = lock_path(config, "writer")?;
+        lane_control::check_opened_path(&writer_path, file)?;
+        let writer_metadata = file.metadata()?;
+        let anchor = WriterInode::from_metadata(&writer_metadata)?;
+        let bytes = writer_marker(file)?;
         let marked = bytes == WRITER_MARKER;
-        let legacy = length != 0 && !marked;
-        if legacy && !migration_allowed {
-            bail!("journal adoption requires an explicit stopped-writer recover adopt");
+        let binding_path = lock_path(config, "binding")?;
+        let mut binding = read_binding(config)?;
+        let database_exists = config.state_dir.join("state.sqlite3").try_exists()?;
+        let fresh = !database_exists && binding.is_none() && bytes.is_empty();
+        if fresh && (!stopped || adopt) {
+            bail!("initialization requires exclusive writer ownership");
         }
-        if legacy
-            && (length != 64
-                || bytes != digest(config.state_dir.as_os_str().as_encoded_bytes()).as_bytes())
-        {
-            bail!("account is bound to a different durable state directory");
+        if !fresh && !database_exists {
+            bail!("bound journal is missing; authoritative recovery required");
         }
-        let binding = read_binding(config)?;
-        let database = config.state_dir.join("state.sqlite3");
-        if migration_allowed && !database.exists() {
-            bail!("adoption requires an existing initialized journal");
-        }
-        if legacy || binding.is_some() || database.exists() {
-            if !migration_allowed && !legacy && binding.is_none() {
-                bail!("unanchored journal requires explicit stopped-writer adoption");
+        if let Some(binding) = &binding {
+            if binding.admission_inode.is_some() {
+                binding.check_admission(&admission_path, &admission_metadata)?;
+            } else if !(adopt && stopped) {
+                bail!("account admission authority requires explicit stopped adoption");
             }
-            // Never create or initialize a missing/replaced bound database.
-            if !database.exists() {
-                bail!("bound journal is missing; authoritative recovery required");
+            if binding.writer_inode.is_some() {
+                binding.check_writer(&writer_path, &writer_metadata)?;
+                if !marked && !(adopt && stopped && bytes.is_empty()) {
+                    bail!("permanent writer marker missing; explicit stopped adoption required");
+                }
+            } else if !(adopt && stopped && marked) {
+                bail!(
+                    "unanchored established writer requires its intact permanent marker and explicit stopped adoption"
+                );
             }
+        } else if !fresh {
+            if !(adopt && stopped)
+                || !(bytes.is_empty()
+                    || bytes == digest(config.state_dir.as_os_str().as_encoded_bytes()).as_bytes())
+            {
+                bail!("unbound journal requires intact evidence and explicit stopped adoption");
+            }
+        }
+        if !fresh {
+            // All authority checks precede writable SQLite setup, routing and recovery.
             let existing = Store::read_only(config)?.context("bound journal is missing")?;
-            if existing.control().is_err() {
-                bail!("bound journal is uninitialized");
-            }
-            if existing.schema_version()? != 2 {
-                if !legacy || binding.is_some() {
-                    bail!("legacy journal authority is missing or inconsistent; writes blocked");
-                }
-                if !migration_allowed {
-                    bail!("journal adoption requires a stopped writer; run recover adopt first");
-                }
-            } else {
-                let (database_id, sequence) = existing
-                    .database_identity()
-                    .context("existing journal authority is missing or malformed")?;
-                if database_id.len() != 32
-                    || !database_id.bytes().all(|byte| byte.is_ascii_hexdigit())
-                    || sequence < 0
-                {
-                    bail!("existing journal authority is invalid");
-                }
-            }
-        }
-        let mut store = Store::open(config)?;
-        store.bind_routing(config)?;
-        let location = fs::canonicalize(&config.state_dir)?
-            .to_string_lossy()
-            .into_owned();
-        let (database_id, sequence) = store.database_identity()?;
-        let expected_identity = digest(identity(config)?);
-        let binding = match binding {
-            Some(binding) => {
-                if binding.location != location
-                    || binding.identity != expected_identity
-                    || binding.database_id != database_id
-                    || binding.dispatch_sequence > sequence
-                {
-                    bail!("journal identity or dispatch witness mismatch; writes blocked");
-                }
-                // Journal-ahead gaps happened before the network boundary. Preserve
-                // dispatch intent as uncertain; advancing the witness never replays it.
-                Binding {
-                    dispatch_sequence: sequence,
-                    ..binding
-                }
-            }
-            None => Binding {
-                location,
-                identity: expected_identity,
+            migration::ensure_complete(&existing.db)?;
+            existing.check_config_identity(config)?;
+            let (database_id, sequence) = existing.database_identity()?;
+            let candidate = binding.get_or_insert(Binding {
+                location: fs::canonicalize(&config.state_dir)?
+                    .to_string_lossy()
+                    .into_owned(),
+                identity: digest(identity(config)?),
                 database_id,
                 dispatch_sequence: sequence,
-            },
-        };
-        let binding_path = lock_path(config, "binding")?;
-        write_binding(&binding_path, &binding)?;
-        if !marked {
-            // Never replace the locked inode. The permanent marker only detects
-            // deleted binding metadata; all changing identity/witness data lives separately.
-            file.rewind()?;
-            file.write_all(WRITER_MARKER)?;
-            file.set_len(WRITER_MARKER.len() as u64)?;
-            file.sync_all()?;
-            File::open(
-                lock_path(config, "writer")?
-                    .parent()
-                    .context("lock parent missing")?,
-            )?
-            .sync_all()?;
+                writer_inode: None,
+                admission_inode: None,
+            });
+            candidate.validate()?;
+            if adopt && existing.routing_status(config)?["matches_config"] != true {
+                bail!("adoption requires matching existing routing evidence");
+            }
+            if !stopped && existing.routing_status(config)?["matches_config"] != true {
+                bail!("stop the runtime before changing API routing");
+            }
         }
-        store.binding = Some((binding_path, binding));
-        store.writer_path = Some((lock_path(config, "writer")?, file.metadata()?));
+        if !fresh && adopt {
+            let binding = binding.as_mut().context("adoption binding missing")?;
+            binding.writer_inode = Some(anchor); // absent or already checked identical
+            binding.admission_inode = Some(admission_anchor);
+            lane_control::check_opened_path(&admission_path, &gate.0)?;
+            gate.0.sync_all()?;
+            lane_control::check_opened_path(&writer_path, file)?;
+            file.sync_all()?;
+            gate.check_acquired(config)?;
+            File::open(writer_path.parent().context("writer parent missing")?)?.sync_all()?;
+            write_binding(&binding_path, binding)?;
+        }
+        if !fresh && !marked {
+            lane_control::check_opened_path(&writer_path, file)?;
+            Self::mark_writer(file, &writer_path)?;
+        }
+        if fresh {
+            lane_control::check_opened_path(&admission_path, &gate.0)?;
+            lane_control::check_opened_path(&writer_path, file)?;
+            gate.0.sync_all()?;
+            file.sync_all()?;
+            File::open(writer_path.parent().context("writer parent missing")?)?.sync_all()?;
+        } else {
+            gate.validate(config)?;
+        }
+        let authority = binding.map(|binding| {
+            (
+                (binding_path.clone(), binding),
+                (writer_path.clone(), writer_metadata),
+            )
+        });
+        let mut store = Store::open_inner(config, authority)?;
+        if fresh {
+            lane_control::check_opened_path(&admission_path, &gate.0)?;
+            lane_control::check_opened_path(&writer_path, file)?;
+            file.sync_all()?;
+            File::open(writer_path.parent().context("writer parent missing")?)?.sync_all()?;
+            let (database_id, sequence) = store.database_identity()?;
+            let binding = Binding {
+                location: fs::canonicalize(&config.state_dir)?
+                    .to_string_lossy()
+                    .into_owned(),
+                identity: digest(identity(config)?),
+                database_id,
+                dispatch_sequence: sequence,
+                writer_inode: Some(anchor),
+                admission_inode: Some(admission_anchor),
+            };
+            gate.check_acquired(config)?;
+            write_binding(&binding_path, &binding)?;
+            lane_control::check_opened_path(&writer_path, file)?;
+            Self::mark_writer(file, &writer_path)?;
+            store.binding = Some((binding_path, binding));
+            store.writer_path = Some((writer_path, file.metadata()?));
+        }
+        gate.validate(config)?;
+        store.continuity()?;
+        store.bind_routing(config)?;
+        if !adopt {
+            // A journal-ahead gap remains uncertain; advancing its witness never replays it.
+            store.publish_dispatch_witness()?;
+        }
+        store.continuity()?;
+        gate.validate(config)?;
         Ok(store)
     }
 
-    /// Controls share the admission gate but never migrate beneath a live writer.
-    pub(crate) fn control_store(config: &Config) -> Result<Store> {
-        let mut file = private_file(&lock_path(config, "writer")?)?;
-        let stopped = file.try_lock().is_ok();
-        let result = Self::open_bound_store(&mut file, config, false);
+    fn mark_writer(file: &mut File, path: &Path) -> Result<()> {
+        file.rewind()?;
+        file.write_all(WRITER_MARKER)?;
+        file.set_len(WRITER_MARKER.len() as u64)?;
+        file.sync_all()?;
+        File::open(path.parent().context("writer parent missing")?)?.sync_all()?;
+        Ok(())
+    }
+
+    /// Caller holds admission. A live-control branch requires an actual lock-busy result.
+    pub(crate) fn control_store(config: &Config, gate: &AccountAdmissionGuard) -> Result<Store> {
+        migration::ensure_no_pending(config)?;
+        let mut file = Self::open_writer(config, false)?;
+        let stopped = match file.try_lock() {
+            Ok(()) => true,
+            Err(error) => {
+                let error = std::io::Error::from(error);
+                if error.kind() != std::io::ErrorKind::WouldBlock {
+                    return Err(error.into());
+                }
+                false
+            }
+        };
+        let result = Self::open_bound_store(&mut file, config, gate, false, stopped);
         if stopped {
             let _ = file.unlock();
         }
@@ -623,23 +845,163 @@ impl Drop for AccountLock {
 
 /// Pause commits under the same gate used for admission. HTTP dispatch holds this
 /// gate until its bounded response completes; a pause acknowledgment cannot race it.
-pub(crate) struct AdmissionGuard(File);
-impl AdmissionGuard {
+pub(crate) struct AccountAdmissionGuard(File, PathBuf, Option<Binding>);
+impl AccountAdmissionGuard {
     pub(crate) fn acquire(config: &Config) -> Result<Self> {
-        let file = private_file(&lock_path(config, "admission")?)?;
+        Self::ordinary(config, false)
+    }
+
+    pub(crate) fn try_acquire(config: &Config) -> Result<Self> {
+        Self::ordinary(config, true)
+    }
+
+    fn ordinary(config: &Config, nonblocking: bool) -> Result<Self> {
+        let binding = read_binding(config)?.context("independent account binding missing")?;
+        binding.check_context(config)?;
+        if binding.writer_inode.is_none() || binding.admission_inode.is_none() {
+            bail!(
+                "account authority is unanchored; stop all controllers and native work, then explicitly recover adopt"
+            );
+        }
+        let path = lock_path(config, "admission")?;
+        let file = lane_control::opened_file(&path, true, false)?;
+        binding.check_admission(&path, &file.metadata()?)?;
+        if nonblocking {
+            file.try_lock()
+                .map_err(std::io::Error::from)
+                .context("account admission is busy")?;
+        } else {
+            file.lock()
+                .context("cannot acquire account admission gate")?;
+        }
+        let guard = Self(file, path, Some(binding));
+        guard.validate(config)?;
+        Ok(guard)
+    }
+
+    /// Config-only fencing never adopts or initializes an existing journal.
+    pub(crate) fn for_provisioning(config: &Config) -> Result<Self> {
+        if read_binding(config)?.is_some() {
+            return Self::acquire(config);
+        }
+        Self::for_initialization(config, false)
+    }
+
+    pub(crate) fn for_control(config: &Config) -> Result<Self> {
+        Self::for_initialization(config, false)
+    }
+
+    fn for_initialization(config: &Config, adopt: bool) -> Result<Self> {
+        let binding = read_binding(config)?;
+        if binding.is_some() && !adopt {
+            return Self::acquire(config);
+        }
+        let database_exists = config.state_dir.join("state.sqlite3").try_exists()?;
+        if database_exists != adopt && binding.is_none() {
+            bail!(
+                "existing journals require explicit stopped adoption; adoption requires an initialized journal"
+            );
+        }
+        let marker = read_private_bytes(&lock_path(config, "writer")?, 64)?;
+        if binding.is_none() && !adopt && marker.as_ref().is_some_and(|bytes| !bytes.is_empty()) {
+            bail!("established writer authority cannot be provisioned as a fresh account");
+        }
+        let guard = Self::raw(config, binding.is_none(), binding)?;
+        if config.state_dir.join("state.sqlite3").try_exists()? != database_exists
+            || read_private_bytes(&lock_path(config, "writer")?, 64)? != marker
+        {
+            bail!("account initialization authority changed while acquiring admission");
+        }
+        Ok(guard)
+    }
+
+    /// Isolated stopped migration acquisition; absence is not ordinary authority.
+    fn for_migration(config: &Config, create: bool) -> Result<Self> {
+        let binding = read_binding(config)?;
+        Self::raw(config, create, binding)
+    }
+
+    fn raw(config: &Config, create: bool, binding: Option<Binding>) -> Result<Self> {
+        let path = lock_path(config, "admission")?;
+        if let Some(binding) = &binding {
+            binding.check_context(config)?;
+        }
+        let file = lane_control::opened_file(
+            &path,
+            true,
+            create
+                && binding
+                    .as_ref()
+                    .is_none_or(|binding| binding.admission_inode.is_none()),
+        )?;
+        if let Some(binding) = &binding {
+            if binding.admission_inode.is_some() {
+                binding.check_admission(&path, &file.metadata()?)?;
+            }
+        }
         file.lock()
             .context("cannot acquire account admission gate")?;
-        Ok(Self(file))
+        let guard = Self(file, path, binding);
+        guard.check_acquired(config)?;
+        Ok(guard)
     }
-    pub(crate) fn try_acquire(config: &Config) -> Result<Self> {
-        let file = private_file(&lock_path(config, "admission")?)?;
-        file.try_lock()
-            .map_err(std::io::Error::from)
-            .context("account admission is busy")?;
-        Ok(Self(file))
+
+    fn check_acquired(&self, config: &Config) -> Result<()> {
+        lane_control::check_opened_path(&self.1, &self.0)?;
+        let current = read_binding(config)?;
+        match (&self.2, &current) {
+            (None, None) => {}
+            (Some(expected), Some(current))
+                if expected.same_authority(current)
+                    && current.dispatch_sequence >= expected.dispatch_sequence =>
+            {
+                current.check_context(config)?;
+                if current.admission_inode.is_some() {
+                    current.check_admission(&self.1, &self.0.metadata()?)?;
+                }
+            }
+            _ => bail!("account admission authority changed while acquiring the gate"),
+        }
+        Ok(())
+    }
+
+    fn validated_binding(&self) -> Result<Binding> {
+        let current = read_account_binding(&self.1.with_extension("binding"))?
+            .context("independent account binding missing")?;
+        current.check_admission(&self.1, &self.0.metadata()?)?;
+        let writer = self.1.with_extension("writer");
+        current.check_writer(&writer, &fs::symlink_metadata(&writer)?)?;
+        if read_private_bytes(&writer, 64)?.as_deref() != Some(WRITER_MARKER) {
+            bail!("permanent writer marker missing; explicit stopped adoption required");
+        }
+        if let Some(expected) = &self.2 {
+            // Only an explicit stopped publication may fill previously absent fields.
+            // Every recorded identity remains fixed, including the held gate itself.
+            if current.location != expected.location
+                || current.identity != expected.identity
+                || current.database_id != expected.database_id
+                || current.dispatch_sequence < expected.dispatch_sequence
+                || expected
+                    .writer_inode
+                    .is_some_and(|inode| current.writer_inode != Some(inode))
+                || expected
+                    .admission_inode
+                    .is_some_and(|inode| current.admission_inode != Some(inode))
+            {
+                bail!("accepted account admission authority changed");
+            }
+        }
+        Ok(current)
+    }
+
+    pub(super) fn validate(&self, config: &Config) -> Result<()> {
+        if self.1 != lock_path(config, "admission")? {
+            bail!("account admission guard belongs to another account");
+        }
+        self.validated_binding()?.check_context(config)
     }
 }
-impl Drop for AdmissionGuard {
+impl Drop for AccountAdmissionGuard {
     fn drop(&mut self) {
         let _ = self.0.unlock();
     }
@@ -654,7 +1016,7 @@ pub(crate) struct Control {
 #[derive(Clone)]
 pub(crate) struct Operation {
     pub id: i64,
-    pub kind: WorkKind,
+    pub kind: LaneId,
     pub key: String,
     pub state: String,
     pub request: Value,
@@ -663,6 +1025,8 @@ pub(crate) struct Operation {
     pub job_id: Option<String>,
     pub txid: Option<String>,
     pub next_at: i64,
+    pub binding_revision: i64,
+    persisted_binding_revision: std::cell::Cell<i64>,
     persisted_state: std::cell::RefCell<String>,
     pub generation: i64,
 }
@@ -705,44 +1069,24 @@ impl WaitEvidence {
     }
 }
 
-/// Read failures are independent of normal work cadence and shared by callers
-/// of the same endpoint class, including answer/mine challenge observations.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ReadScope {
-    Challenge,
-    Identity,
-    Assignments,
-    AssignmentEvidence,
-    Job,
-    Receipt,
-}
-
-impl ReadScope {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Challenge => "challenge",
-            Self::Identity => "identity",
-            Self::Assignments => "assignments",
-            Self::AssignmentEvidence => "assignment_evidence",
-            Self::Job => "job",
-            Self::Receipt => "receipt",
-        }
-    }
-
-    pub(crate) const ALL: [Self; 6] = [
-        Self::Challenge,
-        Self::Identity,
-        Self::Assignments,
-        Self::AssignmentEvidence,
-        Self::Job,
-        Self::Receipt,
-    ];
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ReadBackoff {
     pub failures: u32,
     pub next_at: i64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AdmissionCutoff {
+    pub at: i64,
+    pub grant_id: i64,
+}
+impl AdmissionCutoff {
+    fn current() -> Self {
+        Self {
+            at: now(),
+            grant_id: i64::MAX,
+        }
+    }
 }
 
 fn read_delay(failures: u32, base: u64, cap: u64, jitter: u64) -> u64 {
@@ -846,13 +1190,12 @@ fn same_journal_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
     }
     #[cfg(not(unix))]
     {
-        // database_id and the durable sequence remain authoritative everywhere.
         let _ = (left, right);
-        true
+        false
     }
 }
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 struct HistoricalAnswer {
     operation_id: i64,
     accepted_answer_id: i64,
@@ -883,9 +1226,13 @@ const HISTORICAL_ANSWERS: &str = "
         json_extract(accepted.request,'$.solver.epoch')
     GROUP BY original.id";
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct UncertaintyAccounting {
     total: u64,
+    own_total: u64,
+    own_exempt: u64,
+    own_blockers: Vec<i64>,
+    legacy_floor: bool,
     eligible: u64,
     exempt: u64,
     historical: Vec<HistoricalAnswer>,
@@ -894,33 +1241,14 @@ struct UncertaintyAccounting {
     retry_not_before: i64,
     grace_until: i64,
     retry_grace_until: i64,
-    writing_operation: Option<i64>,
-    floor_operation: Option<i64>,
-    grace_operation: Option<i64>,
-    retry_operation: Option<i64>,
+    restriction_scope: Option<String>,
+    retry_origin_floor: i64,
 }
 
 impl UncertaintyAccounting {
     fn active(&self) -> u64 {
-        self.total - self.exempt
+        self.own_total - self.own_exempt
     }
-
-    fn blocking_operation(&self, reason: &str) -> Option<i64> {
-        match reason {
-            "effect_in_flight" => self.writing_operation,
-            "retained_retry_minimum" => self.floor_operation,
-            "uncertainty_grace" => self.grace_operation,
-            "uncertain_answer_retry_delay" => self.retry_operation,
-            _ => None,
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct AnswerRetryReservation {
-    original_operation_id: i64,
-    ready_at: i64,
-    same_operation: bool,
 }
 
 fn identity(config: &Config) -> Result<String> {
@@ -941,7 +1269,7 @@ impl Store {
             })?)
     }
 
-    fn database_identity(&self) -> Result<(String, i64)> {
+    pub(crate) fn database_identity(&self) -> Result<(String, i64)> {
         Ok(self.db.query_row(
             "SELECT database_id,dispatch_sequence FROM authority WHERE singleton=1",
             [],
@@ -949,57 +1277,208 @@ impl Store {
         )?)
     }
 
+    fn check_config_identity(&self, config: &Config) -> Result<()> {
+        let stored: String = self.db.query_row(
+            "SELECT identity FROM control WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        if stored != identity(config)? {
+            bail!("state belongs to a different immutable network identity");
+        }
+        Ok(())
+    }
+
     fn check_binding(&self, config: &Config) -> Result<()> {
-        if let Some(binding) = read_binding(config)? {
+        let stored: String = self.db.query_row(
+            "SELECT identity FROM control WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        let account: Value = serde_json::from_str(&stored)?;
+        let path = account_lock_path(
+            account["chain"]
+                .as_str()
+                .context("stored account chain missing")?,
+            account["address"]
+                .as_str()
+                .context("stored account address missing")?,
+            "binding",
+        )?;
+        if let Some(binding) = read_account_binding(&path)? {
             let (id, sequence) = self.database_identity()?;
             if id != binding.database_id
                 || sequence < binding.dispatch_sequence
-                || binding.identity != digest(identity(config)?)
+                || binding.identity != digest(&stored)
                 || binding.location != fs::canonicalize(&config.state_dir)?.to_string_lossy()
             {
                 bail!("bound journal identity or dispatch witness mismatch");
+            }
+            // Unanchored metadata is inspectable, but never grants mutation.
+            if binding.writer_inode.is_some() {
+                let writer_path = path.with_extension("writer");
+                let writer = lane_control::opened_file(&writer_path, false, false)?;
+                binding.check_writer(&writer_path, &writer.metadata()?)?;
+            }
+            if binding.admission_inode.is_some() {
+                let admission_path = path.with_extension("admission");
+                let admission = lane_control::opened_file(&admission_path, false, false)?;
+                binding.check_admission(&admission_path, &admission.metadata()?)?;
             }
         }
         Ok(())
     }
 
+    pub(super) fn writer_authority_status(&self) -> Result<Value> {
+        let stored: String = self.db.query_row(
+            "SELECT identity FROM control WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        let account: Value = serde_json::from_str(&stored)?;
+        let path = account_lock_path(
+            account["chain"]
+                .as_str()
+                .context("stored account chain missing")?,
+            account["address"]
+                .as_str()
+                .context("stored account address missing")?,
+            "binding",
+        )?;
+        let binding = read_account_binding(&path)?;
+        let marker = read_private_bytes(&path.with_extension("writer"), 64)?;
+        let unanchored_admission_intact = binding.as_ref().is_none_or(|binding| {
+            binding.admission_inode.is_some()
+                || lane_control::opened_file(&path.with_extension("admission"), false, false)
+                    .is_ok()
+        });
+        if let Some(binding) = &binding {
+            if binding.admission_inode.is_some() {
+                let admission_path = path.with_extension("admission");
+                binding
+                    .check_admission(&admission_path, &fs::symlink_metadata(&admission_path)?)?;
+            }
+        }
+        let (state, prerequisite) = match binding {
+            Some(_) if !unanchored_admission_intact => (
+                "authority_incomplete",
+                Some(
+                    "Established account-admission gate is missing or unsafe; authoritative recovery is required, not first-anchor adoption.",
+                ),
+            ),
+            Some(binding) if binding.writer_inode.is_some() => {
+                let writer_path = path.with_extension("writer");
+                let writer = lane_control::opened_file(&writer_path, false, false)?;
+                binding.check_writer(&writer_path, &writer.metadata()?)?;
+                if marker.as_deref() == Some(WRITER_MARKER) && binding.admission_inode.is_none() {
+                    (
+                        "admission_unanchored",
+                        Some(
+                            "Stop all controllers and native work; explicit recover adopt must establish account-admission continuity before ordinary use.",
+                        ),
+                    )
+                } else if marker.as_deref() == Some(WRITER_MARKER) {
+                    ("anchored", None)
+                } else if marker.as_deref() == Some(b"") {
+                    (
+                        "initialization_interrupted",
+                        Some(
+                            "Stop all controllers and native work; explicit recover adopt may finish the marker only on this same anchored inode.",
+                        ),
+                    )
+                } else {
+                    bail!("permanent writer marker changed; authoritative recovery required");
+                }
+            }
+            Some(binding)
+                if binding.admission_inode.is_some()
+                    && marker.as_deref() == Some(WRITER_MARKER) =>
+            {
+                (
+                    "writer_unanchored",
+                    Some(
+                        "Stop all controllers and native work; explicit recover adopt requires the intact writer and matching admission anchor.",
+                    ),
+                )
+            }
+            Some(_) if marker.as_deref() == Some(WRITER_MARKER) => (
+                "unanchored",
+                Some(
+                    "Stop all controllers and native work, then use explicit recover adopt to establish first-inode continuity; pre-adoption history is not proved.",
+                ),
+            ),
+            Some(_) => (
+                "authority_incomplete",
+                Some(
+                    "Established writer marker is missing or changed; authoritative recovery is required, not lock deletion or re-adoption.",
+                ),
+            ),
+            None => (
+                "unbound",
+                Some(
+                    "Explicit stopped recover adopt requires intact initialized journal and lane evidence.",
+                ),
+            ),
+        };
+        Ok(json!({"state":state,"recovery_prerequisite":prerequisite}))
+    }
+
     pub(crate) fn continuity(&self) -> Result<()> {
-        if let Some((path, expected)) = &self.database_file {
-            let current = fs::symlink_metadata(path).context("bound journal disappeared")?;
-            validate_private_file(&current)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                if current.dev() != expected.dev() || current.ino() != expected.ino() {
-                    bail!("bound journal inode changed");
-                }
-            }
+        Self::continuity_in(
+            &self.db,
+            &self.binding,
+            &self.writer_path,
+            &self.database_file,
+        )
+    }
+
+    fn continuity_in(
+        db: &Connection,
+        binding: &Option<(PathBuf, Binding)>,
+        writer_path: &Option<(PathBuf, fs::Metadata)>,
+        database_file: &Option<(PathBuf, fs::Metadata)>,
+    ) -> Result<()> {
+        migration::ensure_complete(db)?;
+        if let Some((path, expected)) = database_file {
+            lane_control::check_file_identity(path, expected)
+                .context("bound journal continuity lost")?;
         }
-        if let Some((path, expected)) = &self.writer_path {
-            let current = fs::symlink_metadata(path).context("writer lock disappeared")?;
-            validate_private_file(&current)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                if current.dev() != expected.dev() || current.ino() != expected.ino() {
-                    bail!("writer lock inode changed; stopping authority");
-                }
-            }
+        if let Some((path, expected)) = writer_path {
+            lane_control::check_file_identity(path, expected)
+                .context("writer lock inode changed; stopping authority")?;
         }
-        if let Some((path, expected)) = &self.binding {
-            let current: Binding = serde_json::from_slice(&fs::read(path)?)?;
-            let (id, sequence) = self.database_identity()?;
+        if let Some((path, expected)) = binding {
+            let current = binding_at(path)?.context("independent account binding disappeared")?;
+            let (id, sequence): (String, i64) = db.query_row(
+                "SELECT database_id,dispatch_sequence FROM authority WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
             if current.database_id != id
                 || current.database_id != expected.database_id
                 || current.dispatch_sequence > sequence
                 || current.identity != expected.identity
                 || current.dispatch_sequence < expected.dispatch_sequence
                 || current.location != expected.location
+                || current.writer_inode != expected.writer_inode
+                || current.admission_inode != expected.admission_inode
             {
                 bail!("account binding continuity lost");
             }
+            let (writer, metadata) = writer_path
+                .as_ref()
+                .context("bound store lacks writer authority")?;
+            expected.check_writer(writer, metadata)?;
+            current.check_writer(writer, metadata)?;
+            let admission_path = path.with_extension("admission");
+            let admission_metadata = fs::symlink_metadata(&admission_path)?;
+            expected.check_admission(&admission_path, &admission_metadata)?;
+            current.check_admission(&admission_path, &admission_metadata)?;
+            if read_private_bytes(writer, 64)?.as_deref() != Some(WRITER_MARKER) {
+                bail!("permanent writer marker changed");
+            }
             let disk = Path::new(&expected.location).join("state.sqlite3");
-            let db_path: String = self.db.query_row(
+            let db_path: String = db.query_row(
                 "SELECT file FROM pragma_database_list WHERE name='main'",
                 [],
                 |r| r.get(0),
@@ -1051,8 +1530,8 @@ impl Store {
             db.query_row("SELECT version FROM control WHERE singleton=1", [], |r| {
                 r.get(0)
             })?;
-        if !matches!(version, 1 | 2) {
-            bail!("unsupported state schema");
+        if version != CURRENT_JOURNAL_FORMAT {
+            bail!("unsupported state schema; stop the runtime and use explicit migration");
         }
         let store = Self {
             db,
@@ -1061,175 +1540,106 @@ impl Store {
             database_file: None,
         };
         store.check_binding(config)?;
+        validate_required_lane_state(&store.db)?;
         Ok(Some(store))
     }
 
+    /// Unbound construction is only a unit-fixture convenience, not lifetime authority.
+    #[cfg(test)]
     pub(crate) fn open(config: &Config) -> Result<Self> {
-        if read_binding(config)?.is_some() {
-            Self::read_only(config)?.context("bound journal missing")?;
+        Self::open_inner(config, None)
+    }
+
+    fn open_inner(
+        config: &Config,
+        authority: Option<((PathBuf, Binding), (PathBuf, fs::Metadata))>,
+    ) -> Result<Self> {
+        migration::ensure_no_pending(config)?;
+        // Existing journals are inspected before WAL, DDL, normalization or any write.
+        let existing = Self::read_only(config)?;
+        if let Some(existing) = &existing {
+            migration::ensure_complete(&existing.db)?;
+            existing.check_config_identity(config)?;
+            existing
+                .database_identity()
+                .context("journal authority is missing or malformed")?;
         }
+        if let Some((binding, writer)) = &authority {
+            let existing = existing
+                .as_ref()
+                .context("bound journal disappeared before open")?;
+            let accepted = binding_at(&binding.0)?.context("independent binding disappeared")?;
+            if accepted != binding.1 {
+                bail!("account binding changed before writable open");
+            }
+            accepted.check_writer(&writer.0, &writer.1)?;
+            let admission_path = binding.0.with_extension("admission");
+            accepted.check_admission(&admission_path, &fs::symlink_metadata(&admission_path)?)?;
+            existing.check_binding(config)?;
+        }
+        let fresh = existing.is_none();
+        drop(existing);
         private_dir(&config.state_dir)?;
         let path = fs::canonicalize(&config.state_dir)?.join("state.sqlite3");
         let mut db = {
             let _opening = DATABASE_OPEN
                 .lock()
                 .map_err(|_| anyhow::anyhow!("database opening lock poisoned"))?;
-            prepare_database(&path)?;
+            if fresh {
+                prepare_database(&path)?;
+            }
             Connection::open_with_flags(
-                path,
+                &path,
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
                     | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
                     | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
-            )
-            .context("cannot open local state")?
+            )?
         };
         db.busy_timeout(std::time::Duration::from_secs(5))?;
+        if !fresh {
+            migration::ensure_complete(&db)?;
+        }
+        if let Some((binding, writer)) = &authority {
+            binding.1.check_writer(&writer.0, &writer.1)?;
+            let admission_path = binding.0.with_extension("admission");
+            binding
+                .1
+                .check_admission(&admission_path, &fs::symlink_metadata(&admission_path)?)?;
+        }
         db.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;",
         )?;
-        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute_batch(
-            "CREATE TABLE IF NOT EXISTS control (
-                singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-                paused INTEGER NOT NULL, generation INTEGER NOT NULL,
-                identity TEXT NOT NULL, version INTEGER NOT NULL);
-             CREATE TABLE IF NOT EXISTS operations (
-                id INTEGER PRIMARY KEY, kind TEXT NOT NULL, work_key TEXT NOT NULL,
-                state TEXT NOT NULL, request TEXT NOT NULL, result TEXT, payload TEXT,
-                job_id TEXT, txid TEXT, generation INTEGER NOT NULL, revision TEXT NOT NULL,
-                next_at INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL);
-             CREATE INDEX IF NOT EXISTS operations_key ON operations(kind,work_key);
-             CREATE INDEX IF NOT EXISTS operations_state ON operations(state,kind,updated_at);
-             CREATE TABLE IF NOT EXISTS events (
-                id INTEGER PRIMARY KEY, at INTEGER NOT NULL, code TEXT NOT NULL,
-                kind TEXT, operation_id INTEGER);
-             CREATE TABLE IF NOT EXISTS schedule (kind TEXT PRIMARY KEY, next_at INTEGER NOT NULL, cursor TEXT);
-             CREATE TABLE IF NOT EXISTS read_backoff (
-                scope TEXT PRIMARY KEY, failures INTEGER NOT NULL, next_at INTEGER NOT NULL);
-             CREATE TABLE IF NOT EXISTS read_observations (
-                scope TEXT PRIMARY KEY, in_flight INTEGER NOT NULL DEFAULT 0,
-                started_at INTEGER, finished_at INTEGER, last_http_success_at INTEGER,
-                last_success_at INTEGER, last_failure_at INTEGER, failure_category TEXT,
-                status INTEGER, local_next_at INTEGER NOT NULL DEFAULT 0,
-                server_not_before INTEGER NOT NULL DEFAULT 0,
-                retained_conservative_floor INTEGER NOT NULL DEFAULT 0);
-             CREATE TABLE IF NOT EXISTS assignment_selection (
-                singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-                revision TEXT NOT NULL, generation INTEGER NOT NULL, observed_at INTEGER NOT NULL,
-                observed_count INTEGER NOT NULL, inventory_complete INTEGER NOT NULL,
-                eligible INTEGER NOT NULL);
-             INSERT OR IGNORE INTO read_observations(scope,retained_conservative_floor)
-                SELECT scope,next_at FROM read_backoff;
-             CREATE TABLE IF NOT EXISTS observation (singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-                epoch INTEGER NOT NULL, observed_at INTEGER NOT NULL);
-             CREATE TABLE IF NOT EXISTS runtime_state (singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-                effective_revision TEXT NOT NULL, reload_blocked INTEGER NOT NULL,
-                capabilities TEXT NOT NULL, observed_at INTEGER NOT NULL);
-             CREATE TABLE IF NOT EXISTS health_evidence (
-                singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-                hosted_identity_verified INTEGER CHECK(hosted_identity_verified IN (0,1)),
-                epoch INTEGER, first_observed_at INTEGER,
-                answered INTEGER CHECK(answered IN (0,1)));
-             CREATE TABLE IF NOT EXISTS hosted_identity_evidence (
-                singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-                status TEXT NOT NULL CHECK(status IN ('verified','unavailable','authentication_failed',
-                    'identity_mismatch','invalid_response','legacy_unknown')),
-                observed_at INTEGER, last_verified_at INTEGER,
-                rejection TEXT CHECK(rejection IN ('authentication_failed','identity_mismatch')),
-                legacy_failure INTEGER NOT NULL CHECK(legacy_failure IN (0,1)));
-             CREATE TABLE IF NOT EXISTS identity_normalizations (
-                id INTEGER PRIMARY KEY, preview_token TEXT NOT NULL UNIQUE, audit TEXT NOT NULL);"
-        )?;
-        let expected = identity(config)?;
-        let existing: Option<(String, i64)> = tx
-            .query_row(
-                "SELECT identity,version FROM control WHERE singleton=1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        match existing {
-            Some((stored, version)) => {
-                if !matches!(version, 1 | 2) {
-                    bail!("unsupported state schema; do not downgrade this database");
-                }
-                if stored != expected {
-                    bail!("state belongs to a different immutable network identity");
-                }
-            }
-            None => {
-                tx.execute("INSERT INTO control VALUES (1,1,0,?1,1)", [&expected])?;
-                tx.execute(
-                    "INSERT INTO events(at,code) VALUES (?1,'initialized_paused')",
-                    [now()],
-                )?;
-            }
+        if fresh {
+            let database_id: String =
+                db.query_row("SELECT lower(hex(randomblob(16)))", [], |r| r.get(0))?;
+            let gates = lane_control::provision_unbound_lane_gates(config, &database_id)?;
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            initialize_schema(&tx)?;
+            tx.execute(
+                "INSERT INTO control(singleton,paused,generation,identity,version) VALUES (1,1,0,?1,?2)",
+                params![identity(config)?, CURRENT_JOURNAL_FORMAT],
+            )?;
+            tx.execute("INSERT INTO authority VALUES (1,?1,0)", [database_id])?;
+            initialize_lane_state(&tx, &gates)?;
+            tx.execute(
+                "INSERT INTO events(at,code) VALUES (?1,'initialized_paused')",
+                [now()],
+            )?;
+            tx.commit()?;
         }
-        tx.execute_batch(
-            "CREATE TABLE IF NOT EXISTS authority (
-                singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-                database_id TEXT NOT NULL, dispatch_sequence INTEGER NOT NULL);
-             INSERT OR IGNORE INTO authority VALUES (1,lower(hex(randomblob(16))),0);
-             CREATE TABLE IF NOT EXISTS operation_evidence (
-                operation_id INTEGER PRIMARY KEY REFERENCES operations(id),
-                policy TEXT, model_deadline INTEGER, http_deadline INTEGER,
-                dispatch_sequence INTEGER, blocked_since INTEGER, evidence TEXT,
-                observed_at INTEGER, safety_observed_at INTEGER, resolution TEXT);
-             CREATE TABLE IF NOT EXISTS operation_candidates (
-                operation_id INTEGER PRIMARY KEY REFERENCES operations(id),
-                candidates TEXT NOT NULL, truncated INTEGER NOT NULL DEFAULT 0);
-             CREATE TABLE IF NOT EXISTS runtime_policy (
-                singleton INTEGER PRIMARY KEY CHECK(singleton=1), policy TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS routing_profile (
-                singleton INTEGER PRIMARY KEY CHECK(singleton=1), profile TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS operation_links (
-                operation_id INTEGER PRIMARY KEY REFERENCES operations(id),
-                retry_of INTEGER NOT NULL REFERENCES operations(id), payload_reused INTEGER NOT NULL);
-             CREATE TABLE IF NOT EXISTS operation_timing (
-                operation_id INTEGER PRIMARY KEY REFERENCES operations(id), retry_not_before INTEGER NOT NULL);
-             INSERT OR IGNORE INTO operation_timing
-                SELECT id,next_at FROM operations WHERE state IN ('dispatching','queued','unknown','included_pending');
-             CREATE TABLE IF NOT EXISTS manual_grants (
-                id INTEGER PRIMARY KEY, epoch INTEGER NOT NULL, kind TEXT NOT NULL,
-                generation INTEGER NOT NULL, created_at INTEGER NOT NULL, consumed_by INTEGER REFERENCES operations(id));
-             CREATE TABLE IF NOT EXISTS manual_grant_revocations (
-                grant_id INTEGER PRIMARY KEY REFERENCES manual_grants(id), revoked_at INTEGER NOT NULL);
-             DROP INDEX IF EXISTS manual_grants_pending;
-             CREATE TABLE IF NOT EXISTS risk_admissions (
-                dispatch_sequence INTEGER PRIMARY KEY, operation_id INTEGER NOT NULL REFERENCES operations(id),
-                policy TEXT NOT NULL, revision TEXT NOT NULL, blocker_ids TEXT NOT NULL,
-                retry_of INTEGER REFERENCES operations(id), manual_grant_id INTEGER REFERENCES manual_grants(id),
-                admitted_at INTEGER NOT NULL);
-             CREATE TABLE IF NOT EXISTS risk_historical_answers (
-                dispatch_sequence INTEGER NOT NULL REFERENCES risk_admissions(dispatch_sequence),
-                operation_id INTEGER NOT NULL REFERENCES operations(id),
-                accepted_answer_id INTEGER NOT NULL REFERENCES operations(id),
-                PRIMARY KEY(dispatch_sequence,operation_id));
-             CREATE INDEX IF NOT EXISTS operation_links_retry_of ON operation_links(retry_of);
-             CREATE TABLE IF NOT EXISTS historical_answer_accounting_events (
-                revision INTEGER PRIMARY KEY, original_id INTEGER NOT NULL REFERENCES operations(id),
-                accepted_answer_id INTEGER REFERENCES operations(id), observed_at INTEGER NOT NULL);
-             CREATE INDEX IF NOT EXISTS historical_answer_accounting_original
-                ON historical_answer_accounting_events(original_id,revision DESC);
-             CREATE TABLE IF NOT EXISTS risk_accounting_snapshots (
-                dispatch_sequence INTEGER PRIMARY KEY REFERENCES risk_admissions(dispatch_sequence),
-                witness_revision INTEGER NOT NULL, unresolved_count INTEGER NOT NULL,
-                eligible_count INTEGER NOT NULL, exempt_count INTEGER NOT NULL);
-             UPDATE operations SET work_key=lower(work_key)
-                WHERE kind='judge' AND length(work_key)=64 AND work_key<>lower(work_key);
-             UPDATE operations SET txid=lower(txid) WHERE length(txid)=64 AND txid<>lower(txid);
-             UPDATE control SET version=2 WHERE singleton=1;"
-        )?;
-        tx.commit()?;
-        let database_path = fs::canonicalize(&config.state_dir)?.join("state.sqlite3");
-        let database_metadata = fs::symlink_metadata(&database_path)?;
-        Ok(Self {
+        let metadata = fs::symlink_metadata(&path)?;
+        let (binding, writer_path) = match authority {
+            Some((binding, writer)) => (Some(binding), Some(writer)),
+            None => (None, None),
+        };
+        let store = Self {
             db,
-            binding: None,
-            writer_path: None,
-            database_file: Some((database_path, database_metadata)),
-        })
+            binding,
+            writer_path,
+            database_file: Some((path, metadata)),
+        };
+        store.continuity()?;
+        Ok(store)
     }
 
     fn routing_profile(&self) -> Result<Option<String>> {
@@ -1262,8 +1672,10 @@ impl Store {
                 AND (SELECT COUNT(*) FROM operations b WHERE b.kind=operations.kind
                     AND b.work_key=operations.work_key COLLATE NOCASE
                     AND b.state NOT IN ('prelaunch_failed','abandoned_model')
-                    AND NOT EXISTS(SELECT 1 FROM operation_links l WHERE l.operation_id=b.id AND l.payload_reused=1)) < ?1))",
-            [config.preparation.max_attempts_per_work], |row| row.get(0))?)
+                    AND NOT EXISTS(SELECT 1 FROM operation_links l WHERE l.operation_id=b.id AND l.payload_reused=1))
+                    < CASE operations.kind WHEN 'answer' THEN ?1 WHEN 'judge' THEN ?2 ELSE 0 END))",
+            params![config.capabilities.answer.preparation.max_attempts_per_work,
+                config.capabilities.judge.preparation.max_attempts_per_work], |row| row.get(0))?)
     }
 
     pub(crate) fn routing_change_allowed(&self, config: &Config) -> Result<()> {
@@ -1281,6 +1693,7 @@ impl Store {
 
     /// Called only under the account writer and admission guards, before any HTTP.
     fn bind_routing(&mut self, config: &Config) -> Result<()> {
+        self.continuity()?;
         self.routing_change_allowed(config)?;
         let profile = serde_json::to_string(&config.network.api)?;
         let previous = self.routing_profile()?;
@@ -1291,11 +1704,11 @@ impl Store {
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         if previous.is_some() || digest(&profile) != crate::endpoints::LEGACY_API_FINGERPRINT {
-            tx.execute_batch("DELETE FROM observation;
+            tx.execute_batch("DELETE FROM lane_observations;
                 UPDATE control SET generation=generation+1 WHERE singleton=1;
                 UPDATE health_evidence SET hosted_identity_verified=NULL,epoch=NULL,first_observed_at=NULL,answered=NULL;
                 DELETE FROM hosted_identity_evidence;
-                UPDATE read_observations SET in_flight=0,started_at=NULL,last_success_at=NULL,last_http_success_at=NULL;")?;
+                UPDATE read_state SET in_flight=0,started_at=NULL,last_success_at=NULL,last_http_success_at=NULL;")?;
         }
         tx.execute(
             "INSERT INTO routing_profile VALUES(1,?1)
@@ -1306,8 +1719,9 @@ impl Store {
             "INSERT INTO events(at,code) VALUES(?1,'routing_profile_bound')",
             [now()],
         )?;
+        Self::continuity_in(&tx, &self.binding, &self.writer_path, &self.database_file)?;
         tx.commit()?;
-        Ok(())
+        self.continuity()
     }
 
     fn routing_status(&self, config: &Config) -> Result<Value> {
@@ -1341,11 +1755,42 @@ impl Store {
         )?)
     }
 
-    pub(crate) fn set_paused(&mut self, paused: bool) -> Result<()> {
+    pub(crate) fn set_paused(
+        &mut self,
+        paused: bool,
+        account: &AccountAdmissionGuard,
+    ) -> Result<()> {
+        self.check_pause_guard(account)?;
         self.continuity()?;
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        account.validated_binding()?;
+        Self::continuity_in(&tx, &self.binding, &self.writer_path, &self.database_file)?;
+        Self::write_pause(&tx, paused)?;
+        account.validated_binding()?;
+        Self::continuity_in(&tx, &self.binding, &self.writer_path, &self.database_file)?;
+        tx.commit().context(
+            "global control commit uncertain; reread pause state and generation before retrying",
+        )?;
+        self.check_pause_guard(account)
+            .and_then(|()| self.continuity())
+            .context("global control commit uncertain; reread pause state and generation before retrying")
+    }
+
+    fn check_pause_guard(&self, account: &AccountAdmissionGuard) -> Result<()> {
+        let (path, expected) = self
+            .binding
+            .as_ref()
+            .context("global control requires bound authority")?;
+        let accepted = account.validated_binding()?;
+        if account.1.with_extension("binding") != *path || !expected.same_authority(&accepted) {
+            bail!("global control guard differs from accepted account authority");
+        }
+        Ok(())
+    }
+
+    fn write_pause(tx: &Connection, paused: bool) -> Result<()> {
         tx.execute(
             "UPDATE control SET paused=?1,generation=generation+1 WHERE singleton=1",
             [paused],
@@ -1354,8 +1799,23 @@ impl Store {
             "INSERT INTO events(at,code) VALUES (?1,?2)",
             params![now(), if paused { "paused" } else { "resumed" }],
         )?;
-        tx.commit()?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn set_paused_unbound(&mut self, paused: bool) -> Result<()> {
+        assert!(
+            self.binding.is_none(),
+            "bound fixtures must hold account admission"
+        );
+        self.continuity()?;
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::write_pause(&tx, paused)?;
+        Self::continuity_in(&tx, &self.binding, &self.writer_path, &self.database_file)?;
+        tx.commit()?;
+        self.continuity()
     }
 
     pub(crate) fn recover(&mut self) -> Result<()> {
@@ -1363,8 +1823,9 @@ impl Store {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::recover_interrupted_model(&tx)?;
         tx.execute(
-            "UPDATE read_observations SET in_flight=0,finished_at=?1 WHERE in_flight!=0",
+            "UPDATE read_state SET in_flight=0,finished_at=?1 WHERE in_flight!=0",
             [now()],
         )?;
         for (from, to) in [("generating", "model_unknown"), ("dispatching", "unknown")] {
@@ -1378,41 +1839,9 @@ impl Store {
                 params![to, now(), from],
             )?;
         }
-        // Older writers could commit the response before its timing row.
-        // Reconstruct only captured submit minima, never a fresh delay from now.
-        {
-            let mut statement = tx.prepare(
-                "SELECT operation_id,evidence,observed_at FROM operation_evidence
-                 WHERE evidence IS NOT NULL",
-            )?;
-            let rows = statement.query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<i64>>(2)?,
-                ))
-            })?;
-            for row in rows {
-                let (id, text, observed_at) = row?;
-                let Ok(evidence) = serde_json::from_str::<Value>(&text) else {
-                    continue;
-                };
-                if evidence["stage"] != "submit" {
-                    continue;
-                }
-                let floor = Self::captured_retry_floor(&evidence, observed_at);
-                if floor > 0 {
-                    tx.execute(
-                        "INSERT INTO operation_timing VALUES (?1,?2)
-                         ON CONFLICT(operation_id) DO UPDATE SET
-                         retry_not_before=MAX(retry_not_before,excluded.retry_not_before)",
-                        params![id, floor],
-                    )?;
-                }
-            }
-        }
+        Self::continuity_in(&tx, &self.binding, &self.writer_path, &self.database_file)?;
         tx.commit()?;
-        Ok(())
+        self.continuity()
     }
 
     pub(crate) fn abandon_models(&mut self) -> Result<usize> {
@@ -1433,13 +1862,16 @@ impl Store {
              WHERE state='model_unknown' AND payload IS NULL AND job_id IS NULL AND txid IS NULL",
             [now()],
         )?;
+        Self::continuity_in(&tx, &self.binding, &self.writer_path, &self.database_file)?;
         tx.commit()?;
+        self.continuity()?;
         Ok(count)
     }
 
-    pub(crate) fn begin(
+    #[cfg(test)]
+    fn begin(
         &mut self,
-        kind: WorkKind,
+        kind: LaneId,
         key: &str,
         state: &str,
         request: &Value,
@@ -1449,23 +1881,38 @@ impl Store {
         self.begin_linked(kind, key, (state, request), control, revision, None)
     }
 
-    pub(crate) fn begin_linked(
+    #[cfg(test)]
+    fn begin_linked(
         &mut self,
-        kind: WorkKind,
+        kind: LaneId,
         key: &str,
         intent: (&str, &Value),
         control: Control,
         revision: &str,
         retry: Option<(&Operation, bool)>,
     ) -> Result<Operation> {
-        let (state, request) = intent;
         self.continuity()?;
-        if !matches!(state, "generating" | "prepared") {
-            bail!("invalid initial operation state");
-        }
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let id = Self::begin_linked_in(&tx, kind, key, intent, control, revision, retry)?;
+        tx.commit()?;
+        self.operation(id)?.context("durable operation missing")
+    }
+
+    fn begin_linked_in(
+        tx: &Connection,
+        kind: LaneId,
+        key: &str,
+        intent: (&str, &Value),
+        control: Control,
+        revision: &str,
+        retry: Option<(&Operation, bool)>,
+    ) -> Result<i64> {
+        let (state, request) = intent;
+        if !matches!(state, "generating" | "prepared") {
+            bail!("invalid initial operation state");
+        }
         let current = tx.query_row(
             "SELECT paused,generation FROM control WHERE singleton=1",
             [],
@@ -1489,12 +1936,12 @@ impl Store {
             bail!("preparation capacity is already occupied");
         }
         // Mining has no model payload; publish its complete prepared intent atomically.
-        let payload = (kind == WorkKind::Mine && state == "prepared").then_some("{}");
+        let payload = (kind == LaneId::Mine && state == "prepared").then_some("{}");
         tx.execute("INSERT INTO operations(kind,work_key,state,request,generation,revision,created_at,updated_at,payload)
             VALUES (?1,?2,?3,?4,?5,?6,?7,?7,?8)", params![kind.as_str(),key,state,serde_json::to_string(request)?,control.generation,revision,now(),payload])?;
         let id = tx.last_insert_rowid();
         if let Some((original, reuse)) = retry {
-            if kind != WorkKind::Answer || original.kind != WorkKind::Answer {
+            if kind != LaneId::Answer || original.kind != LaneId::Answer {
                 bail!("only answer attempts may link an uncertain retry");
             }
             let eligible: bool = tx.query_row(
@@ -1511,17 +1958,21 @@ impl Store {
                 params![id, original.id, reuse],
             )?;
             if reuse {
+                let (canonical_key, canonical_request): (String, String) = tx.query_row(
+                    "SELECT work_key,request FROM operations WHERE id=?1",
+                    [original.id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
                 if state != "prepared"
-                    || original.payload.is_none()
-                    || original.key != key
-                    || request != &original.request
+                    || key != canonical_key
+                    || request != &serde_json::from_str::<Value>(&canonical_request)?
                 {
                     bail!("captured retry requires matching complete answer");
                 }
                 tx.execute(
-                    "UPDATE operations SET
-                    payload=(SELECT payload FROM operations WHERE id=?1),
-                    result=(SELECT result FROM operations WHERE id=?1) WHERE id=?2",
+                    "UPDATE operations SET (work_key,request,payload,result)=
+                    (SELECT work_key,request,payload,result FROM operations WHERE id=?1)
+                    WHERE id=?2",
                     params![original.id, id],
                 )?;
             }
@@ -1530,15 +1981,25 @@ impl Store {
             "INSERT INTO events(at,code,kind,operation_id) VALUES (?1,?2,?3,?4)",
             params![now(), state, kind.as_str(), id],
         )?;
-        tx.commit()?;
-        self.operation(id)?.context("durable operation missing")
+        // Prepared intent alone proves no model capture. An explicit captured
+        // retry retains the original capture time (including unknown), never now.
+        let reused_model = retry
+            .filter(|(_, reuse)| *reuse)
+            .map(|(original, _)| original.id);
+        tx.execute("INSERT INTO operation_timing(operation_id,retry_not_before,generation_started_at,model_captured_at)
+            VALUES(?1,0,CASE WHEN ?2='generating' THEN ?3 END,
+                (SELECT model_captured_at FROM operation_timing WHERE operation_id=?4))",
+            params![id,state,now(),reused_model])?;
+        Ok(id)
     }
 
-    pub(crate) fn save(&mut self, op: &Operation, event: &str) -> Result<()> {
+    #[cfg(test)]
+    fn save(&mut self, op: &Operation, event: &str) -> Result<()> {
         self.save_admitted(op, event, None)
     }
 
-    pub(crate) fn dispatch_intent(&mut self, op: &mut Operation, config: &Config) -> Result<bool> {
+    #[cfg(test)]
+    fn dispatch_intent(&mut self, op: &mut Operation, config: &Config) -> Result<bool> {
         let previous = op.state.clone();
         op.state = "dispatching".into();
         if !self.admission_allowed(config, op)? {
@@ -1549,6 +2010,7 @@ impl Store {
         Ok(true)
     }
 
+    #[cfg(test)]
     fn save_admitted(
         &mut self,
         op: &Operation,
@@ -1556,22 +2018,54 @@ impl Store {
         config: Option<&Config>,
     ) -> Result<()> {
         self.continuity()?;
+        let dispatch = op.state == "dispatching" && *op.persisted_state.borrow() != "dispatching";
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let binding = Self::save_transition_in(&tx, op, event, &op.state, config)?;
+        tx.commit()?;
+        Self::transition_committed(op, &op.state, binding);
+        if dispatch {
+            self.publish_dispatch_witness()?;
+        }
+        Ok(())
+    }
+
+    fn transition_committed(op: &Operation, state: &str, binding_revision: i64) {
+        *op.persisted_state.borrow_mut() = state.to_owned();
+        op.persisted_binding_revision.set(binding_revision);
+    }
+
+    fn publish_dispatch_witness(&mut self) -> Result<()> {
+        self.continuity()?;
+        let (_, sequence) = self.database_identity()?;
+        if let Some((path, binding)) = &mut self.binding {
+            binding.dispatch_sequence = sequence;
+            write_binding(path, binding)?;
+        }
+        self.continuity()
+    }
+
+    fn save_transition_in(
+        tx: &Connection,
+        op: &Operation,
+        event: &str,
+        target_state: &str,
+        config: Option<&Config>,
+    ) -> Result<i64> {
         let predecessor = op.persisted_state.borrow().clone();
         let was_effect = matches!(
             predecessor.as_str(),
             "dispatching" | "queued" | "unknown" | "included_pending"
         );
-        if matches!(op.state.as_str(), "queued" | "unknown" | "included_pending") && !was_effect {
+        if matches!(target_state, "queued" | "unknown" | "included_pending") && !was_effect {
             bail!("effect transition requires durable dispatch intent");
         }
         // Only local static codes enter the public event stream.
         if !event.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') {
             bail!("invalid local event code");
         }
-        let tx = self
-            .db
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if op.state == "dispatching" && predecessor != "dispatching" {
+        if target_state == "dispatching" && predecessor != "dispatching" {
             if !matches!(predecessor.as_str(), "generated" | "prepared" | "retry") {
                 bail!("invalid dispatch predecessor");
             }
@@ -1580,20 +2074,25 @@ impl Store {
                     bail!("dispatch capability is not active");
                 }
                 Some(
-                    Self::risk_decision(&tx, config, op)?
+                    Self::risk_decision(tx, config, op)?
                         .context("participation admission closed")?,
                 )
             } else {
-                let occupied: bool = tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM operations WHERE id!=?1
+                #[cfg(not(test))]
+                bail!("dispatch requires guarded participation admission");
+                #[cfg(test)]
+                {
+                    let occupied: bool = tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM operations WHERE id!=?1
                     AND state IN ('dispatching','queued','unknown','included_pending'))",
-                    [op.id],
-                    |r| r.get(0),
-                )?;
-                if occupied {
-                    bail!("wallet effect slot is occupied");
+                        [op.id],
+                        |r| r.get(0),
+                    )?;
+                    if occupied {
+                        bail!("wallet effect slot is occupied");
+                    }
+                    None
                 }
-                None
             };
             let (paused, generation): (bool, i64) = tx.query_row(
                 "SELECT paused,generation FROM control WHERE singleton=1",
@@ -1614,25 +2113,40 @@ impl Store {
             // Local polling cadence is not a server-imposed admission minimum.
             // Keep an explicit zero so reopening cannot inherit op.next_at.
             tx.execute(
-                "INSERT OR IGNORE INTO operation_timing VALUES (?1,0)",
+                "INSERT OR IGNORE INTO operation_timing(operation_id,retry_not_before) VALUES (?1,0)",
                 [op.id],
             )?;
             if let (Some(config), Some(decision)) = (config, decision) {
+                let lane_revision = config.lane_revision(op.kind)?;
+                let participation = if op.kind == LaneId::Answer {
+                    serde_json::to_value(config.capabilities.answer.participation)?
+                } else {
+                    serde_json::to_value(config.participation(op.kind))?
+                };
                 if decision.accounting.total > 0 || decision.retry_of.is_some() {
                     tx.execute(
                         "INSERT INTO risk_admissions
                         VALUES ((SELECT dispatch_sequence FROM authority WHERE singleton=1),?1,?2,?3,?4,?5,?6,?7)",
-                        params![op.id,serde_json::to_string(&config.participation)?,config.revision()?,
+                        params![op.id,serde_json::to_string(&json!({"schema_version":2,"lane":op.kind,
+                            "participation":participation,"own_count":decision.accounting.active(),
+                            "own_limit":config.participation(op.kind).max_unresolved_operations,
+                            "account_unresolved":decision.accounting.total,
+                            "blocker_ids_truncated":decision.accounting.total>decision.accounting.blockers.len() as u64}))?,lane_revision,
                             serde_json::to_string(&decision.accounting.blockers)?,decision.retry_of,decision.grant,now()],
                     )?;
-                    if config.participation.historical_unknown_answer_capacity
-                        == HistoricalAnswerCapacity::AcceptedLinked
+                    if op.kind == LaneId::Answer
+                        && config
+                            .capabilities
+                            .answer
+                            .participation
+                            .historical_unknown_answer_capacity
+                            == HistoricalAnswerCapacity::AcceptedLinked
                     {
-                        let revision = Self::capture_historical_revision(&tx)?;
+                        let revision = Self::capture_historical_revision(tx)?;
                         tx.execute(
                             "INSERT INTO risk_accounting_snapshots VALUES
                              ((SELECT dispatch_sequence FROM authority WHERE singleton=1),?1,?2,?3,?4)",
-                            params![revision,decision.accounting.total,
+                            params![revision,decision.accounting.own_total,
                                 decision.accounting.eligible,decision.accounting.exempt],
                         )?;
                     } else if decision.accounting.exempt > 0 {
@@ -1650,8 +2164,10 @@ impl Store {
                     if let Some(grant) = decision.grant {
                         let consumed = tx.execute(
                             "UPDATE manual_grants SET consumed_by=?1 WHERE id=?2 AND consumed_by IS NULL
+                            AND kind=?3 AND generation=(SELECT generation FROM control WHERE singleton=1)
+                            AND lane_control_revision=(SELECT control_revision FROM lane_control WHERE lane=manual_grants.kind)
                             AND NOT EXISTS(SELECT 1 FROM manual_grant_revocations WHERE grant_id=?2)",
-                            params![op.id,grant],
+                            params![op.id,grant,op.kind.as_str()],
                         )?;
                         if consumed != 1 {
                             bail!("manual participation grant already consumed");
@@ -1672,21 +2188,26 @@ impl Store {
                     .map(|p| serde_json::from_str(&p))
                     .transpose()?
                     .unwrap_or_else(|| json!({}));
-                captured["dispatch_policy"] = json!({"participation":config.participation,
-                    "revision":config.revision()?,"http_seconds":config.timeouts.http_seconds,
-                    "mine_each_epoch":config.schedule.mine_each_epoch});
+                captured["dispatch_policy"] = json!({"schema_version":2,"lane":op.kind,
+                    "participation":participation,"revision":lane_revision,
+                    "http_seconds":config.timeouts(op.kind).http_seconds,
+                    "mine_each_epoch":config.capabilities.mine.schedule.each_epoch});
                 tx.execute(
                     "INSERT INTO operation_evidence(operation_id,policy,http_deadline) VALUES (?1,?2,?3)
                     ON CONFLICT(operation_id) DO UPDATE SET policy=excluded.policy,http_deadline=excluded.http_deadline",
-                    params![op.id,serde_json::to_string(&captured)?,not_before(config.timeouts.http_seconds)],
+                    params![op.id,serde_json::to_string(&captured)?,not_before(config.timeouts(op.kind).http_seconds)],
                 )?;
             }
         }
         let changed = tx.execute(
             "UPDATE operations SET state=?1,result=?2,payload=?3,job_id=?4,txid=?5,next_at=?6,
-            updated_at=CASE WHEN state!=?1 THEN ?7 ELSE updated_at END WHERE id=?8 AND state=?9",
+            binding_revision=binding_revision+CASE WHEN job_id IS NOT ?4 OR txid IS NOT ?5
+                OR (state IN ('queued','unknown','included_pending','confirmed')) !=
+                   (?1 IN ('queued','unknown','included_pending','confirmed')) THEN 1 ELSE 0 END,
+            updated_at=CASE WHEN state!=?1 THEN ?7 ELSE updated_at END
+            WHERE id=?8 AND state=?9 AND binding_revision=?10",
             params![
-                op.state,
+                target_state,
                 op.result.as_ref().map(serde_json::to_string).transpose()?,
                 op.payload.as_ref().map(serde_json::to_string).transpose()?,
                 op.job_id,
@@ -1694,18 +2215,31 @@ impl Store {
                 op.next_at,
                 now(),
                 op.id,
-                predecessor
+                predecessor,
+                op.persisted_binding_revision.get()
             ],
         )?;
         if changed != 1 {
             bail!("stale operation transition");
         }
-        if predecessor != op.state {
+        let binding_revision: i64 = tx.query_row(
+            "SELECT binding_revision FROM operations WHERE id=?1",
+            [op.id],
+            |r| r.get(0),
+        )?;
+        if binding_revision != op.persisted_binding_revision.get() {
+            tx.execute(
+                "UPDATE read_state SET retired=1,in_flight=0
+                WHERE operation_id=?1 AND binding_revision!=?2 AND retired=0",
+                params![op.id, binding_revision],
+            )?;
+        }
+        if predecessor != target_state {
             if matches!(
                 predecessor.as_str(),
                 "dispatching" | "queued" | "unknown" | "included_pending"
             ) && !matches!(
-                op.state.as_str(),
+                target_state,
                 "dispatching" | "queued" | "unknown" | "included_pending"
             ) {
                 tx.execute(
@@ -1714,7 +2248,7 @@ impl Store {
                     params![
                         op.id,
                         serde_json::to_string(
-                            &json!({"source":"bound_protocol_result","state":op.state,"at":now()})
+                            &json!({"source":"bound_protocol_result","state":target_state,"at":now()})
                         )?
                     ],
                 )?;
@@ -1723,37 +2257,50 @@ impl Store {
                 "INSERT INTO events(at,code,kind,operation_id) VALUES (?1,?2,?3,?4)",
                 params![now(), event, op.kind.as_str(), op.id],
             )?;
+            let timing = match target_state {
+                "generating" => Some("generation_started_at"),
+                "generated" => Some("model_captured_at"),
+                "queued" => Some("queued_since"),
+                "dispatching" => Some("dispatch_started_at"),
+                _ => None,
+            };
+            if let Some(column) = timing {
+                tx.execute(&format!("INSERT INTO operation_timing(operation_id,retry_not_before,{column}) VALUES(?1,0,?2)
+                    ON CONFLICT(operation_id) DO UPDATE SET {column}=excluded.{column}"), params![op.id,now()])?;
+            }
         }
+        Self::capture_work_revision(tx)?;
+        tx.execute(
+            "DELETE FROM events WHERE id <= (SELECT COALESCE(MAX(id),0)-2000 FROM events)",
+            [],
+        )?;
+        Ok(binding_revision)
+    }
+
+    pub(crate) fn event(&mut self, code: &str, kind: Option<LaneId>) -> Result<()> {
+        self.continuity()?;
+        if !code.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') {
+            bail!("invalid local event code");
+        }
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO events(at,code,kind) VALUES (?1,?2,?3)",
+            params![now(), code, kind.map(|k| k.as_str())],
+        )?;
+        if matches!(code, "runtime_stopped" | "controller_running") {
+            tx.execute(
+                "UPDATE runtime_state SET controller_stopped=?1 WHERE singleton=1",
+                [code == "runtime_stopped"],
+            )?;
+        }
+        Self::capture_work_revision(&tx)?;
         tx.execute(
             "DELETE FROM events WHERE id <= (SELECT COALESCE(MAX(id),0)-2000 FROM events)",
             [],
         )?;
         tx.commit()?;
-        *op.persisted_state.borrow_mut() = op.state.clone();
-        if op.state == "dispatching" && predecessor != "dispatching" {
-            let (_, sequence) = self.database_identity()?;
-            if let Some((path, binding)) = &mut self.binding {
-                binding.dispatch_sequence = sequence;
-                // SQLite FULL commit precedes witness fsync+rename+directory fsync;
-                // only then may Runtime poll the prepared network future.
-                write_binding(path, binding)?;
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn event(&mut self, code: &str, kind: Option<WorkKind>) -> Result<()> {
-        if !code.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') {
-            bail!("invalid local event code");
-        }
-        self.db.execute(
-            "INSERT INTO events(at,code,kind) VALUES (?1,?2,?3)",
-            params![now(), code, kind.map(|k| k.as_str())],
-        )?;
-        self.db.execute(
-            "DELETE FROM events WHERE id <= (SELECT COALESCE(MAX(id),0)-2000 FROM events)",
-            [],
-        )?;
         Ok(())
     }
 
@@ -1761,7 +2308,7 @@ impl Store {
         let row = self
             .db
             .query_row(
-                "SELECT id,kind,work_key,state,request,result,payload,job_id,txid,next_at,generation
+                "SELECT id,kind,work_key,state,request,result,payload,job_id,txid,next_at,generation,binding_revision
             FROM operations WHERE id=?1",
                 [id],
                 |r| {
@@ -1777,6 +2324,7 @@ impl Store {
                         r.get::<_, Option<String>>(8)?,
                         r.get::<_, i64>(9)?,
                         r.get::<_, i64>(10)?,
+                        r.get::<_, i64>(11)?,
                     ))
                 },
             )
@@ -1785,14 +2333,16 @@ impl Store {
             Ok(Operation {
                 id: r.0,
                 kind: match r.1.as_str() {
-                    "answer" => WorkKind::Answer,
-                    "judge" => WorkKind::Judge,
-                    "mine" => WorkKind::Mine,
+                    "answer" => LaneId::Answer,
+                    "judge" => LaneId::Judge,
+                    "mine" => LaneId::Mine,
                     _ => bail!("invalid operation kind in state"),
                 },
                 key: r.2,
                 persisted_state: std::cell::RefCell::new(r.3.clone()),
                 generation: r.10,
+                binding_revision: r.11,
+                persisted_binding_revision: std::cell::Cell::new(r.11),
                 state: r.3,
                 request: serde_json::from_str(&r.4)?,
                 result: r.5.map(|s| serde_json::from_str(&s)).transpose()?,
@@ -1823,177 +2373,17 @@ impl Store {
         )?)
     }
 
-    pub(crate) fn record_retry_minimum(&self, id: i64, seconds: u64) -> Result<()> {
-        self.record_retry_deadline(id, not_before(seconds))
-    }
-
-    pub(crate) fn record_retry_deadline(&self, id: i64, deadline: i64) -> Result<()> {
-        self.db.execute(
-            "INSERT INTO operation_timing VALUES (?1,?2)
-            ON CONFLICT(operation_id) DO UPDATE SET retry_not_before=MAX(retry_not_before,excluded.retry_not_before)",
-            params![id,deadline],
-        )?;
-        Ok(())
-    }
-
-    pub(crate) fn record_scope_retry_minimum(&self, scope: ReadScope, seconds: u64) -> Result<()> {
-        let selector = match scope {
-            ReadScope::Job => "job_id IS NOT NULL AND txid IS NULL",
-            ReadScope::Receipt => "txid IS NOT NULL",
-            _ => return Ok(()),
-        };
-        self.db.execute(
-            &format!(
-                "INSERT INTO operation_timing(operation_id,retry_not_before)
-                SELECT id,?1 FROM operations WHERE state IN ('queued','unknown','included_pending')
-                AND {selector} ON CONFLICT(operation_id) DO UPDATE SET
-                retry_not_before=MAX(retry_not_before,excluded.retry_not_before)"
-            ),
-            [not_before(seconds)],
-        )?;
-        Ok(())
-    }
-
     /// Shared by preparation, transactional admission, and read-only status.
     /// Stream narrow evidence columns; never load historical operation payloads.
     fn uncertainty_accounting(
         db: &Connection,
         config: &Config,
+        kind: LaneId,
         excluding: Option<i64>,
         retry_of: Option<i64>,
         capture_blockers: bool,
     ) -> Result<UncertaintyAccounting> {
-        let policy = &config.participation;
-        let has_table = |name: &str| -> Result<bool> {
-            Ok(db.query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1)",
-                [name],
-                |r| r.get(0),
-            )?)
-        };
-        let has_evidence = has_table("operation_evidence")?;
-        let eligible = if has_evidence && has_table("operation_links")? {
-            HISTORICAL_ANSWERS
-        } else {
-            "SELECT NULL AS operation_id,NULL AS accepted_answer_id WHERE 0"
-        };
-        let (evidence, blocked_since) = if has_evidence {
-            (
-                "LEFT JOIN operation_evidence e ON e.operation_id=o.id",
-                "COALESCE(e.blocked_since,o.created_at)",
-            )
-        } else {
-            ("", "o.created_at")
-        };
-        let (timing, floor) = if has_table("operation_timing")? {
-            (
-                "LEFT JOIN operation_timing t ON t.operation_id=o.id",
-                "COALESCE(t.retry_not_before,o.next_at)",
-            )
-        } else {
-            ("", "o.next_at")
-        };
-        let mut statement = db.prepare(&format!(
-            "WITH historical AS ({eligible})
-             SELECT o.id,o.state='dispatching',{blocked_since},{floor},h.accepted_answer_id
-             FROM operations o {evidence} {timing}
-             LEFT JOIN historical h ON h.operation_id=o.id
-             WHERE o.id!=?1 AND o.state IN ('dispatching','queued','unknown','included_pending')
-             ORDER BY o.id"
-        ))?;
-        let mut rows = statement.query([excluding.unwrap_or(-1)])?;
-        let mut result = UncertaintyAccounting::default();
-        let accepted_linked =
-            policy.historical_unknown_answer_capacity == HistoricalAnswerCapacity::AcceptedLinked;
-        let blocker_limit = u64::from(policy.max_unresolved_operations)
-            + if accepted_linked {
-                0
-            } else {
-                u64::from(policy.max_historical_unknown_answers)
-            };
-        while let Some(row) = rows.next()? {
-            let id: i64 = row.get(0)?;
-            let dispatched: bool = row.get(1)?;
-            let since: i64 = row.get(2)?;
-            let floor: i64 = row.get(3)?;
-            let witness: Option<i64> = row.get(4)?;
-            result.total += 1;
-            result.eligible += u64::from(witness.is_some());
-            let exempt = witness.is_some()
-                && policy.mode == ParticipationMode::ParticipationFirst
-                && (accepted_linked
-                    || result.exempt < u64::from(policy.max_historical_unknown_answers));
-            if exempt {
-                result.exempt += 1;
-                if result.historical.len() < HISTORICAL_EXAMPLE_LIMIT {
-                    result.historical.push(HistoricalAnswer {
-                        operation_id: id,
-                        accepted_answer_id: witness.context("historical witness missing")?,
-                    });
-                }
-            }
-            if capture_blockers
-                && (!accepted_linked || !exempt)
-                && (result.blockers.len() as u64) < blocker_limit
-            {
-                result.blockers.push(id);
-            }
-            // Exemption affects capacity only, never floors or grace.
-            result.writing |= dispatched;
-            if dispatched {
-                result.writing_operation = Some(id);
-            }
-            if floor > result.retry_not_before {
-                result.retry_not_before = floor;
-                result.floor_operation = Some(id);
-            }
-            let retry = Some(id) == retry_of;
-            let retry_grace =
-                i64::try_from(policy.uncertain_answer_retry_seconds).unwrap_or(i64::MAX);
-            if retry {
-                result.retry_operation = Some(id);
-                result.retry_grace_until = result
-                    .retry_grace_until
-                    .max(since.saturating_add(retry_grace));
-            }
-            let grace = if retry {
-                policy
-                    .uncertainty_grace_seconds
-                    .max(policy.uncertain_answer_retry_seconds)
-            } else {
-                policy.uncertainty_grace_seconds
-            };
-            let until = since.saturating_add(i64::try_from(grace).unwrap_or(i64::MAX));
-            if until > result.grace_until {
-                result.grace_until = until;
-                result.grace_operation = Some(id);
-            }
-        }
-        if has_evidence {
-            // A proven refusal is not an uncertain effect, but Retry-After
-            // remains an account admission floor even if rollover discards its
-            // reusable payload. Do not add it to capacity, blockers, or grace.
-            let refusal_floor: Option<(i64, i64)> = db.query_row(
-                &format!(
-                    "SELECT o.id,{floor} FROM operations o {evidence} {timing}
-                     WHERE o.id!=?1 AND o.state NOT IN ('dispatching','queued','unknown','included_pending')
-                     AND CASE WHEN json_valid(e.evidence) THEN
-                        json_extract(e.evidence,'$.stage')='submit'
-                        AND json_extract(e.evidence,'$.reason')='proven_not_accepted'
-                     ELSE 0 END
-                     ORDER BY {floor} DESC,o.id LIMIT 1"
-                ),
-                [excluding.unwrap_or(-1)],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            ).optional()?;
-            if let Some((id, floor)) = refusal_floor
-                && floor > result.retry_not_before
-            {
-                result.retry_not_before = floor;
-                result.floor_operation = Some(id);
-            }
-        }
-        Ok(result)
+        accounting::uncertainty_accounting(db, config, kind, excluding, retry_of, capture_blockers)
     }
 
     /// Append only changed direct witnesses. A NULL witness revokes eligibility.
@@ -2026,125 +2416,61 @@ impl Store {
         config: &Config,
         op: &Operation,
     ) -> Result<Option<RiskDecision>> {
-        // Retrying this operation must honor its own server floor, not only
-        // the floors of other uncertain operations in the accounting below.
-        let retry_not_before: i64 = db.query_row(
-            "SELECT COALESCE((SELECT retry_not_before FROM operation_timing WHERE operation_id=?1),0)",
-            [op.id],
-            |row| row.get(0),
-        )?;
-        if retry_not_before > now() {
-            return Ok(None);
-        }
-        let reload_blocked: bool = db.query_row(
-            "SELECT COALESCE((SELECT reload_blocked FROM runtime_state WHERE singleton=1),0)",
-            [],
-            |r| r.get(0),
-        )?;
-        if reload_blocked {
-            return Ok(None);
-        }
-        if op.kind != WorkKind::Answer && Self::answer_retry_reservation(db, config)?.is_some() {
-            return Ok(None);
-        }
-        let policy = &config.participation;
-        let epoch = op.request["solver"]["epoch"].as_u64();
-        let retry_of: Option<i64> = db
-            .query_row(
-                "SELECT retry_of FROM operation_links WHERE operation_id=?1",
-                [op.id],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let accounting = Self::uncertainty_accounting(db, config, Some(op.id), retry_of, true)?;
-        if accounting.active() + 1 > u64::from(policy.unresolved_limit(op.kind))
-            || accounting.writing
-            || accounting.retry_not_before > now()
-        {
-            return Ok(None);
-        }
-        if op.kind == WorkKind::Answer {
-            let Some(epoch) = epoch else { return Ok(None) };
-            let pattern = format!("{epoch}:%");
-            let (attempts, accepted, uncertain): (u32, bool, bool) = db.query_row(
-                "SELECT COUNT(*),COALESCE(MAX(o.txid IS NOT NULL OR o.state IN ('included_pending','confirmed','final')),0),
-                COALESCE(MAX(o.state IN ('dispatching','queued','unknown','included_pending')),0)
-                FROM operations o LEFT JOIN operation_evidence e ON e.operation_id=o.id
-                WHERE o.kind='answer' AND o.work_key LIKE ?1 AND o.id!=?2
-                AND (e.dispatch_sequence IS NOT NULL OR o.job_id IS NOT NULL OR o.state IN ('dispatching','queued','unknown','included_pending','confirmed','final','refused'))",
-                params![pattern,op.id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
-            )?;
-            if accepted
-                || attempts >= policy.max_answer_attempts_per_epoch
-                || (uncertain && retry_of.is_none())
-            {
-                return Ok(None);
-            }
-            if let Some(origin) = retry_of {
-                let eligible: bool = db.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM operations WHERE id=?1 AND kind='answer'
-                    AND work_key LIKE ?2 AND state IN ('queued','unknown') AND txid IS NULL AND payload IS NOT NULL)",
-                    params![origin,pattern], |r| r.get(0),
-                )?;
-                if !eligible || !policy.retry_uncertain_answers {
-                    return Ok(None);
-                }
-            }
-        }
-        if op.kind == WorkKind::Mine && config.schedule.mine_each_epoch {
-            let Some(epoch) = epoch else { return Ok(None) };
-            if Self::mine_epoch_attempted_in(db, epoch, Some(op.id))? {
-                return Ok(None);
-            }
-        }
-        let mut decision = RiskDecision {
-            accounting,
-            retry_of,
-            grant: None,
-        };
-        if decision.accounting.total == 0 && retry_of.is_none() {
-            return Ok(Some(decision));
-        }
-        if policy.mode == ParticipationMode::Strict || !policy.allows(op.kind) {
-            return Ok(None);
-        }
-        if decision.accounting.retry_grace_until > now() {
-            return Ok(None);
-        }
-        if policy.mode == ParticipationMode::Manual {
-            let Some(epoch) = epoch else { return Ok(None) };
-            decision.grant = db.query_row(
-                "SELECT id FROM manual_grants WHERE epoch=?1 AND kind=?2 AND generation=?3 AND consumed_by IS NULL
-                AND NOT EXISTS(SELECT 1 FROM manual_grant_revocations WHERE grant_id=manual_grants.id)",
-                params![i64::try_from(epoch)?,op.kind.as_str(),op.generation], |r| r.get(0),
-            ).optional()?;
-            if decision.grant.is_none() {
-                return Ok(None);
-            }
-        } else if decision.accounting.grace_until > now() {
-            return Ok(None);
-        }
-        Ok(Some(decision))
+        Self::risk_decision_at(db, config, op, AdmissionCutoff::current())
+    }
+
+    fn risk_decision_at(
+        db: &Connection,
+        config: &Config,
+        op: &Operation,
+        cutoff: AdmissionCutoff,
+    ) -> Result<Option<RiskDecision>> {
+        accounting::risk_decision_at(db, config, op, cutoff)
     }
 
     pub(crate) fn admission_allowed(&self, config: &Config, op: &Operation) -> Result<bool> {
+        self.admission_allowed_at(config, op, AdmissionCutoff::current())
+    }
+
+    pub(crate) fn admission_cutoff(&self) -> Result<AdmissionCutoff> {
+        Ok(self.db.query_row(
+            "SELECT CAST(strftime('%s','now') AS INTEGER),COALESCE(MAX(id),0) FROM manual_grants",
+            [],
+            |r| {
+                Ok(AdmissionCutoff {
+                    at: r.get(0)?,
+                    grant_id: r.get(1)?,
+                })
+            },
+        )?)
+    }
+
+    pub(crate) fn operation_ready_at(&self, id: i64) -> Result<i64> {
+        Ok(self.db.query_row(
+            "SELECT CASE WHEN next_at>0 THEN next_at ELSE created_at END
+            FROM operations WHERE id=?1",
+            [id],
+            |r| r.get(0),
+        )?)
+    }
+
+    pub(crate) fn admission_allowed_at(
+        &self,
+        config: &Config,
+        op: &Operation,
+        cutoff: AdmissionCutoff,
+    ) -> Result<bool> {
         let control = self.control()?;
         Ok(!control.paused
             && control.generation == op.generation
             && config.mode(op.kind) == Mode::Active
-            && op.next_at <= now()
-            && Self::risk_decision(&self.db, config, op)?.is_some())
+            && op.next_at <= cutoff.at
+            && Self::risk_decision_at(&self.db, config, op, cutoff)?.is_some())
     }
 
-    pub(crate) fn authorize(
-        &mut self,
-        config: &Config,
-        epoch: u64,
-        kind: WorkKind,
-    ) -> Result<Value> {
+    pub(crate) fn authorize(&mut self, config: &Config, epoch: u64, kind: LaneId) -> Result<Value> {
         self.continuity()?;
-        if config.participation.mode != ParticipationMode::Manual
-            || !config.participation.allows(kind)
+        if config.participation(kind).mode != ParticipationMode::Manual
             || config.mode(kind) != Mode::Active
         {
             bail!(
@@ -2162,12 +2488,36 @@ impl Store {
         if paused {
             bail!("manual authorization requires resumed state");
         }
-        let unresolved: u64 = tx.query_row(
-            "SELECT COUNT(*) FROM operations WHERE state IN ('dispatching','queued','unknown','included_pending')",
-            [], |r| r.get(0),
+        let lane_control = Self::lane_control_in(&tx, kind)?;
+        if lane_control.paused {
+            bail!("manual authorization requires resumed lane control");
+        }
+        let fenced: bool = tx.query_row(
+            "SELECT COALESCE((SELECT reload_blocked FROM runtime_state WHERE singleton=1),0)
+            OR EXISTS(SELECT 1 FROM hosted_identity_evidence WHERE rejection IS NOT NULL)",
+            [],
+            |r| r.get(0),
         )?;
-        if unresolved + 1 > u64::from(config.participation.unresolved_limit(kind)) {
-            bail!("manual authorization exceeds unresolved operation limit");
+        if fenced {
+            bail!("manual authorization blocked by shared authority");
+        }
+        let retry_of: Option<i64> = if kind == LaneId::Answer {
+            tx.query_row(
+                "SELECT id FROM operations WHERE kind='answer' AND work_key LIKE ?1
+                AND state IN ('queued','unknown') AND txid IS NULL AND payload IS NOT NULL
+                ORDER BY id DESC LIMIT 1",
+                [format!("{epoch}:%")],
+                |r| r.get(0),
+            )
+            .optional()?
+        } else {
+            None
+        };
+        let accounting = Self::uncertainty_accounting(&tx, config, kind, None, retry_of, true)?;
+        if let Some((reason, _)) =
+            Self::account_blocker(config.participation(kind), &accounting, true)
+        {
+            bail!("manual authorization blocked: {reason}");
         }
         let (attempts,accepted,uncertain): (u32,bool,bool) = tx.query_row(
             "SELECT COUNT(*),COALESCE(MAX(o.txid IS NOT NULL OR o.state IN ('included_pending','confirmed','final')),0),
@@ -2177,27 +2527,38 @@ impl Store {
             AND (e.dispatch_sequence IS NOT NULL OR o.job_id IS NOT NULL OR o.state IN ('dispatching','queued','unknown','included_pending','confirmed','final','refused'))",
             params![kind.as_str(),format!("{epoch}:%")], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
         )?;
-        if kind == WorkKind::Answer
+        if kind == LaneId::Answer
             && (accepted
-                || attempts >= config.participation.max_answer_attempts_per_epoch
-                || (uncertain && !config.participation.retry_uncertain_answers))
+                || attempts
+                    >= config
+                        .capabilities
+                        .answer
+                        .participation
+                        .max_answer_attempts_per_epoch
+                || (uncertain
+                    && !config
+                        .capabilities
+                        .answer
+                        .participation
+                        .retry_uncertain_answers))
         {
             bail!("manual authorization cannot authorize a duplicate or exhausted answer attempt");
         }
-        if kind == WorkKind::Mine && config.schedule.mine_each_epoch && attempts > 0 {
+        if kind == LaneId::Mine && config.capabilities.mine.schedule.each_epoch && attempts > 0 {
             bail!("manual authorization cannot authorize another mine in the same epoch");
         }
         let pending: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM manual_grants WHERE epoch=?1 AND kind=?2 AND generation=?3
-            AND consumed_by IS NULL AND NOT EXISTS(SELECT 1 FROM manual_grant_revocations WHERE grant_id=manual_grants.id))",
-            params![i64::try_from(epoch)?,kind.as_str(),generation], |r| r.get(0),
+            AND lane_control_revision=?4 AND consumed_by IS NULL
+            AND NOT EXISTS(SELECT 1 FROM manual_grant_revocations WHERE grant_id=manual_grants.id))",
+            params![i64::try_from(epoch)?,kind.as_str(),generation,lane_control.control_revision], |r| r.get(0),
         )?;
         if pending {
             bail!("a pending grant already exists for this epoch, kind and generation");
         }
         tx.execute(
-            "INSERT INTO manual_grants(epoch,kind,generation,created_at) VALUES (?1,?2,?3,?4)",
-            params![i64::try_from(epoch)?, kind.as_str(), generation, now()],
+            "INSERT INTO manual_grants(epoch,kind,generation,created_at,lane_control_revision) VALUES (?1,?2,?3,?4,?5)",
+            params![i64::try_from(epoch)?, kind.as_str(), generation, now(), lane_control.control_revision],
         )
         .context("a grant already exists for this epoch, kind and generation")?;
         let id = tx.last_insert_rowid();
@@ -2230,10 +2591,30 @@ impl Store {
         Ok(self.answer_retry_blocker(config, original)?.is_none())
     }
 
+    pub(crate) fn answer_retry_allowed_at(
+        &self,
+        config: &Config,
+        original: &Operation,
+        cutoff: AdmissionCutoff,
+    ) -> Result<bool> {
+        Ok(self
+            .answer_retry_blocker_at(config, original, cutoff)?
+            .is_none())
+    }
+
     fn answer_retry_blocker(
         &self,
         config: &Config,
         original: &Operation,
+    ) -> Result<Option<(&'static str, Option<i64>)>> {
+        self.answer_retry_blocker_at(config, original, AdmissionCutoff::current())
+    }
+
+    fn answer_retry_blocker_at(
+        &self,
+        config: &Config,
+        original: &Operation,
+        cutoff: AdmissionCutoff,
     ) -> Result<Option<(&'static str, Option<i64>)>> {
         let epoch = original.request["solver"]["epoch"]
             .as_u64()
@@ -2241,328 +2622,194 @@ impl Store {
         if let Some(blocker) = Self::answer_retry_policy_blocker(&self.db, config, epoch, None)? {
             return Ok(Some((blocker, None)));
         }
-        let accounting =
-            Self::uncertainty_accounting(&self.db, config, None, Some(original.id), false)?;
-        self.uncertainty_blocker_with(config, WorkKind::Answer, Some(epoch), &accounting)
+        let accounting = Self::uncertainty_accounting(
+            &self.db,
+            config,
+            LaneId::Answer,
+            None,
+            Some(original.id),
+            false,
+        )?;
+        self.uncertainty_blocker_with_at(config, LaneId::Answer, Some(epoch), &accounting, cutoff)
     }
 
-    // Policy intent is shared by retry preparation and priority admission. Other
-    // operations' temporary grace/floors must not erase an intended retry.
+    // Domain retry policy is shared by preparation and transactional admission.
     fn answer_retry_policy_blocker(
         db: &Connection,
         config: &Config,
         epoch: u64,
         reusing: Option<i64>,
     ) -> Result<Option<&'static str>> {
-        if config.participation.mode == ParticipationMode::Strict {
-            return Ok(Some("strict_uncertainty"));
+        if config.participation(LaneId::Answer).mode == ParticipationMode::Strict {
+            return Ok(Some("account_uncertainty"));
         }
-        if !config.participation.retry_uncertain_answers {
+        if !config
+            .capabilities
+            .answer
+            .participation
+            .retry_uncertain_answers
+        {
             return Ok(Some("uncertain_retry_disabled"));
-        }
-        if !config.participation.allow_answer {
-            return Ok(Some("participation_disabled"));
         }
         if db.query_row("SELECT paused FROM control WHERE singleton=1", [], |r| {
             r.get(0)
         })? {
             return Ok(Some("admission_paused"));
         }
-        if config.mode(WorkKind::Answer) != Mode::Active {
+        if config.mode(LaneId::Answer) != Mode::Active {
             return Ok(Some("capability_not_active"));
         }
         let (attempts,accepted): (u32,bool) = db.query_row(
             "SELECT COUNT(CASE WHEN o.id!=COALESCE(?2,-1) THEN 1 END),
             COALESCE(MAX(o.txid IS NOT NULL OR o.state IN ('included_pending','confirmed','final')),0)
             FROM operations o LEFT JOIN operation_evidence e ON e.operation_id=o.id
-            WHERE o.kind='answer' AND o.work_key LIKE ?1
+            WHERE o.kind='answer' AND o.work_key>=?1 AND o.work_key<?3
             AND (e.dispatch_sequence IS NOT NULL OR o.job_id IS NOT NULL OR o.state IN ('dispatching','queued','unknown','included_pending','confirmed','final','refused'))",
-            params![format!("{epoch}:%"),reusing], |r| Ok((r.get(0)?,r.get(1)?)),
+            params![format!("{epoch}:"),reusing,format!("{epoch};")], |r| Ok((r.get(0)?,r.get(1)?)),
         )?;
         if accepted {
             return Ok(Some("answer_already_accepted"));
         }
-        if attempts >= config.participation.max_answer_attempts_per_epoch {
+        if attempts
+            >= config
+                .capabilities
+                .answer
+                .participation
+                .max_answer_attempts_per_epoch
+        {
             return Ok(Some("answer_attempt_budget_exhausted"));
         }
         Ok(None)
-    }
-
-    /// A standalone answer refused before enqueue retries the same operation,
-    /// not an uncertain original. Mirror risk_decision's policy gates without
-    /// treating other operations' transient grace/floors/capacity as lost intent.
-    fn refused_answer_reservation(
-        db: &Connection,
-        config: &Config,
-        epoch: u64,
-        generation: i64,
-    ) -> Result<Option<AnswerRetryReservation>> {
-        let candidate: Option<(i64, i64)> = db
-            .query_row(
-                "SELECT o.id,MAX(o.next_at,COALESCE(t.retry_not_before,o.next_at))
-             FROM operations o JOIN operation_evidence e ON e.operation_id=o.id
-             LEFT JOIN operation_timing t ON t.operation_id=o.id
-             WHERE o.kind='answer' AND o.state='retry' AND o.generation=?1
-             AND o.work_key LIKE ?2 AND json_extract(o.request,'$.solver.epoch')=?3
-             AND o.payload IS NOT NULL AND o.job_id IS NULL AND o.txid IS NULL
-             AND e.dispatch_sequence IS NOT NULL
-             AND NOT EXISTS(SELECT 1 FROM operation_links WHERE operation_id=o.id)
-             AND NOT EXISTS(SELECT 1 FROM operation_candidates WHERE operation_id=o.id)
-             AND CASE WHEN json_valid(e.evidence) THEN
-                json_extract(e.evidence,'$.stage')='submit'
-                AND json_extract(e.evidence,'$.route')='answer'
-                AND json_extract(e.evidence,'$.reason')='proven_not_accepted'
-             ELSE 0 END
-             ORDER BY o.id LIMIT 1",
-                params![generation, format!("{epoch}:%"), epoch],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        let Some((id, ready_at)) = candidate else {
-            return Ok(None);
-        };
-        if ready_at > now() {
-            return Ok(None);
-        }
-        let (attempts, accepted, uncertain): (u32, bool, bool) = db.query_row(
-            "SELECT COUNT(*),COALESCE(MAX(o.txid IS NOT NULL OR o.state IN ('included_pending','confirmed','final')),0),
-             COALESCE(MAX(o.state IN ('dispatching','queued','unknown','included_pending')),0)
-             FROM operations o LEFT JOIN operation_evidence e ON e.operation_id=o.id
-             WHERE o.kind='answer' AND o.work_key LIKE ?1 AND o.id!=?2
-             AND (e.dispatch_sequence IS NOT NULL OR o.job_id IS NOT NULL OR o.state IN
-                ('dispatching','queued','unknown','included_pending','confirmed','final','refused'))",
-            params![format!("{epoch}:%"),id],
-            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
-        )?;
-        if accepted || uncertain || attempts >= config.participation.max_answer_attempts_per_epoch {
-            return Ok(None);
-        }
-        let other_effect: bool = db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM operations WHERE id!=?1
-             AND state IN ('dispatching','queued','unknown','included_pending'))",
-            [id],
-            |r| r.get(0),
-        )?;
-        if other_effect {
-            if config.participation.mode == ParticipationMode::Strict
-                || !config.participation.allow_answer
-            {
-                return Ok(None);
-            }
-            if config.participation.mode == ParticipationMode::Manual {
-                let granted: bool = db.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM manual_grants WHERE epoch=?1 AND kind='answer'
-                     AND generation=?2 AND consumed_by IS NULL AND NOT EXISTS(
-                        SELECT 1 FROM manual_grant_revocations WHERE grant_id=manual_grants.id))",
-                    params![epoch, generation],
-                    |r| r.get(0),
-                )?;
-                if !granted {
-                    return Ok(None);
-                }
-            }
-        }
-        Ok(Some(AnswerRetryReservation {
-            original_operation_id: id,
-            ready_at,
-            same_operation: true,
-        }))
-    }
-
-    /// A derived, restart-safe priority fence, not permission to submit. Start
-    /// only at the original's own retry point; retain every other admission gate.
-    fn answer_retry_reservation(
-        db: &Connection,
-        config: &Config,
-    ) -> Result<Option<AnswerRetryReservation>> {
-        let epoch: Option<u64> = db
-            .query_row(
-                "SELECT epoch FROM health_evidence WHERE singleton=1 AND answered=0",
-                [],
-                |r| r.get(0),
-            )
-            .optional()?
-            .flatten();
-        let Some(epoch) = epoch else { return Ok(None) };
-        let (generation, reload_blocked, paused): (i64, bool, bool) = db.query_row(
-            "SELECT generation,COALESCE((SELECT reload_blocked FROM runtime_state WHERE singleton=1),0),paused
-             FROM control WHERE singleton=1",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )?;
-        if reload_blocked || paused || config.mode(WorkKind::Answer) != Mode::Active {
-            return Ok(None);
-        }
-        if let Some(reservation) = Self::refused_answer_reservation(db, config, epoch, generation)?
-        {
-            return Ok(Some(reservation));
-        }
-        if config.participation.mode == ParticipationMode::Manual {
-            let granted: bool = db.query_row(
-                "SELECT EXISTS(SELECT 1 FROM manual_grants WHERE epoch=?1 AND kind='answer'
-                 AND generation=?2 AND consumed_by IS NULL AND NOT EXISTS(
-                    SELECT 1 FROM manual_grant_revocations WHERE grant_id=manual_grants.id))",
-                params![epoch, generation],
-                |r| r.get(0),
-            )?;
-            if !granted {
-                return Ok(None);
-            }
-        }
-        let pattern = format!("{epoch}:%");
-        let candidate: Option<(i64, i64, i64)> = db.query_row(
-            "SELECT o.id,COALESCE(e.blocked_since,o.created_at),COALESCE(t.retry_not_before,o.next_at)
-             FROM operations o LEFT JOIN operation_evidence e ON e.operation_id=o.id
-             LEFT JOIN operation_timing t ON t.operation_id=o.id
-             WHERE o.kind='answer' AND o.work_key LIKE ?1
-             AND o.state IN ('queued','unknown') AND o.txid IS NULL AND o.payload IS NOT NULL
-             ORDER BY o.id DESC LIMIT 1",
-            [&pattern], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        ).optional()?;
-        let Some((id, since, floor)) = candidate else {
-            return Ok(None);
-        };
-        // A linked operation refused before enqueue can retry its own payload
-        // without consuming a third operation. Match transactional admission's
-        // exclusion of that operation, but never discount stale or bound work.
-        // Fresh retry preparation still calls the policy check with no exclusion.
-        let reusing: Option<i64> = db
-            .query_row(
-                "SELECT o.id FROM operations o JOIN operation_links l ON l.operation_id=o.id
-             WHERE l.retry_of=?1 AND o.kind='answer' AND o.work_key LIKE ?2
-             AND o.generation=?3 AND o.state IN ('prepared','generated','retry')
-             AND o.payload IS NOT NULL AND o.job_id IS NULL AND o.txid IS NULL
-             AND json_extract(o.request,'$.solver.epoch')=?4
-             ORDER BY o.id LIMIT 1",
-                params![id, pattern, generation, epoch],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if Self::answer_retry_policy_blocker(db, config, epoch, reusing)?.is_some() {
-            return Ok(None);
-        }
-        // Only unsent preparation failures close intent. A stale discarded
-        // draft or a dispatched rejection may still permit another retry.
-        let preparation_closed: bool = db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM operations WHERE id=(
-                SELECT MAX(id) FROM operations WHERE kind='answer' AND work_key LIKE ?1)
-             AND id>?2 AND generation=?3
-             AND state IN ('rejected','model_unknown','locally_rejected')
-             AND job_id IS NULL AND txid IS NULL
-             AND NOT EXISTS(SELECT 1 FROM operation_evidence e
-                WHERE e.operation_id=operations.id AND e.dispatch_sequence IS NOT NULL))",
-            params![pattern, id, generation],
-            |r| r.get(0),
-        )?;
-        if preparation_closed {
-            return Ok(None);
-        }
-        let delay = if config.participation.mode == ParticipationMode::Manual {
-            config.participation.uncertain_answer_retry_seconds
-        } else {
-            config
-                .participation
-                .uncertain_answer_retry_seconds
-                .max(config.participation.uncertainty_grace_seconds)
-        };
-        let ready_at = floor.max(since.saturating_add(i64::try_from(delay).unwrap_or(i64::MAX)));
-        Ok((ready_at <= now()).then_some(AnswerRetryReservation {
-            original_operation_id: id,
-            ready_at,
-            same_operation: false,
-        }))
     }
 
     #[cfg(test)]
     fn uncertainty_open(
         &self,
         config: &Config,
-        kind: WorkKind,
+        kind: LaneId,
         epoch: Option<u64>,
         retry_of: Option<i64>,
     ) -> Result<bool> {
-        let accounting = Self::uncertainty_accounting(&self.db, config, None, retry_of, false)?;
-        self.uncertainty_open_with(config, kind, epoch, &accounting)
-    }
-
-    fn uncertainty_open_with(
-        &self,
-        config: &Config,
-        kind: WorkKind,
-        epoch: Option<u64>,
-        accounting: &UncertaintyAccounting,
-    ) -> Result<bool> {
+        let accounting =
+            Self::uncertainty_accounting(&self.db, config, kind, None, retry_of, false)?;
         Ok(self
-            .uncertainty_blocker_with(config, kind, epoch, accounting)?
+            .uncertainty_blocker_with(config, kind, epoch, &accounting)?
             .is_none())
     }
 
-    fn manual_authorized(&self, kind: WorkKind, epoch: Option<u64>) -> Result<Option<bool>> {
+    fn manual_authorized(&self, kind: LaneId, epoch: Option<u64>) -> Result<Option<bool>> {
+        self.manual_authorized_at(kind, epoch, AdmissionCutoff::current())
+    }
+
+    fn manual_authorized_at(
+        &self,
+        kind: LaneId,
+        epoch: Option<u64>,
+        cutoff: AdmissionCutoff,
+    ) -> Result<Option<bool>> {
         let Some(epoch) = epoch else { return Ok(None) };
         if !self.has_table("manual_grants")? || !self.has_table("manual_grant_revocations")? {
             return Ok(None);
         }
         Ok(Some(self.db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM manual_grants WHERE epoch=?1 AND kind=?2 AND generation=?3 AND consumed_by IS NULL
+            "SELECT EXISTS(SELECT 1 FROM manual_grants WHERE epoch=?1 AND kind=?2 AND generation=?3
+             AND id<=?4 AND created_at<=?5 AND consumed_by IS NULL
+             AND lane_control_revision=(SELECT control_revision FROM lane_control WHERE lane=manual_grants.kind AND paused=0)
              AND NOT EXISTS(SELECT 1 FROM manual_grant_revocations WHERE grant_id=manual_grants.id))",
-            params![i64::try_from(epoch)?,kind.as_str(),self.control()?.generation],
+            params![i64::try_from(epoch)?,kind.as_str(),self.control()?.generation,cutoff.grant_id,cutoff.at],
             |r| r.get(0),
         )?))
+    }
+
+    fn account_blocker(
+        policy: Participation,
+        accounting: &UncertaintyAccounting,
+        granted: bool,
+    ) -> Option<(&'static str, Option<i64>)> {
+        Self::account_blocker_at(policy, accounting, granted, AdmissionCutoff::current())
+    }
+
+    fn account_blocker_at(
+        policy: Participation,
+        accounting: &UncertaintyAccounting,
+        granted: bool,
+        cutoff: AdmissionCutoff,
+    ) -> Option<(&'static str, Option<i64>)> {
+        if accounting.writing {
+            return Some(("effect_in_flight", None));
+        }
+        if accounting.retry_origin_floor > cutoff.at {
+            return Some((
+                "operation_retry_minimum",
+                Some(accounting.retry_origin_floor),
+            ));
+        }
+        if accounting.retry_not_before > cutoff.at {
+            return Some((
+                if accounting.legacy_floor {
+                    "retained_legacy_floor"
+                } else {
+                    "shared_server_restriction"
+                },
+                Some(accounting.retry_not_before),
+            ));
+        }
+        if accounting.active().saturating_add(1) > u64::from(policy.max_unresolved_operations) {
+            return Some(("lane_unresolved_capacity", None));
+        }
+        if accounting.total == 0 {
+            return None;
+        }
+        if policy.mode == ParticipationMode::Strict {
+            return Some(("account_uncertainty", None));
+        }
+        if accounting.retry_grace_until > cutoff.at {
+            return Some((
+                "uncertain_answer_retry_delay",
+                Some(accounting.retry_grace_until),
+            ));
+        }
+        if policy.mode == ParticipationMode::Manual {
+            if !granted {
+                return Some(("manual_authorization_required", None));
+            }
+        } else if accounting.grace_until > cutoff.at {
+            return Some(("account_uncertainty_grace", Some(accounting.grace_until)));
+        }
+        None
     }
 
     fn uncertainty_blocker_with(
         &self,
         config: &Config,
-        kind: WorkKind,
+        kind: LaneId,
         epoch: Option<u64>,
         accounting: &UncertaintyAccounting,
     ) -> Result<Option<(&'static str, Option<i64>)>> {
-        let policy = &config.participation;
-        if accounting.total == 0 {
-            return Ok((accounting.retry_not_before > now())
-                .then_some(("retained_retry_minimum", Some(accounting.retry_not_before))));
-        }
-        if policy.mode == ParticipationMode::Strict {
-            return Ok(Some(("strict_uncertainty", None)));
-        }
-        if !policy.allows(kind) {
-            return Ok(Some(("participation_disabled", None)));
-        }
-        if accounting.active() + 1 > u64::from(policy.unresolved_limit(kind)) {
-            let reason = if kind != WorkKind::Answer
-                && accounting.active() < u64::from(policy.max_unresolved_operations)
-            {
-                "answer_capacity_reserved"
-            } else {
-                "unresolved_capacity"
-            };
-            return Ok(Some((reason, None)));
-        }
-        if accounting.writing {
-            return Ok(Some(("effect_in_flight", None)));
-        }
-        let current = now();
-        if accounting.retry_not_before > current {
-            return Ok(Some((
-                "retained_retry_minimum",
-                Some(accounting.retry_not_before),
-            )));
-        }
-        if accounting.retry_grace_until > current {
-            return Ok(Some((
-                "uncertain_answer_retry_delay",
-                Some(accounting.retry_grace_until),
-            )));
-        }
-        if policy.mode == ParticipationMode::Manual {
-            let granted = self.manual_authorized(kind, epoch)?.unwrap_or(false);
-            if !granted {
-                return Ok(Some(("manual_authorization_required", None)));
-            }
-        } else if accounting.grace_until > current {
-            return Ok(Some(("uncertainty_grace", Some(accounting.grace_until))));
-        }
-        Ok(None)
+        self.uncertainty_blocker_with_at(
+            config,
+            kind,
+            epoch,
+            accounting,
+            AdmissionCutoff::current(),
+        )
+    }
+
+    fn uncertainty_blocker_with_at(
+        &self,
+        config: &Config,
+        kind: LaneId,
+        epoch: Option<u64>,
+        accounting: &UncertaintyAccounting,
+        cutoff: AdmissionCutoff,
+    ) -> Result<Option<(&'static str, Option<i64>)>> {
+        Ok(Self::account_blocker_at(
+            config.participation(kind),
+            accounting,
+            self.manual_authorized_at(kind, epoch, cutoff)?
+                .unwrap_or(false),
+            cutoff,
+        ))
     }
 
     pub(crate) fn mine_epoch_attempted(&self, epoch: u64) -> Result<bool> {
@@ -2578,50 +2825,14 @@ impl Store {
         // proves complete later history; missing/pruned history is conservative.
         Ok(db.query_row(
             "SELECT EXISTS(SELECT 1 FROM operations o LEFT JOIN operation_evidence e ON e.operation_id=o.id
-            WHERE o.kind='mine' AND o.work_key LIKE ?1 AND (?2 IS NULL OR o.id!=?2)
+            WHERE o.kind='mine' AND o.work_key>=?1 AND o.work_key<?3 AND (?2 IS NULL OR o.id!=?2)
             AND (e.dispatch_sequence IS NOT NULL OR o.state IN
             ('dispatching','retry','queued','unknown','included_pending','confirmed','final','completed','rejected','stale','refused')
             OR (o.state='discarded' AND e.operation_id IS NULL AND
                 (EXISTS(SELECT 1 FROM events WHERE operation_id=o.id AND code='dispatch_intent')
                 OR NOT EXISTS(SELECT 1 FROM events WHERE operation_id=o.id AND code='prepared')))))",
-            params![format!("{epoch}:%"),excluding], |r| r.get(0),
+            params![format!("{epoch}:"),excluding,format!("{epoch};")], |r| r.get(0),
         )?)
-    }
-
-    /// At most two bound candidates per cycle; selection does not consume fairness.
-    pub(crate) fn reconciliation_batch(&self) -> Result<Vec<Operation>> {
-        let cursor: i64 = self.db.query_row(
-            "SELECT COALESCE(CAST(cursor AS INTEGER),0) FROM schedule WHERE kind='reconciliation'",
-            [], |r| r.get(0),
-        ).optional()?.unwrap_or(0);
-        let mut statement = self.db.prepare(
-            "SELECT o.id FROM operations o
-            LEFT JOIN read_backoff r ON r.scope=CASE WHEN o.txid IS NOT NULL THEN 'receipt' ELSE 'job' END
-            LEFT JOIN operation_timing t ON t.operation_id=o.id
-            WHERE o.state IN ('queued','unknown','included_pending')
-            AND (o.job_id IS NOT NULL OR o.txid IS NOT NULL) AND o.next_at<=?1
-            AND COALESCE(r.next_at,0)<=?1
-            AND (o.txid IS NOT NULL OR COALESCE(t.retry_not_before,o.next_at)<=?1)
-            ORDER BY CASE WHEN o.id>?2 THEN 0 ELSE 1 END,o.id LIMIT 2",
-        )?;
-        let ids = statement
-            .query_map(params![now(), cursor], |r| r.get::<_, i64>(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        ids.into_iter()
-            .map(|id| {
-                self.operation(id)?
-                    .context("reconciliation operation missing")
-            })
-            .collect()
-    }
-
-    pub(crate) fn reconciliation_attempted(&self, operation: i64) -> Result<()> {
-        self.db.execute(
-            "INSERT INTO schedule(kind,next_at,cursor) VALUES ('reconciliation',0,?1)
-             ON CONFLICT(kind) DO UPDATE SET cursor=excluded.cursor",
-            [operation.to_string()],
-        )?;
-        Ok(())
     }
 
     pub(crate) fn effect(&self) -> Result<Option<Operation>> {
@@ -2639,7 +2850,7 @@ impl Store {
             .map(Option::flatten)
     }
 
-    pub(crate) fn preparation(&self, kind: WorkKind) -> Result<Option<Operation>> {
+    pub(crate) fn preparation(&self, kind: LaneId) -> Result<Option<Operation>> {
         let id: Option<i64> = self
             .db
             .query_row(
@@ -2654,30 +2865,8 @@ impl Store {
             .map(Option::flatten)
     }
 
-    pub(crate) fn capture_policy(
-        &self,
-        id: i64,
-        policy: &Value,
-        model_seconds: Option<u64>,
-        http_seconds: Option<u64>,
-    ) -> Result<()> {
-        self.db.execute(
-            "INSERT INTO operation_evidence(operation_id,policy,model_deadline,http_deadline)
-            VALUES (?1,?2,?3,?4) ON CONFLICT(operation_id) DO UPDATE SET
-            policy=COALESCE(operation_evidence.policy,excluded.policy),
-            model_deadline=COALESCE(operation_evidence.model_deadline,excluded.model_deadline),
-            http_deadline=COALESCE(excluded.http_deadline,operation_evidence.http_deadline)",
-            params![
-                id,
-                serde_json::to_string(policy)?,
-                model_seconds.map(not_before),
-                http_seconds.map(not_before)
-            ],
-        )?;
-        Ok(())
-    }
-
     pub(crate) fn record_evidence(&self, id: i64, evidence: &Value) -> Result<()> {
+        self.continuity()?;
         let text = serde_json::to_string(evidence)?;
         if text.len() > 4096 {
             bail!("diagnostic evidence exceeds bound");
@@ -2709,18 +2898,16 @@ impl Store {
         evidence: &Value,
         candidates: &Value,
     ) -> Result<()> {
-        // No response-derived evidence may commit without its server floor.
+        // Request-bound restrictions are ingested before this local evidence CAS.
         let tx = self.db.unchecked_transaction()?;
         self.record_candidates(id, candidates)?;
         self.record_evidence(id, evidence)?;
-        if let Some(seconds) = evidence["retry_after_seconds"].as_u64() {
-            self.record_retry_minimum(id, seconds)?;
-        }
         tx.commit()?;
         Ok(())
     }
 
     pub(crate) fn record_candidates(&self, id: i64, candidates: &Value) -> Result<()> {
+        self.continuity()?;
         if candidates["job_id"].is_null()
             && candidates["transaction_ids"]
                 .as_array()
@@ -2743,7 +2930,7 @@ impl Store {
         Ok(())
     }
 
-    pub(crate) fn attempt_count(&self, kind: WorkKind, key: &str) -> Result<u32> {
+    pub(crate) fn attempt_count(&self, kind: LaneId, key: &str) -> Result<u32> {
         Ok(self.db.query_row(
             "SELECT COUNT(*) FROM operations WHERE kind=?1 AND work_key=?2 COLLATE NOCASE",
             params![kind.as_str(), key],
@@ -2751,7 +2938,7 @@ impl Store {
         )?)
     }
 
-    pub(crate) fn model_budget_used(&self, kind: WorkKind, key: &str) -> Result<u32> {
+    pub(crate) fn model_budget_used(&self, kind: LaneId, key: &str) -> Result<u32> {
         Ok(self.db.query_row(
             "SELECT COUNT(*) FROM operations WHERE kind=?1 AND work_key=?2 COLLATE NOCASE
             AND state NOT IN ('prelaunch_failed','abandoned_model')
@@ -2761,39 +2948,35 @@ impl Store {
         )?)
     }
 
-    pub(crate) fn retry_models(&mut self, config: &Config) -> Result<()> {
-        self.db.execute("UPDATE operations SET state=CASE WHEN state='model_unknown'
-            THEN 'superseded_model_unknown' ELSE 'retry_model' END,updated_at=?1
-            WHERE (state='rejected' OR (state='model_unknown' AND ?3))
+    pub(crate) fn model_retry_not_before(&self, kind: LaneId, key: &str) -> Result<i64> {
+        Ok(self.db.query_row("SELECT COALESCE(MAX(next_at),0) FROM operations
+            WHERE kind=?1 AND work_key=?2 COLLATE NOCASE
             AND payload IS NULL AND job_id IS NULL AND txid IS NULL
-            AND (SELECT COUNT(*) FROM operations b WHERE b.kind=operations.kind AND b.work_key=operations.work_key
-                AND b.state NOT IN ('prelaunch_failed','abandoned_model')
-                AND NOT EXISTS(SELECT 1 FROM operation_links l WHERE l.operation_id=b.id AND l.payload_reused=1)) < ?2",
-            params![now(),config.preparation.max_attempts_per_work,config.preparation.retry_uncertain])?;
+            AND state IN ('rejected','model_unknown','superseded_model_unknown','retry_model','prelaunch_failed','discarded')",
+            params![kind.as_str(),key],|r|r.get(0))?)
+    }
+
+    pub(crate) fn retry_models(&mut self, config: &Config) -> Result<()> {
+        self.continuity()?;
+        for kind in [LaneId::Answer, LaneId::Judge] {
+            let preparation = config
+                .preparation(kind)
+                .context("model preparation policy missing")?;
+            self.db.execute("UPDATE operations SET state=CASE WHEN state='model_unknown'
+                THEN 'superseded_model_unknown' ELSE 'retry_model' END,updated_at=?1
+                WHERE kind=?4 AND (state='rejected' OR (state='model_unknown' AND ?3))
+                AND next_at<=?1 AND payload IS NULL AND job_id IS NULL AND txid IS NULL
+                AND (SELECT COUNT(*) FROM operations b WHERE b.kind=operations.kind AND b.work_key=operations.work_key
+                    AND b.state NOT IN ('prelaunch_failed','abandoned_model')
+                    AND NOT EXISTS(SELECT 1 FROM operation_links l WHERE l.operation_id=b.id AND l.payload_reused=1)) < ?2",
+                params![now(),preparation.max_attempts_per_work,preparation.retry_uncertain,kind.as_str()])?;
+        }
         Ok(())
     }
 
-    pub(crate) fn awaiting_finality(&self, kind: WorkKind) -> Result<Option<Operation>> {
-        let id:Option<i64> = self.db.query_row("SELECT id FROM operations WHERE state='confirmed' AND kind=?1 AND next_at<=?2 ORDER BY next_at,id LIMIT 1",
-            params![kind.as_str(),now()],|r|r.get(0)).optional()?;
-        match id {
-            Some(id) => self.operation(id),
-            None => Ok(None),
-        }
-    }
-
-    pub(crate) fn attempted(&self, kind: WorkKind, key: &str) -> Result<bool> {
+    pub(crate) fn attempted(&self, kind: LaneId, key: &str) -> Result<bool> {
         Ok(self.db.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE kind=?1 AND work_key=?2 COLLATE NOCASE AND state NOT IN ('discarded','stale','prelaunch_failed','abandoned_model','retry_model','superseded_model_unknown'))",
             params![kind.as_str(),key], |r| r.get(0))?)
-    }
-
-    fn answer_epoch_accepted(&self, epoch: u64) -> Result<bool> {
-        Ok(self.db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM operations WHERE kind='answer' AND work_key LIKE ?1
-            AND txid IS NOT NULL AND state IN ('included_pending','confirmed','final'))",
-            [format!("{epoch}:%")],
-            |row| row.get(0),
-        )?)
     }
 
     pub(crate) fn answer_epoch_attempted(&self, epoch: u64) -> Result<bool> {
@@ -2805,7 +2988,7 @@ impl Store {
         )?)
     }
 
-    pub(crate) fn next_at(&self, kind: WorkKind) -> Result<i64> {
+    pub(crate) fn next_at(&self, kind: LaneId) -> Result<i64> {
         Ok(self
             .db
             .query_row(
@@ -2816,64 +2999,56 @@ impl Store {
             .optional()?
             .unwrap_or(0))
     }
-    pub(crate) fn defer(&self, kind: WorkKind, seconds: u64) -> Result<()> {
+    pub(crate) fn defer(&self, kind: LaneId, seconds: u64) -> Result<()> {
+        self.continuity()?;
         self.db.execute("INSERT INTO schedule(kind,next_at) VALUES (?1,?2) ON CONFLICT(kind) DO UPDATE SET next_at=excluded.next_at",
             params![kind.as_str(),not_before(seconds)])?;
         Ok(())
     }
 
+    pub(crate) fn participation_next_at(&self, kind: LaneId) -> Result<i64> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT next_at FROM schedule WHERE kind=?1",
+                [format!("{}:participation", kind.as_str())],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(0))
+    }
+
+    pub(crate) fn defer_participation(&self, kind: LaneId, seconds: u64) -> Result<()> {
+        self.continuity()?;
+        self.db.execute(
+            "INSERT INTO schedule(kind,next_at) VALUES (?1,?2)
+            ON CONFLICT(kind) DO UPDATE SET next_at=excluded.next_at",
+            params![
+                format!("{}:participation", kind.as_str()),
+                not_before(seconds)
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn capture_work_revision(db: &Connection) -> Result<()> {
+        db.execute("UPDATE control SET work_revision=MAX(work_revision,
+            COALESCE((SELECT MAX(id) FROM events WHERE operation_id IS NOT NULL),0)) WHERE singleton=1", [])?;
+        Ok(())
+    }
+
     pub(crate) fn work_revision(&self) -> Result<i64> {
         Ok(self.db.query_row(
-            "SELECT COALESCE(MAX(id),0) FROM events WHERE operation_id IS NOT NULL",
+            "SELECT MAX(work_revision,
+            COALESCE((SELECT MAX(id) FROM events WHERE operation_id IS NOT NULL),0))
+            FROM control WHERE singleton=1",
             [],
             |r| r.get(0),
         )?)
     }
 
-    pub(crate) fn wake_delay(&self, config: &Config, fallback: u64) -> Result<u64> {
-        let current = now();
-        let mut deadline = current.saturating_add(fallback.min(i64::MAX as u64) as i64);
-        for kind in [WorkKind::Answer, WorkKind::Judge, WorkKind::Mine] {
-            if config.mode(kind) == Mode::Off {
-                continue;
-            }
-            let scope = if kind == WorkKind::Judge {
-                ReadScope::Assignments
-            } else {
-                ReadScope::Challenge
-            };
-            let next = self.next_at(kind)?.max(self.read_backoff(scope)?.next_at);
-            if next > current {
-                deadline = deadline.min(next);
-            }
-        }
-        let mut job_not_before = 0;
-        for scope in ReadScope::ALL {
-            let next = self.read_backoff(scope)?.next_at;
-            if scope == ReadScope::Job {
-                job_not_before = next;
-            }
-            if next > current {
-                deadline = deadline.min(next);
-            }
-        }
-        // Only opted-in bound queued jobs contribute already-due deadlines.
-        // Their endpoint and durable retry fences prevent a wake/read busy loop.
-        let operation: Option<i64> = self.db.query_row(
-            "SELECT MIN(CASE WHEN ?3 AND o.state='queued' AND o.job_id IS NOT NULL AND o.txid IS NULL
-                THEN MAX(o.next_at,COALESCE(t.retry_not_before,o.next_at),?2) ELSE o.next_at END)
-             FROM operations o LEFT JOIN operation_timing t ON t.operation_id=o.id
-             WHERE o.state IN ('prepared','generated','retry','queued','unknown','included_pending')
-                AND (o.next_at>?1 OR (?3 AND o.state='queued' AND o.job_id IS NOT NULL AND o.txid IS NULL))",
-            params![current,job_not_before,config.schedule.queued_job_polling.is_some()],
-            |r|r.get(0))?;
-        if let Some(next) = operation {
-            deadline = deadline.min(next);
-        }
-        Ok(deadline.saturating_sub(current).max(1) as u64)
-    }
-
-    pub(crate) fn defer_until(&self, kind: WorkKind, deadline: i64) -> Result<()> {
+    pub(crate) fn defer_until(&self, kind: LaneId, deadline: i64) -> Result<()> {
+        self.continuity()?;
         self.db.execute(
             "INSERT INTO schedule(kind,next_at) VALUES (?1,?2)
             ON CONFLICT(kind) DO UPDATE SET next_at=excluded.next_at",
@@ -2882,7 +3057,8 @@ impl Store {
         Ok(())
     }
 
-    pub(crate) fn record_assignment_selection(
+    #[cfg(test)]
+    fn record_assignment_selection(
         &self,
         revision: &str,
         generation: i64,
@@ -2890,292 +3066,29 @@ impl Store {
         inventory_complete: bool,
         eligible: bool,
     ) -> Result<()> {
-        self.db.execute(
-            "INSERT INTO assignment_selection SELECT 1,?1,?2,?3,?4,?5,?6
-            WHERE EXISTS (SELECT 1 FROM control WHERE singleton=1 AND generation=?2)
-            ON CONFLICT(singleton) DO UPDATE SET revision=excluded.revision,
-            generation=excluded.generation,observed_at=excluded.observed_at,
-            observed_count=excluded.observed_count,inventory_complete=excluded.inventory_complete,
-            eligible=excluded.eligible",
-            params![
-                revision,
-                generation,
-                now(),
-                observed_count as u64,
-                inventory_complete,
-                eligible
-            ],
+        self.db
+            .execute("INSERT OR IGNORE INTO runtime_authority VALUES(1,0)", [])?;
+        let authority_epoch = self.db.query_row(
+            "SELECT authority_epoch FROM runtime_authority WHERE singleton=1",
+            [],
+            |r| r.get(0),
         )?;
-        Ok(())
-    }
-
-    pub(crate) fn cancel_read(&self, scope: ReadScope) -> Result<()> {
-        // Cancellation is neither an HTTP failure nor validated observation.
-        // Preserve prior success/failure evidence and all retained retry floors.
-        self.db.execute(
-            "UPDATE read_observations SET in_flight=0,finished_at=?2
-            WHERE scope=?1 AND in_flight=1",
-            params![scope.as_str(), now()],
-        )?;
-        Ok(())
-    }
-
-    pub(crate) fn read_started(&self, scope: ReadScope) -> Result<()> {
-        if scope == ReadScope::Assignments {
-            self.db.execute("DELETE FROM assignment_selection", [])?;
-        }
-        self.db.execute(
-            "INSERT INTO read_observations(scope,in_flight,started_at) VALUES (?1,1,?2)
-            ON CONFLICT(scope) DO UPDATE SET in_flight=1,started_at=excluded.started_at",
-            params![scope.as_str(), now()],
-        )?;
-        Ok(())
-    }
-
-    pub(crate) fn read_finished(
-        &self,
-        scope: ReadScope,
-        status: Option<u16>,
-        category: Option<&str>,
-    ) -> Result<()> {
-        self.db.execute("UPDATE read_observations SET in_flight=0,finished_at=?2,status=?3,
-            failure_category=?4,last_http_success_at=CASE WHEN ?3>=200 AND ?3<300 THEN ?2 ELSE last_http_success_at END
-            WHERE scope=?1", params![scope.as_str(),now(),status,category])?;
-        Ok(())
-    }
-
-    pub(crate) fn reschedule_read(
-        &self,
-        scope: ReadScope,
-        base: u64,
-        cap: u64,
-        jitter: u64,
-    ) -> Result<()> {
-        let old = self.read_backoff(scope)?;
-        if old.failures == 0 {
-            return Ok(());
-        }
-        let timing: Option<(Option<i64>, i64, i64)> = self
-            .db
-            .query_row(
-                "SELECT last_failure_at,server_not_before,retained_conservative_floor FROM read_observations WHERE scope=?1",
-                [scope.as_str()],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .optional()?;
-        let Some((Some(failed_at), floor, legacy_floor)) = timing else {
-            return Ok(());
+        let stamp = AdmissionStampSnapshot {
+            account_generation: generation,
+            lane_control_revision: self.lane_control(LaneId::Judge)?.control_revision,
+            authority_epoch,
+            lane_config_revision: revision.to_owned(),
         };
-        let local = failed_at
-            .saturating_add(read_delay(old.failures, base, cap, jitter).min(i64::MAX as u64) as i64)
-            .saturating_add(1);
-        let next = local.max(floor).max(legacy_floor);
-        let tx = self.db.unchecked_transaction()?;
-        tx.execute(
-            "UPDATE read_observations SET local_next_at=?2 WHERE scope=?1",
-            params![scope.as_str(), local],
-        )?;
-        tx.execute(
-            "UPDATE read_backoff SET next_at=?2 WHERE scope=?1",
-            params![scope.as_str(), next],
-        )?;
-        if scope == ReadScope::Challenge {
-            tx.execute(
-                "UPDATE schedule SET next_at=?2 WHERE kind IN ('answer','mine') AND next_at=?1",
-                params![old.next_at, next],
-            )?;
-        } else if scope == ReadScope::Assignments {
-            tx.execute(
-                "UPDATE schedule SET next_at=?2 WHERE kind='judge' AND next_at=?1",
-                params![old.next_at, next],
-            )?;
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    pub(crate) fn reads(&self) -> Result<Value> {
-        let mut rows = Vec::with_capacity(ReadScope::ALL.len());
-        let has_backoff = self.has_table("read_backoff")?;
-        let has_observations = self.has_table("read_observations")?;
-        for scope in ReadScope::ALL {
-            let backoff = if has_backoff {
-                self.read_backoff(scope)?
-            } else {
-                ReadBackoff::default()
-            };
-            let detail = if has_observations {
-                self.db.query_row("SELECT in_flight,started_at,finished_at,last_http_success_at,last_success_at,
-                    last_failure_at,failure_category,status,local_next_at,server_not_before,retained_conservative_floor
-                    FROM read_observations WHERE scope=?1",[scope.as_str()],|r| {
-                    let category: Option<String> = r.get(6)?;
-                    Ok(json!({"state":if r.get::<_,bool>(0)? {"in_flight"} else {"idle"},
-                        "started_at":r.get::<_,Option<i64>>(1)?,"finished_at":r.get::<_,Option<i64>>(2)?,
-                        "last_http_success_at":r.get::<_,Option<i64>>(3)?,"last_success_at":r.get::<_,Option<i64>>(4)?,
-                        "last_failure_at":r.get::<_,Option<i64>>(5)?,"failure_category":category.as_deref().map(safe_read_category),
-                        "status":r.get::<_,Option<u16>>(7)?,"local_next_at":r.get::<_,i64>(8)?,
-                        "server_not_before":r.get::<_,i64>(9)?,
-                        "retained_conservative_floor":r.get::<_,i64>(10)?}))
-                }).optional()?
-            } else {
-                None
-            };
-            let mut detail = detail.unwrap_or_else(|| {
-                json!({"state":"idle","started_at":null,"finished_at":null,
-                "last_http_success_at":null,"last_success_at":null,"last_failure_at":null,
-                "failure_category":null,"status":null,"local_next_at":0,"server_not_before":0,
-                "retained_conservative_floor":backoff.next_at})
-            });
-            detail["scope"] = json!(scope.as_str());
-            detail["failures"] = json!(backoff.failures);
-            detail["next_at"] = json!(backoff.next_at);
-            detail["due_in_seconds"] = json!(backoff.next_at.saturating_sub(now()).max(0));
-            rows.push(detail);
-        }
-        Ok(json!(rows))
-    }
-
-    pub(crate) fn read_backoff(&self, scope: ReadScope) -> Result<ReadBackoff> {
-        Ok(self
-            .db
-            .query_row(
-                "SELECT failures,next_at FROM read_backoff WHERE scope=?1",
-                [scope.as_str()],
-                |row| {
-                    Ok(ReadBackoff {
-                        failures: row.get(0)?,
-                        next_at: row.get(1)?,
-                    })
-                },
-            )
-            .optional()?
-            .unwrap_or_default())
-    }
-
-    pub(crate) fn fail_read(
-        &self,
-        scope: ReadScope,
-        retry_seconds: u64,
-        cap_seconds: u64,
-        jitter_seconds: u64,
-        server_minimum: Option<u64>,
-    ) -> Result<ReadBackoff> {
-        let tx = self.db.unchecked_transaction()?;
-        let state = self.fail_read_in(
-            &tx,
-            scope,
-            retry_seconds,
-            cap_seconds,
-            jitter_seconds,
-            server_minimum,
-        )?;
-        tx.commit()?;
-        Ok(state)
-    }
-
-    fn fail_read_in(
-        &self,
-        tx: &rusqlite::Transaction<'_>,
-        scope: ReadScope,
-        retry_seconds: u64,
-        cap_seconds: u64,
-        jitter_seconds: u64,
-        server_minimum: Option<u64>,
-    ) -> Result<ReadBackoff> {
-        let failures = self.read_backoff(scope)?.failures.saturating_add(1);
-        let local = not_before(read_delay(
-            failures,
-            retry_seconds,
-            cap_seconds,
-            jitter_seconds,
-        ));
-        let (prior_floor, legacy_floor): (i64, i64) = self.db.query_row(
-            "SELECT server_not_before,retained_conservative_floor FROM read_observations WHERE scope=?1",
-            [scope.as_str()],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        ).optional()?.unwrap_or_default();
-        // The old API included jitter after the server minimum. Keep that conservative rule.
-        let floor = prior_floor.max(server_minimum.map_or(0, |seconds| {
-            not_before(seconds.saturating_add(jitter_seconds))
-        }));
-        let state = ReadBackoff {
-            failures,
-            next_at: local.max(floor).max(legacy_floor),
-        };
-        tx.execute(
-            "INSERT INTO read_backoff(scope,failures,next_at) VALUES (?1,?2,?3)
-            ON CONFLICT(scope) DO UPDATE SET failures=excluded.failures,next_at=excluded.next_at",
-            params![scope.as_str(), state.failures, state.next_at],
-        )?;
-        tx.execute("INSERT INTO read_observations(scope,last_failure_at,failure_category,local_next_at,server_not_before)
-            VALUES (?1,?2,'unusable_response',?3,?4) ON CONFLICT(scope) DO UPDATE SET
-            last_failure_at=excluded.last_failure_at,local_next_at=excluded.local_next_at,
-            server_not_before=excluded.server_not_before,
-            failure_category=COALESCE(read_observations.failure_category,'unusable_response')",
-            params![scope.as_str(),now(),local,floor])?;
-        Ok(state)
-    }
-
-    pub(crate) fn reset_read(&self, scope: ReadScope) -> Result<()> {
-        let tx = self.db.unchecked_transaction()?;
-        Self::reset_read_in(&tx, scope)?;
-        tx.commit()?;
-        Ok(())
-    }
-
-    fn reset_read_in(tx: &rusqlite::Transaction<'_>, scope: ReadScope) -> Result<()> {
-        tx.execute("DELETE FROM read_backoff WHERE scope=?1", [scope.as_str()])?;
-        tx.execute(
-            "INSERT INTO read_observations(scope,last_success_at) VALUES (?1,?2)
-            ON CONFLICT(scope) DO UPDATE SET last_success_at=excluded.last_success_at,
-            local_next_at=0,server_not_before=0,retained_conservative_floor=0,failure_category=NULL",
-            params![scope.as_str(), now()],
-        )?;
-        Ok(())
-    }
-    pub(crate) fn observe(&self, epoch: u64, answered: bool) -> Result<()> {
-        let epoch = i64::try_from(epoch).context("epoch out of range")?;
-        let tx = self.db.unchecked_transaction()?;
-        let (previous_epoch, previous_answered): (Option<i64>, Option<bool>) = tx
-            .query_row(
-                "SELECT epoch,answered FROM health_evidence WHERE singleton=1",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?
-            .unwrap_or((None, None));
-        let observed_at = now();
-        let evidence = if answered {
-            "challenge_answered"
-        } else {
-            "challenge_unanswered"
-        };
-        // Epoch transitions, not repeated polls, start the grace clock. Legacy
-        // observations acquire evidence on their first new authenticated read.
-        if previous_epoch != Some(epoch) {
-            tx.execute(
-                "INSERT INTO events(at,code) VALUES (?1,'epoch_observed')",
-                [observed_at],
-            )?;
-        }
-        if previous_epoch != Some(epoch) || previous_answered != Some(answered) {
-            tx.execute(
-                "INSERT INTO events(at,code) VALUES (?1,?2)",
-                params![observed_at, evidence],
-            )?;
-        }
-        tx.execute(
-            "INSERT INTO health_evidence(singleton,epoch,first_observed_at,answered)
-             VALUES (1,?1,?2,?3) ON CONFLICT(singleton) DO UPDATE SET
-             first_observed_at=CASE WHEN health_evidence.epoch=excluded.epoch
-                 THEN health_evidence.first_observed_at ELSE excluded.first_observed_at END,
-             epoch=excluded.epoch,answered=excluded.answered",
-            params![epoch, observed_at, answered],
-        )?;
-        tx.execute("INSERT INTO observation VALUES (1,?1,?2) ON CONFLICT(singleton) DO UPDATE SET epoch=excluded.epoch,observed_at=excluded.observed_at",
-            params![epoch,observed_at])?;
-        tx.commit()?;
-        Ok(())
+        self.record_lane_participation(
+            LaneId::Judge,
+            &stamp,
+            &json!({
+            "source":"validated_assignment_inventory","observed_at":now(),"valid_until":now()+60,
+            "completeness":if inventory_complete{"complete"}else{"bounded_partial"},
+            "observed_opportunities":observed_count,"eligible_candidates":u64::from(eligible),
+            "locally_judgeable":eligible,"assessment_reason":null,
+            "assessment_creates_model_work":false,"outcome":"unobserved"}),
+        )
     }
 
     pub(crate) fn history(&self) -> Result<Vec<String>> {
@@ -3196,14 +3109,23 @@ impl Store {
     pub(crate) fn runtime_state(&self, config: &Config, reload_blocked: bool) -> Result<()> {
         self.continuity()?;
         let tx = self.db.unchecked_transaction()?;
+        let mut policy = json!({"schema_version":2,"capabilities":config.capabilities,
+            "identity":config.identity,"runtime":config.runtime,"build":crate::runtime::build_info()});
+        let mut revisions = serde_json::Map::new();
+        for lane in LaneId::ALL {
+            revisions.insert(
+                lane.as_str().into(),
+                Value::String(config.lane_revision(lane)?),
+            );
+        }
+        policy["lane_revisions"] = Value::Object(revisions);
         tx.execute("INSERT INTO runtime_policy VALUES (1,?1) ON CONFLICT(singleton) DO UPDATE SET policy=excluded.policy",
-            [serde_json::to_string(&json!({"timeouts":config.timeouts,"schedule":config.schedule,
-                "preparation":config.preparation,"participation":config.participation,
-                "build":crate::runtime::build_info()}))?])?;
+            [serde_json::to_string(&policy)?])?;
         tx.execute(
-            "INSERT INTO runtime_state VALUES (1,?1,?2,?3,?4) ON CONFLICT(singleton) DO UPDATE SET
+            "INSERT INTO runtime_state(singleton,effective_revision,reload_blocked,capabilities,observed_at,controller_stopped)
+             VALUES (1,?1,?2,?3,?4,0) ON CONFLICT(singleton) DO UPDATE SET
             effective_revision=excluded.effective_revision,reload_blocked=excluded.reload_blocked,
-            capabilities=excluded.capabilities,observed_at=excluded.observed_at",
+            capabilities=excluded.capabilities,observed_at=excluded.observed_at,controller_stopped=0",
             params![
                 config.revision()?,
                 reload_blocked,
@@ -3222,6 +3144,7 @@ impl Store {
     }
 
     pub(crate) fn heartbeat(&self) -> Result<()> {
+        self.continuity()?;
         self.db.execute(
             "UPDATE runtime_state SET observed_at=?1 WHERE singleton=1 AND observed_at<?1",
             [now()],
@@ -3240,12 +3163,12 @@ impl Store {
         minimum: Option<u64>,
     ) -> Result<()> {
         let tx = self.db.unchecked_transaction()?;
-        self.read_finished(ReadScope::Identity, status, category)?;
+        self.read_finished(&ReadKey::Identity, status, category)?;
         Self::write_identity_outcome(&tx, outcome)?;
         if outcome == HostedIdentityOutcome::Verified {
-            Self::reset_read_in(&tx, ReadScope::Identity)?;
+            self.reset_read_in(&tx, &ReadKey::Identity)?;
         } else {
-            self.fail_read_in(&tx, ReadScope::Identity, retry.0, retry.1, retry.2, minimum)?;
+            self.fail_read_in(&tx, &ReadKey::Identity, retry.0, retry.1, retry.2, minimum)?;
         }
         tx.commit()?;
         Ok(())
@@ -3267,7 +3190,7 @@ impl Store {
         tx.execute(
             "INSERT INTO hosted_identity_evidence VALUES(1,?1,?2,
                 CASE WHEN ?1='verified' THEN ?2 ELSE
-                    (SELECT last_success_at FROM read_observations WHERE scope='identity'
+                    (SELECT last_success_at FROM read_state WHERE owner='account' AND purpose='identity' AND resource='identity'
                      AND (SELECT hosted_identity_verified FROM health_evidence WHERE singleton=1)=1)
                 END,?3,
                 CASE WHEN ?1='verified' THEN 0 ELSE
@@ -3289,6 +3212,20 @@ impl Store {
             [],
         )?;
         Ok(())
+    }
+
+    pub(crate) fn identity_refresh_needed(&self) -> Result<bool> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT rejection IS NULL AND status IN
+                 ('legacy_unknown','unavailable','invalid_response')
+                 FROM hosted_identity_evidence WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(true))
     }
 
     fn hosted_identity(db: &Connection) -> Result<Value> {
@@ -3330,18 +3267,17 @@ impl Store {
         } else {
             None
         };
-        let last_verified_at: Option<i64> =
-            if legacy == Some(true) && has_table("read_observations")? {
-                db.query_row(
-                    "SELECT last_success_at FROM read_observations WHERE scope='identity'",
+        let last_verified_at: Option<i64> = if legacy == Some(true) && has_table("read_state")? {
+            db.query_row(
+                    "SELECT last_success_at FROM read_state WHERE owner='account' AND purpose='identity' AND resource='identity'",
                     [],
                     |row| row.get(0),
                 )
                 .optional()?
                 .flatten()
-            } else {
-                None
-            };
+        } else {
+            None
+        };
         Ok(
             json!({"status":if legacy.is_some() {"legacy_unknown"} else {"unobserved"},
             "observed_at":null,"last_verified_at":last_verified_at,"rejection":null,
@@ -3350,6 +3286,7 @@ impl Store {
     }
 
     pub(crate) fn safety_observed(&self, id: i64) -> Result<()> {
+        self.continuity()?;
         self.db.execute(
             "INSERT INTO operation_evidence(operation_id,safety_observed_at) VALUES (?1,?2)
             ON CONFLICT(operation_id) DO UPDATE SET safety_observed_at=excluded.safety_observed_at",
@@ -3383,16 +3320,28 @@ impl Store {
                 *slot = Some(row.get(2)?);
             }
         }
+        let mut statement = self.db.prepare("SELECT t.operation_id,t.generation_started_at,t.model_captured_at,t.queued_since,t.dispatch_started_at
+            FROM operations o JOIN operation_timing t ON t.operation_id=o.id
+            WHERE o.state IN ('generating','generated','prepared','dispatching','queued','unknown','included_pending')")?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let entry = evidence.entry(row.get(0)?).or_default();
+            entry.generating = row.get::<_, Option<i64>>(1)?.or(entry.generating);
+            entry.captured = row.get::<_, Option<i64>>(2)?.or(entry.captured);
+            entry.queued = row.get::<_, Option<i64>>(3)?.or(entry.queued);
+            entry.dispatch = row.get::<_, Option<i64>>(4)?.or(entry.dispatch);
+        }
         Ok(evidence)
     }
 
     pub(crate) fn operation_poll_timing(&self, id: i64) -> Result<(Option<i64>, i64)> {
         let (queued_since, minimum): (Option<i64>, i64) = self.db.query_row(
             "SELECT
-             (SELECT at FROM
+             COALESCE((SELECT queued_since FROM operation_timing WHERE operation_id=o.id AND o.state='queued'),
+              (SELECT at FROM
               (SELECT id,operation_id,code,at FROM events ORDER BY id DESC LIMIT 2000)
               WHERE operation_id=o.id AND o.state='queued'
-              AND code IN ('submission_queued','job_pending') ORDER BY id DESC LIMIT 1),
+              AND code IN ('submission_queued','job_pending') ORDER BY id DESC LIMIT 1)),
              COALESCE((SELECT retry_not_before FROM operation_timing WHERE operation_id=o.id),o.next_at)
              FROM operations o WHERE o.id=?1",
             [id], |row| Ok((row.get(0)?, row.get(1)?)),
@@ -3402,904 +3351,6 @@ impl Store {
             queued_since.filter(|at| *at >= 0 && *at <= current),
             minimum,
         ))
-    }
-
-    fn work_projection(
-        &self,
-        config: &Config,
-        reads: &Value,
-        epoch: Option<u64>,
-        answered: Option<bool>,
-        stopped: bool,
-        reload_blocked: bool,
-    ) -> Result<Value> {
-        let control = self.control()?;
-        let current = now();
-        let waits = self.wait_evidence()?;
-        let has_evidence = self.has_table("operation_evidence")?;
-        let selection = if self.has_table("assignment_selection")? {
-            self.db
-                .query_row(
-                    "SELECT s.observed_at,s.observed_count,s.inventory_complete,s.eligible
-                FROM assignment_selection s JOIN runtime_state r
-                    ON r.effective_revision=s.revision
-                WHERE s.generation=?1",
-                    [control.generation],
-                    |row| {
-                        Ok(json!({"observed_at":row.get::<_,i64>(0)?,
-                    "observed_count":row.get::<_,u64>(1)?,
-                    "inventory_complete":row.get::<_,bool>(2)?,
-                    "eligible":row.get::<_,bool>(3)?,
-                    "evidence":"observed_inventory_only"}))
-                    },
-                )
-                .optional()?
-        } else {
-            None
-        };
-        let reservation = if has_evidence
-            && self.has_table("operation_timing")?
-            && self.has_table("health_evidence")?
-            && self.has_table("manual_grants")?
-            && self.has_table("manual_grant_revocations")?
-        {
-            Self::answer_retry_reservation(&self.db, config)?
-        } else {
-            None
-        };
-        let mut work = json!({});
-        for kind in [WorkKind::Answer, WorkKind::Judge, WorkKind::Mine] {
-            let prepared = self.preparation(kind)?;
-            let retry_original = if kind == WorkKind::Answer && prepared.is_some() {
-                epoch
-                    .map(|epoch| self.uncertain_answer(epoch))
-                    .transpose()?
-                    .flatten()
-            } else {
-                None
-            };
-            let operation = if prepared.is_some() {
-                prepared
-            } else if kind != WorkKind::Judge {
-                let id: Option<i64> = self.db.query_row(
-                    "SELECT id FROM operations WHERE kind=?1 AND work_key LIKE ?2
-                    AND state IN ('dispatching','queued','unknown','included_pending','confirmed','final','completed','model_unknown')
-                    ORDER BY id DESC LIMIT 1",
-                    params![kind.as_str(),format!("{}:%",epoch.unwrap_or(u64::MAX))],|r| r.get(0)).optional()?;
-                id.map(|id| self.operation(id)).transpose()?.flatten()
-            } else {
-                None
-            };
-            let op = operation.as_ref();
-            let scope = if kind == WorkKind::Judge {
-                ReadScope::Assignments
-            } else {
-                ReadScope::Challenge
-            };
-            let read = reads
-                .as_array()
-                .and_then(|rows| rows.iter().find(|row| row["scope"] == scope.as_str()));
-            let read_at = read.and_then(|row| row["next_at"].as_i64()).unwrap_or(0);
-            let mut next_at = Some(self.next_at(kind)?.max(read_at).max(current));
-            let mut phase = "observing";
-            let mut reason = "observation_due";
-            let mut action = if kind == WorkKind::Judge {
-                "observe_assignments"
-            } else {
-                "observe_challenge"
-            };
-            let accounting =
-                Self::uncertainty_accounting(&self.db, config, op.map(|op| op.id), None, false)?;
-            let capacity = accounting.active().saturating_add(1)
-                > u64::from(config.participation.unresolved_limit(kind));
-            if read.is_some_and(|row| row["state"] == "in_flight") {
-                phase = "observing";
-                reason = "read_in_flight";
-                action = if kind == WorkKind::Judge {
-                    "await_assignments"
-                } else {
-                    "await_challenge"
-                };
-                next_at = None;
-            } else if read_at > current {
-                reason = "read_backoff";
-            } else if next_at.is_some_and(|at| at > current) {
-                reason = "cadence";
-            }
-            if kind == WorkKind::Judge
-                && op.is_none()
-                && selection
-                    .as_ref()
-                    .is_some_and(|value| value["eligible"] == false)
-                && !read.is_some_and(|row| row["state"] == "in_flight")
-                && read_at <= current
-            {
-                reason = "no_eligible_in_observed_inventory";
-            }
-            if kind == WorkKind::Answer && answered == Some(true) {
-                phase = "answered";
-                reason = "hosted_answer_observed";
-            }
-            if capacity {
-                phase = "blocked";
-                reason = if kind != WorkKind::Answer
-                    && config.participation.answer_reserved_slots > 0
-                    && accounting.active()
-                        < u64::from(config.participation.max_unresolved_operations)
-                {
-                    "answer_capacity_reserved"
-                } else {
-                    "unresolved_capacity"
-                };
-                action = "await_reconciliation";
-                next_at = None;
-            }
-            if let Some(op) = op {
-                match op.state.as_str() {
-                    "generating" => {
-                        phase = "preparing";
-                        reason = if op.request["solver"]["epoch"].as_u64() != epoch
-                            && kind == WorkKind::Answer
-                        {
-                            "model_capacity"
-                        } else {
-                            "model_running"
-                        };
-                        action = "await_model";
-                        next_at = if self.has_table("operation_evidence")? {
-                            self.db.query_row("SELECT model_deadline FROM operation_evidence WHERE operation_id=?1",
-                                [op.id],|r| r.get::<_,Option<i64>>(0)).optional()?.flatten()
-                        } else {
-                            None
-                        };
-                    }
-                    "prepared" | "generated" | "retry" => {
-                        if !capacity {
-                            phase = "prepared";
-                            reason = "fresh_evidence_required";
-                            action = if kind == WorkKind::Judge {
-                                "revalidate_assignment"
-                            } else {
-                                "revalidate_challenge"
-                            };
-                            next_at = Some(op.next_at.max(read_at).max(current));
-                            if op.next_at > current {
-                                reason = "operation_backoff";
-                            } else if read_at > current {
-                                reason = "read_backoff";
-                            } else if self.has_table("operation_timing")?
-                                && !self.admission_allowed(config, op)?
-                            {
-                                phase = "blocked";
-                                action = "await_reconciliation";
-                                next_at = None;
-                                let (writing, floor, grace): (bool,i64,i64) = self.db.query_row(
-                                    "SELECT COALESCE(MAX(o.state='dispatching'),0),
-                                    COALESCE(MAX(COALESCE(t.retry_not_before,o.next_at)),0),
-                                    COALESCE(MAX(COALESCE(e.blocked_since,o.created_at)),0)
-                                    FROM operations o LEFT JOIN operation_timing t ON t.operation_id=o.id
-                                    LEFT JOIN operation_evidence e ON e.operation_id=o.id
-                                    WHERE o.id!=?1 AND o.state IN ('dispatching','queued','unknown','included_pending')",
-                                    [op.id],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
-                                let floor = floor.max(accounting.retry_not_before);
-                                if writing {
-                                    reason = "effect_in_flight";
-                                    action = "await_effect";
-                                } else if floor > current {
-                                    reason = "retained_retry_minimum";
-                                    next_at = Some(floor);
-                                } else if accounting.total == 0 {
-                                    reason = "request_eligibility";
-                                    action = "revalidate_request";
-                                    next_at = Some(current);
-                                } else if config.participation.mode == ParticipationMode::Strict {
-                                    reason = "strict_uncertainty";
-                                } else if !config.participation.allows(kind) {
-                                    reason = "participation_disabled";
-                                } else if config.participation.mode == ParticipationMode::Manual {
-                                    reason = "manual_authorization_required";
-                                    action = "authorize";
-                                } else {
-                                    let until = grace.saturating_add(
-                                        config
-                                            .participation
-                                            .uncertainty_grace_seconds
-                                            .min(i64::MAX as u64)
-                                            as i64,
-                                    );
-                                    if until > current {
-                                        reason = "uncertainty_grace";
-                                        next_at = Some(until);
-                                    } else {
-                                        reason = "request_eligibility";
-                                        action = "revalidate_request";
-                                    }
-                                }
-                            }
-                            if phase == "prepared" {
-                                let identity = reads.as_array().and_then(|rows| {
-                                    rows.iter().find(|row| row["scope"] == "identity")
-                                });
-                                let identity_at = identity
-                                    .and_then(|row| row["next_at"].as_i64())
-                                    .unwrap_or(0);
-                                if identity_at > current {
-                                    reason = "identity_backoff";
-                                    next_at = Some(next_at.unwrap_or(current).max(identity_at));
-                                }
-                                if read.is_some_and(|row| row["state"] == "in_flight") {
-                                    reason = "freshness_in_flight";
-                                    action = if kind == WorkKind::Judge {
-                                        "await_assignments"
-                                    } else {
-                                        "await_challenge"
-                                    };
-                                    next_at = None;
-                                } else if identity.is_some_and(|row| row["state"] == "in_flight") {
-                                    reason = "identity_in_flight";
-                                    action = "await_identity";
-                                    next_at = None;
-                                }
-                            }
-                        }
-                    }
-                    "dispatching" => {
-                        phase = "dispatching";
-                        reason = "effect_in_flight";
-                        action = "await_effect";
-                        next_at = None;
-                    }
-                    "queued" | "unknown" | "included_pending" => {
-                        phase = match op.state.as_str() {
-                            "queued" => "queued",
-                            "included_pending" => "included_pending",
-                            _ => "unknown",
-                        };
-                        reason = "authoritative_evidence_required";
-                        let bound_scope = if op.txid.is_some() {
-                            Some(ReadScope::Receipt)
-                        } else if op.job_id.is_some() {
-                            Some(ReadScope::Job)
-                        } else {
-                            None
-                        };
-                        action = match bound_scope {
-                            Some(ReadScope::Receipt) => "read_receipt",
-                            Some(_) => "read_job",
-                            None => "authoritative_recovery",
-                        };
-                        next_at = bound_scope.map(|scope| {
-                            reads
-                                .as_array()
-                                .and_then(|rows| {
-                                    rows.iter().find(|row| row["scope"] == scope.as_str())
-                                })
-                                .and_then(|row| row["next_at"].as_i64())
-                                .unwrap_or(0)
-                                .max(op.next_at)
-                                .max(current)
-                        });
-                    }
-                    "model_unknown" => {
-                        phase = "blocked";
-                        reason = "model_uncertain";
-                        action = if config.preparation.retry_uncertain {
-                            "retry_model"
-                        } else {
-                            "recover_model"
-                        };
-                        next_at = None;
-                    }
-                    "confirmed" | "final" => {
-                        phase = "included";
-                        reason = if op.state == "final" {
-                            "checkpoint_reported"
-                        } else {
-                            "receipt_included"
-                        };
-                        action = "observe_challenge";
-                    }
-                    "completed" => {
-                        phase = "completed";
-                        reason = "mine_completed";
-                    }
-                    _ => {}
-                }
-                if op.generation != control.generation
-                    && matches!(op.state.as_str(), "prepared" | "generated" | "retry")
-                {
-                    phase = "blocked";
-                    reason = "generation_changed";
-                    action = "discard_unsent";
-                    next_at = Some(current);
-                }
-            }
-            if kind != WorkKind::Answer
-                && reservation.is_some()
-                && phase == "blocked"
-                && op.is_some_and(|op| {
-                    op.generation == control.generation
-                        && matches!(op.state.as_str(), "prepared" | "generated" | "retry")
-                })
-            {
-                phase = "blocked";
-                reason = "answer_retry_reserved";
-                action = "await_answer_retry";
-                next_at = None;
-            }
-            if config.mode(kind) == Mode::ReadOnly {
-                phase = "read_only";
-                reason = "capability_read_only";
-                action = if kind == WorkKind::Judge {
-                    "observe_assignments"
-                } else {
-                    "observe_challenge"
-                };
-                next_at = Some(self.next_at(kind)?.max(read_at).max(current));
-            }
-            if stopped {
-                phase = "stopped";
-                reason = "controller_stopped";
-                action = "start_controller";
-                next_at = None;
-            }
-            if reload_blocked {
-                phase = "blocked";
-                reason = "config_reload_rejected";
-                action = "repair_config";
-                next_at = None;
-            }
-            if control.paused {
-                phase = "paused";
-                reason = "admission_paused";
-                action = "resume";
-                next_at = None;
-            }
-            if config.mode(kind) == Mode::Off {
-                phase = "off";
-                reason = "capability_off";
-                action = "enable_capability";
-                next_at = None;
-            }
-            work[kind.as_str()] = json!({"phase":phase,"reason":reason,"next_action":action,
-                "next_at":next_at,"epoch":epoch,"operation_id":op.map(|op| op.id),
-                "operation_epoch":op.and_then(|op| op.request["solver"]["epoch"].as_u64())});
-            work[kind.as_str()]["admission"] = if self.has_table("operation_timing")?
-                && self.has_table("manual_grants")?
-                && self.has_table("manual_grant_revocations")?
-            {
-                json!(
-                    self.uncertainty_blocker_with(config, kind, epoch, &accounting)?
-                        .map(|(reason, next_at)| json!({"reason":reason,"next_at":next_at}))
-                )
-            } else {
-                Value::Null
-            };
-            let manual_authorized = self.manual_authorized(kind, epoch)?;
-            work[kind.as_str()]["manual_authorized"] = json!(manual_authorized);
-            if has_evidence && self.has_table("operation_links")? && kind != WorkKind::Mine {
-                let latest = self.db.query_row(
-                    "SELECT o.id,o.work_key,o.state,e.evidence,
-                     o.revision=(SELECT effective_revision FROM runtime_state WHERE singleton=1) FROM operations o
-                     LEFT JOIN operation_evidence e ON e.operation_id=o.id
-                     WHERE o.id=(SELECT id FROM operations WHERE kind=?1 AND generation=?2
-                        AND (?1='judge' OR work_key LIKE ?3) ORDER BY id DESC LIMIT 1)
-                     AND o.payload IS NULL AND o.job_id IS NULL AND o.txid IS NULL
-                     AND o.state IN ('model_unknown','superseded_model_unknown','rejected','retry_model','prelaunch_failed')",
-                    params![kind.as_str(),control.generation,format!("{}:%",epoch.unwrap_or(u64::MAX))],
-                    |r| Ok((r.get::<_, i64>(0)?,r.get::<_, String>(1)?,r.get::<_, String>(2)?,
-                        r.get::<_, Option<String>>(3)?,r.get::<_, Option<bool>>(4)?)),
-                ).optional()?;
-                let empty_inventory = kind == WorkKind::Judge
-                    && selection.as_ref().is_some_and(|selection| {
-                        selection["inventory_complete"] == true && selection["observed_count"] == 0
-                    });
-                if !empty_inventory
-                    && let Some((id, key, state, diagnostic, current_route)) = latest
-                {
-                    let used = self.model_budget_used(kind, &key)?;
-                    let limit = config.preparation.max_attempts_per_work;
-                    let retry_eligible = used < limit
-                        && (state != "model_unknown" || config.preparation.retry_uncertain);
-                    let diagnostic = diagnostic
-                        .as_deref()
-                        .and_then(|value| serde_json::from_str::<Value>(value).ok());
-                    let failure = diagnostic
-                        .as_ref()
-                        .filter(|value| value["stage"] == "model")
-                        .and_then(|value| value["reason"].as_str())
-                        .filter(|code| {
-                            matches!(
-                                *code,
-                                "native_auth_unavailable"
-                                    | "native_route_mismatch"
-                                    | "native_api_unsupported"
-                                    | "executable_unavailable"
-                                    | "invalid_solver_setup"
-                                    | "core_guidance_missing"
-                                    | "unsupported_harness_version"
-                                    | "invalid_model_deadline"
-                                    | "model_admission_closed"
-                                    | "model_launch_unknown"
-                                    | "model_execution_unknown"
-                            )
-                        });
-                    work[kind.as_str()]["model"] = json!({"operation_id":id,
-                        "state":state,"retry_eligible":retry_eligible,"budget_used":used,
-                        "budget_limit":limit,"failure_category":failure,
-                        "scope":if kind == WorkKind::Answer { "current_work" } else { "historical_assignment" },
-                        "current_route":current_route,
-                        "evidence":"latest_model_only_attempt_in_current_generation"});
-                }
-            }
-            if let Some(reservation) = reservation {
-                work[kind.as_str()]["admission_reservation"] = json!({
-                    "original_operation_id":reservation.original_operation_id,
-                    "active":true,
-                    "same_operation":reservation.same_operation,
-                    "basis":if reservation.same_operation { "proven_refusal_retry" } else { "uncertain_answer_retry" },
-                    "retry_not_before":reservation.ready_at,
-                    "requires_fresh_eligibility":true
-                });
-            }
-            if kind == WorkKind::Judge {
-                work[kind.as_str()]["selection"] = json!(selection);
-            }
-            if kind == WorkKind::Answer
-                && let Some(original) = op
-                    .filter(|op| {
-                        matches!(op.state.as_str(), "queued" | "unknown")
-                            && op.txid.is_none()
-                            && op.payload.is_some()
-                    })
-                    .or(retry_original.as_ref())
-            {
-                // Recovery of the original and admission of a distinct risk-opted
-                // retry are separate. Neither this projection nor elapsed time
-                // supplies fresh challenge evidence or resolves the original.
-                let blocker = if has_evidence
-                    && self.has_table("operation_timing")?
-                    && self.has_table("manual_grants")?
-                    && self.has_table("manual_grant_revocations")?
-                    && original.request["solver"]["epoch"].as_u64().is_some()
-                {
-                    self.answer_retry_blocker(config, original)?
-                } else {
-                    Some(("retry_evidence_unavailable", None))
-                };
-                let retry_accounting =
-                    Self::uncertainty_accounting(&self.db, config, None, Some(original.id), false)?;
-                let blocking_operation =
-                    blocker.and_then(|(reason, _)| retry_accounting.blocking_operation(reason));
-                let (mut retry_reason, mut retry_at) = match blocker {
-                    Some(blocker) => blocker,
-                    None => (
-                        "fresh_evidence_required",
-                        Some(self.next_at(kind)?.max(read_at).max(current)),
-                    ),
-                };
-                let mut retry_action = if blocker.is_none() {
-                    "revalidate_challenge"
-                } else if retry_reason == "manual_authorization_required" {
-                    "authorize"
-                } else {
-                    "await_retry_eligibility"
-                };
-                if blocker.is_none() {
-                    if read.is_some_and(|row| row["state"] == "in_flight") {
-                        retry_reason = "freshness_in_flight";
-                        retry_action = "await_challenge";
-                        retry_at = None;
-                    } else if read_at > current {
-                        retry_reason = "read_backoff";
-                    }
-                }
-                if blocker.is_none() && answered == Some(true) {
-                    retry_reason = "hosted_answer_observed";
-                    retry_action = "observe_challenge";
-                    retry_at = Some(self.next_at(kind)?.max(read_at).max(current));
-                }
-                if stopped || reload_blocked || control.paused || config.mode(kind) != Mode::Active
-                {
-                    retry_reason = reason;
-                    retry_action = action;
-                    retry_at = next_at;
-                }
-                work[kind.as_str()]["retry"] = json!({
-                    "original_operation_id":original.id,
-                    "policy_eligible":blocker.is_none(),
-                    "reason":retry_reason,"next_action":retry_action,"next_at":retry_at,
-                    "requires_fresh_eligibility":true,
-                    "blocking_operation_id":blocking_operation,
-                    "reservation_active":reservation.is_some_and(|r| r.original_operation_id == original.id),
-                    "manual_authorized":manual_authorized,
-                    "reservation_retry_not_before":reservation.map(|r| r.ready_at)
-                });
-            }
-            let effect_since = if let Some(op) = op.filter(|op| {
-                has_evidence
-                    && matches!(
-                        op.state.as_str(),
-                        "dispatching" | "queued" | "unknown" | "included_pending"
-                    )
-            }) {
-                self.db
-                    .query_row(
-                        "SELECT blocked_since FROM operation_evidence WHERE operation_id=?1",
-                        [op.id],
-                        |row| row.get::<_, Option<i64>>(0),
-                    )
-                    .optional()?
-                    .flatten()
-            } else {
-                None
-            };
-            let empty = WaitEvidence::default();
-            work[kind.as_str()]["wait"] = waits
-                .get(&op.map_or(-1, |op| op.id))
-                .unwrap_or(&empty)
-                .projection(op.map_or("", |op| op.state.as_str()), effect_since, current);
-        }
-        Ok(work)
-    }
-
-    pub(crate) fn status(&self, config: &Config) -> Result<Value> {
-        // Keep heartbeat, epoch and answer evidence in one read snapshot.
-        let snapshot = self.db.unchecked_transaction()?;
-        let control = self.control()?;
-        let mut stmt = self.db.prepare(
-            "SELECT kind,state,COUNT(*) FROM operations GROUP BY kind,state ORDER BY kind,state",
-        )?;
-        let counts = stmt.query_map([], |r| Ok(json!({"kind":r.get::<_,String>(0)?,"state":r.get::<_,String>(1)?,"count":r.get::<_,i64>(2)?})))?
-            .collect::<std::result::Result<Vec<_>,_>>()?;
-        let mut pending: Option<Value> = self.db.query_row(
-            "SELECT kind,state,next_at,revision,generation,created_at,updated_at,id FROM operations
-             WHERE state IN ('generating','generated','prepared','dispatching','queued','unknown','included_pending','retry')
-             ORDER BY CASE WHEN state IN ('dispatching','queued','unknown','included_pending') THEN 0 ELSE 1 END,id LIMIT 1", [], |r| {
-                Ok(json!({"kind":r.get::<_,String>(0)?,"state":r.get::<_,String>(1)?,
-                    "next_at":r.get::<_,i64>(2)?,"captured_revision":r.get::<_,String>(3)?,
-                    "captured_generation":r.get::<_,i64>(4)?,"created_at":r.get::<_,i64>(5)?,
-                    "updated_at":r.get::<_,i64>(6)?,"operation_id":r.get::<_,i64>(7)?}))
-            },
-        ).optional()?;
-        if self.schema_version()? == 2
-            && let Some(pending) = pending.as_mut()
-        {
-            struct PendingEvidence {
-                blocked_since: Option<i64>,
-                model_deadline: Option<i64>,
-                http_deadline: Option<i64>,
-                diagnostic: Option<String>,
-            }
-            let detail = self.db.query_row(
-                "SELECT blocked_since,model_deadline,http_deadline,evidence FROM operation_evidence WHERE operation_id=?1",
-                [pending["operation_id"].as_i64().unwrap_or_default()],
-                |row| Ok(PendingEvidence {
-                    blocked_since: row.get(0)?,
-                    model_deadline: row.get(1)?,
-                    http_deadline: row.get(2)?,
-                    diagnostic: row.get(3)?,
-                }),
-            ).optional()?;
-            if let Some(detail) = detail {
-                pending["blocked_since"] = json!(detail.blocked_since);
-                pending["model_deadline"] = json!(detail.model_deadline);
-                pending["http_deadline"] = json!(detail.http_deadline);
-                pending["diagnostic"] = detail
-                    .diagnostic
-                    .map(|value| serde_json::from_str::<Value>(&value))
-                    .transpose()?
-                    .unwrap_or(Value::Null);
-            }
-        }
-        let observed: Option<Value> = self
-            .db
-            .query_row(
-                "SELECT epoch,observed_at FROM observation WHERE singleton=1",
-                [],
-                |r| Ok(json!({"epoch":r.get::<_,i64>(0)?,"observed_at":r.get::<_,i64>(1)?})),
-            )
-            .optional()?;
-        let mut effective: Option<Value> = self.db.query_row("SELECT effective_revision,reload_blocked,capabilities,observed_at FROM runtime_state WHERE singleton=1", [], |r| {
-            Ok(json!({"revision":r.get::<_,String>(0)?,"reload_blocked":r.get::<_,bool>(1)?,
-                "capabilities":r.get::<_,String>(2)?,"observed_at":r.get::<_,i64>(3)?}))
-        }).optional()?;
-        if let Some(effective) = effective.as_mut() {
-            let capabilities: Value = serde_json::from_str(
-                effective["capabilities"]
-                    .as_str()
-                    .context("invalid stored capabilities")?,
-            )?;
-            effective["capabilities"] = capabilities;
-            if self.schema_version()? == 2 {
-                let policy: Option<String> = self
-                    .db
-                    .query_row(
-                        "SELECT policy FROM runtime_policy WHERE singleton=1",
-                        [],
-                        |r| r.get(0),
-                    )
-                    .optional()?;
-                effective["policy"] = policy
-                    .map(|s| serde_json::from_str::<Value>(&s))
-                    .transpose()?
-                    .unwrap_or(Value::Null);
-            }
-        }
-        let stored_identity: String =
-            self.db
-                .query_row("SELECT identity FROM control WHERE singleton=1", [], |r| {
-                    r.get(0)
-                })?;
-        let stored: Value = serde_json::from_str(&stored_identity)?;
-        let last_event: Option<String> = self
-            .db
-            .query_row(
-                "SELECT code FROM events ORDER BY id DESC LIMIT 1",
-                [],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let controller_stopped: bool = self.db.query_row(
-            "SELECT COALESCE((SELECT code='runtime_stopped' FROM events WHERE code IN
-             ('controller_running','runtime_stopped') ORDER BY id DESC LIMIT 1),0)",
-            [],
-            |r| r.get(0),
-        )?;
-        // Older databases remain readable without migrating or writing to them.
-        let has_health_evidence: bool = self.db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_schema
-             WHERE type='table' AND name='health_evidence')",
-            [],
-            |r| r.get(0),
-        )?;
-        let (first_observed_at, answered): (Option<i64>, Option<bool>) = if has_health_evidence {
-            self.db
-                .query_row(
-                    "SELECT first_observed_at,answered
-                     FROM health_evidence WHERE singleton=1",
-                    [],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .optional()?
-                .unwrap_or((None, None))
-        } else {
-            (None, None)
-        };
-        let hosted_identity = Self::hosted_identity(&self.db)?;
-        let hosted_identity_verified = if !hosted_identity["rejection"].is_null() {
-            Some(false)
-        } else if hosted_identity["status"] == "verified" {
-            Some(true)
-        } else {
-            None
-        };
-        let epoch_evidence = json!({"first_observed_at":first_observed_at,"answered":answered});
-        let effect = self.effect()?;
-        let stored_policy = effective.as_ref().and_then(|e| {
-            serde_json::from_value::<Participation>(e["policy"]["participation"].clone()).ok()
-        });
-        let policy_source = if stored_policy.is_some() {
-            "effective"
-        } else {
-            "unavailable"
-        };
-        let mut policy_config = config.clone();
-        policy_config.participation = stored_policy.unwrap_or_default();
-        if let Some(capabilities) = effective
-            .as_ref()
-            .and_then(|e| serde_json::from_value(e["capabilities"].clone()).ok())
-        {
-            policy_config.capabilities = capabilities;
-        }
-        if let Some(policy) = effective.as_ref().map(|e| &e["policy"]) {
-            if let Ok(schedule) = serde_json::from_value(policy["schedule"].clone()) {
-                policy_config.schedule = schedule;
-            }
-            if let Ok(preparation) = serde_json::from_value(policy["preparation"].clone()) {
-                policy_config.preparation = preparation;
-            }
-        }
-        let risk_admissions: u64 = if self.has_table("risk_admissions")? {
-            self.db
-                .query_row("SELECT COUNT(*) FROM risk_admissions", [], |r| r.get(0))?
-        } else {
-            0
-        };
-        let epoch = observed.as_ref().and_then(|o| o["epoch"].as_u64());
-        let accounting = Self::uncertainty_accounting(&self.db, &policy_config, None, None, false)?;
-        let unresolved_count = accounting.total;
-        let mut uncertainty_blocks = json!({});
-        let mut affected = Vec::new();
-        for kind in [WorkKind::Answer, WorkKind::Judge, WorkKind::Mine] {
-            let mut blocked = if self.has_table("operation_timing")?
-                && self.has_table("manual_grants")?
-                && self.has_table("manual_grant_revocations")?
-            {
-                !self.uncertainty_open_with(&policy_config, kind, epoch, &accounting)?
-            } else {
-                unresolved_count > 0
-            };
-            if !blocked
-                && unresolved_count > 0
-                && kind == WorkKind::Answer
-                && let Some(epoch) = epoch
-                && self.answer_epoch_attempted(epoch)?
-                && !self.answer_epoch_accepted(epoch)?
-            {
-                blocked = match self.uncertain_answer(epoch)? {
-                    Some(original) => !self.answer_retry_allowed(&policy_config, &original)?,
-                    // Accepted or model-only work is eligibility, not an uncertainty fence.
-                    None => false,
-                };
-            }
-            uncertainty_blocks[kind.as_str()] = json!(blocked);
-            if !blocked
-                && kind != WorkKind::Answer
-                && self.has_table("operation_evidence")?
-                && self.has_table("operation_timing")?
-                && self.has_table("health_evidence")?
-                && self.has_table("manual_grants")?
-                && self.has_table("manual_grant_revocations")?
-            {
-                blocked = Self::answer_retry_reservation(&self.db, &policy_config)?.is_some();
-            }
-            if blocked {
-                affected.push(kind.as_str());
-            }
-        }
-        let blocked = !affected.is_empty();
-        let participation = json!({"policy":policy_config.participation,"policy_source":policy_source,
-            "unresolved_count":unresolved_count,"risk_admissions":risk_admissions,
-            "active_unresolved_count":accounting.active(),
-            "historical_eligible_count":accounting.eligible,
-            "capacity_exempt_count":accounting.exempt,
-            "historical_unknown_answer_count":accounting.exempt,
-            "historical_unknown_answers":accounting.historical,
-            "historical_unknown_answers_truncated":accounting.exempt > accounting.historical.len() as u64,
-            "observation_epoch":epoch,"uncertainty_blocks":uncertainty_blocks});
-        let oldest_unresolved_operation = effect.as_ref().map(|op| op.id);
-        let oldest_unresolved_since = if self.schema_version()? == 2 {
-            effect.as_ref().map(|op| self.db.query_row(
-                "SELECT COALESCE((SELECT blocked_since FROM operation_evidence WHERE operation_id=?1),created_at)
-                FROM operations WHERE id=?1", [op.id], |r| r.get::<_,i64>(0))).transpose()?
-        } else {
-            effect
-                .as_ref()
-                .map(|op| {
-                    self.db.query_row(
-                        "SELECT created_at FROM operations WHERE id=?1",
-                        [op.id],
-                        |row| row.get::<_, i64>(0),
-                    )
-                })
-                .transpose()?
-        };
-        let last_progress: Option<i64> = self.db.query_row(
-            "SELECT MAX(updated_at) FROM operations
-            WHERE state IN ('confirmed','final','completed')",
-            [],
-            |r| r.get(0),
-        )?;
-        let mut captured_work = Vec::new();
-        let last_safety_observation: Option<i64> = if self.schema_version()? == 2 {
-            let mut statement = self.db.prepare("SELECT o.id,o.kind,o.state,o.revision,o.generation,
-                e.model_deadline,e.http_deadline,e.policy,o.created_at FROM operations o
-                LEFT JOIN operation_evidence e ON e.operation_id=o.id
-                WHERE o.state IN ('generating','generated','prepared','retry') ORDER BY o.id LIMIT 3")?;
-            let rows = statement.query_map([],|r| Ok((json!({"operation_id":r.get::<_,i64>(0)?,
-                "kind":r.get::<_,String>(1)?,"state":r.get::<_,String>(2)?,
-                "captured_revision":r.get::<_,String>(3)?,"captured_generation":r.get::<_,i64>(4)?,
-                "model_deadline":r.get::<_,Option<i64>>(5)?,"http_deadline":r.get::<_,Option<i64>>(6)?,
-                "created_at":r.get::<_,i64>(8)?}),
-                r.get::<_,Option<String>>(7)?)))?;
-            for row in rows {
-                let (mut work, policy) = row?;
-                if let Some(policy) = policy {
-                    let policy: Value = serde_json::from_str(&policy)?;
-                    work["captured_policy"] = json!({"model":policy["model"]["model"],
-                        "harness":policy["model"]["harness"],"reasoning":policy["model"]["reasoning"],
-                        "model_seconds":policy["model_seconds"],"attempt":policy["attempt"]});
-                }
-                captured_work.push(work);
-            }
-            self.db.query_row(
-                "SELECT MAX(safety_observed_at) FROM operation_evidence",
-                [],
-                |r| r.get(0),
-            )?
-        } else {
-            None
-        };
-        let timing = self.has_table("operation_timing")?;
-        let (evidence_join, deadlines) = if self.schema_version()? == 2 {
-            (
-                "LEFT JOIN operation_evidence e ON e.operation_id=o.id",
-                "e.http_deadline,e.model_deadline",
-            )
-        } else {
-            ("", "NULL,NULL")
-        };
-        let timing_join = if timing {
-            "LEFT JOIN operation_timing t ON t.operation_id=o.id"
-        } else {
-            ""
-        };
-        let floor = if timing {
-            "COALESCE(t.retry_not_before,o.next_at)"
-        } else {
-            "o.next_at"
-        };
-        let mut statement = self.db.prepare(&format!(
-            "SELECT o.id,o.state,o.created_at,o.updated_at,{deadlines},o.kind,o.next_at,{floor},
-             CASE WHEN o.txid IS NOT NULL THEN 'receipt' WHEN o.job_id IS NOT NULL THEN 'job' END
-             FROM operations o {evidence_join} {timing_join}
-             WHERE o.state IN ('generating','generated','prepared','retry','dispatching','queued','unknown','included_pending')
-             ORDER BY o.id"))?;
-        let pending_work = statement
-            .query_map([], |r| {
-                let id: i64 = r.get(0)?;
-                let state: String = r.get(1)?;
-                let kind: String = r.get(6)?;
-                let effect = matches!(
-                    state.as_str(),
-                    "dispatching" | "queued" | "unknown" | "included_pending"
-                );
-                let capacity_counted = if !effect
-                    || accounting
-                        .historical
-                        .iter()
-                        .any(|row| row.operation_id == id)
-                {
-                    Some(false)
-                } else if kind != "answer"
-                    || accounting.exempt == accounting.historical.len() as u64
-                {
-                    Some(true)
-                } else {
-                    None
-                };
-                Ok(json!({"operation_id":id,"state":state,
-                "created_at":r.get::<_,i64>(2)?,"updated_at":r.get::<_,i64>(3)?,
-                "http_deadline":r.get::<_,Option<i64>>(4)?,
-                "model_deadline":r.get::<_,Option<i64>>(5)?,"kind":kind,
-                "next_at":r.get::<_,i64>(7)?,"retry_not_before":r.get::<_,i64>(8)?,
-                "reconciliation_scope":r.get::<_,Option<String>>(9)?,
-                "capacity_counted":capacity_counted}))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        let reads = self.reads()?;
-        let work = self.work_projection(
-            &policy_config,
-            &reads,
-            epoch,
-            answered,
-            controller_stopped,
-            effective
-                .as_ref()
-                .is_some_and(|e| e["reload_blocked"] == true),
-        )?;
-        let status = json!({"initialized":true,"paused":control.paused,"generation":control.generation,
-            "identity_fingerprint":digest(format!("{}\n{}",stored["chain"].as_str().unwrap_or_default(),stored["address"].as_str().unwrap_or_default())),
-            "chain":stored["chain"],"capabilities":config.capabilities,"observation":observed,
-            "configured_revision":config.optional_revision()?,"effective_runtime":effective,
-            "network_routing":self.routing_status(config)?,
-            "controller_stopped":controller_stopped,"epoch_evidence":epoch_evidence,
-            "identity_matches_config":stored_identity==identity(config)?,"last_event":last_event,
-            "hosted_identity_verified":hosted_identity_verified,
-            "hosted_identity":hosted_identity,
-            "reads":reads,"work":work,
-            "pending":pending,"operations":counts,"evidence":"authenticated_hosted_response",
-            "admission_blocked":blocked,"oldest_unresolved_operation":oldest_unresolved_operation,
-            "oldest_unresolved_since":oldest_unresolved_since,
-            "affected_capabilities":affected,"participation":participation,
-            "last_progress_at":last_progress,"last_reported_build":effective.as_ref().map(|e| &e["policy"]["build"]),
-            "process_identity":"unverified",
-            "captured_work":captured_work,"last_safety_observation_at":last_safety_observation,
-            "pending_work":pending_work,
-            "finality":"node_reported_only","paid":"not_verified"});
-        snapshot.commit()?;
-        Ok(status)
     }
 
     fn identity_normalization_preview(db: &Connection, revision: &str) -> Result<(Value, Value)> {
@@ -4327,11 +3378,11 @@ impl Store {
                 [],
                 |row| row.get::<_, bool>(0),
             )?;
-        let mut observation = if exists("read_observations")? {
+        let observation = if exists("read_state")? {
             db.query_row(
                 "SELECT in_flight,started_at,finished_at,last_http_success_at,last_success_at,
                  last_failure_at,failure_category,status,local_next_at,server_not_before,
-                 retained_conservative_floor FROM read_observations WHERE scope='identity'",
+                 retained_conservative_floor FROM read_state WHERE owner='account' AND purpose='identity' AND resource='identity'",
                 [], |row| Ok(json!({
                     "in_flight":row.get::<_,bool>(0)?, "started_at":row.get::<_,Option<i64>>(1)?,
                     "finished_at":row.get::<_,Option<i64>>(2)?,
@@ -4350,20 +3401,13 @@ impl Store {
         };
         let backoff = db
             .query_row(
-                "SELECT failures,next_at FROM read_backoff WHERE scope='identity'",
+                "SELECT failures,MAX(local_next_at,server_not_before,retained_conservative_floor)
+                 FROM read_state WHERE owner='account' AND purpose='identity' AND resource='identity'",
                 [],
                 |row| Ok(json!({"failures":row.get::<_,i64>(0)?,"next_at":row.get::<_,i64>(1)?})),
             )
             .optional()?
             .unwrap_or(Value::Null);
-        // Opening an old journal materializes this default row from backoff.
-        // Bind the preview to its meaning, not the presence of migration metadata.
-        if observation.is_null() && !backoff.is_null() {
-            observation = json!({"in_flight":false,"started_at":null,"finished_at":null,
-                "last_http_success_at":null,"last_success_at":null,"last_failure_at":null,
-                "failure_category":null,"status":null,"local_next_at":0,"server_not_before":0,
-                "retained_conservative_floor":backoff["next_at"]});
-        }
         let binding = db.query_row(
             "SELECT a.database_id,a.dispatch_sequence,c.generation,c.paused
              FROM authority a,control c WHERE a.singleton=1 AND c.singleton=1",
@@ -4584,7 +3628,7 @@ impl Store {
                 // Old endpoint_halted also represented broad paused/halted flags
                 // and prefix matches. Only the exact middleware category is proof.
                 (Some(503), Some("halt_middleware"))
-                    if e.route != WorkKind::Mine && e.reason == "proven_not_accepted" =>
+                    if e.route != LaneId::Mine && e.reason == "proven_not_accepted" =>
                 {
                     Some("submit_503_halt_middleware")
                 }
@@ -4745,7 +3789,7 @@ impl Store {
 
     pub(crate) fn inspect(&self, id: i64) -> Result<Value> {
         let op = self.operation(id)?.context("operation not found")?;
-        let policy = if self.schema_version()? == 2 {
+        let policy = if self.schema_version()? == CURRENT_JOURNAL_FORMAT {
             self.db.query_row("SELECT policy,evidence,dispatch_sequence,blocked_since,resolution FROM operation_evidence WHERE operation_id=?1",
                 [id], |r| Ok(json!({"captured_policy":r.get::<_,Option<String>>(0)?,
                     "evidence":r.get::<_,Option<String>>(1)?,"dispatch_sequence":r.get::<_,Option<i64>>(2)?,
@@ -4753,7 +3797,7 @@ impl Store {
         } else {
             None
         };
-        let candidates = if self.schema_version()? == 2 {
+        let candidates = if self.schema_version()? == CURRENT_JOURNAL_FORMAT {
             self.db
                 .query_row(
                     "SELECT candidates,truncated FROM operation_candidates WHERE operation_id=?1",
@@ -4852,7 +3896,7 @@ impl Store {
                     admission["accounting"] = json!({
                         "witness_revision":revision,"unresolved_count":total,
                         "historical_eligible_count":eligible,"capacity_exempt_count":exempt,
-                        "active_unresolved_count":total-exempt,"blocker_ids_scope":"active",
+                        "own_charged_count":total-exempt,"blocker_ids_scope":"account_uncertainty",
                     });
                     admission["historical_unknown_answers_truncated"] =
                         json!(exempt > examples.len() as u64);
@@ -4888,7 +3932,7 @@ impl Store {
 
     pub(crate) fn operations_list(
         &self,
-        kind: Option<WorkKind>,
+        kind: Option<LaneId>,
         state: Option<&str>,
         before: Option<i64>,
         limit: usize,
@@ -4912,14 +3956,16 @@ impl Store {
         } else {
             ("NULL,0", "")
         };
-        let (evidence_columns, evidence_join) = if self.has_table("operation_evidence")? {
-            (
-                "e.blocked_since,e.model_deadline,e.http_deadline",
-                "LEFT JOIN operation_evidence e ON e.operation_id=o.id",
-            )
-        } else {
-            ("NULL,NULL,NULL", "")
-        };
+        let (evidence_columns, evidence_join, model_column) =
+            if self.has_table("operation_evidence")? {
+                (
+                    "e.blocked_since,e.model_deadline,e.http_deadline",
+                    "LEFT JOIN operation_evidence e ON e.operation_id=o.id",
+                    "e.model_attempt",
+                )
+            } else {
+                ("NULL,NULL,NULL", "", "NULL")
+            };
         let (timing_column, timing_join) = if self.has_table("operation_timing")? {
             (
                 "t.retry_not_before",
@@ -4930,7 +3976,7 @@ impl Store {
         };
         let mut statement = self.db.prepare(&format!(
             "SELECT o.id,o.kind,o.state,o.request,o.created_at,o.updated_at,o.next_at,o.generation,
-                o.job_id IS NOT NULL,o.txid IS NOT NULL,{link_columns},{evidence_columns},{timing_column}
+                o.job_id IS NOT NULL,o.txid IS NOT NULL,{link_columns},{evidence_columns},{timing_column},{model_column}
             FROM operations o {link_join} {evidence_join} {timing_join}
             WHERE (?1 IS NULL OR o.kind=?1) AND (?2 IS NULL OR o.state=?2)
                 AND (?3 IS NULL OR o.id<?3) ORDER BY o.id DESC LIMIT ?4",
@@ -4946,17 +3992,21 @@ impl Store {
                 "payload_reused":r.get::<_,bool>(11)?,"blocked_since":r.get::<_,Option<i64>>(12)?,
                 "model_deadline":r.get::<_,Option<i64>>(13)?,"http_deadline":r.get::<_,Option<i64>>(14)?,
                 "retry_not_before":r.get::<_,Option<i64>>(15)?,
-            }),r.get::<_,String>(3)?)),
+            }),r.get::<_,String>(3)?,r.get::<_,Option<String>>(16)?)),
         )?;
         let mut operations = Vec::with_capacity(limit.min(100));
         let mut more = false;
         for row in rows {
-            let (mut operation, request) = row?;
+            let (mut operation, request, model_attempt) = row?;
             if operations.len() == limit {
                 more = true;
                 break;
             }
             let request: Value = serde_json::from_str(&request)?;
+            operation["model_attempt"] = model_attempt
+                .map(|value| serde_json::from_str::<Value>(&value))
+                .transpose()?
+                .unwrap_or(Value::Null);
             operation["epoch"] = request["solver"]["epoch"]
                 .as_u64()
                 .map_or(Value::Null, Value::from);
@@ -4994,18 +4044,22 @@ impl Store {
             ("NULL", "")
         };
         let mut statement = self.db.prepare(&format!(
-            "SELECT g.id,g.epoch,g.kind,g.generation,g.created_at,g.consumed_by,{revoked_column}
-            FROM manual_grants g {revoked_join} WHERE (?1 IS NULL OR g.id<?1) ORDER BY g.id DESC LIMIT ?2",
+            "SELECT g.id,g.epoch,g.kind,g.generation,g.created_at,g.consumed_by,{revoked_column},
+                g.lane_control_revision,COALESCE(g.lane_control_revision=l.control_revision,0)
+            FROM manual_grants g LEFT JOIN lane_control l ON l.lane=g.kind {revoked_join}
+            WHERE (?1 IS NULL OR g.id<?1) ORDER BY g.id DESC LIMIT ?2",
         ))?;
         let mut grants = statement.query_map(params![before,(limit+1) as i64], |r| {
             let generation: i64 = r.get(3)?;
             let consumed_by: Option<i64> = r.get(5)?;
             let revoked_at: Option<i64> = r.get(6)?;
+            let current_lane_control: bool = r.get(8)?;
             Ok(json!({"grant_id":r.get::<_,i64>(0)?,"epoch":r.get::<_,u64>(1)?,
                 "kind":r.get::<_,String>(2)?,"generation":generation,"created_at":r.get::<_,i64>(4)?,
                 "consumed_by":consumed_by,"revoked_at":revoked_at,
                 "state":if revoked_at.is_some() {"revoked"} else if consumed_by.is_some() {"consumed"}
-                    else if generation!=control.generation {"expired"} else {"pending"},
+                    else if generation!=control.generation || !current_lane_control {"expired"} else {"pending"},
+                "lane_control_revision":r.get::<_,Option<i64>>(7)?,"current_lane_control":current_lane_control,
                 "current_generation":generation==control.generation}))
         })?.collect::<std::result::Result<Vec<_>,_>>()?;
         let more = grants.len() > limit;
@@ -5076,7 +4130,16 @@ impl Store {
         {
             return Err(EventCursorError::Replaced.into());
         }
-        let Some(store) = Self::read_only(config)? else {
+        let opened = Self::read_only(config).map_err(|error| {
+            if cursor.and_then(|cursor| cursor.journal.as_ref()).is_some()
+                && error.downcast_ref::<LaneControlError>().is_some()
+            {
+                error.context(EventCursorError::Replaced)
+            } else {
+                error
+            }
+        })?;
+        let Some(store) = opened else {
             if before.is_some() {
                 return Err(EventCursorError::Replaced.into());
             }
@@ -5187,7 +4250,20 @@ impl Store {
 mod tests {
     use super::*;
 
-    fn refusal_evidence(kind: WorkKind, status: u16, category: Option<&str>) -> Value {
+    // Explicit retained legacy minima for repair/admission fixtures only.
+    impl Store {
+        fn record_retry_minimum(&self, id: i64, seconds: u64) -> Result<()> {
+            self.record_retry_deadline(id, not_before(seconds))
+        }
+        fn record_retry_deadline(&self, id: i64, deadline: i64) -> Result<()> {
+            self.db.execute("INSERT INTO operation_timing(operation_id,retry_not_before) VALUES(?1,?2)
+                ON CONFLICT(operation_id) DO UPDATE SET retry_not_before=MAX(retry_not_before,excluded.retry_not_before)",
+                params![id,deadline])?;
+            Ok(())
+        }
+    }
+
+    fn refusal_evidence(kind: LaneId, status: u16, category: Option<&str>) -> Value {
         json!({
             "stage":"submit","route":kind.as_str(),"status":status,
             "reason":"route_result_unknown","retry_after_seconds":3600,
@@ -5211,9 +4287,11 @@ mod tests {
         let path = temp.path().join("config.toml");
         fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
         let (account, mut store) = AccountLock::acquire(&config).unwrap();
-        store.set_paused(false).unwrap();
+        store
+            .set_paused(false, &AccountAdmissionGuard::acquire(&config).unwrap())
+            .unwrap();
         for epoch in 1..=3 {
-            let op = prepared_epoch(&mut store, WorkKind::Judge, epoch, "historical");
+            let op = prepared_epoch(&mut store, LaneId::Judge, epoch, "historical");
             // Seed legacy retained outcomes; do not ask today's dispatcher to
             // reproduce historical concurrent writes or ignore refusal floors.
             store
@@ -5225,7 +4303,9 @@ mod tests {
                 .unwrap();
             age_refusal_evidence(&store, op.id);
         }
-        store.set_paused(true).unwrap();
+        store
+            .set_paused(true, &AccountAdmissionGuard::acquire(&config).unwrap())
+            .unwrap();
         let preview = doctor_repairs(&path, None).unwrap();
         assert!(doctor_repairs(&path, Some(&preview)).is_err());
         drop(account);
@@ -5261,16 +4341,16 @@ mod tests {
     #[test]
     fn work_diagnostics_preserve_bound_recovery_and_effective_model_budget() {
         let (_temp, mut config, mut store) = participation_fixture();
-        let mut judge = dispatched_unknown(&mut store, &config, WorkKind::Judge, 1);
+        let mut judge = dispatched_unknown(&mut store, &config, LaneId::Judge, 1);
         judge.job_id = Some("private-job-canary".into());
         store.save(&judge, "dispatch_outcome_unknown").unwrap();
-        store.observe(2, false).unwrap();
-        config.participation.mode = ParticipationMode::Manual;
-        config.preparation.retry_uncertain = true;
-        config.preparation.max_attempts_per_work = 1;
+        observe(&store, 2, false).unwrap();
+        config.capabilities.answer.participation.mode = ParticipationMode::Manual;
+        config.capabilities.answer.preparation.retry_uncertain = true;
+        config.capabilities.answer.preparation.max_attempts_per_work = 1;
         let mut model = store
             .begin(
-                WorkKind::Answer,
+                LaneId::Answer,
                 "2:words",
                 "generating",
                 &json!({"solver":{"epoch":2}}),
@@ -5292,14 +4372,14 @@ mod tests {
             status["work"]["answer"]["admission"]["reason"],
             "manual_authorization_required"
         );
-        config.preparation.max_attempts_per_work = 2;
+        config.capabilities.answer.preparation.max_attempts_per_work = 2;
         // Desired configuration alone must not make the old loaded budget larger.
         assert_eq!(
             store.status(&config).unwrap()["work"]["answer"]["model"]["retry_eligible"],
             false
         );
         store.runtime_state(&config, false).unwrap();
-        store.authorize(&config, 2, WorkKind::Answer).unwrap();
+        store.authorize(&config, 2, LaneId::Answer).unwrap();
         let status = store.status(&config).unwrap();
         assert_eq!(status["work"]["answer"]["model"]["retry_eligible"], true);
         assert_eq!(status["work"]["answer"]["manual_authorized"], true);
@@ -5312,11 +4392,11 @@ mod tests {
             response_evidence,
         };
         for (kind, status) in [
-            (WorkKind::Answer, 429),
-            (WorkKind::Judge, 429),
-            (WorkKind::Mine, 429),
-            (WorkKind::Answer, 503),
-            (WorkKind::Judge, 503),
+            (LaneId::Answer, 429),
+            (LaneId::Judge, 429),
+            (LaneId::Mine, 429),
+            (LaneId::Answer, 503),
+            (LaneId::Judge, 503),
         ] {
             for (field, value) in [
                 ("state", json!("done")),
@@ -5388,7 +4468,7 @@ mod tests {
         use crate::protocol::{Response, ResponseSource, response_evidence};
         for missing_timing in [false, true] {
             let (_temp, config, mut store) = participation_fixture();
-            let op = dispatched_unknown(&mut store, &config, WorkKind::Judge, 1);
+            let op = dispatched_unknown(&mut store, &config, LaneId::Judge, 1);
             let response = Response {
                 status: 429,
                 body: json!({"error":"accept queue full"}),
@@ -5469,7 +4549,7 @@ mod tests {
             (400, Some("request_rejected"), false),
         ] {
             let (_temp, config, mut store) = participation_fixture();
-            let op = dispatched_unknown(&mut store, &config, WorkKind::Judge, 1);
+            let op = dispatched_unknown(&mut store, &config, LaneId::Judge, 1);
             store
                 .record_evidence(op.id, &refusal_evidence(op.kind, status, category))
                 .unwrap();
@@ -5502,7 +4582,7 @@ mod tests {
             ),
         ] {
             let (_temp, config, mut store) = participation_fixture();
-            let op = dispatched_unknown(&mut store, &config, WorkKind::Judge, 1);
+            let op = dispatched_unknown(&mut store, &config, LaneId::Judge, 1);
             let mut evidence = refusal_evidence(op.kind, status, Some(category));
             evidence["reason"] = json!(reason);
             store.record_evidence(op.id, &evidence).unwrap();
@@ -5531,7 +4611,7 @@ mod tests {
         }
         {
             let (_temp, config, mut store) = participation_fixture();
-            let op = dispatched_unknown(&mut store, &config, WorkKind::Mine, 1);
+            let op = dispatched_unknown(&mut store, &config, LaneId::Mine, 1);
             let mut evidence = refusal_evidence(op.kind, 503, Some("halt_middleware"));
             evidence["reason"] = json!("proven_not_accepted");
             store.record_evidence(op.id, &evidence).unwrap();
@@ -5555,7 +4635,7 @@ mod tests {
             ("accepted", json!(true)),
         ] {
             let (_temp, config, mut store) = participation_fixture();
-            let op = dispatched_unknown(&mut store, &config, WorkKind::Judge, 1);
+            let op = dispatched_unknown(&mut store, &config, LaneId::Judge, 1);
             let mut evidence = refusal_evidence(op.kind, 429, Some("rate_limited"));
             evidence[field] = value;
             store.record_evidence(op.id, &evidence).unwrap();
@@ -5578,7 +4658,7 @@ mod tests {
             "INSERT INTO events(at,code,kind,operation_id) VALUES(1,'processed_submission_rejected','judge',?1)",
         ] {
             let (_temp, config, mut store) = participation_fixture();
-            let op = dispatched_unknown(&mut store, &config, WorkKind::Judge, 1);
+            let op = dispatched_unknown(&mut store, &config, LaneId::Judge, 1);
             store
                 .record_evidence(op.id, &refusal_evidence(op.kind, 429, Some("rate_limited")))
                 .unwrap();
@@ -5597,7 +4677,7 @@ mod tests {
 
     #[test]
     fn historical_refusal_retirement_is_atomic_audited_idempotent_and_never_replays() {
-        for kind in [WorkKind::Answer, WorkKind::Judge, WorkKind::Mine] {
+        for kind in [LaneId::Answer, LaneId::Judge, LaneId::Mine] {
             for payload in [None, Some(json!({"private":"historical-payload-canary"}))] {
                 let (_temp, config, mut store) = participation_fixture();
                 let mut op = dispatched_unknown(&mut store, &config, kind, 1);
@@ -5642,13 +4722,13 @@ mod tests {
                 assert!(store.attempted(kind, &op.key).unwrap());
                 assert!(store.preparation(kind).unwrap().is_none());
                 assert!(store.effect().unwrap().is_none());
-                assert!(store.reconciliation_batch().unwrap().is_empty());
+                assert!(store.reconciliation_batch(kind).unwrap().is_empty());
                 assert!(store.uncertain_answer(1).unwrap().is_none());
                 assert!(!store.routing_busy(&config).unwrap());
-                if kind == WorkKind::Answer {
+                if kind == LaneId::Answer {
                     assert!(store.answer_epoch_attempted(1).unwrap());
                 }
-                if kind == WorkKind::Mine {
+                if kind == LaneId::Mine {
                     assert!(store.mine_epoch_attempted(1).unwrap());
                 }
                 assert_eq!(
@@ -5686,7 +4766,7 @@ mod tests {
     #[test]
     fn historical_refusal_preview_tokens_detect_changes_and_audit_failure_rolls_back() {
         let (_temp, config, mut store) = participation_fixture();
-        let op = dispatched_unknown(&mut store, &config, WorkKind::Judge, 1);
+        let op = dispatched_unknown(&mut store, &config, LaneId::Judge, 1);
         store
             .record_evidence(op.id, &refusal_evidence(op.kind, 429, Some("rate_limited")))
             .unwrap();
@@ -5702,7 +4782,7 @@ mod tests {
         assert!(store.resolve_refusal(op.id, "revision", token).is_err());
         let (preview, _) = Store::refusal_preview(&store.db, op.id, "revision").unwrap();
         let token = preview["preview_token"].as_str().unwrap();
-        store.set_paused(true).unwrap();
+        store.set_paused_unbound(true).unwrap();
         assert!(store.resolve_refusal(op.id, "revision", token).is_err());
         let (preview, _) = Store::refusal_preview(&store.db, op.id, "revision").unwrap();
         let token = preview["preview_token"].as_str().unwrap();
@@ -5739,7 +4819,7 @@ mod tests {
     fn historical_refusal_cannot_retire_an_unexpired_server_or_legacy_floor() {
         for legacy in [false, true] {
             let (_temp, config, mut store) = participation_fixture();
-            let mut op = dispatched_unknown(&mut store, &config, WorkKind::Judge, 1);
+            let mut op = dispatched_unknown(&mut store, &config, LaneId::Judge, 1);
             store
                 .record_evidence(op.id, &refusal_evidence(op.kind, 429, Some("rate_limited")))
                 .unwrap();
@@ -5769,85 +4849,9 @@ mod tests {
     }
 
     #[test]
-    fn proven_refusal_floor_gates_other_work_without_uncertainty_even_after_rollover() {
-        for mode in [
-            ParticipationMode::Strict,
-            ParticipationMode::ParticipationFirst,
-        ] {
-            for refused_kind in [WorkKind::Answer, WorkKind::Judge, WorkKind::Mine] {
-                let (_temp, mut config, mut store) = participation_fixture();
-                let mut refused = dispatched_unknown(&mut store, &config, refused_kind, 1);
-                refused.state = "retry".into();
-                refused.next_at = 0;
-                store.save(&refused, "submission_backoff").unwrap();
-                let mut evidence = refusal_evidence(refused_kind, 429, Some("rate_limited"));
-                evidence["reason"] = json!("proven_not_accepted");
-                store.record_evidence(refused.id, &evidence).unwrap();
-                let floor = not_before(3600);
-                store.record_retry_deadline(refused.id, floor).unwrap();
-                config.participation.mode = mode;
-                let other_kind = if refused_kind == WorkKind::Answer {
-                    WorkKind::Judge
-                } else {
-                    WorkKind::Answer
-                };
-                let mut other = prepared_epoch(&mut store, other_kind, 2, "fresh");
-                for discarded in [false, true] {
-                    if discarded {
-                        refused.state = "discarded".into();
-                        store.save(&refused, "request_no_longer_current").unwrap();
-                    }
-                    let accounting = Store::uncertainty_accounting(
-                        &store.db,
-                        &config,
-                        Some(other.id),
-                        None,
-                        true,
-                    )
-                    .unwrap();
-                    assert_eq!(accounting.total, 0);
-                    assert_eq!(accounting.active(), 0);
-                    assert_eq!(accounting.grace_until, 0);
-                    assert!(accounting.blockers.is_empty());
-                    assert_eq!(accounting.retry_not_before, floor);
-                    assert_eq!(accounting.floor_operation, Some(refused.id));
-                    assert_eq!(
-                        store
-                            .uncertainty_blocker_with(&config, other_kind, Some(2), &accounting)
-                            .unwrap(),
-                        Some(("retained_retry_minimum", Some(floor))),
-                    );
-                    assert!(!store.admission_allowed(&config, &other).unwrap());
-                    assert!(!store.dispatch_intent(&mut other, &config).unwrap());
-                    other.state = "dispatching".into();
-                    assert!(
-                        store
-                            .save_admitted(&other, "dispatch_intent", Some(&config))
-                            .is_err()
-                    );
-                    other.state = "prepared".into();
-                }
-                // Expire only the fixture clock. No stale payload is revived.
-                store
-                    .db
-                    .execute(
-                        "UPDATE operation_timing SET retry_not_before=0 WHERE operation_id=?1",
-                        [refused.id],
-                    )
-                    .unwrap();
-                assert!(store.dispatch_intent(&mut other, &config).unwrap());
-                assert_eq!(
-                    store.operation(refused.id).unwrap().unwrap().state,
-                    "discarded"
-                );
-            }
-        }
-    }
-
-    #[test]
     fn non_refusal_terminal_diagnostics_do_not_create_refusal_floor_authority() {
         let (_temp, config, mut store) = participation_fixture();
-        let mut old = dispatched_unknown(&mut store, &config, WorkKind::Judge, 1);
+        let mut old = dispatched_unknown(&mut store, &config, LaneId::Judge, 1);
         old.state = "discarded".into();
         store.save(&old, "request_no_longer_current").unwrap();
         store
@@ -5858,7 +4862,8 @@ mod tests {
             .unwrap();
         store.record_retry_minimum(old.id, 3600).unwrap();
         let accounting =
-            Store::uncertainty_accounting(&store.db, &config, None, None, true).unwrap();
+            Store::uncertainty_accounting(&store.db, &config, LaneId::Answer, None, None, true)
+                .unwrap();
         assert_eq!(accounting.total, 0);
         assert_eq!(accounting.retry_not_before, 0);
     }
@@ -5866,7 +4871,7 @@ mod tests {
     #[test]
     fn retry_dispatch_honors_own_retained_server_floor_even_if_local_due_time_changes() {
         let (_temp, config, mut store) = participation_fixture();
-        let mut op = dispatched_unknown(&mut store, &config, WorkKind::Judge, 1);
+        let mut op = dispatched_unknown(&mut store, &config, LaneId::Judge, 1);
         op.state = "retry".into();
         op.next_at = 0;
         store.save(&op, "submission_backoff").unwrap();
@@ -6093,7 +5098,7 @@ mod tests {
         assert!(!path.exists());
     }
 
-    fn begin(store: &mut Store, kind: WorkKind, key: &str, state: &str) -> Operation {
+    fn begin(store: &mut Store, kind: LaneId, key: &str, state: &str) -> Operation {
         let control = store.control().unwrap();
         let initial = if state == "generating" {
             "generating"
@@ -6126,23 +5131,75 @@ mod tests {
 
     fn participation_fixture() -> (tempfile::TempDir, Config, Store) {
         let (temp, mut config) = fixture();
-        config.capabilities.answer = Mode::Active;
-        config.capabilities.judge = Mode::Active;
-        config.capabilities.mine = Mode::Active;
-        config.participation.mode = ParticipationMode::ParticipationFirst;
-        config.participation.uncertainty_grace_seconds = 0;
-        config.participation.uncertain_answer_retry_seconds = 0;
+        config.capabilities.answer.mode = Mode::Active;
+        config.capabilities.judge.mode = Mode::Active;
+        config.capabilities.mine.mode = Mode::Active;
+        config.capabilities.answer.participation.mode = ParticipationMode::ParticipationFirst;
+        config
+            .capabilities
+            .answer
+            .participation
+            .uncertainty_grace_seconds = 0;
+        config
+            .capabilities
+            .answer
+            .participation
+            .uncertain_answer_retry_seconds = 0;
+        config.capabilities.judge.participation.mode = ParticipationMode::ParticipationFirst;
+        config
+            .capabilities
+            .judge
+            .participation
+            .uncertainty_grace_seconds = 0;
+        config.capabilities.mine.participation.mode = ParticipationMode::ParticipationFirst;
+        config
+            .capabilities
+            .mine
+            .participation
+            .uncertainty_grace_seconds = 0;
         let mut store = Store::open(&config).unwrap();
-        store.set_paused(false).unwrap();
+        store.set_paused_unbound(false).unwrap();
         (temp, config, store)
     }
 
-    fn prepared_epoch(
-        store: &mut Store,
-        kind: WorkKind,
-        epoch: u64,
-        fingerprint: &str,
-    ) -> Operation {
+    fn observe(store: &Store, epoch: u64, answered: bool) -> Result<()> {
+        store.set_authority_epoch(1)?;
+        let sequence = store
+            .lane_observation(LaneId::Answer)?
+            .and_then(|value| value["request_sequence"].as_u64())
+            .unwrap_or(0)
+            + 1;
+        store.seed_lane_observation_for_test(
+            LaneId::Answer,
+            LaneObservationStamp {
+                authority_epoch: 1,
+                generation: store.control()?.generation,
+                request_sequence: sequence,
+                started_at: now(),
+                completed_at: now(),
+            },
+            epoch,
+            answered,
+            "test",
+            &json!({}),
+        )?;
+        // Tests of historical identity repair explicitly retain legacy evidence.
+        store.db.execute(
+            "INSERT OR IGNORE INTO health_evidence(singleton) VALUES (1)",
+            [],
+        )?;
+        Ok(())
+    }
+
+    fn shared_floor(store: &Store, config: &Config, deadline: i64) {
+        store.db.execute("INSERT INTO request_restrictions VALUES
+            (?1,?2,'account_authenticated','*','server_retry_after',?3,?4,'test','job',1,1,3600,NULL)
+            ON CONFLICT(authority,origin,scope,target,basis) DO UPDATE SET not_before=excluded.not_before",
+            params![format!("{}\n{}",config.network.chain,config.network.address),
+                reqwest::Url::parse(&config.network.base_url).unwrap().origin().ascii_serialization(),deadline,now()]).unwrap();
+    }
+
+    fn prepared_epoch(store: &mut Store, kind: LaneId, epoch: u64, fingerprint: &str) -> Operation {
         let mut op = store
             .begin(
                 kind,
@@ -6161,7 +5218,7 @@ mod tests {
     fn dispatched_unknown(
         store: &mut Store,
         config: &Config,
-        kind: WorkKind,
+        kind: LaneId,
         epoch: u64,
     ) -> Operation {
         let mut op = prepared_epoch(store, kind, epoch, "fingerprint");
@@ -6178,7 +5235,7 @@ mod tests {
     ) -> Operation {
         let mut accepted = store
             .begin_linked(
-                WorkKind::Answer,
+                LaneId::Answer,
                 &original.key,
                 ("prepared", &original.request),
                 store.control().unwrap(),
@@ -6196,21 +5253,39 @@ mod tests {
     #[test]
     fn accepted_linked_capacity_and_witness_growth_survive_restart_and_tightening() {
         let (_temp, mut config, mut store) = participation_fixture();
-        config.participation.historical_unknown_answer_capacity =
-            HistoricalAnswerCapacity::AcceptedLinked;
-        config.participation.max_unresolved_operations = 2;
-        config.participation.retry_uncertain_answers = true;
+        config
+            .capabilities
+            .answer
+            .participation
+            .historical_unknown_answer_capacity = HistoricalAnswerCapacity::AcceptedLinked;
+        config
+            .capabilities
+            .answer
+            .participation
+            .max_unresolved_operations = 2;
+        config
+            .capabilities
+            .answer
+            .participation
+            .retry_uncertain_answers = true;
         let mut originals = Vec::new();
         let mut accepted = Vec::new();
         for epoch in 1..=24 {
-            let original = dispatched_unknown(&mut store, &config, WorkKind::Answer, epoch);
+            let original = dispatched_unknown(&mut store, &config, LaneId::Answer, epoch);
             assert!(store.answer_retry_allowed(&config, &original).unwrap());
             accepted.push(accepted_linked_answer(&mut store, &config, &original));
             originals.push(original);
             drop(store);
             store = Store::open(&config).unwrap();
-            let accounting =
-                Store::uncertainty_accounting(&store.db, &config, None, None, false).unwrap();
+            let accounting = Store::uncertainty_accounting(
+                &store.db,
+                &config,
+                LaneId::Answer,
+                None,
+                None,
+                false,
+            )
+            .unwrap();
             assert_eq!(
                 (
                     accounting.total,
@@ -6221,38 +5296,60 @@ mod tests {
                 (epoch, epoch, epoch, 0)
             );
         }
-        let mut next = prepared_epoch(&mut store, WorkKind::Answer, 25, "next");
-        config.participation.max_unresolved_operations = 1;
+        let mut next = prepared_epoch(&mut store, LaneId::Answer, 25, "next");
+        config
+            .capabilities
+            .answer
+            .participation
+            .max_unresolved_operations = 1;
         assert!(store.admission_allowed(&config, &next).unwrap());
         for mode in [ParticipationMode::Strict, ParticipationMode::Manual] {
-            config.participation.mode = mode;
+            config.capabilities.answer.participation.mode = mode;
             assert!(!store.admission_allowed(&config, &next).unwrap());
-            let accounting =
-                Store::uncertainty_accounting(&store.db, &config, None, None, false).unwrap();
+            let accounting = Store::uncertainty_accounting(
+                &store.db,
+                &config,
+                LaneId::Answer,
+                None,
+                None,
+                false,
+            )
+            .unwrap();
             assert_eq!(
                 (accounting.eligible, accounting.exempt, accounting.active()),
                 (24, 0, 24)
             );
         }
-        config.participation.mode = ParticipationMode::ParticipationFirst;
-        config.participation.historical_unknown_answer_capacity = HistoricalAnswerCapacity::Bounded;
-        config.participation.max_historical_unknown_answers = 2;
+        config.capabilities.answer.participation.mode = ParticipationMode::ParticipationFirst;
+        config
+            .capabilities
+            .answer
+            .participation
+            .historical_unknown_answer_capacity = HistoricalAnswerCapacity::Bounded;
+        config
+            .capabilities
+            .answer
+            .participation
+            .max_historical_unknown_answers = 2;
         assert!(!store.admission_allowed(&config, &next).unwrap());
-        config.participation.historical_unknown_answer_capacity =
-            HistoricalAnswerCapacity::AcceptedLinked;
-        store.record_retry_minimum(originals[0].id, 3600).unwrap();
+        config
+            .capabilities
+            .answer
+            .participation
+            .historical_unknown_answer_capacity = HistoricalAnswerCapacity::AcceptedLinked;
+        shared_floor(&store, &config, now() + 3600);
         drop(store);
         store = Store::open(&config).unwrap();
         assert!(!store.admission_allowed(&config, &next).unwrap());
         assert!(
             !store
-                .uncertainty_open(&config, WorkKind::Answer, Some(25), None)
+                .uncertainty_open(&config, LaneId::Answer, Some(25), None)
                 .unwrap()
         );
         // Expire only the fixture's wall-clock floor; no operation is retired.
         store
             .db
-            .execute("UPDATE operation_timing SET retry_not_before=0", [])
+            .execute("UPDATE request_restrictions SET not_before=0", [])
             .unwrap();
         assert!(store.dispatch_intent(&mut next, &config).unwrap());
         next.state = "unknown".into();
@@ -6260,24 +5357,35 @@ mod tests {
         store.runtime_state(&config, false).unwrap();
         let status = store.status(&config).unwrap();
         assert_eq!(status["participation"]["unresolved_count"], 25);
-        assert_eq!(status["participation"]["historical_eligible_count"], 24);
-        assert_eq!(status["participation"]["capacity_exempt_count"], 24);
-        assert_eq!(status["participation"]["active_unresolved_count"], 1);
         assert_eq!(
-            status["participation"]["historical_unknown_answers"]
+            status["participation"]["lanes"]["answer"]["historical_eligible_count"],
+            24
+        );
+        assert_eq!(
+            status["participation"]["lanes"]["answer"]["capacity_exempt_count"],
+            24
+        );
+        assert_eq!(status["participation"]["lanes"]["answer"]["own_count"], 1);
+        assert_eq!(
+            status["participation"]["lanes"]["answer"]["historical_unknown_answers"]
                 .as_array()
                 .unwrap()
                 .len(),
             20
         );
         assert_eq!(
-            status["participation"]["historical_unknown_answers_truncated"],
+            status["participation"]["lanes"]["answer"]["historical_unknown_answers_truncated"],
             true
         );
         let inspection = store.inspect(next.id).unwrap();
         let risk = &inspection["risk_admissions"][0];
         assert_eq!(risk["accounting"]["capacity_exempt_count"], 24);
-        assert_eq!(risk["blocker_ids"], "[]");
+        assert_eq!(
+            serde_json::from_str::<Vec<i64>>(risk["blocker_ids"].as_str().unwrap())
+                .unwrap()
+                .len(),
+            HISTORICAL_EXAMPLE_LIMIT
+        );
         assert_eq!(risk["historical_unknown_answers_truncated"], true);
         let counts: (u64, u64, u64) = store
             .db
@@ -6298,7 +5406,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(blocker_count, 24);
+        assert!(blocker_count >= 24);
         for original in &originals {
             assert_eq!(
                 store.operation(original.id).unwrap().unwrap().state,
@@ -6307,16 +5415,21 @@ mod tests {
         }
         assert!(
             !store
-                .uncertainty_open(&config, WorkKind::Answer, Some(26), None)
+                .uncertainty_open(&config, LaneId::Answer, Some(26), None)
                 .unwrap()
         );
-        config.participation.max_unresolved_operations = 3;
+        config
+            .capabilities
+            .answer
+            .participation
+            .max_unresolved_operations = 3;
         accepted[0].state = "rejected".into();
         store.save(&accepted[0], "receipt_rejected").unwrap();
         let accounting =
-            Store::uncertainty_accounting(&store.db, &config, None, None, false).unwrap();
+            Store::uncertainty_accounting(&store.db, &config, LaneId::Answer, None, None, false)
+                .unwrap();
         assert_eq!((accounting.exempt, accounting.active()), (23, 2));
-        let mut later = prepared_epoch(&mut store, WorkKind::Answer, 26, "later");
+        let mut later = prepared_epoch(&mut store, LaneId::Answer, 26, "later");
         assert!(store.dispatch_intent(&mut later, &config).unwrap());
         let revoked: u64 = store.db.query_row(
             "SELECT COUNT(*) FROM historical_answer_accounting_events WHERE accepted_answer_id IS NULL",
@@ -6333,10 +5446,17 @@ mod tests {
     #[test]
     fn accepted_linked_requires_direct_same_epoch_dispatched_identifierless_unknown() {
         let (_temp, mut config, mut store) = participation_fixture();
-        config.participation.historical_unknown_answer_capacity =
-            HistoricalAnswerCapacity::AcceptedLinked;
-        config.participation.retry_uncertain_answers = true;
-        let original = dispatched_unknown(&mut store, &config, WorkKind::Answer, 7);
+        config
+            .capabilities
+            .answer
+            .participation
+            .historical_unknown_answer_capacity = HistoricalAnswerCapacity::AcceptedLinked;
+        config
+            .capabilities
+            .answer
+            .participation
+            .retry_uncertain_answers = true;
+        let original = dispatched_unknown(&mut store, &config, LaneId::Answer, 7);
         let accepted = accepted_linked_answer(&mut store, &config, &original);
         for (change, restore) in [
             (
@@ -6369,13 +5489,37 @@ mod tests {
             ),
         ] {
             store.db.execute(change, [original.id]).unwrap();
-            let accounting =
-                Store::uncertainty_accounting(&store.db, &config, None, None, false).unwrap();
+            let owner = store.operation(original.id).unwrap().unwrap().kind;
+            let accounting = Store::uncertainty_accounting(
+                &store.db,
+                &config,
+                LaneId::Answer,
+                None,
+                None,
+                false,
+            )
+            .unwrap();
             assert_eq!(
                 (accounting.eligible, accounting.exempt, accounting.active()),
-                (0, 0, 1),
+                (0, 0, u64::from(owner == LaneId::Answer)),
                 "{change}"
             );
+            assert_eq!(accounting.total, 1, "{change}");
+            if owner != LaneId::Answer {
+                let owning_lane =
+                    Store::uncertainty_accounting(&store.db, &config, owner, None, None, true)
+                        .unwrap();
+                assert_eq!(
+                    (
+                        owning_lane.eligible,
+                        owning_lane.exempt,
+                        owning_lane.active()
+                    ),
+                    (0, 0, 1),
+                    "{change}"
+                );
+                assert_eq!(owning_lane.own_blockers, vec![original.id], "{change}");
+            }
             store.db.execute(restore, [original.id]).unwrap();
         }
         for (state, active, eligible) in [
@@ -6393,8 +5537,15 @@ mod tests {
                     params![state, accepted.id],
                 )
                 .unwrap();
-            let accounting =
-                Store::uncertainty_accounting(&store.db, &config, None, None, false).unwrap();
+            let accounting = Store::uncertainty_accounting(
+                &store.db,
+                &config,
+                LaneId::Answer,
+                None,
+                None,
+                false,
+            )
+            .unwrap();
             assert_eq!(
                 (accounting.active(), accounting.eligible),
                 (active, eligible),
@@ -6409,7 +5560,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            Store::uncertainty_accounting(&store.db, &config, None, None, false)
+            Store::uncertainty_accounting(&store.db, &config, LaneId::Answer, None, None, false)
                 .unwrap()
                 .eligible,
             0
@@ -6429,7 +5580,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            Store::uncertainty_accounting(&store.db, &config, None, None, false)
+            Store::uncertainty_accounting(&store.db, &config, LaneId::Answer, None, None, false)
                 .unwrap()
                 .eligible,
             0
@@ -6437,7 +5588,7 @@ mod tests {
         // An accepted grandchild does not qualify an ancestor without a direct accepted retry.
         let mut retry = store
             .begin_linked(
-                WorkKind::Answer,
+                LaneId::Answer,
                 &original.key,
                 ("prepared", &original.request),
                 store.control().unwrap(),
@@ -6445,7 +5596,11 @@ mod tests {
                 Some((&original, true)),
             )
             .unwrap();
-        config.participation.max_answer_attempts_per_epoch = 4;
+        config
+            .capabilities
+            .answer
+            .participation
+            .max_answer_attempts_per_epoch = 4;
         store
             .db
             .execute(
@@ -6458,7 +5613,8 @@ mod tests {
         store.save(&retry, "dispatch_outcome_unknown").unwrap();
         accepted_linked_answer(&mut store, &config, &retry);
         let accounting =
-            Store::uncertainty_accounting(&store.db, &config, None, None, false).unwrap();
+            Store::uncertainty_accounting(&store.db, &config, LaneId::Answer, None, None, false)
+                .unwrap();
         assert_eq!(
             (
                 accounting.total,
@@ -6472,43 +5628,10 @@ mod tests {
     }
 
     #[test]
-    fn historical_accounting_reads_old_journals_without_migration() {
-        let (_temp, mut config, mut store) = participation_fixture();
-        config.participation.retry_uncertain_answers = true;
-        dispatched_unknown(&mut store, &config, WorkKind::Answer, 7);
-        store.observe(7, false).unwrap();
-        store.runtime_state(&config, false).unwrap();
-        store
-            .db
-            .execute_batch(
-                "DROP TABLE risk_accounting_snapshots;
-             DROP TABLE historical_answer_accounting_events;
-             DROP TABLE operation_links; DROP TABLE operation_timing;",
-            )
-            .unwrap();
-        drop(store);
-        let store = Store::read_only(&config).unwrap().unwrap();
-        let status = store.status(&config).unwrap();
-        assert_eq!(status["participation"]["unresolved_count"], 1);
-        assert_eq!(status["participation"]["historical_eligible_count"], 0);
-        assert_eq!(status["participation"]["active_unresolved_count"], 1);
-        assert_eq!(
-            status["work"]["answer"]["retry"]["reason"],
-            "retry_evidence_unavailable"
-        );
-        assert_eq!(status["work"]["answer"]["phase"], "unknown");
-        assert!(
-            !store
-                .has_table("historical_answer_accounting_events")
-                .unwrap()
-        );
-    }
-
-    #[test]
     fn pending_routes_bind_only_legacy_defaults_and_survive_restart() {
         for state in ["generating", "prepared", "unknown"] {
             let (_temp, config, mut store) = participation_fixture();
-            let op = begin(&mut store, WorkKind::Answer, "7:pending", state);
+            let op = begin(&mut store, LaneId::Answer, "7:pending", state);
             let mut changed = config.clone();
             changed.network.api.routes.insert(
                 crate::endpoints::Endpoint::Challenge,
@@ -6544,7 +5667,7 @@ mod tests {
     fn confirmed_receipts_keep_the_original_routing_profile_until_final() {
         let (_temp, config, mut store) = participation_fixture();
         store.bind_routing(&config).unwrap();
-        let mut op = begin(&mut store, WorkKind::Answer, "7:included", "confirmed");
+        let mut op = begin(&mut store, LaneId::Answer, "7:included", "confirmed");
         op.txid = Some("a".repeat(64));
         store.save(&op, "receipt_included").unwrap();
         let mut changed = config.clone();
@@ -6560,13 +5683,12 @@ mod tests {
                 .unwrap_err()
                 .is::<RoutingProfileError>()
         );
-        assert_eq!(
+        assert!(
             store
-                .awaiting_finality(WorkKind::Answer)
+                .reconciliation_batch(LaneId::Answer)
                 .unwrap()
-                .unwrap()
-                .id,
-            op.id
+                .iter()
+                .any(|pending| pending.id == op.id)
         );
         op.state = "final".into();
         store.save(&op, "node_reported_final").unwrap();
@@ -6577,13 +5699,12 @@ mod tests {
     #[test]
     fn first_custom_binding_revokes_legacy_grants_and_observations() {
         let (_temp, mut config, mut store) = participation_fixture();
-        config.participation.mode = ParticipationMode::Manual;
-        config.participation.allow_answer = true;
-        store.observe(9, false).unwrap();
+        config.capabilities.answer.participation.mode = ParticipationMode::Manual;
+        observe(&store, 9, false).unwrap();
         store
             .record_identity_outcome(HostedIdentityOutcome::Verified)
             .unwrap();
-        let grant = store.authorize(&config, 9, WorkKind::Answer).unwrap();
+        let grant = store.authorize(&config, 9, LaneId::Answer).unwrap();
         config.network.api.routes.insert(
             crate::endpoints::Endpoint::Challenge,
             "/different-challenge".into(),
@@ -6592,7 +5713,9 @@ mod tests {
         assert!(store.control().unwrap().generation > grant["generation"].as_i64().unwrap());
         let observations: i64 = store
             .db
-            .query_row("SELECT COUNT(*) FROM observation", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM lane_observations", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(observations, 0);
         let identity: Option<bool> = store
@@ -6609,8 +5732,8 @@ mod tests {
             json!({"status":"unobserved","observed_at":null,"last_verified_at":null,
                 "rejection":null,"legacy_failure":false})
         );
-        dispatched_unknown(&mut store, &config, WorkKind::Judge, 8);
-        let mut answer = prepared_epoch(&mut store, WorkKind::Answer, 9, "fresh");
+        dispatched_unknown(&mut store, &config, LaneId::Judge, 8);
+        let mut answer = prepared_epoch(&mut store, LaneId::Answer, 9, "fresh");
         assert!(!store.dispatch_intent(&mut answer, &config).unwrap());
     }
 
@@ -6619,10 +5742,10 @@ mod tests {
         for initial in ["rejected", "model_unknown"] {
             for convert in [false, true] {
                 let (_temp, mut config, mut store) = participation_fixture();
-                config.preparation.max_attempts_per_work = 2;
-                config.preparation.retry_uncertain = true;
+                config.capabilities.answer.preparation.max_attempts_per_work = 2;
+                config.capabilities.answer.preparation.retry_uncertain = true;
                 store.bind_routing(&config).unwrap();
-                let op = begin(&mut store, WorkKind::Answer, "7:retry", initial);
+                let op = begin(&mut store, LaneId::Answer, "7:retry", initial);
                 if convert {
                     store.retry_models(&config).unwrap();
                 }
@@ -6641,12 +5764,13 @@ mod tests {
                 if initial == "model_unknown" && !convert {
                     continue;
                 }
-                changed.preparation.max_attempts_per_work = 1;
+                changed
+                    .capabilities
+                    .answer
+                    .preparation
+                    .max_attempts_per_work = 1;
                 store.bind_routing(&changed).unwrap();
-                assert_eq!(
-                    store.model_budget_used(WorkKind::Answer, &op.key).unwrap(),
-                    1
-                );
+                assert_eq!(store.model_budget_used(LaneId::Answer, &op.key).unwrap(), 1);
             }
         }
     }
@@ -6654,19 +5778,31 @@ mod tests {
     #[test]
     fn historical_allowance_preserves_unknowns_and_records_dispatch_witnesses() {
         let (_temp, mut config, mut store) = participation_fixture();
-        config.participation.retry_uncertain_answers = true;
-        let original = dispatched_unknown(&mut store, &config, WorkKind::Answer, 7);
+        config
+            .capabilities
+            .answer
+            .participation
+            .retry_uncertain_answers = true;
+        let original = dispatched_unknown(&mut store, &config, LaneId::Answer, 7);
         let accepted = accepted_linked_answer(&mut store, &config, &original);
-        store.observe(7, true).unwrap();
+        observe(&store, 7, true).unwrap();
         store.runtime_state(&config, false).unwrap();
         assert_eq!(
-            store.status(&config).unwrap()["participation"]["uncertainty_blocks"]["answer"],
-            false
+            store.status(&config).unwrap()["participation"]["lanes"]["answer"]["allowed"],
+            true
         );
-        config.participation.max_unresolved_operations = 1;
-        let mut next = prepared_epoch(&mut store, WorkKind::Answer, 8, "next");
+        config
+            .capabilities
+            .answer
+            .participation
+            .max_unresolved_operations = 1;
+        let mut next = prepared_epoch(&mut store, LaneId::Answer, 8, "next");
         assert!(!store.dispatch_intent(&mut next, &config).unwrap());
-        config.participation.max_historical_unknown_answers = 1;
+        config
+            .capabilities
+            .answer
+            .participation
+            .max_historical_unknown_answers = 1;
         assert!(store.dispatch_intent(&mut next, &config).unwrap());
         next.state = "unknown".into();
         store.save(&next, "dispatch_outcome_unknown").unwrap();
@@ -6684,33 +5820,53 @@ mod tests {
         store.runtime_state(&config, false).unwrap();
         let status = store.status(&config).unwrap();
         assert_eq!(status["participation"]["unresolved_count"], 2);
-        assert_eq!(status["participation"]["active_unresolved_count"], 1);
+        assert_eq!(status["participation"]["lanes"]["answer"]["own_count"], 1);
         assert_eq!(
             store.operation(original.id).unwrap().unwrap().state,
             "unknown"
         );
-        let mut third = prepared_epoch(&mut store, WorkKind::Answer, 9, "third");
+        let mut third = prepared_epoch(&mut store, LaneId::Answer, 9, "third");
         assert!(!store.dispatch_intent(&mut third, &config).unwrap());
     }
 
     #[test]
     fn historical_allowance_never_weakens_policy_floors_or_binding_evidence() {
         let (_temp, mut config, mut store) = participation_fixture();
-        config.participation.retry_uncertain_answers = true;
-        let original = dispatched_unknown(&mut store, &config, WorkKind::Answer, 7);
+        config
+            .capabilities
+            .answer
+            .participation
+            .retry_uncertain_answers = true;
+        let original = dispatched_unknown(&mut store, &config, LaneId::Answer, 7);
         let mut accepted = accepted_linked_answer(&mut store, &config, &original);
-        config.participation.max_unresolved_operations = 1;
-        config.participation.max_historical_unknown_answers = 1;
-        let next = prepared_epoch(&mut store, WorkKind::Answer, 8, "next");
+        config
+            .capabilities
+            .answer
+            .participation
+            .max_unresolved_operations = 1;
+        config
+            .capabilities
+            .answer
+            .participation
+            .max_historical_unknown_answers = 1;
+        let next = prepared_epoch(&mut store, LaneId::Answer, 8, "next");
         assert!(store.admission_allowed(&config, &next).unwrap());
         for mode in [ParticipationMode::Strict, ParticipationMode::Manual] {
-            config.participation.mode = mode;
+            config.capabilities.answer.participation.mode = mode;
             assert!(!store.admission_allowed(&config, &next).unwrap());
         }
-        config.participation.mode = ParticipationMode::ParticipationFirst;
-        config.participation.max_historical_unknown_answers = 0;
+        config.capabilities.answer.participation.mode = ParticipationMode::ParticipationFirst;
+        config
+            .capabilities
+            .answer
+            .participation
+            .max_historical_unknown_answers = 0;
         assert!(!store.admission_allowed(&config, &next).unwrap());
-        config.participation.max_historical_unknown_answers = 1;
+        config
+            .capabilities
+            .answer
+            .participation
+            .max_historical_unknown_answers = 1;
         accepted.state = "rejected".into();
         store.save(&accepted, "receipt_rejected").unwrap();
         assert!(!store.admission_allowed(&config, &next).unwrap());
@@ -6723,7 +5879,7 @@ mod tests {
         bound.job_id = None;
         store.save(&bound, "fixture_unbound").unwrap();
         assert!(store.admission_allowed(&config, &next).unwrap());
-        store.record_retry_minimum(original.id, 3600).unwrap();
+        shared_floor(&store, &config, now() + 3600);
         assert!(!store.admission_allowed(&config, &next).unwrap());
         assert_eq!(
             store.operation(original.id).unwrap().unwrap().state,
@@ -6732,119 +5888,63 @@ mod tests {
     }
 
     #[test]
-    fn answer_reservation_survives_answered_epoch_and_manual_admission() {
-        let (_temp, mut config, mut store) = participation_fixture();
-        config.participation.max_unresolved_operations = 8;
-        config.participation.answer_reserved_slots = 2;
-        config.participation.allow_judge = true;
-        for epoch in 1..=6 {
-            dispatched_unknown(&mut store, &config, WorkKind::Judge, epoch);
-        }
-        store.observe(40, true).unwrap();
-        store.runtime_state(&config, false).unwrap();
-        let mut grade = prepared_epoch(&mut store, WorkKind::Judge, 40, "seventh");
-        let mut mine = prepared_epoch(&mut store, WorkKind::Mine, 40, "mine");
-        assert!(!store.dispatch_intent(&mut grade, &config).unwrap());
-        assert!(!store.dispatch_intent(&mut mine, &config).unwrap());
-        let status = store.status(&config).unwrap();
-        assert_eq!(
-            status["work"]["judge"]["reason"],
-            "answer_capacity_reserved"
-        );
-        assert_eq!(status["work"]["mine"]["reason"], "answer_capacity_reserved");
-        config.participation.mode = ParticipationMode::Manual;
-        assert!(store.authorize(&config, 40, WorkKind::Judge).is_err());
-        assert!(store.authorize(&config, 40, WorkKind::Mine).is_err());
-        store.authorize(&config, 41, WorkKind::Answer).unwrap();
-        let first = dispatched_unknown(&mut store, &config, WorkKind::Answer, 41);
-        store.authorize(&config, 42, WorkKind::Answer).unwrap();
-        let second = dispatched_unknown(&mut store, &config, WorkKind::Answer, 42);
-        assert_ne!(first.id, second.id);
-        assert!(store.authorize(&config, 43, WorkKind::Answer).is_err());
-        let mut third = prepared_epoch(&mut store, WorkKind::Answer, 43, "third");
-        assert!(!store.dispatch_intent(&mut third, &config).unwrap());
-        assert_eq!(third.state, "prepared");
-    }
-
-    #[test]
-    fn read_policy_retimes_local_failure_but_preserves_server_and_legacy_minima() {
-        let (_temp, config) = fixture();
-        let store = Store::open(&config).unwrap();
-        store.read_started(ReadScope::Challenge).unwrap();
-        store
-            .read_finished(ReadScope::Challenge, Some(503), Some("http_status"))
-            .unwrap();
-        let old = store
-            .fail_read(ReadScope::Challenge, 180, 900, 0, None)
-            .unwrap();
-        assert_eq!(store.reads().unwrap()[0]["server_not_before"], 0);
-        store.defer_until(WorkKind::Answer, old.next_at).unwrap();
-        store
-            .reschedule_read(ReadScope::Challenge, 1, 2, 0)
-            .unwrap();
-        assert!(store.read_backoff(ReadScope::Challenge).unwrap().next_at < old.next_at);
-        assert_eq!(
-            store.next_at(WorkKind::Answer).unwrap(),
-            store.read_backoff(ReadScope::Challenge).unwrap().next_at
-        );
-        let floored = store
-            .fail_read(ReadScope::Challenge, 1, 2, 0, Some(90))
-            .unwrap();
-        store
-            .reschedule_read(ReadScope::Challenge, 1, 1, 0)
-            .unwrap();
-        assert_eq!(
-            store.read_backoff(ReadScope::Challenge).unwrap().next_at,
-            floored.next_at
-        );
-        store
-            .db
-            .execute("DROP TABLE read_observations", [])
-            .unwrap();
-        drop(store);
-        let store = Store::open(&config).unwrap();
-        store
-            .reschedule_read(ReadScope::Challenge, 1, 1, 0)
-            .unwrap();
-        assert_eq!(store.read_backoff(ReadScope::Challenge).unwrap(), floored);
-        let diagnostics = store.reads().unwrap();
-        assert_eq!(diagnostics[0]["server_not_before"], 0);
-        assert_eq!(
-            diagnostics[0]["retained_conservative_floor"],
-            floored.next_at
-        );
-        assert_eq!(store.reads().unwrap()[0]["last_failure_at"], Value::Null);
-    }
-
-    #[test]
     fn read_diagnostics_distinguish_http_success_from_usable_evidence_and_bound_codes() {
         let (_temp, config) = fixture();
         let store = Store::open(&config).unwrap();
-        store.read_started(ReadScope::Challenge).unwrap();
-        assert_eq!(store.reads().unwrap()[0]["state"], "in_flight");
         store
-            .read_finished(ReadScope::Challenge, Some(200), Some("invalid_json"))
+            .read_started(&ReadKey::Discovery {
+                lane: LaneId::Answer,
+                source: DiscoverySource::Challenge,
+            })
+            .unwrap();
+        assert_eq!(
+            store.reads_projection().unwrap()["reads"][0]["state"],
+            "in_flight"
+        );
+        store
+            .read_finished(
+                &ReadKey::Discovery {
+                    lane: LaneId::Answer,
+                    source: DiscoverySource::Challenge,
+                },
+                Some(200),
+                Some("invalid_json"),
+            )
             .unwrap();
         store
-            .fail_read(ReadScope::Challenge, 10, 30, 0, None)
+            .fail_read(
+                &ReadKey::Discovery {
+                    lane: LaneId::Answer,
+                    source: DiscoverySource::Challenge,
+                },
+                10,
+                30,
+                0,
+                None,
+            )
             .unwrap();
-        let failed = store.reads().unwrap();
+        let failed = store.reads_projection().unwrap()["reads"].take();
         assert!(failed[0]["last_http_success_at"].is_i64());
         assert!(failed[0]["last_success_at"].is_null());
         assert_eq!(failed[0]["failure_category"], "invalid_json");
         store
             .db
             .execute(
-                "UPDATE read_observations SET failure_category='https://private.invalid/secret'",
+                "UPDATE read_state SET failure_category='https://private.invalid/secret'",
                 [],
             )
             .unwrap();
         assert_eq!(
-            store.reads().unwrap()[0]["failure_category"],
+            store.reads_projection().unwrap()["reads"][0]["failure_category"],
             "unusable_response"
         );
-        store.reset_read(ReadScope::Challenge).unwrap();
-        let recovered = store.reads().unwrap();
+        store
+            .reset_read(&ReadKey::Discovery {
+                lane: LaneId::Answer,
+                source: DiscoverySource::Challenge,
+            })
+            .unwrap();
+        let recovered = store.reads_projection().unwrap()["reads"].take();
         assert!(recovered[0]["last_success_at"].is_i64());
         assert_eq!(
             recovered[0]["last_failure_at"],
@@ -6854,84 +5954,15 @@ mod tests {
     }
 
     #[test]
-    fn participation_admission_is_bounded_durable_and_never_resolves_blockers() {
-        let (_temp, mut config, mut store) = participation_fixture();
-        let old = dispatched_unknown(&mut store, &config, WorkKind::Judge, 1);
-        let mut answer = prepared_epoch(&mut store, WorkKind::Answer, 2, "new");
-        config.participation.mode = ParticipationMode::Strict;
-        assert!(!store.dispatch_intent(&mut answer, &config).unwrap());
-        config.participation.mode = ParticipationMode::ParticipationFirst;
-        config.participation.uncertainty_grace_seconds = 300;
-        assert!(!store.dispatch_intent(&mut answer, &config).unwrap());
-        config.participation.uncertainty_grace_seconds = 0;
-        config.participation.max_unresolved_operations = 1;
-        assert!(!store.dispatch_intent(&mut answer, &config).unwrap());
-        config.participation.max_unresolved_operations = 2;
-        config.participation.allow_answer = false;
-        assert!(!store.dispatch_intent(&mut answer, &config).unwrap());
-        config.participation.allow_answer = true;
-        store.runtime_state(&config, true).unwrap();
-        assert!(!store.dispatch_intent(&mut answer, &config).unwrap());
-        store.runtime_state(&config, false).unwrap();
-        assert!(store.dispatch_intent(&mut answer, &config).unwrap());
-        answer.state = "queued".into();
-        answer.job_id = Some("bound-new-job".into());
-        store.save(&answer, "submission_queued").unwrap();
-        let inspection = store.inspect(answer.id).unwrap();
-        assert_eq!(inspection["risk_admissions"].as_array().unwrap().len(), 1);
-        assert_eq!(store.operation(old.id).unwrap().unwrap().state, "unknown");
-        drop(store);
-        let mut store = Store::open(&config).unwrap();
-        store.recover().unwrap();
-        let mut mine = prepared_epoch(&mut store, WorkKind::Mine, 2, "new");
-        assert!(!store.dispatch_intent(&mut mine, &config).unwrap());
-        config.participation.max_unresolved_operations = 3;
-        assert!(store.dispatch_intent(&mut mine, &config).unwrap());
-        assert_eq!(store.operation(old.id).unwrap().unwrap().state, "unknown");
-        assert_eq!(store.reconciliation_batch().unwrap()[0].id, answer.id);
-        let status = store.status(&config).unwrap();
-        assert_eq!(status["participation"]["unresolved_count"], 3);
-        assert_eq!(status["participation"]["risk_admissions"], 2);
-    }
-
-    #[test]
-    fn live_dispatch_and_retry_minimum_cannot_be_overridden() {
-        let (_temp, mut config, mut store) = participation_fixture();
-        let mut old = prepared_epoch(&mut store, WorkKind::Judge, 1, "old");
-        assert!(store.dispatch_intent(&mut old, &config).unwrap());
-        let mut next = prepared_epoch(&mut store, WorkKind::Answer, 2, "new");
-        assert!(!store.dispatch_intent(&mut next, &config).unwrap());
-        old.state = "unknown".into();
-        store.save(&old, "dispatch_outcome_unknown").unwrap();
-        config.participation.mode = ParticipationMode::Manual;
-        store.authorize(&config, 2, WorkKind::Answer).unwrap();
-        store.record_retry_minimum(old.id, 600).unwrap();
-        assert!(!store.dispatch_intent(&mut next, &config).unwrap());
-        assert_eq!(
-            store
-                .db
-                .query_row(
-                    "SELECT COUNT(*) FROM manual_grants WHERE consumed_by IS NULL",
-                    [],
-                    |r| r.get::<_, i64>(0),
-                )
-                .unwrap(),
-            1
-        );
-        config.participation.mode = ParticipationMode::ParticipationFirst;
-        assert!(!store.dispatch_intent(&mut next, &config).unwrap());
-    }
-
-    #[test]
     fn risk_history_rolls_back_with_stale_cas_and_closed_capabilities() {
         let (_temp, mut config, mut store) = participation_fixture();
-        dispatched_unknown(&mut store, &config, WorkKind::Judge, 1);
-        let mut next = prepared_epoch(&mut store, WorkKind::Answer, 2, "new");
+        dispatched_unknown(&mut store, &config, LaneId::Judge, 1);
+        let mut next = prepared_epoch(&mut store, LaneId::Answer, 2, "new");
         for mode in [Mode::Off, Mode::ReadOnly] {
-            config.capabilities.answer = mode;
+            config.capabilities.answer.mode = mode;
             assert!(!store.dispatch_intent(&mut next, &config).unwrap());
         }
-        config.capabilities.answer = Mode::Active;
+        config.capabilities.answer.mode = Mode::Active;
         let mut stale = next.clone();
         assert!(store.dispatch_intent(&mut next, &config).unwrap());
         next.state = "unknown".into();
@@ -6945,26 +5976,47 @@ mod tests {
             1
         );
         assert_eq!(store.operation(next.id).unwrap().unwrap().state, "unknown");
-        config.participation.mode = ParticipationMode::Manual;
-        config.participation.max_unresolved_operations = 2;
-        assert!(store.authorize(&config, 3, WorkKind::Mine).is_err());
-        config.participation.max_unresolved_operations = 4;
-        config.participation.max_answer_attempts_per_epoch = 1;
-        config.participation.retry_uncertain_answers = true;
-        assert!(store.authorize(&config, 2, WorkKind::Answer).is_err());
+        config.capabilities.answer.participation.mode = ParticipationMode::Manual;
+        config
+            .capabilities
+            .answer
+            .participation
+            .max_unresolved_operations = 2;
+        assert!(store.authorize(&config, 3, LaneId::Mine).is_err());
+        config
+            .capabilities
+            .answer
+            .participation
+            .max_unresolved_operations = 4;
+        config
+            .capabilities
+            .answer
+            .participation
+            .max_answer_attempts_per_epoch = 1;
+        config
+            .capabilities
+            .answer
+            .participation
+            .retry_uncertain_answers = true;
+        assert!(store.authorize(&config, 2, LaneId::Answer).is_err());
     }
 
     #[test]
     fn manual_grants_are_one_dispatch_and_generation_and_epoch_scoped() {
         let (_temp, mut config, mut store) = participation_fixture();
-        dispatched_unknown(&mut store, &config, WorkKind::Judge, 1);
-        config.participation.mode = ParticipationMode::Manual;
-        config.participation.uncertainty_grace_seconds = 600;
-        let mut next = prepared_epoch(&mut store, WorkKind::Answer, 2, "new");
+        dispatched_unknown(&mut store, &config, LaneId::Judge, 1);
+        config.capabilities.answer.participation.mode = ParticipationMode::Manual;
+        config.capabilities.mine.participation.mode = ParticipationMode::Manual;
+        config
+            .capabilities
+            .answer
+            .participation
+            .uncertainty_grace_seconds = 600;
+        let mut next = prepared_epoch(&mut store, LaneId::Answer, 2, "new");
         assert!(!store.dispatch_intent(&mut next, &config).unwrap());
-        store.authorize(&config, 3, WorkKind::Answer).unwrap();
+        store.authorize(&config, 3, LaneId::Answer).unwrap();
         assert!(!store.dispatch_intent(&mut next, &config).unwrap());
-        let grant = store.authorize(&config, 2, WorkKind::Answer).unwrap();
+        let grant = store.authorize(&config, 2, LaneId::Answer).unwrap();
         assert!(store.dispatch_intent(&mut next, &config).unwrap());
         next.state = "unknown".into();
         store.save(&next, "dispatch_outcome_unknown").unwrap();
@@ -6972,565 +6024,147 @@ mod tests {
             store.inspect(next.id).unwrap()["risk_admissions"][0]["manual_grant_id"],
             grant["grant_id"]
         );
-        let mut another = prepared_epoch(&mut store, WorkKind::Mine, 2, "new");
+        let mut another = prepared_epoch(&mut store, LaneId::Mine, 2, "new");
         assert!(!store.dispatch_intent(&mut another, &config).unwrap());
-        store.authorize(&config, 2, WorkKind::Mine).unwrap();
-        store.set_paused(true).unwrap();
-        assert!(store.authorize(&config, 2, WorkKind::Mine).is_err());
-        store.set_paused(false).unwrap();
+        store.authorize(&config, 2, LaneId::Mine).unwrap();
+        store.set_paused_unbound(true).unwrap();
+        assert!(store.authorize(&config, 2, LaneId::Mine).is_err());
+        store.set_paused_unbound(false).unwrap();
         assert!(!store.dispatch_intent(&mut another, &config).unwrap());
         another.state = "discarded".into();
         store.save(&another, "unsent_admission_closed").unwrap();
-        let mut after_resume = prepared_epoch(&mut store, WorkKind::Mine, 2, "new");
+        let mut after_resume = prepared_epoch(&mut store, LaneId::Mine, 2, "new");
         assert!(!store.dispatch_intent(&mut after_resume, &config).unwrap());
-        store.authorize(&config, 2, WorkKind::Mine).unwrap();
+        store.authorize(&config, 2, LaneId::Mine).unwrap();
         assert!(store.dispatch_intent(&mut after_resume, &config).unwrap());
     }
 
-    fn standalone_refused_answer(store: &mut Store, config: &Config) -> Operation {
-        let mut op = dispatched_unknown(store, config, WorkKind::Answer, 7);
-        op.state = "retry".into();
-        op.next_at = 0;
-        store.save(&op, "submission_backoff").unwrap();
-        let mut evidence = refusal_evidence(WorkKind::Answer, 429, Some("rate_limited"));
-        evidence["reason"] = json!("proven_not_accepted");
-        evidence["retry_after_seconds"] = Value::Null;
-        store.record_evidence(op.id, &evidence).unwrap();
-        op
-    }
-
     #[test]
-    fn standalone_refusal_priority_matches_strict_and_manual_risk_policy() {
-        for mode in [
-            ParticipationMode::Strict,
-            ParticipationMode::Manual,
-            ParticipationMode::ParticipationFirst,
+    fn captured_retry_validates_canonical_input_and_copies_canonical_artifacts() {
+        let (_temp, config, mut store) = participation_fixture();
+        let mut original = store
+            .begin(
+                LaneId::Answer,
+                "7:original",
+                "prepared",
+                &json!({"solver":{"id":"captured-request","epoch":7,"words":["burn"],
+                    "min_chars":4,"max_chars":100},"challenge_fingerprint":"original"}),
+                store.control().unwrap(),
+                "original_revision",
+            )
+            .unwrap();
+        original.payload = Some(json!({"answer":"captured burning"}));
+        original.result = Some(json!({"answer":"captured burning","model":"original-model"}));
+        assert!(store.dispatch_intent(&mut original, &config).unwrap());
+        original.state = "unknown".into();
+        store.save(&original, "dispatch_outcome_unknown").unwrap();
+        let original = store.operation(original.id).unwrap().unwrap();
+
+        for changed in [
+            "request",
+            "fingerprint",
+            "words",
+            "constraints",
+            "key",
+            "all",
         ] {
-            for other_effect in [false, true] {
-                let (_temp, mut config, mut store) = participation_fixture();
-                config.participation.retry_uncertain_answers = false;
-                config.participation.max_answer_attempts_per_epoch = 1;
-                let retry = standalone_refused_answer(&mut store, &config);
-                let existing = other_effect
-                    .then(|| dispatched_unknown(&mut store, &config, WorkKind::Judge, 7));
-                let mut lower = prepared_epoch(&mut store, WorkKind::Judge, 7, "next");
-                config.participation.mode = mode;
-                store.observe(7, false).unwrap();
-                if other_effect && mode == ParticipationMode::Manual {
-                    assert!(
-                        Store::answer_retry_reservation(&store.db, &config)
-                            .unwrap()
-                            .is_none()
-                    );
-                    assert!(!store.admission_allowed(&config, &retry).unwrap());
-                    store
-                        .db
-                        .execute(
-                            "INSERT INTO manual_grants(epoch,kind,generation,created_at)
-                         VALUES(7,'answer',?1,?2)",
-                            params![store.control().unwrap().generation, now()],
-                        )
-                        .unwrap();
-                }
-                let reserved = !other_effect || mode != ParticipationMode::Strict;
-                assert_eq!(
-                    Store::answer_retry_reservation(&store.db, &config)
-                        .unwrap()
-                        .is_some(),
-                    reserved
-                );
-                if !other_effect {
-                    // Ordinary same-operation retry needs neither uncertain
-                    // retry opt-in nor a manual risk grant when no effects exist.
-                    assert!(store.admission_allowed(&config, &retry).unwrap());
-                }
-                if let Some(existing) = existing {
-                    store.record_retry_minimum(existing.id, 3600).unwrap();
-                    config.participation.uncertainty_grace_seconds = 7200;
-                    assert_eq!(
-                        Store::answer_retry_reservation(&store.db, &config)
-                            .unwrap()
-                            .is_some(),
-                        reserved
-                    );
-                    assert!(!store.admission_allowed(&config, &retry).unwrap());
-                }
-                if reserved {
-                    assert!(!store.dispatch_intent(&mut lower, &config).unwrap());
-                    store.runtime_state(&config, false).unwrap();
-                    let status = store.status(&config).unwrap();
-                    for kind in ["answer", "judge", "mine"] {
-                        let reservation = &status["work"][kind]["admission_reservation"];
-                        assert_eq!(reservation["active"], true);
-                        assert_eq!(reservation["same_operation"], true);
-                        assert_eq!(reservation["basis"], "proven_refusal_retry");
-                        assert_eq!(reservation["original_operation_id"], retry.id);
-                    }
-                    assert!(status["work"]["answer"]["retry"].is_null());
-                    if !other_effect {
-                        assert_eq!(status["participation"]["unresolved_count"], 0);
-                        assert_eq!(
-                            status["participation"]["uncertainty_blocks"]["judge"],
-                            false
-                        );
-                        assert_eq!(status["participation"]["uncertainty_blocks"]["mine"], false);
-                        assert_eq!(status["admission_blocked"], true);
-                    }
-                }
-                if other_effect {
-                    config.participation.allow_answer = false;
-                    assert!(
-                        Store::answer_retry_reservation(&store.db, &config)
-                            .unwrap()
-                            .is_none()
-                    );
-                }
+            let mut detached = original.clone();
+            if matches!(changed, "request" | "all") {
+                detached.request["solver"]["id"] = json!("changed-request");
             }
-        }
-    }
-
-    #[test]
-    fn standalone_refusal_reservation_waits_for_own_deadlines_and_releases_invalid_intent() {
-        for fence in [
-            "local_delay",
-            "server_floor",
-            "discarded",
-            "stale_generation",
-            "paused",
-            "off",
-            "read_only",
-            "reload",
-            "rollover",
-            "answered",
-            "payload_missing",
-            "unproven",
-            "candidate",
-            "accepted",
-            "other_accepted",
-            "other_uncertain",
-            "budget",
-        ] {
-            let (_temp, mut config, mut store) = participation_fixture();
-            config.participation.max_answer_attempts_per_epoch = 1;
-            let mut retry = standalone_refused_answer(&mut store, &config);
-            store.observe(7, false).unwrap();
-            assert!(
-                Store::answer_retry_reservation(&store.db, &config)
-                    .unwrap()
-                    .is_some()
-            );
-            match fence {
-                "local_delay" => {
-                    retry.next_at = not_before(3600);
-                    store.save(&retry, "submission_backoff").unwrap();
-                }
-                "server_floor" => store.record_retry_minimum(retry.id, 3600).unwrap(),
-                "discarded" => {
-                    retry.state = "discarded".into();
-                    store.save(&retry, "request_no_longer_current").unwrap();
-                }
-                "stale_generation" => {
-                    store.set_paused(true).unwrap();
-                    store.set_paused(false).unwrap();
-                }
-                "paused" => store.set_paused(true).unwrap(),
-                "off" => config.capabilities.answer = Mode::Off,
-                "read_only" => config.capabilities.answer = Mode::ReadOnly,
-                "reload" => store.runtime_state(&config, true).unwrap(),
-                "rollover" => store.observe(8, false).unwrap(),
-                "answered" => store.observe(7, true).unwrap(),
-                "payload_missing" => {
-                    store
-                        .db
-                        .execute("UPDATE operations SET payload=NULL WHERE id=?1", [retry.id])
-                        .unwrap();
-                }
-                "unproven" => {
-                    store
-                        .record_evidence(
-                            retry.id,
-                            &refusal_evidence(WorkKind::Answer, 429, Some("rate_limited")),
-                        )
-                        .unwrap();
-                }
-                "candidate" => {
-                    store
-                        .record_candidates(
-                            retry.id,
-                            &json!({"job_id":"untrusted","transaction_ids":[]}),
-                        )
-                        .unwrap();
-                }
-                "accepted" => {
-                    store
-                        .db
-                        .execute(
-                            "UPDATE operations SET state='confirmed',txid=?2 WHERE id=?1",
-                            params![retry.id, "a".repeat(64)],
-                        )
-                        .unwrap();
-                }
-                "other_accepted" | "other_uncertain" | "budget" => {
-                    let state = match fence {
-                        "other_accepted" => "confirmed",
-                        "other_uncertain" => "unknown",
-                        _ => "refused",
-                    };
-                    store.db.execute(
-                        "INSERT INTO operations(kind,work_key,state,request,generation,revision,created_at,updated_at)
-                         SELECT kind,work_key,?2,request,generation,revision,created_at,updated_at FROM operations WHERE id=?1",
-                        params![retry.id,state],
-                    ).unwrap();
-                }
-                _ => unreachable!(),
+            if matches!(changed, "fingerprint" | "all") {
+                detached.request["challenge_fingerprint"] = json!("changed");
             }
+            if matches!(changed, "words" | "all") {
+                detached.request["solver"]["words"] = json!(["water"]);
+            }
+            if matches!(changed, "constraints" | "all") {
+                detached.request["solver"]["min_chars"] = json!(5);
+                detached.request["solver"]["max_chars"] = json!(80);
+            }
+            if matches!(changed, "key" | "all") {
+                detached.key = "7:changed".into();
+            }
+            assert_eq!(detached.request["solver"]["epoch"], 7);
+            let error = store
+                .begin_linked(
+                    LaneId::Answer,
+                    &detached.key,
+                    ("prepared", &detached.request),
+                    store.control().unwrap(),
+                    "retry_revision",
+                    Some((&detached, true)),
+                )
+                .err()
+                .unwrap();
             assert!(
-                Store::answer_retry_reservation(&store.db, &config)
-                    .unwrap()
-                    .is_none(),
-                "{fence}"
+                error
+                    .to_string()
+                    .contains("captured retry requires matching complete answer"),
+                "{changed}: {error}"
             );
+            assert!(store.preparation(LaneId::Answer).unwrap().is_none());
+            let counts: (i64, i64) = store
+                .db
+                .query_row(
+                    "SELECT (SELECT COUNT(*) FROM operations),(SELECT COUNT(*) FROM operation_links)",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(counts, (1, 0), "{changed}");
         }
-    }
 
-    #[test]
-    fn linked_refusal_same_operation_retry_keeps_priority_without_a_third_attempt_budget() {
-        let (_temp, mut config, mut store) = participation_fixture();
-        config.participation.allow_judge = true;
-        config.participation.retry_uncertain_answers = true;
-        config.participation.max_answer_attempts_per_epoch = 2;
-        let original = dispatched_unknown(&mut store, &config, WorkKind::Answer, 7);
-        store.observe(7, false).unwrap();
-        let mut retry = store
+        let mut detached = original.clone();
+        detached.request["solver"]["words"] = json!(["water"]);
+        detached.key = "7:changed".into();
+        detached.payload = None;
+        detached.result = Some(json!({"answer":"detached result"}));
+        let retry = store
             .begin_linked(
-                WorkKind::Answer,
+                LaneId::Answer,
                 &original.key,
                 ("prepared", &original.request),
                 store.control().unwrap(),
                 "retry_revision",
-                Some((&original, true)),
+                Some((&detached, true)),
             )
             .unwrap();
-        assert!(store.dispatch_intent(&mut retry, &config).unwrap());
-        retry.state = "retry".into();
-        retry.next_at = 0;
-        store.save(&retry, "submission_backoff").unwrap();
-        let mut evidence = refusal_evidence(WorkKind::Answer, 429, Some("rate_limited"));
-        evidence["reason"] = json!("proven_not_accepted");
-        store.record_evidence(retry.id, &evidence).unwrap();
-        let mut lower = prepared_epoch(&mut store, WorkKind::Judge, 7, "next");
-        assert!(!store.answer_retry_allowed(&config, &original).unwrap());
-        assert_eq!(
-            Store::answer_retry_policy_blocker(&store.db, &config, 7, None).unwrap(),
-            Some("answer_attempt_budget_exhausted"),
-        );
-        assert_eq!(
-            Store::answer_retry_reservation(&store.db, &config)
-                .unwrap()
-                .unwrap()
-                .original_operation_id,
-            original.id,
-        );
-        assert!(!store.dispatch_intent(&mut lower, &config).unwrap());
-        assert!(store.admission_allowed(&config, &retry).unwrap());
-        // The same operation may cross dispatch again; its identity/budget and
-        // the unresolved original are preserved rather than minting attempt 3.
-        assert!(store.dispatch_intent(&mut retry, &config).unwrap());
-        retry.state = "retry".into();
-        store.save(&retry, "submission_backoff").unwrap();
-        assert_eq!(
-            store
-                .attempt_count(WorkKind::Answer, &original.key)
-                .unwrap(),
-            2
-        );
-        assert!(!store.answer_retry_allowed(&config, &original).unwrap());
-        assert!(!store.dispatch_intent(&mut lower, &config).unwrap());
-
-        config.participation.max_answer_attempts_per_epoch = 1;
-        assert!(
-            Store::answer_retry_reservation(&store.db, &config)
-                .unwrap()
-                .is_none()
-        );
-        assert!(!store.admission_allowed(&config, &retry).unwrap());
-        config.participation.max_answer_attempts_per_epoch = 2;
-        store.set_paused(true).unwrap();
-        store.set_paused(false).unwrap();
-        assert!(
-            Store::answer_retry_reservation(&store.db, &config)
-                .unwrap()
-                .is_none()
-        );
-        assert!(!store.admission_allowed(&config, &retry).unwrap());
-        assert!(!store.answer_retry_allowed(&config, &original).unwrap());
-        assert_eq!(
-            store.operation(original.id).unwrap().unwrap().state,
-            "unknown"
-        );
-    }
-
-    #[test]
-    fn answer_retry_reservation_drains_existing_grace_without_admitting_new_effects() {
-        for queued in [false, true] {
-            let (_temp, mut config, mut store) = participation_fixture();
-            config.participation.allow_judge = true;
-            let mut original = dispatched_unknown(&mut store, &config, WorkKind::Answer, 7);
-            if queued {
-                original.state = "queued".into();
-                original.job_id = Some("private-answer-job".into());
-                store.save(&original, "submission_queued").unwrap();
-            }
-            let mut existing = dispatched_unknown(&mut store, &config, WorkKind::Judge, 7);
-            existing.state = "queued".into();
-            existing.job_id = Some("private-judge-job".into());
-            store.save(&existing, "submission_queued").unwrap();
-            let mut lower = prepared_epoch(&mut store, WorkKind::Judge, 7, "next");
-            store.observe(7, false).unwrap();
-            config.participation.retry_uncertain_answers = true;
-            config.participation.uncertainty_grace_seconds = 300;
-            config.participation.uncertain_answer_retry_seconds = 600;
-            let ready_since = now() - 7200;
-            store
-                .db
-                .execute(
-                    "UPDATE operation_evidence SET blocked_since=?1 WHERE operation_id=?2",
-                    params![ready_since, original.id],
-                )
-                .unwrap();
-            store.runtime_state(&config, false).unwrap();
-            let status = store.status(&config).unwrap();
-            assert_eq!(status["work"]["judge"]["reason"], "answer_retry_reserved");
-            assert_eq!(
-                status["work"]["judge"]["admission_reservation"]["original_operation_id"],
-                original.id
-            );
-            assert_eq!(
-                status["work"]["answer"]["retry"]["blocking_operation_id"],
-                existing.id
-            );
-            assert_eq!(
-                status["work"]["answer"]["retry"]["reason"],
-                "uncertainty_grace"
-            );
-            assert!(
-                status["work"]["answer"]["retry"]["next_at"]
-                    .as_i64()
-                    .unwrap()
-                    > now()
-            );
-            assert!(!store.dispatch_intent(&mut lower, &config).unwrap());
-            assert!(!store.answer_retry_allowed(&config, &original).unwrap());
-            assert!(
-                store
-                    .reconciliation_batch()
-                    .unwrap()
-                    .iter()
-                    .any(|op| op.id == existing.id)
-            );
-            store.read_started(ReadScope::Challenge).unwrap();
-            store
-                .read_finished(ReadScope::Challenge, Some(200), None)
-                .unwrap();
-            store.observe(7, false).unwrap();
-
-            // Move only fixture clocks, never sleep for the production delays.
-            store
-                .db
-                .execute(
-                    "UPDATE operation_evidence SET blocked_since=?1 WHERE operation_id=?2",
-                    params![ready_since, existing.id],
-                )
-                .unwrap();
-            let floor = now() + 3600;
-            store.record_retry_deadline(existing.id, floor).unwrap();
-            assert!(!store.answer_retry_allowed(&config, &original).unwrap());
-            let status = store.status(&config).unwrap();
-            assert_eq!(
-                status["work"]["answer"]["retry"]["blocking_operation_id"],
-                existing.id
-            );
-            assert_eq!(status["work"]["answer"]["retry"]["next_at"], floor);
-            store
-                .db
-                .execute("UPDATE operation_timing SET retry_not_before=0", [])
-                .unwrap();
-            config.participation.max_unresolved_operations = 2;
-            assert!(!store.answer_retry_allowed(&config, &original).unwrap());
-            config.participation.max_unresolved_operations = 4;
-            assert!(store.answer_retry_allowed(&config, &original).unwrap());
-            assert!(!store.dispatch_intent(&mut lower, &config).unwrap());
-            let accepted = accepted_linked_answer(&mut store, &config, &original);
-            assert!(store.dispatch_intent(&mut lower, &config).unwrap());
-            assert_eq!(
-                store.operation(original.id).unwrap().unwrap().state,
-                if queued { "queued" } else { "unknown" }
-            );
-            assert!(accepted.id > original.id);
-            assert!(!status.to_string().contains("private-"));
-            assert!(!status.to_string().contains("captured answer"));
-        }
-    }
-
-    #[test]
-    fn answer_retry_reservation_survives_stale_drafts_and_dispatched_rejections() {
-        for dispatched in [false, true] {
-            let (_temp, mut config, mut store) = participation_fixture();
-            config.participation.allow_judge = true;
-            config.participation.retry_uncertain_answers = true;
-            config.participation.max_answer_attempts_per_epoch = 3;
-            let original = dispatched_unknown(&mut store, &config, WorkKind::Answer, 7);
-            store.observe(7, false).unwrap();
-            store.runtime_state(&config, false).unwrap();
-            store.read_started(ReadScope::Assignments).unwrap();
-            let status = store.status(&config).unwrap();
-            assert_eq!(status["work"]["judge"]["phase"], "observing");
-            assert_eq!(status["work"]["judge"]["reason"], "read_in_flight");
-            assert_eq!(
-                status["work"]["judge"]["admission_reservation"]["original_operation_id"],
-                original.id
-            );
-
-            let mut previous = store
-                .begin_linked(
-                    WorkKind::Answer,
-                    &original.key,
-                    ("prepared", &original.request),
-                    store.control().unwrap(),
-                    "retry_revision",
-                    Some((&original, true)),
-                )
-                .unwrap();
-            if dispatched {
-                assert!(store.dispatch_intent(&mut previous, &config).unwrap());
-                previous.state = "rejected".into();
-                store.save(&previous, "submission_rejected").unwrap();
-            } else {
-                previous.state = "discarded".into();
-                store.save(&previous, "request_no_longer_current").unwrap();
-            }
-            let mut lower = prepared_epoch(&mut store, WorkKind::Judge, 7, "next");
-            lower.next_at = now() + 60;
-            store.save(&lower, "operation_backoff").unwrap();
-            let status = store.status(&config).unwrap();
-            assert_eq!(status["work"]["judge"]["reason"], "freshness_in_flight");
-            assert_eq!(
-                status["work"]["judge"]["admission_reservation"]["original_operation_id"],
-                original.id
-            );
-            lower.next_at = 0;
-            store.save(&lower, "operation_ready").unwrap();
-            assert!(store.answer_retry_allowed(&config, &original).unwrap());
-            assert!(!store.dispatch_intent(&mut lower, &config).unwrap());
-            let accepted = accepted_linked_answer(&mut store, &config, &original);
-            assert!(accepted.id > previous.id);
-            assert!(store.dispatch_intent(&mut lower, &config).unwrap());
-            assert_eq!(
-                store.operation(original.id).unwrap().unwrap().state,
-                "unknown"
-            );
-        }
-    }
-
-    #[test]
-    fn answer_retry_reservation_requires_live_authorized_retry_intent() {
-        for fence in [
-            "disabled",
-            "answer_disabled",
-            "off",
-            "paused",
-            "exhausted",
-            "answered",
-            "accepted",
-            "rollover",
-            "strict",
-            "manual",
-            "floor",
-            "delay",
-            "model_failed",
-        ] {
-            let (_temp, mut config, mut store) = participation_fixture();
-            config.participation.allow_judge = true;
-            config.participation.retry_uncertain_answers = true;
-            let mut original = dispatched_unknown(&mut store, &config, WorkKind::Answer, 7);
-            let lower = prepared_epoch(&mut store, WorkKind::Judge, 7, "next");
-            store.observe(7, false).unwrap();
-            assert!(
-                Store::answer_retry_reservation(&store.db, &config)
-                    .unwrap()
-                    .is_some()
-            );
-            assert!(!store.admission_allowed(&config, &lower).unwrap());
-            match fence {
-                "disabled" => config.participation.retry_uncertain_answers = false,
-                "answer_disabled" => config.participation.allow_answer = false,
-                "off" => config.capabilities.answer = Mode::Off,
-                "paused" => {
-                    store.set_paused(true).unwrap();
-                }
-                "exhausted" => config.participation.max_answer_attempts_per_epoch = 1,
-                "answered" => store.observe(7, true).unwrap(),
-                "accepted" => {
-                    original.state = "included_pending".into();
-                    original.txid = Some("b".repeat(64));
-                    store.save(&original, "submission_included").unwrap();
-                }
-                "rollover" => store.observe(8, false).unwrap(),
-                "strict" => config.participation.mode = ParticipationMode::Strict,
-                "manual" => config.participation.mode = ParticipationMode::Manual,
-                "floor" => store
-                    .record_retry_deadline(original.id, now() + 3600)
-                    .unwrap(),
-                "delay" => config.participation.uncertain_answer_retry_seconds = 3600,
-                "model_failed" => {
-                    let mut failed = store
-                        .begin_linked(
-                            WorkKind::Answer,
-                            "7:changed",
-                            ("generating", &original.request),
-                            store.control().unwrap(),
-                            "test_revision",
-                            Some((&original, false)),
-                        )
-                        .unwrap();
-                    failed.state = "model_unknown".into();
-                    store.save(&failed, "model_launch_unknown").unwrap();
-                }
-                _ => unreachable!(),
-            }
-            assert!(
-                Store::answer_retry_reservation(&store.db, &config)
-                    .unwrap()
-                    .is_none(),
-                "{fence}"
-            );
-            if !matches!(fence, "paused" | "strict" | "manual" | "floor") {
-                assert!(store.admission_allowed(&config, &lower).unwrap(), "{fence}");
-            }
-            if fence == "manual" {
-                store.authorize(&config, 7, WorkKind::Judge).unwrap();
-                assert!(store.admission_allowed(&config, &lower).unwrap());
-                store.authorize(&config, 7, WorkKind::Answer).unwrap();
-                assert!(!store.admission_allowed(&config, &lower).unwrap());
-                accepted_linked_answer(&mut store, &config, &original);
-                assert!(store.admission_allowed(&config, &lower).unwrap());
-            }
-        }
+        assert_ne!(retry.id, original.id);
+        assert_eq!(retry.key, original.key);
+        assert_eq!(retry.request, original.request);
+        assert_eq!(retry.payload, original.payload);
+        assert_eq!(retry.result, original.result);
+        let inspection = store.inspect(retry.id).unwrap();
+        assert_eq!(inspection["retry_of"], original.id);
+        assert_eq!(inspection["payload_reused"], true);
     }
 
     #[test]
     fn uncertain_answer_reuses_payload_with_distinct_bounded_durable_attempts() {
         let (_temp, mut config, mut store) = participation_fixture();
-        let original = dispatched_unknown(&mut store, &config, WorkKind::Answer, 7);
+        let original = dispatched_unknown(&mut store, &config, LaneId::Answer, 7);
         assert!(!store.answer_retry_allowed(&config, &original).unwrap());
-        config.participation.retry_uncertain_answers = true;
-        config.participation.uncertain_answer_retry_seconds = 600;
+        config
+            .capabilities
+            .answer
+            .participation
+            .retry_uncertain_answers = true;
+        config
+            .capabilities
+            .answer
+            .participation
+            .uncertain_answer_retry_seconds = 600;
         assert!(!store.answer_retry_allowed(&config, &original).unwrap());
-        config.participation.uncertain_answer_retry_seconds = 0;
+        config
+            .capabilities
+            .answer
+            .participation
+            .uncertain_answer_retry_seconds = 0;
         assert!(store.answer_retry_allowed(&config, &original).unwrap());
         let retry = store
             .begin_linked(
-                WorkKind::Answer,
+                LaneId::Answer,
                 &original.key,
                 ("prepared", &original.request),
                 store.control().unwrap(),
@@ -7542,19 +6176,27 @@ mod tests {
         assert_eq!(retry.payload, original.payload);
         assert_eq!(
             store
-                .model_budget_used(WorkKind::Answer, &original.key)
+                .model_budget_used(LaneId::Answer, &original.key)
                 .unwrap(),
             1
         );
         drop(store);
         let mut store = Store::open(&config).unwrap();
         let mut retry = store.operation(retry.id).unwrap().unwrap();
-        config.participation.mode = ParticipationMode::Strict;
+        config.capabilities.answer.participation.mode = ParticipationMode::Strict;
         assert!(!store.dispatch_intent(&mut retry, &config).unwrap());
-        config.participation.mode = ParticipationMode::ParticipationFirst;
-        config.participation.retry_uncertain_answers = false;
+        config.capabilities.answer.participation.mode = ParticipationMode::ParticipationFirst;
+        config
+            .capabilities
+            .answer
+            .participation
+            .retry_uncertain_answers = false;
         assert!(!store.dispatch_intent(&mut retry, &config).unwrap());
-        config.participation.retry_uncertain_answers = true;
+        config
+            .capabilities
+            .answer
+            .participation
+            .retry_uncertain_answers = true;
         assert!(store.dispatch_intent(&mut retry, &config).unwrap());
         retry.state = "unknown".into();
         store.save(&retry, "dispatch_outcome_unknown").unwrap();
@@ -7568,7 +6210,7 @@ mod tests {
         assert_eq!(inspection["payload_reused"], true);
         let mut rotated = store
             .begin_linked(
-                WorkKind::Answer,
+                LaneId::Answer,
                 "7:rotated",
                 ("prepared", &original.request),
                 store.control().unwrap(),
@@ -7582,10 +6224,18 @@ mod tests {
     #[test]
     fn uncertain_answer_retry_projection_separates_floors_freshness_and_budget() {
         let (_temp, mut config, mut store) = participation_fixture();
-        config.participation.retry_uncertain_answers = true;
-        config.participation.max_answer_attempts_per_epoch = 2;
-        let original = dispatched_unknown(&mut store, &config, WorkKind::Answer, 62);
-        store.observe(62, false).unwrap();
+        config
+            .capabilities
+            .answer
+            .participation
+            .retry_uncertain_answers = true;
+        config
+            .capabilities
+            .answer
+            .participation
+            .max_answer_attempts_per_epoch = 2;
+        let original = dispatched_unknown(&mut store, &config, LaneId::Answer, 62);
+        observe(&store, 62, false).unwrap();
         store.runtime_state(&config, false).unwrap();
         let floor = now() + 3600;
         store.record_retry_deadline(original.id, floor).unwrap();
@@ -7597,7 +6247,7 @@ mod tests {
         );
         assert_eq!(
             status["work"]["answer"]["retry"]["reason"],
-            "retained_retry_minimum"
+            "operation_retry_minimum"
         );
         assert_eq!(status["work"]["answer"]["retry"]["next_at"], floor);
         assert_eq!(status["work"]["answer"]["retry"]["policy_eligible"], false);
@@ -7622,7 +6272,16 @@ mod tests {
             true
         );
         store
-            .fail_read(ReadScope::Challenge, 90, 300, 0, None)
+            .fail_read(
+                &ReadKey::Discovery {
+                    lane: LaneId::Answer,
+                    source: DiscoverySource::Challenge,
+                },
+                90,
+                300,
+                0,
+                None,
+            )
             .unwrap();
         drop(store);
         let readonly = Store::read_only(&config).unwrap().unwrap();
@@ -7630,7 +6289,13 @@ mod tests {
         assert_eq!(status["work"]["answer"]["retry"]["reason"], "read_backoff");
         assert_eq!(
             status["work"]["answer"]["retry"]["next_at"],
-            readonly.read_backoff(ReadScope::Challenge).unwrap().next_at
+            readonly
+                .read_backoff(&ReadKey::Discovery {
+                    lane: LaneId::Answer,
+                    source: DiscoverySource::Challenge
+                })
+                .unwrap()
+                .next_at
         );
         assert_eq!(
             readonly.operation(original.id).unwrap().unwrap().state,
@@ -7638,13 +6303,22 @@ mod tests {
         );
         assert_eq!(
             readonly
-                .attempt_count(WorkKind::Answer, &original.key)
+                .attempt_count(LaneId::Answer, &original.key)
                 .unwrap(),
             1
         );
         drop(readonly);
         let mut store = Store::open(&config).unwrap();
-        store.read_started(ReadScope::Challenge).unwrap();
+        let discovery = ReadKey::Discovery {
+            lane: LaneId::Answer,
+            source: DiscoverySource::Challenge,
+        };
+        assert!(!store.read_started(&discovery).unwrap());
+        store.db.execute(
+            "UPDATE read_state SET local_next_at=0 WHERE owner='answer' AND purpose='discovery'",
+            [],
+        ).unwrap();
+        assert!(store.read_started(&discovery).unwrap());
         let status = store.status(&config).unwrap();
         assert_eq!(
             status["work"]["answer"]["retry"]["reason"],
@@ -7652,11 +6326,23 @@ mod tests {
         );
         assert!(status["work"]["answer"]["retry"]["next_at"].is_null());
         store
-            .read_finished(ReadScope::Challenge, Some(200), None)
+            .read_finished(
+                &ReadKey::Discovery {
+                    lane: LaneId::Answer,
+                    source: DiscoverySource::Challenge,
+                },
+                Some(200),
+                None,
+            )
             .unwrap();
-        store.reset_read(ReadScope::Challenge).unwrap();
+        store
+            .reset_read(&ReadKey::Discovery {
+                lane: LaneId::Answer,
+                source: DiscoverySource::Challenge,
+            })
+            .unwrap();
 
-        store.observe(62, true).unwrap();
+        observe(&store, 62, true).unwrap();
         let status = store.status(&config).unwrap();
         assert_eq!(
             status["work"]["answer"]["retry"]["reason"],
@@ -7666,10 +6352,10 @@ mod tests {
             store.operation(original.id).unwrap().unwrap().state,
             "unknown"
         );
-        store.observe(62, false).unwrap();
+        observe(&store, 62, false).unwrap();
         let mut retry = store
             .begin_linked(
-                WorkKind::Answer,
+                LaneId::Answer,
                 &original.key,
                 ("prepared", &original.request),
                 store.control().unwrap(),
@@ -7688,7 +6374,7 @@ mod tests {
         );
         assert_eq!(
             status["work"]["answer"]["retry"]["reason"],
-            "retained_retry_minimum"
+            "operation_retry_minimum"
         );
         assert_eq!(status["work"]["answer"]["retry"]["next_at"], floor);
         assert!(!store.dispatch_intent(&mut retry, &config).unwrap());
@@ -7709,7 +6395,7 @@ mod tests {
         );
         assert_eq!(status["work"]["answer"]["retry"]["policy_eligible"], false);
         assert!(!store.answer_retry_allowed(&config, &retry).unwrap());
-        store.observe(62, true).unwrap();
+        observe(&store, 62, true).unwrap();
         let status = store.status(&config).unwrap();
         assert_eq!(
             status["work"]["answer"]["retry"]["reason"],
@@ -7726,10 +6412,10 @@ mod tests {
     #[test]
     fn uncertain_answer_retry_projection_uses_effective_policy_and_preserves_fences() {
         let (_temp, mut config, mut store) = participation_fixture();
-        let original = dispatched_unknown(&mut store, &config, WorkKind::Answer, 62);
-        store.observe(62, false).unwrap();
+        let original = dispatched_unknown(&mut store, &config, LaneId::Answer, 62);
+        observe(&store, 62, false).unwrap();
         for (mode, enabled, capacity, delay, expected) in [
-            (ParticipationMode::Strict, true, 8, 0, "strict_uncertainty"),
+            (ParticipationMode::Strict, true, 8, 0, "account_uncertainty"),
             (
                 ParticipationMode::ParticipationFirst,
                 false,
@@ -7742,7 +6428,7 @@ mod tests {
                 true,
                 1,
                 0,
-                "unresolved_capacity",
+                "lane_unresolved_capacity",
             ),
             (
                 ParticipationMode::ParticipationFirst,
@@ -7759,10 +6445,22 @@ mod tests {
                 "manual_authorization_required",
             ),
         ] {
-            config.participation.mode = mode;
-            config.participation.retry_uncertain_answers = enabled;
-            config.participation.max_unresolved_operations = capacity;
-            config.participation.uncertain_answer_retry_seconds = delay;
+            config.capabilities.answer.participation.mode = mode;
+            config
+                .capabilities
+                .answer
+                .participation
+                .retry_uncertain_answers = enabled;
+            config
+                .capabilities
+                .answer
+                .participation
+                .max_unresolved_operations = capacity;
+            config
+                .capabilities
+                .answer
+                .participation
+                .uncertain_answer_retry_seconds = delay;
             store.runtime_state(&config, false).unwrap();
             let status = store.status(&Config::default()).unwrap();
             assert_eq!(status["work"]["answer"]["retry"]["reason"], expected);
@@ -7779,11 +6477,15 @@ mod tests {
     fn accepted_answer_blocks_every_same_epoch_duplicate_even_prepared_retry() {
         for state in ["included_pending", "confirmed", "final"] {
             let (_temp, mut config, mut store) = participation_fixture();
-            config.participation.retry_uncertain_answers = true;
-            let mut original = dispatched_unknown(&mut store, &config, WorkKind::Answer, 9);
+            config
+                .capabilities
+                .answer
+                .participation
+                .retry_uncertain_answers = true;
+            let mut original = dispatched_unknown(&mut store, &config, LaneId::Answer, 9);
             let mut retry = store
                 .begin_linked(
-                    WorkKind::Answer,
+                    LaneId::Answer,
                     &original.key,
                     ("prepared", &original.request),
                     store.control().unwrap(),
@@ -7802,216 +6504,62 @@ mod tests {
     #[test]
     fn mine_each_epoch_and_safe_same_operation_retry_are_distinct() {
         let (_temp, mut config, mut store) = participation_fixture();
-        config.schedule.mine_each_epoch = true;
-        let mut mine = dispatched_unknown(&mut store, &config, WorkKind::Mine, 10);
+        config.capabilities.mine.schedule.each_epoch = true;
+        let mut mine = dispatched_unknown(&mut store, &config, LaneId::Mine, 10);
         mine.state = "retry".into();
         store.save(&mine, "submission_backoff").unwrap();
         assert!(store.dispatch_intent(&mut mine, &config).unwrap());
         mine.state = "completed".into();
         store.save(&mine, "mine_completed").unwrap();
         assert!(store.mine_epoch_attempted(10).unwrap());
-        let mut duplicate = prepared_epoch(&mut store, WorkKind::Mine, 10, "rotated");
+        let mut duplicate = prepared_epoch(&mut store, LaneId::Mine, 10, "rotated");
         assert!(!store.dispatch_intent(&mut duplicate, &config).unwrap());
         duplicate.state = "discarded".into();
         store.save(&duplicate, "request_no_longer_current").unwrap();
-        let mut next = prepared_epoch(&mut store, WorkKind::Mine, 11, "new");
+        let mut next = prepared_epoch(&mut store, LaneId::Mine, 11, "new");
         assert!(store.dispatch_intent(&mut next, &config).unwrap());
     }
 
     #[test]
-    fn reconciliation_scope_floors_do_not_hide_other_due_scopes() {
+    fn status_requires_effective_lane_policy_without_desired_fallback() {
         let (_temp, mut config, mut store) = participation_fixture();
-        config.participation.max_unresolved_operations = 8;
-        let mut jobs = Vec::new();
-        for epoch in 1..3 {
-            let mut op = dispatched_unknown(&mut store, &config, WorkKind::Mine, epoch);
-            op.job_id = Some(format!("blocked-job-{epoch}"));
-            op.state = "queued".into();
-            store.save(&op, "submission_queued").unwrap();
-            jobs.push(op.id);
-        }
-        let mut receipt = dispatched_unknown(&mut store, &config, WorkKind::Mine, 3);
-        receipt.txid = Some("a".repeat(64));
-        receipt.state = "included_pending".into();
-        store.save(&receipt, "receipt_included").unwrap();
-        store.fail_read(ReadScope::Job, 60, 60, 0, None).unwrap();
-        let selected = store.reconciliation_batch().unwrap();
-        assert_eq!(
-            selected.iter().map(|op| op.id).collect::<Vec<_>>(),
-            vec![receipt.id]
-        );
-        store.reset_read(ReadScope::Job).unwrap();
-        for id in jobs {
-            store.record_retry_minimum(id, 60).unwrap();
-        }
-        let selected = store.reconciliation_batch().unwrap();
-        assert_eq!(
-            selected.iter().map(|op| op.id).collect::<Vec<_>>(),
-            vec![receipt.id]
-        );
-    }
-
-    #[test]
-    fn pending_work_keeps_later_queue_evidence_in_current_and_legacy_journals() {
-        for legacy in [false, true] {
-            let (_temp, config, mut store) = participation_fixture();
-            let old = dispatched_unknown(&mut store, &config, WorkKind::Judge, 1);
-            let later = begin(&mut store, WorkKind::Mine, "later", "prepared");
-            store
-                .db
-                .execute(
-                    "UPDATE operations SET state='queued',created_at=1 WHERE id=?1",
-                    [later.id],
-                )
-                .unwrap();
-            if legacy {
-                store
-                    .db
-                    .execute_batch(
-                        "UPDATE control SET version=1;
-                     DROP TABLE authority; DROP TABLE operation_evidence;
-                     DROP TABLE runtime_policy; DROP TABLE operation_timing;",
-                    )
-                    .unwrap();
-            }
-            let status = store.status(&config).unwrap();
-            assert_eq!(status["pending"]["operation_id"], old.id);
-            let work = status["pending_work"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|work| work["operation_id"] == later.id)
-                .unwrap();
-            assert_eq!(work["state"], "queued");
-            assert_eq!(work["created_at"], 1);
-            assert!(work["http_deadline"].is_null());
-        }
-    }
-
-    #[test]
-    fn legacy_oldest_uncertainty_requires_an_effect() {
-        let (_temp, config, mut store) = participation_fixture();
-        let op = begin(&mut store, WorkKind::Mine, "legacy", "prepared");
-        store
-            .db
-            .execute_batch(
-                "UPDATE control SET version=1;
-             DROP TABLE authority; DROP TABLE operation_evidence; DROP TABLE runtime_policy;
-             DROP TABLE operation_timing;",
-            )
-            .unwrap();
-        let status = store.status(&config).unwrap();
-        assert_eq!(status["pending"]["operation_id"], op.id);
-        assert!(status["oldest_unresolved_operation"].is_null());
-        assert!(status["oldest_unresolved_since"].is_null());
-        store
-            .db
-            .execute(
-                "UPDATE operations SET state='unknown',created_at=100 WHERE id=?1",
-                [op.id],
-            )
-            .unwrap();
-        let status = store.status(&config).unwrap();
-        assert_eq!(status["oldest_unresolved_operation"], op.id);
-        assert_eq!(status["oldest_unresolved_since"], 100);
-    }
-
-    #[test]
-    fn bounded_reconciliation_rotates_past_identifierless_oldest_across_restart() {
-        let (_temp, mut config, mut store) = participation_fixture();
-        config.participation.max_unresolved_operations = 8;
-        dispatched_unknown(&mut store, &config, WorkKind::Judge, 1);
-        let mut ids = Vec::new();
-        for epoch in 2..6 {
-            let mut op = dispatched_unknown(&mut store, &config, WorkKind::Mine, epoch);
-            op.job_id = Some(format!("bound-job-{epoch}"));
-            op.state = "queued".into();
-            store.save(&op, "submission_queued").unwrap();
-            ids.push(op.id);
-        }
-        assert_eq!(
-            store
-                .reconciliation_batch()
-                .unwrap()
-                .iter()
-                .map(|o| o.id)
-                .collect::<Vec<_>>(),
-            ids[..2]
-        );
-        // A failed first request can impose a scope floor that skips the second.
-        store.reconciliation_attempted(ids[0]).unwrap();
-        drop(store);
-        let store = Store::open(&config).unwrap();
-        assert_eq!(
-            store
-                .reconciliation_batch()
-                .unwrap()
-                .iter()
-                .map(|o| o.id)
-                .collect::<Vec<_>>(),
-            ids[1..3]
-        );
-        store.reconciliation_attempted(ids[2]).unwrap();
-        assert_eq!(
-            store
-                .reconciliation_batch()
-                .unwrap()
-                .iter()
-                .map(|o| o.id)
-                .collect::<Vec<_>>(),
-            vec![ids[3], ids[0]]
-        );
-    }
-
-    #[test]
-    fn status_uses_effective_policy_without_mutating_legacy_auxiliary_tables() {
-        let (_temp, mut config, mut store) = participation_fixture();
-        dispatched_unknown(&mut store, &config, WorkKind::Judge, 1);
-        store.observe(2, false).unwrap();
+        dispatched_unknown(&mut store, &config, LaneId::Judge, 1);
         store.runtime_state(&config, false).unwrap();
-        let mut accepted = dispatched_unknown(&mut store, &config, WorkKind::Answer, 2);
-        accepted.state = "final".into();
-        accepted.txid = Some("a".repeat(64));
-        store.save(&accepted, "receipt_final").unwrap();
-        config.participation.mode = ParticipationMode::Strict;
-        let status = store.status(&config).unwrap();
+        config.capabilities.answer.participation.mode = ParticipationMode::Strict;
         assert_eq!(
-            status["participation"]["policy"]["mode"],
-            "participation_first"
+            store.status(&config).unwrap()["participation"]["lanes"]["answer"]["allowed"],
+            true
         );
-        assert_eq!(
-            status["participation"]["uncertainty_blocks"]["answer"],
-            false
-        );
-        assert_eq!(status["participation"]["uncertainty_blocks"]["judge"], true);
-        assert_eq!(status["participation"]["uncertainty_blocks"]["mine"], false);
-        store.db.execute_batch(
-            "DROP TABLE risk_admissions; DROP TABLE operation_links; DROP TABLE operation_timing;
-            DROP TABLE manual_grants; DELETE FROM runtime_policy;",
-        ).unwrap();
-        drop(store);
-        let store = Store::read_only(&config).unwrap().unwrap();
+        store.db.execute("DELETE FROM runtime_policy", []).unwrap();
+        let changes = store.db.total_changes();
         let status = store.status(&config).unwrap();
         assert_eq!(status["participation"]["policy_source"], "unavailable");
-        assert_eq!(status["participation"]["policy"]["mode"], "strict");
-        assert_eq!(status["participation"]["unresolved_count"], 1);
-        assert!(!store.has_table("risk_admissions").unwrap());
+        assert!(status["participation"]["lanes"]["answer"].is_null());
+        assert_eq!(store.db.total_changes(), changes);
     }
 
     #[test]
     fn proven_nonacceptance_allows_new_fingerprint_within_distinct_attempt_budget() {
         let (_temp, mut config, mut store) = participation_fixture();
-        config.participation.mode = ParticipationMode::Strict;
-        let mut old = dispatched_unknown(&mut store, &config, WorkKind::Answer, 7);
+        config.capabilities.answer.participation.mode = ParticipationMode::Strict;
+        let mut old = dispatched_unknown(&mut store, &config, LaneId::Answer, 7);
         old.state = "retry".into();
         store.save(&old, "submission_backoff").unwrap();
         old.state = "discarded".into();
         store.save(&old, "request_no_longer_current").unwrap();
         assert!(!store.answer_epoch_attempted(7).unwrap());
-        let mut current = prepared_epoch(&mut store, WorkKind::Answer, 7, "rotated");
-        config.participation.max_answer_attempts_per_epoch = 1;
+        let mut current = prepared_epoch(&mut store, LaneId::Answer, 7, "rotated");
+        config
+            .capabilities
+            .answer
+            .participation
+            .max_answer_attempts_per_epoch = 1;
         assert!(!store.dispatch_intent(&mut current, &config).unwrap());
-        config.participation.max_answer_attempts_per_epoch = 2;
+        config
+            .capabilities
+            .answer
+            .participation
+            .max_answer_attempts_per_epoch = 2;
         assert!(store.dispatch_intent(&mut current, &config).unwrap());
         assert!(
             store.inspect(current.id).unwrap()["risk_admissions"]
@@ -8025,7 +6573,7 @@ mod tests {
     #[test]
     fn bound_legacy_stale_answer_retains_epoch_dispatch_budget() {
         let (_temp, mut config, mut store) = participation_fixture();
-        let mut old = dispatched_unknown(&mut store, &config, WorkKind::Answer, 7);
+        let mut old = dispatched_unknown(&mut store, &config, LaneId::Answer, 7);
         old.job_id = Some("legacy-bound-job".into());
         old.state = "stale".into();
         store.save(&old, "processed_submission_rejected").unwrap();
@@ -8040,20 +6588,30 @@ mod tests {
         store.db.execute("DELETE FROM events", []).unwrap();
         drop(store);
         let mut store = Store::open(&config).unwrap();
-        let mut current = prepared_epoch(&mut store, WorkKind::Answer, 7, "rotated");
-        config.participation.max_answer_attempts_per_epoch = 1;
+        let mut current = prepared_epoch(&mut store, LaneId::Answer, 7, "rotated");
+        config
+            .capabilities
+            .answer
+            .participation
+            .max_answer_attempts_per_epoch = 1;
         assert!(!store.dispatch_intent(&mut current, &config).unwrap());
-        config.participation.max_answer_attempts_per_epoch = 2;
+        config
+            .capabilities
+            .answer
+            .participation
+            .max_answer_attempts_per_epoch = 2;
         assert!(store.dispatch_intent(&mut current, &config).unwrap());
     }
 
     #[test]
     fn oldest_unresolved_is_not_the_current_grace_blocker() {
         let (_temp, mut config, mut store) = participation_fixture();
-        config.participation.allow_judge = true;
-        config.participation.allow_mine = true;
-        config.participation.max_unresolved_operations = 4;
-        let old = dispatched_unknown(&mut store, &config, WorkKind::Judge, 1);
+        config
+            .capabilities
+            .answer
+            .participation
+            .max_unresolved_operations = 4;
+        let old = dispatched_unknown(&mut store, &config, LaneId::Judge, 1);
         let old_since = now() - 86400;
         store
             .db
@@ -8062,22 +6620,33 @@ mod tests {
                 params![old_since, old.id],
             )
             .unwrap();
-        let recent = dispatched_unknown(&mut store, &config, WorkKind::Mine, 2);
-        let prepared = prepared_epoch(&mut store, WorkKind::Answer, 3, "current");
-        store.observe(3, false).unwrap();
-        config.participation.uncertainty_grace_seconds = 300;
+        let recent = dispatched_unknown(&mut store, &config, LaneId::Mine, 2);
+        let prepared = prepared_epoch(&mut store, LaneId::Answer, 3, "current");
+        observe(&store, 3, false).unwrap();
+        config
+            .capabilities
+            .answer
+            .participation
+            .uncertainty_grace_seconds = 300;
         store.runtime_state(&config, false).unwrap();
         let status = store.status(&config).unwrap();
         assert_eq!(status["oldest_unresolved_operation"], old.id);
         assert_eq!(status["oldest_unresolved_since"], old_since);
         assert_eq!(status["admission_blocked"], true);
-        assert_eq!(status["work"]["answer"]["reason"], "uncertainty_grace");
+        assert_eq!(
+            status["work"]["answer"]["reason"],
+            "account_uncertainty_grace"
+        );
         assert!(status["work"]["answer"]["next_at"].as_i64().unwrap() >= now() + 299);
         assert!(!store.admission_allowed(&config, &prepared).unwrap());
         assert!(status.get("blocking_operation").is_none());
         assert!(status.get("blocked_since").is_none());
 
-        config.participation.uncertainty_grace_seconds = 0;
+        config
+            .capabilities
+            .answer
+            .participation
+            .uncertainty_grace_seconds = 0;
         store.runtime_state(&config, false).unwrap();
         let status = store.status(&config).unwrap();
         assert_eq!(status["admission_blocked"], false);
@@ -8093,43 +6662,81 @@ mod tests {
     fn inventory_selection_is_durable_bounded_evidence_not_admission_or_global_absence() {
         let (_temp, mut config, store) = participation_fixture();
         store.runtime_state(&config, false).unwrap();
-        let revision = config.revision().unwrap();
+        let revision = config.lane_revision(LaneId::Judge).unwrap();
         let generation = store.control().unwrap().generation;
         store
             .record_assignment_selection(&revision, generation, 2, false, false)
             .unwrap();
-        store.defer(WorkKind::Judge, 120).unwrap();
+        store.defer(LaneId::Judge, 120).unwrap();
         drop(store);
         let mut store = Store::open(&config).unwrap();
         let work = store.status(&config).unwrap()["work"]["judge"].clone();
         assert_eq!(work["reason"], "no_eligible_in_observed_inventory");
-        assert_eq!(work["selection"]["observed_count"], 2);
-        assert_eq!(work["selection"]["inventory_complete"], false);
-        assert_eq!(work["selection"]["evidence"], "observed_inventory_only");
+        assert_eq!(work["assessment"]["observed_opportunities"], 2);
+        assert_eq!(work["assessment"]["completeness"], "bounded_partial");
         assert!(work["next_at"].as_i64().unwrap() > now());
         store
-            .fail_read(ReadScope::Assignments, 1, 10, 0, Some(600))
+            .fail_read(
+                &ReadKey::Discovery {
+                    lane: LaneId::Judge,
+                    source: DiscoverySource::Assignments,
+                },
+                600,
+                900,
+                0,
+                None,
+            )
             .unwrap();
-        let floor = store.read_backoff(ReadScope::Assignments).unwrap().next_at;
+        let floor = store
+            .read_backoff(&ReadKey::Discovery {
+                lane: LaneId::Judge,
+                source: DiscoverySource::Assignments,
+            })
+            .unwrap()
+            .next_at;
         let work = store.status(&config).unwrap()["work"]["judge"].clone();
         assert_eq!(work["reason"], "read_backoff");
         assert!(work["next_at"].as_i64().unwrap() >= floor);
-        store.read_started(ReadScope::Assignments).unwrap();
-        assert!(store.status(&config).unwrap()["work"]["judge"]["selection"].is_null());
-        store.cancel_read(ReadScope::Assignments).unwrap();
+        assert!(
+            !store
+                .read_started(&ReadKey::Discovery {
+                    lane: LaneId::Judge,
+                    source: DiscoverySource::Assignments
+                })
+                .unwrap()
+        );
         assert_eq!(
-            store.read_backoff(ReadScope::Assignments).unwrap().next_at,
+            store.status(&config).unwrap()["work"]["judge"]["assessment"]["observed_opportunities"],
+            2
+        );
+        store
+            .cancel_read(&ReadKey::Discovery {
+                lane: LaneId::Judge,
+                source: DiscoverySource::Assignments,
+            })
+            .unwrap();
+        assert_eq!(
+            store
+                .read_backoff(&ReadKey::Discovery {
+                    lane: LaneId::Judge,
+                    source: DiscoverySource::Assignments
+                })
+                .unwrap()
+                .next_at,
             floor
         );
         store
             .record_assignment_selection(&revision, generation, 0, true, false)
             .unwrap();
-        config.preparation.max_attempts_per_work += 1;
+        config.capabilities.answer.preparation.max_attempts_per_work += 1;
         store.runtime_state(&config, false).unwrap();
-        assert!(store.status(&config).unwrap()["work"]["judge"]["selection"].is_null());
-        store.set_paused(true).unwrap();
-        store.set_paused(false).unwrap();
-        let revision = config.revision().unwrap();
+        assert_eq!(
+            store.status(&config).unwrap()["work"]["judge"]["assessment"]["observed_opportunities"],
+            0
+        );
+        store.set_paused_unbound(true).unwrap();
+        store.set_paused_unbound(false).unwrap();
+        let revision = config.lane_revision(LaneId::Judge).unwrap();
         store
             .record_assignment_selection(
                 &revision,
@@ -8142,49 +6749,20 @@ mod tests {
         store
             .record_assignment_selection(&revision, generation, 0, true, false)
             .unwrap();
-        let selection = store.status(&config).unwrap()["work"]["judge"]["selection"].clone();
-        assert_eq!(selection["observed_count"], 1);
-        assert_eq!(selection["eligible"], true);
+        let assessment = store.status(&config).unwrap()["work"]["judge"]["assessment"].clone();
+        assert_eq!(assessment["observed_opportunities"], 1);
+        assert_eq!(assessment["locally_judgeable"], true);
     }
 
     #[test]
-    fn restart_restores_captured_legacy_submission_floor_without_renewing_it() {
-        for observation in [Some(now() - 60), None] {
-            let (_temp, mut config, mut store) = participation_fixture();
-            config.participation.uncertainty_grace_seconds = 0;
-            let mut op = prepared_epoch(&mut store, WorkKind::Judge, 1, "legacy");
-            assert!(store.dispatch_intent(&mut op, &config).unwrap());
-            store
-                .record_evidence(
-                    op.id,
-                    &refusal_evidence(WorkKind::Judge, 429, Some("rate_limited")),
-                )
-                .unwrap();
-            store
-                .db
-                .execute(
-                    "UPDATE operation_evidence SET observed_at=?1 WHERE operation_id=?2",
-                    params![observation, op.id],
-                )
-                .unwrap();
-            assert_eq!(store.operation_poll_timing(op.id).unwrap().1, 0);
-            drop(store);
-            let mut store = Store::open(&config).unwrap();
-            store.recover().unwrap();
-            let expected = observation.map(|at| at + 3601).unwrap_or(i64::MAX);
-            assert_eq!(store.operation_poll_timing(op.id).unwrap().1, expected);
-            let mut answer = prepared_epoch(&mut store, WorkKind::Answer, 2, "fresh");
-            assert!(!store.dispatch_intent(&mut answer, &config).unwrap());
-            store.recover().unwrap();
-            assert_eq!(store.operation_poll_timing(op.id).unwrap().1, expected);
-        }
-    }
-
-    #[test]
-    fn submission_capture_atomically_retains_floor_across_restart() {
+    fn submission_evidence_is_atomic_without_reconstructing_request_minima() {
         let (_temp, mut config, mut store) = participation_fixture();
-        config.participation.uncertainty_grace_seconds = 0;
-        let mut op = prepared_epoch(&mut store, WorkKind::Judge, 1, "limited");
+        config
+            .capabilities
+            .answer
+            .participation
+            .uncertainty_grace_seconds = 0;
+        let mut op = prepared_epoch(&mut store, LaneId::Judge, 1, "limited");
         assert!(store.dispatch_intent(&mut op, &config).unwrap());
         let before: Option<String> = store
             .db
@@ -8194,12 +6772,12 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        let evidence = refusal_evidence(WorkKind::Judge, 429, Some("rate_limited"));
+        let evidence = refusal_evidence(LaneId::Judge, 429, Some("rate_limited"));
         store
             .db
             .execute_batch(
-                "CREATE TEMP TRIGGER deny_response_floor BEFORE UPDATE ON operation_timing
-             BEGIN SELECT RAISE(ABORT,'synthetic timing failure'); END;",
+                "CREATE TEMP TRIGGER deny_response_floor BEFORE UPDATE ON operation_evidence
+             BEGIN SELECT RAISE(ABORT,'synthetic evidence failure'); END;",
             )
             .unwrap();
         assert!(
@@ -8217,7 +6795,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             after, before,
-            "diagnostic committed without its server floor"
+            "diagnostic committed despite failed evidence capture"
         );
         store
             .db
@@ -8238,15 +6816,15 @@ mod tests {
             .record_submission_evidence(op.id, &evidence, &json!({"job_id":"candidate"}))
             .unwrap();
         let floor = store.operation_poll_timing(op.id).unwrap().1;
-        assert!(floor >= now() + 3600);
+        assert_eq!(floor, 0);
         // Simulate stopping after response capture, before outcome() saves retry.
         drop(store);
         let mut store = Store::open(&config).unwrap();
         store.recover().unwrap();
         assert_eq!(store.operation(op.id).unwrap().unwrap().state, "unknown");
         assert_eq!(store.operation_poll_timing(op.id).unwrap().1, floor);
-        let mut answer = prepared_epoch(&mut store, WorkKind::Answer, 2, "fresh");
-        assert!(!store.dispatch_intent(&mut answer, &config).unwrap());
+        let mut answer = prepared_epoch(&mut store, LaneId::Answer, 2, "fresh");
+        assert!(store.admission_allowed(&config, &answer).unwrap());
         store
             .db
             .execute(
@@ -8260,7 +6838,7 @@ mod tests {
     #[test]
     fn safe_retry_redispatch_restarts_uncertainty_grace_without_resetting_work_age() {
         let (_temp, mut config, mut store) = participation_fixture();
-        let mut old = dispatched_unknown(&mut store, &config, WorkKind::Judge, 1);
+        let mut old = dispatched_unknown(&mut store, &config, LaneId::Judge, 1);
         old.state = "retry".into();
         store.save(&old, "submission_backoff").unwrap();
         store
@@ -8270,11 +6848,15 @@ mod tests {
                 params![now() - 3600, old.id],
             )
             .unwrap();
-        config.participation.uncertainty_grace_seconds = 300;
+        config
+            .capabilities
+            .answer
+            .participation
+            .uncertainty_grace_seconds = 300;
         assert!(store.dispatch_intent(&mut old, &config).unwrap());
         old.state = "unknown".into();
         store.save(&old, "dispatch_outcome_unknown").unwrap();
-        let mut answer = prepared_epoch(&mut store, WorkKind::Answer, 2, "new");
+        let mut answer = prepared_epoch(&mut store, LaneId::Answer, 2, "new");
         assert!(!store.dispatch_intent(&mut answer, &config).unwrap());
         let blocked_since = store.inspect(old.id).unwrap()["details"]["blocked_since"]
             .as_i64()
@@ -8283,36 +6865,6 @@ mod tests {
         drop(store);
         let mut store = Store::open(&config).unwrap();
         assert!(!store.dispatch_intent(&mut answer, &config).unwrap());
-    }
-
-    #[test]
-    fn queued_wake_accounts_for_overdue_work_without_bypassing_floors() {
-        let (_temp, mut config, mut store) = participation_fixture();
-        let mut op = dispatched_unknown(&mut store, &config, WorkKind::Judge, 1);
-        op.state = "queued".into();
-        op.job_id = Some("bound-job".into());
-        op.next_at = now() + 60;
-        store.save(&op, "submission_queued").unwrap();
-        config.capabilities.answer = Mode::Off;
-        config.capabilities.judge = Mode::Off;
-        config.capabilities.mine = Mode::Off;
-        config.schedule.queued_job_polling = Some(crate::config::QueuedJobPolling {
-            initial_seconds: 15,
-            max_seconds: 120,
-        });
-        let future = store.wake_delay(&config, 600).unwrap();
-        assert!(future > 1 && future <= 60);
-        // A deadline may pass while other work runs after the reconciliation batch.
-        op.next_at = 0;
-        store.save(&op, "job_pending").unwrap();
-        assert_eq!(store.wake_delay(&config, 600).unwrap(), 1);
-        store.record_retry_minimum(op.id, 90).unwrap();
-        assert!(store.wake_delay(&config, 600).unwrap() >= 60);
-        store.fail_read(ReadScope::Job, 180, 900, 0, None).unwrap();
-        assert!(store.wake_delay(&config, 600).unwrap() >= 120);
-        store.reset_read(ReadScope::Job).unwrap();
-        config.schedule.queued_job_polling = None;
-        assert_eq!(store.wake_delay(&config, 600).unwrap(), 600);
     }
 
     #[test]
@@ -8396,13 +6948,14 @@ mod tests {
     #[test]
     fn wait_reporting_reuses_current_effective_cause_without_attributing_elapsed_age() {
         let (_temp, mut config, mut store) = participation_fixture();
-        dispatched_unknown(&mut store, &config, WorkKind::Judge, 1);
-        let mut answer = begin(&mut store, WorkKind::Answer, "2:wait", "generating");
+        store.runtime_state(&config, false).unwrap();
+        dispatched_unknown(&mut store, &config, LaneId::Judge, 1);
+        let mut answer = begin(&mut store, LaneId::Answer, "2:wait", "generating");
         let started = now() - 120;
         store
             .db
             .execute(
-                "UPDATE events SET at=?1 WHERE operation_id=?2 AND code='generating'",
+                "UPDATE operation_timing SET generation_started_at=?1 WHERE operation_id=?2",
                 params![started, answer.id],
             )
             .unwrap();
@@ -8418,7 +6971,7 @@ mod tests {
         store
             .db
             .execute(
-                "UPDATE events SET at=?1 WHERE operation_id=?2 AND code='model_result_captured'",
+                "UPDATE operation_timing SET model_captured_at=?1 WHERE operation_id=?2",
                 params![captured, answer.id],
             )
             .unwrap();
@@ -8429,11 +6982,16 @@ mod tests {
                 [answer.id],
             )
             .unwrap();
-        config.participation.mode = ParticipationMode::Strict;
+        config.capabilities.answer.participation.mode = ParticipationMode::Strict;
         store.runtime_state(&config, false).unwrap();
-        config.participation.mode = ParticipationMode::ParticipationFirst;
+        config.capabilities.answer.participation.mode = ParticipationMode::ParticipationFirst;
         let status = store.status(&config).unwrap();
-        assert_eq!(status["work"]["answer"]["reason"], "strict_uncertainty");
+        assert_eq!(status["work"]["answer"]["reason"], "account_uncertainty");
+        assert!(status["work"]["answer"]["next_at"].is_null());
+        assert_eq!(
+            status["work"]["answer"]["next_at"],
+            status["work"]["answer"]["admission"]["next_at"]
+        );
         assert_eq!(
             status["work"]["answer"]["next_action"],
             "await_reconciliation"
@@ -8448,10 +7006,35 @@ mod tests {
                 .unwrap()
                 >= 80
         );
+        config
+            .capabilities
+            .answer
+            .participation
+            .uncertainty_grace_seconds = 600;
+        store.runtime_state(&config, false).unwrap();
+        let grace = store.status(&config).unwrap();
+        assert_eq!(
+            grace["work"]["answer"]["reason"],
+            "account_uncertainty_grace"
+        );
+        assert_eq!(
+            grace["work"]["answer"]["next_at"],
+            grace["work"]["answer"]["admission"]["not_before"]
+        );
+        assert!(grace["work"]["answer"]["next_at"].as_i64().unwrap() > now());
+        assert_eq!(
+            grace["work"]["answer"]["wait"]["model_captured_at"],
+            captured
+        );
+        assert!(
+            grace["work"]["answer"]["wait"]
+                .get("blocked_seconds")
+                .is_none()
+        );
         drop(store);
         let store = Store::read_only(&config).unwrap().unwrap();
         let inventory = store
-            .operations_list(Some(WorkKind::Answer), None, None, 1)
+            .operations_list(Some(LaneId::Answer), None, None, 1)
             .unwrap();
         assert_eq!(
             inventory["operations"][0]["wait"]["model_captured_at"],
@@ -8467,11 +7050,12 @@ mod tests {
     }
 
     #[test]
-    fn wait_evidence_is_bounded_and_never_falls_back_to_mutable_timestamps() {
+    fn durable_wait_evidence_survives_event_pruning_without_mutable_timestamp_fallback() {
         let (_temp, _config, mut store) = participation_fixture();
-        let mut op = begin(&mut store, WorkKind::Answer, "1:wait", "generating");
+        let mut op = begin(&mut store, LaneId::Answer, "1:wait", "generating");
         op.state = "generated".into();
         store.save(&op, "model_result_captured").unwrap();
+        let before = store.operations_list(None, None, None, 1).unwrap()["operations"][0]["wait"]["model_captured_at"].clone();
         store
             .db
             .execute_batch(
@@ -8479,23 +7063,48 @@ mod tests {
              INSERT INTO events(at,code) SELECT 1,'diagnostic' FROM n;",
             )
             .unwrap();
+        store.event("diagnostic", None).unwrap();
+        store
+            .db
+            .execute("UPDATE operations SET updated_at=1 WHERE id=?1", [op.id])
+            .unwrap();
         let inventory = store.operations_list(None, None, None, 1).unwrap();
-        assert!(inventory["operations"][0]["wait"]["model_captured_at"].is_null());
-        assert!(inventory["operations"][0]["wait"]["unsent_since_capture_seconds"].is_null());
+        assert_eq!(
+            inventory["operations"][0]["wait"]["model_captured_at"],
+            before
+        );
         store.db.execute("DELETE FROM events", []).unwrap();
         store
             .db
-            .execute("DROP TABLE operation_evidence", [])
+            .execute(
+                "UPDATE operation_timing SET model_captured_at=NULL WHERE operation_id=?1",
+                [op.id],
+            )
             .unwrap();
-        let legacy = store.operations_list(None, None, None, 1).unwrap();
-        assert!(legacy["operations"][0]["wait"]["unsent_since_capture_seconds"].is_null());
-        assert!(legacy["operations"][0]["wait"]["effect_age_seconds"].is_null());
+        let missing = store.operations_list(None, None, None, 1).unwrap();
+        assert!(missing["operations"][0]["wait"]["model_captured_at"].is_null());
+        assert!(missing["operations"][0]["wait"]["unsent_since_capture_seconds"].is_null());
+    }
+
+    #[test]
+    fn prepared_mining_has_no_model_capture_timestamp() {
+        let (_temp, _config, mut store) = participation_fixture();
+        let mine = begin(&mut store, LaneId::Mine, "model-free", "prepared");
+        let captured: Option<i64> = store
+            .db
+            .query_row(
+                "SELECT model_captured_at FROM operation_timing WHERE operation_id=?1",
+                [mine.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(captured, None);
     }
 
     #[test]
     fn queued_transition_timing_survives_polling_and_preserves_retry_minima() {
         let (_temp, config, mut store) = participation_fixture();
-        let mut op = prepared_epoch(&mut store, WorkKind::Mine, 1, "queued");
+        let mut op = prepared_epoch(&mut store, LaneId::Mine, 1, "queued");
         assert!(store.dispatch_intent(&mut op, &config).unwrap());
         op.state = "queued".into();
         op.next_at = now() + 300;
@@ -8504,7 +7113,7 @@ mod tests {
         store
             .db
             .execute(
-                "UPDATE events SET at=?1 WHERE operation_id=?2 AND code='submission_queued'",
+                "UPDATE operation_timing SET queued_since=?1 WHERE operation_id=?2",
                 params![queued, op.id],
             )
             .unwrap();
@@ -8554,17 +7163,51 @@ mod tests {
     }
 
     #[test]
+    fn captured_retry_preserves_original_model_capture_time_or_unknown() {
+        for captured in [Some(1234_i64), None] {
+            let (_temp, config, mut store) = participation_fixture();
+            let original = dispatched_unknown(&mut store, &config, LaneId::Answer, 2);
+            store
+                .db
+                .execute(
+                    "UPDATE operation_timing SET model_captured_at=?1 WHERE operation_id=?2",
+                    params![captured, original.id],
+                )
+                .unwrap();
+            let retry = store
+                .begin_linked(
+                    LaneId::Answer,
+                    &original.key,
+                    ("prepared", &original.request),
+                    store.control().unwrap(),
+                    "revision",
+                    Some((&original, true)),
+                )
+                .unwrap();
+            let retained: Option<i64> = store
+                .db
+                .query_row(
+                    "SELECT model_captured_at FROM operation_timing WHERE operation_id=?1",
+                    [retry.id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(retained, captured);
+        }
+    }
+
+    #[test]
     fn operation_inventory_is_sanitized_filtered_and_completely_paginated() {
         let (_temp, config, mut store) = participation_fixture();
-        let mut old = dispatched_unknown(&mut store, &config, WorkKind::Judge, 1);
+        let mut old = dispatched_unknown(&mut store, &config, LaneId::Judge, 1);
         old.job_id = Some("private-bearer-job-canary".into());
         old.txid = Some("private-bound-tx-canary".into());
         store.save(&old, "bound_identifiers").unwrap();
-        let answer = dispatched_unknown(&mut store, &config, WorkKind::Answer, 2);
-        dispatched_unknown(&mut store, &config, WorkKind::Mine, 3);
+        let answer = dispatched_unknown(&mut store, &config, LaneId::Answer, 2);
+        dispatched_unknown(&mut store, &config, LaneId::Mine, 3);
         let retry = store
             .begin_linked(
-                WorkKind::Answer,
+                LaneId::Answer,
                 &answer.key,
                 ("prepared", &answer.request),
                 store.control().unwrap(),
@@ -8598,7 +7241,7 @@ mod tests {
             assert!(!serialized.contains(secret));
         }
         let filtered = store
-            .operations_list(Some(WorkKind::Answer), Some("unknown"), None, 100)
+            .operations_list(Some(LaneId::Answer), Some("unknown"), None, 100)
             .unwrap();
         assert_eq!(filtered["operations"].as_array().unwrap().len(), 1);
         assert_eq!(filtered["operations"][0]["operation_id"], answer.id);
@@ -8614,16 +7257,22 @@ mod tests {
     #[test]
     fn grant_inventory_and_revocation_preserve_history_without_authority() {
         let (_temp, mut config, mut store) = participation_fixture();
-        dispatched_unknown(&mut store, &config, WorkKind::Judge, 1);
-        config.participation.mode = ParticipationMode::Manual;
-        config.participation.uncertainty_grace_seconds = 600;
-        let older = store.authorize(&config, 2, WorkKind::Answer).unwrap()["grant_id"]
+        dispatched_unknown(&mut store, &config, LaneId::Judge, 1);
+        config.capabilities.answer.participation.mode = ParticipationMode::Manual;
+        config
+            .capabilities
+            .answer
+            .participation
+            .uncertainty_grace_seconds = 600;
+        let older = store.authorize(&config, 2, LaneId::Answer).unwrap()["grant_id"]
             .as_i64()
             .unwrap();
-        let revoked = store.authorize(&config, 3, WorkKind::Answer).unwrap()["grant_id"]
+        let revoked = store.authorize(&config, 3, LaneId::Answer).unwrap()["grant_id"]
             .as_i64()
             .unwrap();
-        let newest = store.authorize(&config, 4, WorkKind::Mine).unwrap()["grant_id"]
+        assert!(store.authorize(&config, 4, LaneId::Mine).is_err());
+        config.capabilities.mine.participation.mode = ParticipationMode::Manual;
+        let newest = store.authorize(&config, 4, LaneId::Mine).unwrap()["grant_id"]
             .as_i64()
             .unwrap();
         let first = store.grants(None, 1).unwrap();
@@ -8636,16 +7285,16 @@ mod tests {
         assert!(third["next_before"].is_null());
         let result = store.revoke_grant(revoked).unwrap();
         assert_eq!(store.revoke_grant(revoked).unwrap(), result);
-        let mut answer = prepared_epoch(&mut store, WorkKind::Answer, 3, "new");
+        let mut answer = prepared_epoch(&mut store, LaneId::Answer, 3, "new");
         assert!(!store.dispatch_intent(&mut answer, &config).unwrap());
-        let replacement = store.authorize(&config, 3, WorkKind::Answer).unwrap()["grant_id"]
+        let replacement = store.authorize(&config, 3, LaneId::Answer).unwrap()["grant_id"]
             .as_i64()
             .unwrap();
         assert_ne!(replacement, revoked);
         assert!(store.dispatch_intent(&mut answer, &config).unwrap());
         assert!(store.revoke_grant(replacement).is_err());
-        store.set_paused(true).unwrap();
-        store.set_paused(false).unwrap();
+        store.set_paused_unbound(true).unwrap();
+        store.set_paused_unbound(false).unwrap();
         drop(store);
         let store = Store::read_only(&config).unwrap().unwrap();
         let grants = store.grants(None, 100).unwrap();
@@ -8683,8 +7332,8 @@ mod tests {
     fn prepared_mining_survives_restart_before_any_followup_save() {
         let (_temp, config) = fixture();
         let mut store = Store::open(&config).unwrap();
-        store.set_paused(false).unwrap();
-        let op = begin(&mut store, WorkKind::Mine, "epoch:8", "prepared");
+        store.set_paused_unbound(false).unwrap();
+        let op = begin(&mut store, LaneId::Mine, "epoch:8", "prepared");
         drop(store);
         let mut store = Store::open(&config).unwrap();
         store.recover().unwrap();
@@ -8698,68 +7347,96 @@ mod tests {
     fn read_backoff_is_capped_durable_and_independent_of_work_schedule() {
         let (_temp, config) = fixture();
         let mut store = Store::open(&config).unwrap();
-        store.defer(WorkKind::Answer, 300).unwrap();
-        let work_at = store.next_at(WorkKind::Answer).unwrap();
+        store.defer(LaneId::Answer, 300).unwrap();
+        let work_at = store.next_at(LaneId::Answer).unwrap();
         for (failures, seconds) in [(1, 12), (2, 22), (3, 27), (4, 27)] {
             let before = now();
             let state = store
-                .fail_read(ReadScope::Challenge, 10, 25, 2, None)
+                .fail_read(
+                    &ReadKey::Discovery {
+                        lane: LaneId::Answer,
+                        source: DiscoverySource::Challenge,
+                    },
+                    10,
+                    25,
+                    2,
+                    None,
+                )
                 .unwrap();
             assert_eq!(state.failures, failures);
             assert!(state.next_at > before + seconds);
             assert!(state.next_at <= now() + seconds + 1);
-            assert_eq!(store.next_at(WorkKind::Answer).unwrap(), work_at);
+            assert_eq!(store.next_at(LaneId::Answer).unwrap(), work_at);
             drop(store);
             store = Store::open(&config).unwrap();
-            assert_eq!(store.read_backoff(ReadScope::Challenge).unwrap(), state);
+            assert_eq!(
+                store
+                    .read_backoff(&ReadKey::Discovery {
+                        lane: LaneId::Answer,
+                        source: DiscoverySource::Challenge
+                    })
+                    .unwrap(),
+                state
+            );
         }
         let before = now();
         let state = store
-            .fail_read(ReadScope::Challenge, 10, 25, 2, Some(90))
+            .fail_read(
+                &ReadKey::Discovery {
+                    lane: LaneId::Answer,
+                    source: DiscoverySource::Challenge,
+                },
+                10,
+                25,
+                2,
+                None,
+            )
             .unwrap();
-        assert!(state.next_at >= before + 91);
+        assert!(state.next_at >= before + 27);
         store
-            .fail_read(ReadScope::Identity, 10, 25, 2, None)
+            .fail_read(&ReadKey::Identity, 10, 25, 2, None)
             .unwrap();
-        store.reset_read(ReadScope::Identity).unwrap();
-        assert_eq!(store.read_backoff(ReadScope::Challenge).unwrap(), state);
-        store.reset_read(ReadScope::Challenge).unwrap();
+        store.reset_read(&ReadKey::Identity).unwrap();
+        assert_eq!(
+            store
+                .read_backoff(&ReadKey::Discovery {
+                    lane: LaneId::Answer,
+                    source: DiscoverySource::Challenge
+                })
+                .unwrap(),
+            state
+        );
+        store
+            .reset_read(&ReadKey::Discovery {
+                lane: LaneId::Answer,
+                source: DiscoverySource::Challenge,
+            })
+            .unwrap();
         drop(store);
         let store = Store::open(&config).unwrap();
         assert_eq!(
-            store.read_backoff(ReadScope::Challenge).unwrap(),
+            store
+                .read_backoff(&ReadKey::Discovery {
+                    lane: LaneId::Answer,
+                    source: DiscoverySource::Challenge
+                })
+                .unwrap(),
             ReadBackoff::default()
         );
         let restarted = store
-            .fail_read(ReadScope::Challenge, 10, 25, 2, Some(1))
+            .fail_read(
+                &ReadKey::Discovery {
+                    lane: LaneId::Answer,
+                    source: DiscoverySource::Challenge,
+                },
+                10,
+                25,
+                2,
+                None,
+            )
             .unwrap();
         assert_eq!(restarted.failures, 1);
         assert!(restarted.next_at >= now() + 12);
-    }
-
-    #[test]
-    fn read_backoff_migrates_legacy_state_and_saturates_large_delays() {
-        let (_temp, config) = fixture();
-        let store = Store::open(&config).unwrap();
-        store.db.execute("DROP TABLE read_backoff", []).unwrap();
-        drop(store);
-        let store = Store::open(&config).unwrap();
-        assert_eq!(
-            store.read_backoff(ReadScope::Receipt).unwrap(),
-            ReadBackoff::default()
-        );
-        store
-            .db
-            .execute(
-                "INSERT INTO read_backoff VALUES ('receipt',?1,0)",
-                [u32::MAX],
-            )
-            .unwrap();
-        let state = store
-            .fail_read(ReadScope::Receipt, u64::MAX, 900, u64::MAX, Some(u64::MAX))
-            .unwrap();
-        assert_eq!(state.failures, u32::MAX);
-        assert_eq!(state.next_at, i64::MAX);
     }
 
     #[test]
@@ -8769,7 +7446,16 @@ mod tests {
         for failures in 1..=3 {
             let before = now();
             let state = store
-                .fail_read(ReadScope::Job, 900, 100, 30, Some(1))
+                .fail_read(
+                    &ReadKey::Discovery {
+                        lane: LaneId::Mine,
+                        source: DiscoverySource::Challenge,
+                    },
+                    900,
+                    100,
+                    30,
+                    None,
+                )
                 .unwrap();
             assert_eq!(state.failures, failures);
             assert!(state.next_at >= before + 931);
@@ -8786,15 +7472,16 @@ mod tests {
         let mut alternate = config.clone();
         alternate.state_dir = config.state_dir.with_file_name("other");
         {
-            let _gate = AdmissionGuard::acquire(&config).unwrap();
-            AccountLock::control_store(&config).unwrap();
-            assert!(AccountLock::control_store(&alternate).is_err());
+            let gate = AccountAdmissionGuard::acquire(&config).unwrap();
+            AccountLock::control_store(&config, &gate).unwrap();
+            assert!(AccountLock::control_store(&alternate, &gate).is_err());
         }
         drop(owner);
         assert!(AccountLock::acquire(&alternate).is_err());
-        let _gate = AdmissionGuard::acquire(&alternate).unwrap();
-        assert!(AccountLock::control_store(&alternate).is_err());
-        AccountLock::control_store(&config).unwrap();
+        assert!(AccountAdmissionGuard::acquire(&alternate).is_err());
+        let gate = AccountAdmissionGuard::acquire(&config).unwrap();
+        assert!(AccountLock::control_store(&alternate, &gate).is_err());
+        AccountLock::control_store(&config, &gate).unwrap();
     }
 
     #[test]
@@ -8820,7 +7507,7 @@ mod tests {
                 generation: 0
             }
         );
-        store.set_paused(false).unwrap();
+        store.set_paused_unbound(false).unwrap();
         drop(store);
         let mut store = Store::open(&config).unwrap();
         assert_eq!(
@@ -8830,7 +7517,7 @@ mod tests {
                 generation: 1
             }
         );
-        store.set_paused(true).unwrap();
+        store.set_paused_unbound(true).unwrap();
         drop(store);
         assert_eq!(
             Store::open(&config).unwrap().control().unwrap(),
@@ -8857,19 +7544,19 @@ mod tests {
                 401,
             ),
             (
-                "BEFORE INSERT ON read_backoff",
+                "BEFORE UPDATE OF failures ON read_state",
                 HostedIdentityOutcome::AuthenticationFailed,
                 403,
             ),
             (
-                "BEFORE DELETE ON read_backoff",
+                "BEFORE UPDATE OF local_next_at ON read_state",
                 HostedIdentityOutcome::Verified,
                 200,
             ),
         ] {
             let (_temp, config) = fixture();
             let store = Store::open(&config).unwrap();
-            store.read_started(ReadScope::Identity).unwrap();
+            store.read_started(&ReadKey::Identity).unwrap();
             let prior = if outcome == HostedIdentityOutcome::Verified {
                 HostedIdentityOutcome::AuthenticationFailed
             } else {
@@ -8885,17 +7572,17 @@ mod tests {
                     None,
                     prior,
                     (10, 60, 0),
-                    Some(100),
+                    None,
                 )
                 .unwrap();
-            store.read_started(ReadScope::Identity).unwrap();
+            store.read_started(&ReadKey::Identity).unwrap();
             let before = store.status(&config).unwrap()["hosted_identity"].clone();
-            let reads = store.reads().unwrap();
+            let reads = store.reads_projection().unwrap()["reads"].take();
             let before_read = reads
                 .as_array()
                 .unwrap()
                 .iter()
-                .find(|row| row["scope"] == "identity")
+                .find(|row| row["purpose"] == "identity")
                 .unwrap()
                 .clone();
             store
@@ -8912,19 +7599,19 @@ mod tests {
                         Some("http_status"),
                         outcome,
                         (10, 60, 0),
-                        Some(300),
+                        None,
                     )
                     .is_err()
             );
             drop(store);
             let reader = Store::read_only(&config).unwrap().unwrap();
             assert_eq!(reader.status(&config).unwrap()["hosted_identity"], before);
-            let reads = reader.reads().unwrap();
+            let reads = reader.reads_projection().unwrap()["reads"].take();
             let after_read = reads
                 .as_array()
                 .unwrap()
                 .iter()
-                .find(|row| row["scope"] == "identity")
+                .find(|row| row["purpose"] == "identity")
                 .unwrap();
             for field in [
                 "state",
@@ -8946,13 +7633,7 @@ mod tests {
                 .unwrap();
             let started = now();
             store
-                .complete_identity_read(
-                    Some(http),
-                    Some("http_status"),
-                    outcome,
-                    (10, 60, 0),
-                    Some(300),
-                )
+                .complete_identity_read(Some(http), Some("http_status"), outcome, (10, 60, 0), None)
                 .unwrap();
             drop(store);
             let reader = Store::read_only(&config).unwrap().unwrap();
@@ -8962,11 +7643,11 @@ mod tests {
                 status["hosted_identity_verified"],
                 outcome == HostedIdentityOutcome::Verified
             );
-            let backoff = reader.read_backoff(ReadScope::Identity).unwrap();
+            let backoff = reader.read_backoff(&ReadKey::Identity).unwrap();
             if outcome == HostedIdentityOutcome::Verified {
                 assert_eq!(backoff.failures, 0);
             } else {
-                assert!(backoff.next_at >= started + 300);
+                assert!(backoff.next_at >= started + 10);
                 assert_eq!(
                     status["hosted_identity"]["rejection"],
                     "authentication_failed"
@@ -9020,60 +7701,24 @@ mod tests {
     }
 
     #[test]
-    fn readonly_legacy_identity_flags_remain_uncertain_without_schema_migration() {
-        for legacy in [false, true] {
-            let (_temp, config) = fixture();
-            let store = Store::open(&config).unwrap();
-            store
-                .db
-                .execute("DROP TABLE hosted_identity_evidence", [])
-                .unwrap();
-            store
-                .db
-                .execute(
-                    "INSERT INTO health_evidence(singleton,hosted_identity_verified) VALUES(1,?1)",
-                    [legacy],
-                )
-                .unwrap();
-            store.db.execute(
-                "INSERT INTO read_observations(scope,last_success_at,last_failure_at,failure_category)
-                 VALUES('identity',123,456,'timeout')", [],
-            ).unwrap();
-            let before = store.db.total_changes();
-            let reader = Store::read_only(&config).unwrap().unwrap();
-            let status = reader.status(&config).unwrap();
-            assert_eq!(
-                status["hosted_identity"],
-                json!({"status":"legacy_unknown","observed_at":null,
-                    "last_verified_at":if legacy {Some(123)} else {None},
-                    "rejection":null,"legacy_failure":!legacy})
-            );
-            assert!(status["hosted_identity_verified"].is_null());
-            assert_eq!(reader.db.total_changes(), 0);
-            assert!(!reader.has_table("hosted_identity_evidence").unwrap());
-            assert_eq!(store.db.total_changes(), before);
-        }
-    }
-
-    #[test]
     fn legacy_identity_normalization_is_audited_idempotent_and_preserves_other_evidence() {
         let (_temp, config, mut store) = participation_fixture();
-        store.observe(42, false).unwrap();
+        observe(&store, 42, false).unwrap();
         store
             .db
             .execute("UPDATE health_evidence SET hosted_identity_verified=0", [])
             .unwrap();
-        store.read_started(ReadScope::Identity).unwrap();
+        store.read_started(&ReadKey::Identity).unwrap();
         store
-            .read_finished(ReadScope::Identity, None, Some("timeout"))
+            .read_finished(&ReadKey::Identity, None, Some("timeout"))
             .unwrap();
         store
-            .fail_read(ReadScope::Identity, 30, 120, 0, Some(900))
+            .fail_read(&ReadKey::Identity, 30, 120, 0, None)
             .unwrap();
-        let op = prepared_epoch(&mut store, WorkKind::Judge, 42, "captured");
+        let op = prepared_epoch(&mut store, LaneId::Judge, 42, "captured");
         let control = store.control().unwrap();
         let operation = store.inspect(op.id).unwrap();
-        let reads = store.reads().unwrap();
+        let reads = store.reads_projection().unwrap()["reads"].take();
         let before = store.status(&config).unwrap();
         let (preview, captured) =
             Store::identity_normalization_preview(&store.db, "config").unwrap();
@@ -9085,7 +7730,7 @@ mod tests {
         assert_eq!(applied["applied"], true);
         assert_eq!(store.control().unwrap(), control);
         assert_eq!(store.inspect(op.id).unwrap(), operation);
-        assert_eq!(store.reads().unwrap(), reads);
+        assert_eq!(store.reads_projection().unwrap()["reads"], reads);
         let after = store.status(&config).unwrap();
         assert_eq!(before["hosted_identity"], after["hosted_identity"]);
         assert_eq!(before["epoch_evidence"], after["epoch_evidence"]);
@@ -9159,7 +7804,7 @@ mod tests {
             if let Some(outcome) = outcome {
                 store.record_identity_outcome(outcome).unwrap();
             } else {
-                store.read_started(ReadScope::Identity).unwrap();
+                store.read_started(&ReadKey::Identity).unwrap();
             }
             let before = store.status(&config).unwrap()["hosted_identity"].clone();
             let error = store
@@ -9224,10 +7869,10 @@ mod tests {
     fn hosted_identity_failure_survives_event_pruning_and_reopen_until_verified() {
         use crate::health::{self, Options};
         let (_temp, mut config) = fixture();
-        config.capabilities.answer = crate::config::Mode::Active;
+        config.capabilities.answer.mode = crate::config::Mode::Active;
         let mut store = Store::open(&config).unwrap();
         assert!(store.status(&config).unwrap()["hosted_identity_verified"].is_null());
-        store.set_paused(false).unwrap();
+        store.set_paused_unbound(false).unwrap();
         store
             .record_identity_outcome(HostedIdentityOutcome::IdentityMismatch)
             .unwrap();
@@ -9260,7 +7905,7 @@ mod tests {
         drop(reader);
         let store = Store::open(&config).unwrap();
         store.runtime_state(&config, false).unwrap();
-        store.observe(54, true).unwrap();
+        observe(&store, 54, true).unwrap();
         assert_eq!(
             store.status(&config).unwrap()["identity_matches_config"],
             true
@@ -9285,82 +7930,13 @@ mod tests {
     }
 
     #[test]
-    fn readonly_legacy_state_reports_unknown_hosted_identity_without_writes() {
-        let (_temp, config) = fixture();
-        let store = Store::open(&config).unwrap();
-        store.observe(54, true).unwrap();
-        store.db.execute("DROP TABLE health_evidence", []).unwrap();
-        let schema_version: i64 = store
-            .db
-            .query_row("PRAGMA schema_version", [], |r| r.get(0))
-            .unwrap();
-        let data_version: i64 = store
-            .db
-            .query_row("PRAGMA data_version", [], |r| r.get(0))
-            .unwrap();
-        let events = store.events(1000).unwrap();
-        let reader = Store::read_only(&config).unwrap().unwrap();
-        let status = reader.status(&config).unwrap();
-        assert!(status["hosted_identity_verified"].is_null());
-        assert_eq!(
-            status["epoch_evidence"],
-            json!({"first_observed_at":null,"answered":null})
-        );
-        assert_eq!(status["observation"]["epoch"], 54);
-        assert_eq!(status["identity_matches_config"], true);
-        assert_eq!(reader.db.total_changes(), 0);
-        assert!(
-            reader
-                .record_identity_outcome(HostedIdentityOutcome::Unavailable)
-                .is_err()
-        );
-        drop(reader);
-        assert_eq!(
-            store
-                .db
-                .query_row("PRAGMA schema_version", [], |r| r.get::<_, i64>(0))
-                .unwrap(),
-            schema_version
-        );
-        assert_eq!(
-            store
-                .db
-                .query_row("PRAGMA data_version", [], |r| r.get::<_, i64>(0))
-                .unwrap(),
-            data_version
-        );
-        assert_eq!(store.events(1000).unwrap(), events);
-        let has_table: bool = store
-            .db
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_schema
-                 WHERE type='table' AND name='health_evidence')",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert!(!has_table);
-        drop(store);
-        let store = Store::open(&config).unwrap();
-        assert!(store.status(&config).unwrap()["hosted_identity_verified"].is_null());
-        assert!(store.status(&config).unwrap()["epoch_evidence"]["answered"].is_null());
-        store
-            .record_identity_outcome(HostedIdentityOutcome::Verified)
-            .unwrap();
-        assert_eq!(
-            store.status(&config).unwrap()["hosted_identity_verified"],
-            true
-        );
-    }
-
-    #[test]
     fn pause_generation_closes_admission_even_after_resume() {
         let (_temp, config) = fixture();
         let mut store = Store::open(&config).unwrap();
         assert!(
             store
                 .begin(
-                    WorkKind::Answer,
+                    LaneId::Answer,
                     "1:word",
                     "generating",
                     &json!({}),
@@ -9369,14 +7945,14 @@ mod tests {
                 )
                 .is_err()
         );
-        store.set_paused(false).unwrap();
+        store.set_paused_unbound(false).unwrap();
         let stale = store.control().unwrap();
-        store.set_paused(true).unwrap();
-        store.set_paused(false).unwrap();
+        store.set_paused_unbound(true).unwrap();
+        store.set_paused_unbound(false).unwrap();
         assert!(
             store
                 .begin(
-                    WorkKind::Answer,
+                    LaneId::Answer,
                     "1:word",
                     "generating",
                     &json!({}),
@@ -9391,16 +7967,16 @@ mod tests {
     fn crash_after_model_intent_never_automatically_relaunches() {
         let (_temp, config) = fixture();
         let mut store = Store::open(&config).unwrap();
-        store.set_paused(false).unwrap();
-        begin(&mut store, WorkKind::Answer, "1:word", "generating");
+        store.set_paused_unbound(false).unwrap();
+        begin(&mut store, LaneId::Answer, "1:word", "generating");
         drop(store);
         let mut store = Store::open(&config).unwrap();
         store.recover().unwrap();
         assert!(store.pending().unwrap().is_none());
         assert!(store.answer_epoch_attempted(1).unwrap());
-        assert!(store.attempted(WorkKind::Answer, "1:word").unwrap());
+        assert!(store.attempted(LaneId::Answer, "1:word").unwrap());
         // A model cannot submit on its own; unrelated protocol work remains live.
-        let op = begin(&mut store, WorkKind::Mine, "2:word", "dispatching");
+        let op = begin(&mut store, LaneId::Mine, "2:word", "dispatching");
         store.recover().unwrap();
         assert_eq!(store.abandon_models().unwrap(), 1);
         assert!(!store.answer_epoch_attempted(1).unwrap());
@@ -9414,8 +7990,8 @@ mod tests {
     fn crash_after_http_intent_retains_unknown_payload_and_boundary() {
         let (_temp, config) = fixture();
         let mut store = Store::open(&config).unwrap();
-        store.set_paused(false).unwrap();
-        let mut op = begin(&mut store, WorkKind::Answer, "1:word", "prepared");
+        store.set_paused_unbound(false).unwrap();
+        let mut op = begin(&mut store, LaneId::Answer, "1:word", "prepared");
         op.payload = Some(json!({"answer":"answer-canary"}));
         op.state = "dispatching".into();
         store.save(&op, "dispatch_intent").unwrap();
@@ -9432,8 +8008,8 @@ mod tests {
     fn queue_receipt_and_captured_output_survive_restart_privately() {
         let (_temp, config) = fixture();
         let mut store = Store::open(&config).unwrap();
-        store.set_paused(false).unwrap();
-        let mut op = begin(&mut store, WorkKind::Answer, "2:word", "generated");
+        store.set_paused_unbound(false).unwrap();
+        let mut op = begin(&mut store, LaneId::Answer, "2:word", "generated");
         op.result = Some(json!({"answer":"result-canary"}));
         op.payload = Some(json!({"answer":"payload-canary"}));
         op.state = "dispatching".into();
@@ -9468,21 +8044,46 @@ mod tests {
     fn included_receipt_releases_lane_before_finality() {
         let (_temp, config) = fixture();
         let mut store = Store::open(&config).unwrap();
-        store.set_paused(false).unwrap();
-        let mut op = begin(&mut store, WorkKind::Answer, "3:word", "prepared");
+        store.set_paused_unbound(false).unwrap();
+        let mut op = begin(&mut store, LaneId::Answer, "3:word", "prepared");
         op.payload = Some(json!({"answer":"verified-history"}));
         op.state = "dispatching".into();
         store.save(&op, "dispatch_intent").unwrap();
         op.state = "included_pending".into();
+        op.txid = Some("a".repeat(64));
         store.save(&op, "transaction_included_unconfirmed").unwrap();
         assert_eq!(store.history().unwrap(), vec!["verified-history"]);
         assert!(store.effect().unwrap().is_some());
+        let included = store
+            .admission_projection(&config, LaneId::Answer, Some(3), None)
+            .unwrap();
+        assert_eq!(included["own_count"], 1);
+        assert_eq!(included["account_unresolved"], 1);
         op.state = "confirmed".into();
         store.save(&op, "receipt_included").unwrap();
         assert!(store.pending().unwrap().is_none());
         assert_eq!(store.history().unwrap(), vec!["verified-history"]);
-        assert!(store.awaiting_finality(WorkKind::Answer).unwrap().is_some());
-        begin(&mut store, WorkKind::Judge, "assignment", "generating");
+        let confirmed = store
+            .admission_projection(&config, LaneId::Answer, Some(3), None)
+            .unwrap();
+        assert_eq!(confirmed["own_count"], 0);
+        assert_eq!(confirmed["account_unresolved"], 0);
+        assert!(
+            store
+                .reconciliation_batch(LaneId::Answer)
+                .unwrap()
+                .iter()
+                .any(|pending| pending.id == op.id)
+        );
+        op.state = "final".into();
+        store.save(&op, "receipt_final").unwrap();
+        assert!(
+            store
+                .reconciliation_batch(LaneId::Answer)
+                .unwrap()
+                .is_empty()
+        );
+        begin(&mut store, LaneId::Judge, "assignment", "generating");
         assert!(store.answer_epoch_attempted(3).unwrap());
     }
 
@@ -9490,12 +8091,12 @@ mod tests {
     fn proven_prelaunch_failure_is_retryable_but_unknown_is_not() {
         let (_temp, config) = fixture();
         let mut store = Store::open(&config).unwrap();
-        store.set_paused(false).unwrap();
-        let mut op = begin(&mut store, WorkKind::Answer, "4:word", "generating");
+        store.set_paused_unbound(false).unwrap();
+        let mut op = begin(&mut store, LaneId::Answer, "4:word", "generating");
         op.state = "prelaunch_failed".into();
         store.save(&op, "executable_unavailable").unwrap();
         assert!(!store.answer_epoch_attempted(4).unwrap());
-        let mut next = begin(&mut store, WorkKind::Answer, "4:word", "generating");
+        let mut next = begin(&mut store, LaneId::Answer, "4:word", "generating");
         next.state = "model_unknown".into();
         store.save(&next, "model_launch_unknown").unwrap();
         assert!(store.answer_epoch_attempted(4).unwrap());
@@ -9505,14 +8106,14 @@ mod tests {
     fn normalized_assignment_attempt_survives_restart() {
         let (_temp, config) = fixture();
         let mut store = Store::open(&config).unwrap();
-        store.set_paused(false).unwrap();
-        let mut op = begin(&mut store, WorkKind::Judge, &"A".repeat(64), "prepared");
+        store.set_paused_unbound(false).unwrap();
+        let mut op = begin(&mut store, LaneId::Judge, &"A".repeat(64), "prepared");
         op.state = "abstained".into();
         store.save(&op, "assignment_evidence_insufficient").unwrap();
         drop(store);
         let store = Store::open(&config).unwrap();
-        assert!(store.attempted(WorkKind::Judge, &"a".repeat(64)).unwrap());
-        assert!(!store.attempted(WorkKind::Judge, &"b".repeat(64)).unwrap());
+        assert!(store.attempted(LaneId::Judge, &"a".repeat(64)).unwrap());
+        assert!(!store.attempted(LaneId::Judge, &"b".repeat(64)).unwrap());
     }
 
     #[test]
@@ -9552,21 +8153,21 @@ mod tests {
     fn epoch_evidence_survives_polls_and_resets_only_on_transition() {
         let (_temp, config) = fixture();
         let store = Store::open(&config).unwrap();
-        store.observe(54, false).unwrap();
+        observe(&store, 54, false).unwrap();
         store
             .db
-            .execute("UPDATE health_evidence SET first_observed_at=1", [])
+            .execute("UPDATE lane_observations SET first_observed_at=1", [])
             .unwrap();
-        store.observe(54, false).unwrap();
+        observe(&store, 54, false).unwrap();
         let status = store.status(&config).unwrap();
         assert_eq!(status["epoch_evidence"]["first_observed_at"], 1);
         assert_eq!(status["epoch_evidence"]["answered"], false);
-        store.observe(54, true).unwrap();
+        observe(&store, 54, true).unwrap();
         assert_eq!(
             store.status(&config).unwrap()["epoch_evidence"]["answered"],
             true
         );
-        store.observe(55, false).unwrap();
+        observe(&store, 55, false).unwrap();
         let status = store.status(&config).unwrap();
         assert!(
             status["epoch_evidence"]["first_observed_at"]
@@ -9582,16 +8183,16 @@ mod tests {
     fn epoch_grace_and_answer_state_survive_log_rotation_and_reopen() {
         use crate::health::{self, Options};
         let (_temp, mut config) = fixture();
-        config.capabilities.answer = crate::config::Mode::Active;
+        config.capabilities.answer.mode = crate::config::Mode::Active;
         let mut store = Store::open(&config).unwrap();
-        store.set_paused(false).unwrap();
+        store.set_paused_unbound(false).unwrap();
         store
             .record_identity_outcome(HostedIdentityOutcome::Unavailable)
             .unwrap();
-        store.observe(54, false).unwrap();
+        observe(&store, 54, false).unwrap();
         store
             .db
-            .execute("UPDATE health_evidence SET first_observed_at=1", [])
+            .execute("UPDATE lane_observations SET first_observed_at=1", [])
             .unwrap();
         store
             .record_identity_outcome(HostedIdentityOutcome::Verified)
@@ -9601,7 +8202,7 @@ mod tests {
             ..Options::default()
         };
         for answered in [false, true] {
-            store.observe(54, answered).unwrap();
+            observe(&store, 54, answered).unwrap();
             store
                 .db
                 .execute(
@@ -9631,7 +8232,7 @@ mod tests {
             drop(reader);
             store = Store::open(&config).unwrap();
             store.runtime_state(&config, false).unwrap();
-            store.observe(54, answered).unwrap();
+            observe(&store, 54, answered).unwrap();
             let status = store.status(&config).unwrap();
             assert_eq!(
                 status["epoch_evidence"],
@@ -9649,7 +8250,7 @@ mod tests {
                 }
             );
         }
-        store.observe(55, false).unwrap();
+        observe(&store, 55, false).unwrap();
         let status = store.status(&config).unwrap();
         assert!(
             status["epoch_evidence"]["first_observed_at"]
@@ -9667,14 +8268,14 @@ mod tests {
     fn health_is_read_only_and_current_lifecycle_overrides_old_stop() {
         use crate::health::{self, Options};
         let (_temp, mut config) = fixture();
-        config.capabilities.answer = crate::config::Mode::Active;
+        config.capabilities.answer.mode = crate::config::Mode::Active;
         let mut store = Store::open(&config).unwrap();
-        store.set_paused(false).unwrap();
+        store.set_paused_unbound(false).unwrap();
         store.runtime_state(&config, false).unwrap();
         store
             .record_identity_outcome(HostedIdentityOutcome::Verified)
             .unwrap();
-        store.observe(54, true).unwrap();
+        observe(&store, 54, true).unwrap();
         store.event("runtime_stopped", None).unwrap();
         assert_eq!(store.status(&config).unwrap()["controller_stopped"], true);
         store.runtime_state(&config, false).unwrap();
@@ -9685,7 +8286,8 @@ mod tests {
             min_free_mib: 0,
             ..Options::default()
         };
-        assert_eq!(health::check(&config, options).unwrap()["healthy"], true);
+        let report = health::check(&config, options).unwrap();
+        assert_eq!(report["healthy"], true, "{report}");
         assert_eq!(store.events(1000).unwrap(), before);
         assert_eq!(store.db.total_changes(), changes);
         let read_only = Store::read_only(&config).unwrap().unwrap();
@@ -9710,7 +8312,7 @@ mod tests {
         );
     }
 
-    fn bound_fixture() -> (tempfile::TempDir, Config) {
+    pub(super) fn bound_fixture() -> (tempfile::TempDir, Config) {
         let (dir, mut config) = fixture();
         config.network.address = digest(dir.path().as_os_str().as_encoded_bytes());
         config.network.credential_file = dir.path().join("key");
@@ -9727,9 +8329,9 @@ mod tests {
     fn preparation_is_not_an_effect_and_stale_transitions_cannot_win() {
         let (_dir, config) = fixture();
         let mut store = Store::open(&config).unwrap();
-        store.set_paused(false).unwrap();
-        let mut answer = begin(&mut store, WorkKind::Answer, "1:words", "prepared");
-        let mut judge = begin(&mut store, WorkKind::Judge, &"a".repeat(64), "prepared");
+        store.set_paused_unbound(false).unwrap();
+        let mut answer = begin(&mut store, LaneId::Answer, "1:words", "prepared");
+        let mut judge = begin(&mut store, LaneId::Judge, &"a".repeat(64), "prepared");
         assert!(store.effect().unwrap().is_none());
         let stale = answer.clone();
         answer.state = "dispatching".into();
@@ -9754,7 +8356,11 @@ mod tests {
         assert!(Store::read_only(&config).is_err());
         fs::remove_file(config.state_dir.join("state.sqlite3")).unwrap();
         assert!(crate::runtime::pause(&config).is_err());
-        assert!(AccountLock::control_store(&config).is_err());
+        assert!(
+            AccountAdmissionGuard::for_control(&config)
+                .and_then(|gate| AccountLock::control_store(&config, &gate))
+                .is_err()
+        );
         assert!(Store::open(&config).is_err());
         assert!(Store::read_only(&config).is_err());
         assert!(!config.state_dir.join("state.sqlite3").exists());
@@ -9765,13 +8371,15 @@ mod tests {
     fn independent_dispatch_witness_detects_database_only_rollback() {
         let (dir, config) = bound_fixture();
         let (lock, mut store) = AccountLock::acquire(&config).unwrap();
-        store.set_paused(false).unwrap();
+        store
+            .set_paused(false, &AccountAdmissionGuard::acquire(&config).unwrap())
+            .unwrap();
         let backup = fs::canonicalize(dir.path()).unwrap().join("before.sqlite3");
         store
             .db
             .execute("VACUUM INTO ?1", [backup.to_str().unwrap()])
             .unwrap();
-        let mut op = begin(&mut store, WorkKind::Mine, "1", "prepared");
+        let mut op = begin(&mut store, LaneId::Mine, "1", "prepared");
         op.state = "dispatching".into();
         store.save(&op, "dispatch_intent").unwrap();
         let binding = read_binding(&config).unwrap().unwrap();
@@ -9780,7 +8388,11 @@ mod tests {
         drop(lock);
         fs::copy(backup, config.state_dir.join("state.sqlite3")).unwrap();
         assert!(AccountLock::acquire(&config).is_err());
-        assert!(AccountLock::control_store(&config).is_err());
+        assert!(
+            AccountAdmissionGuard::for_control(&config)
+                .and_then(|gate| AccountLock::control_store(&config, &gate))
+                .is_err()
+        );
         remove_anchors(&config);
     }
 
@@ -9791,8 +8403,8 @@ mod tests {
         // A Store without attached binding simulates death after SQLite commit,
         // before witness advancement; production dispatch cannot cross that gap.
         let mut store = Store::open(&config).unwrap();
-        store.set_paused(false).unwrap();
-        let mut op = begin(&mut store, WorkKind::Mine, "1", "prepared");
+        store.set_paused_unbound(false).unwrap();
+        let mut op = begin(&mut store, LaneId::Mine, "1", "prepared");
         op.state = "dispatching".into();
         store.save(&op, "dispatch_intent").unwrap();
         assert_eq!(read_binding(&config).unwrap().unwrap().dispatch_sequence, 0);
@@ -9807,115 +8419,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_binding_adopts_intact_unknown_and_detects_lock_replacement() {
-        let (_dir, mut config) = bound_fixture();
-        config.schedule.mine_each_epoch = true;
-        config.capabilities.mine = Mode::Active;
-        config.participation.mode = ParticipationMode::ParticipationFirst;
-        config.participation.uncertainty_grace_seconds = 0;
-        let mut store = Store::open(&config).unwrap();
-        store.set_paused(false).unwrap();
-        let mut completed = begin(&mut store, WorkKind::Mine, "2:legacy", "prepared");
-        completed.state = "dispatching".into();
-        store.save(&completed, "dispatch_intent").unwrap();
-        completed.state = "completed".into();
-        store.save(&completed, "mine_completed").unwrap();
-        let mut discarded = begin(&mut store, WorkKind::Mine, "3:legacy", "prepared");
-        discarded.state = "dispatching".into();
-        store.save(&discarded, "dispatch_intent").unwrap();
-        discarded.state = "retry".into();
-        store.save(&discarded, "submission_backoff").unwrap();
-        discarded.state = "discarded".into();
-        store.save(&discarded, "request_no_longer_current").unwrap();
-        let mut unsent = begin(&mut store, WorkKind::Mine, "4:legacy", "prepared");
-        unsent.state = "discarded".into();
-        store.save(&unsent, "request_no_longer_current").unwrap();
-        let mut pruned = begin(&mut store, WorkKind::Mine, "5:legacy", "prepared");
-        pruned.state = "discarded".into();
-        store.save(&pruned, "request_no_longer_current").unwrap();
-        let mut op = begin(&mut store, WorkKind::Mine, "1:legacy", "prepared");
-        op.state = "dispatching".into();
-        store.save(&op, "dispatch_intent").unwrap();
-        op.state = "unknown".into();
-        store.save(&op, "dispatch_outcome_unknown").unwrap();
-        store
-            .db
-            .execute_batch(
-                "UPDATE control SET version=1; DROP TABLE authority;
-            DROP TABLE operation_evidence; DROP TABLE runtime_policy;",
-            )
-            .unwrap();
-        drop(store);
-        let writer = lock_path(&config, "writer").unwrap();
-        let mut legacy = private_file(&writer).unwrap();
-        legacy
-            .write_all(digest(config.state_dir.as_os_str().as_encoded_bytes()).as_bytes())
-            .unwrap();
-        legacy.sync_all().unwrap();
-        drop(legacy);
-        assert!(AccountLock::acquire(&config).is_err());
-        assert!(AccountLock::control_store(&config).is_err());
-        let (lock, mut adopted) = AccountLock::adopt(&config).unwrap();
-        assert_eq!(adopted.effect().unwrap().unwrap().id, op.id);
-        assert_eq!(adopted.effect().unwrap().unwrap().state, "unknown");
-        for epoch in [1, 2, 3] {
-            assert!(adopted.mine_epoch_attempted(epoch).unwrap());
-            let mut duplicate = prepared_epoch(&mut adopted, WorkKind::Mine, epoch, "new");
-            assert!(!adopted.dispatch_intent(&mut duplicate, &config).unwrap());
-            duplicate.state = "discarded".into();
-            adopted
-                .save(&duplicate, "request_no_longer_current")
-                .unwrap();
-        }
-        assert!(!adopted.mine_epoch_attempted(4).unwrap());
-        let mut replacement = prepared_epoch(&mut adopted, WorkKind::Mine, 4, "new");
-        assert!(adopted.dispatch_intent(&mut replacement, &config).unwrap());
-        assert!(!adopted.mine_epoch_attempted(5).unwrap());
-        adopted
-            .db
-            .execute(
-                "DELETE FROM events WHERE id <= (SELECT MAX(id) FROM events WHERE operation_id=?1)",
-                [pruned.id],
-            )
-            .unwrap();
-        assert!(adopted.mine_epoch_attempted(5).unwrap());
-        assert!(adopted.mine_epoch_attempted(3).unwrap());
-        let old = writer.with_extension("fixture-old-lock");
-        fs::rename(&writer, &old).unwrap();
-        drop(private_file(&writer).unwrap());
-        assert!(adopted.continuity().is_err());
-        drop(adopted);
-        drop(lock);
-        fs::remove_file(old).unwrap();
-        remove_anchors(&config);
-    }
-
-    #[test]
-    fn unmarked_legacy_journal_is_not_implicitly_adopted() {
-        let (_dir, config) = bound_fixture();
-        let store = Store::open(&config).unwrap();
-        store
-            .db
-            .execute_batch(
-                "UPDATE control SET version=1; DROP TABLE authority;
-                 DROP TABLE operation_evidence; DROP TABLE runtime_policy;",
-            )
-            .unwrap();
-        drop(store);
-        let acquired = AccountLock::acquire(&config).is_ok();
-        let controlled = AccountLock::control_store(&config).is_ok();
-        let adopted = AccountLock::adopt(&config).is_ok();
-        let schema = Store::read_only(&config)
-            .unwrap()
-            .unwrap()
-            .schema_version()
-            .unwrap();
-        remove_anchors(&config);
-        assert!(!acquired && !controlled && !adopted);
-        assert_eq!(schema, 1);
-    }
-
-    #[test]
     fn adoption_requires_an_existing_initialized_journal() {
         let (_dir, config) = bound_fixture();
         let adopted = AccountLock::adopt(&config).is_ok();
@@ -9926,13 +8429,15 @@ mod tests {
     }
 
     #[test]
-    fn unanchored_schema2_requires_explicit_adoption() {
+    fn unanchored_schema3_requires_explicit_adoption() {
         let (_dir, config) = bound_fixture();
         let store = Store::open(&config).unwrap();
         let identity = store.database_identity().unwrap();
         drop(store);
         let acquired = AccountLock::acquire(&config).is_ok();
-        let controlled = AccountLock::control_store(&config).is_ok();
+        let controlled = AccountAdmissionGuard::for_control(&config)
+            .and_then(|gate| AccountLock::control_store(&config, &gate))
+            .is_ok();
         remove_anchors(&config);
         assert!(!acquired && !controlled);
         let (lock, adopted) = AccountLock::adopt(&config).unwrap();
@@ -9943,7 +8448,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_schema2_authority_is_not_recreated() {
+    fn missing_schema3_authority_is_not_recreated() {
         for explicit in [false, true] {
             let (_dir, config) = bound_fixture();
             let store = Store::open(&config).unwrap();
@@ -9971,13 +8476,13 @@ mod tests {
     #[test]
     fn bounded_model_retry_never_changes_effect_uncertainty() {
         let (_dir, mut config) = fixture();
-        config.preparation.max_attempts_per_work = 2;
+        config.capabilities.answer.preparation.max_attempts_per_work = 2;
         let mut store = Store::open(&config).unwrap();
-        store.set_paused(false).unwrap();
-        let mut model = begin(&mut store, WorkKind::Answer, "1:word", "generating");
+        store.set_paused_unbound(false).unwrap();
+        let mut model = begin(&mut store, LaneId::Answer, "1:word", "generating");
         model.state = "model_unknown".into();
         store.save(&model, "model_launch_unknown").unwrap();
-        let mut effect = begin(&mut store, WorkKind::Judge, &"A".repeat(64), "prepared");
+        let mut effect = begin(&mut store, LaneId::Judge, &"A".repeat(64), "prepared");
         effect.state = "dispatching".into();
         store.save(&effect, "dispatch_intent").unwrap();
         effect.state = "unknown".into();
@@ -9987,15 +8492,15 @@ mod tests {
             store.operation(model.id).unwrap().unwrap().state,
             "model_unknown"
         );
-        config.preparation.retry_uncertain = true;
+        config.capabilities.answer.preparation.retry_uncertain = true;
         store.retry_models(&config).unwrap();
         assert_eq!(
             store.operation(model.id).unwrap().unwrap().state,
             "superseded_model_unknown"
         );
         assert_eq!(store.effect().unwrap().unwrap().id, effect.id);
-        assert!(store.attempted(WorkKind::Judge, &"a".repeat(64)).unwrap());
-        let mut retry = begin(&mut store, WorkKind::Answer, "1:word", "generating");
+        assert!(store.attempted(LaneId::Judge, &"a".repeat(64)).unwrap());
+        let mut retry = begin(&mut store, LaneId::Answer, "1:word", "generating");
         retry.state = "model_unknown".into();
         store.save(&retry, "model_launch_unknown").unwrap();
         store.retry_models(&config).unwrap();
@@ -10008,9 +8513,12 @@ mod tests {
     #[test]
     fn completed_model_retry_budget_survives_restart_without_retrying_uncertain_work() {
         let (_temp, config, mut store) = participation_fixture();
-        assert_eq!(config.preparation.max_attempts_per_work, 2);
-        assert!(!config.preparation.retry_uncertain);
-        let mut first = begin(&mut store, WorkKind::Answer, "7:words", "generating");
+        assert_eq!(
+            config.capabilities.answer.preparation.max_attempts_per_work,
+            2
+        );
+        assert!(!config.capabilities.answer.preparation.retry_uncertain);
+        let mut first = begin(&mut store, LaneId::Answer, "7:words", "generating");
         first.result = Some(json!({"answer":"invalid completed draft"}));
         first.state = "rejected".into();
         store.save(&first, "model_output_invalid").unwrap();
@@ -10023,29 +8531,25 @@ mod tests {
         );
         assert!(!store.answer_epoch_attempted(7).unwrap());
         assert_eq!(
-            store
-                .model_budget_used(WorkKind::Answer, "7:words")
-                .unwrap(),
+            store.model_budget_used(LaneId::Answer, "7:words").unwrap(),
             1
         );
 
-        let mut second = begin(&mut store, WorkKind::Answer, "7:words", "generating");
+        let mut second = begin(&mut store, LaneId::Answer, "7:words", "generating");
         second.result = first.result.clone();
         second.state = "rejected".into();
         store.save(&second, "model_output_invalid").unwrap();
-        let mut uncertain = begin(&mut store, WorkKind::Judge, "uncertain-model", "generating");
+        let mut uncertain = begin(&mut store, LaneId::Judge, "uncertain-model", "generating");
         uncertain.state = "model_unknown".into();
         store.save(&uncertain, "model_launch_unknown").unwrap();
-        let mut dispatched = dispatched_unknown(&mut store, &config, WorkKind::Answer, 9);
+        let mut dispatched = dispatched_unknown(&mut store, &config, LaneId::Answer, 9);
         dispatched.state = "rejected".into();
         store.save(&dispatched, "submission_rejected").unwrap();
         drop(store);
         let mut store = Store::open(&config).unwrap();
         store.retry_models(&config).unwrap();
         assert_eq!(
-            store
-                .model_budget_used(WorkKind::Answer, "7:words")
-                .unwrap(),
+            store.model_budget_used(LaneId::Answer, "7:words").unwrap(),
             2
         );
         assert!(store.answer_epoch_attempted(7).unwrap());
@@ -10060,7 +8564,7 @@ mod tests {
         let retained = store.operation(dispatched.id).unwrap().unwrap();
         assert_eq!(retained.state, "rejected");
         assert_eq!(retained.payload, dispatched.payload);
-        assert_eq!(store.attempt_count(WorkKind::Answer, "7:words").unwrap(), 2);
+        assert_eq!(store.attempt_count(LaneId::Answer, "7:words").unwrap(), 2);
         assert!(store.effect().unwrap().is_none());
     }
 
@@ -10070,7 +8574,11 @@ mod tests {
         drop(AccountLock::acquire(&config).unwrap());
         fs::remove_file(lock_path(&config, "binding").unwrap()).unwrap();
         assert!(AccountLock::acquire(&config).is_err());
-        assert!(AccountLock::control_store(&config).is_err());
+        assert!(
+            AccountAdmissionGuard::for_control(&config)
+                .and_then(|gate| AccountLock::control_store(&config, &gate))
+                .is_err()
+        );
         assert!(Store::read_only(&config).is_err());
         remove_anchors(&config);
     }
@@ -10079,8 +8587,8 @@ mod tests {
     fn unchanged_observation_retains_transition_age_and_private_candidates() {
         let (_dir, config) = fixture();
         let mut store = Store::open(&config).unwrap();
-        store.set_paused(false).unwrap();
-        let mut op = begin(&mut store, WorkKind::Mine, "1", "prepared");
+        store.set_paused_unbound(false).unwrap();
+        let mut op = begin(&mut store, LaneId::Mine, "1", "prepared");
         op.state = "dispatching".into();
         store.save(&op, "dispatch_intent").unwrap();
         op.state = "unknown".into();

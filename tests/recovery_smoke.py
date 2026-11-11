@@ -186,13 +186,16 @@ print(json.dumps({'provider': 'openai-codex', 'model': payload['model'],
                 target = root / (kind + '-core.md')
                 target.write_text(content)
                 target.chmod(0o600)
-            config.write_text(f'''state_dir = "{root / 'state'}"
+            network = f'''state_dir = "{root / 'state'}"
 [network]
 base_url = "http://127.0.0.1:{server.server_port}"
 chain = "{chain}"
 address = "{address}"
 credential_file = "{key}"
-[capabilities]
+'''
+            if args.baseline or args.old_binary:
+                # Only explicit historical-binary scenarios produce schema-less v1.
+                config.write_text(network + f'''[capabilities]
 answer = "active"
 judge = "active"
 mine = "off"
@@ -201,11 +204,13 @@ harness = "{args.harness}"
 executable = "{native}"
 model = "openai/test"
 reasoning = "high"
+core_guidance_file = "answer-core.md"
 [solver.judge]
 harness = "{args.harness}"
 executable = "{native}"
 model = "openai/test"
 reasoning = "high"
+core_guidance_file = "judge-core.md"
 [timeouts]
 http_seconds = 2
 model_seconds = 15
@@ -216,25 +221,53 @@ mine_seconds = 86400
 retry_seconds = 1
 jitter_seconds = 0
 ''')
-            def enable_core_paths():
-                text = config.read_text()
+            else:
+                lanes = ''
                 for kind in ('answer', 'judge'):
-                    text = text.replace(f'[solver.{kind}]',
-                                        f'[solver.{kind}]\ncore_guidance_file = "{kind}-core.md"')
-                config.write_text(text)
-            if not args.baseline and not args.old_binary:
-                enable_core_paths()
+                    lanes += f'''[capabilities.{kind}]
+mode = "active"
+[capabilities.{kind}.model]
+harness = "{args.harness}"
+executable = "{native}"
+model = "openai/test"
+reasoning = "high"
+core_guidance_file = "{kind}-core.md"
+[capabilities.{kind}.timeouts]
+read_http_seconds = 2
+http_seconds = 2
+model_seconds = 15
+[capabilities.{kind}.schedule]
+poll_seconds = 1
+retry_seconds = 1
+jitter_seconds = 0
+'''
+                config.write_text('schema_version = 2\n' + network + '''[runtime]
+shutdown_seconds = 2
+[identity]
+read_http_seconds = 2
+retry_seconds = 1
+jitter_seconds = 0
+[capabilities.mine]
+mode = "off"
+''' + lanes)
+            config.chmod(0o600)
             shared['database'] = root / 'state/state.sqlite3'
             if args.slow_inventory:
                 config.write_text(config.read_text().replace('= "active"', '= "read_only"')
                                   .replace('http_seconds = 2', 'http_seconds = 15'))
             initial_binary = str(args.old_binary.resolve()) if args.old_binary else binary
             command = [initial_binary, '--config', str(config), '--json']
-            def invoke(*words):
-                result = subprocess.run(command + list(words), capture_output=True, text=True, timeout=10)
+            def invoke(*words, stdin=None):
+                result = subprocess.run(command + list(words), input=stdin, capture_output=True, text=True, timeout=10)
                 if result.returncode and words[0] != 'health':
                     raise AssertionError(result.stderr)
                 return json.loads(result.stdout or result.stderr)
+
+            def observed_answer_epoch():
+                status = invoke('status')['data']
+                observation = (status.get('observation') if args.baseline
+                               else status['observations']['answer'])
+                return (observation or {}).get('epoch')
 
             def wait_until(predicate, seconds=12):
                 deadline = time.monotonic() + seconds
@@ -283,7 +316,7 @@ jitter_seconds = 0
                 with guard:
                     shared['epoch'] = 11
                 time.sleep(3)
-                observed = (invoke('status')['data'].get('observation') or {}).get('epoch') == 11
+                observed = observed_answer_epoch() == 11
                 answers = (root / 'calls').read_text().splitlines().count('answer')
                 if args.baseline:
                     assert not observed and answers == 0
@@ -307,7 +340,11 @@ jitter_seconds = 0
                     captured = connection.execute(
                         "SELECT id,request,result,payload FROM operations WHERE kind='judge' ORDER BY id LIMIT 1"
                     ).fetchone()
-                assert json.loads(captured[1])['solver']['core_guidance'] == core_original['judge']
+                captured_model = json.loads(captured[1])['solver']
+                assert captured_model['core_guidance'] == core_original['judge']
+                captured_result = json.loads(captured[2])
+                assert captured_result['provider'] == ('openai' if args.harness == 'openclaw' else 'openai-codex')
+                assert captured_result['model'] == 'openai/test' and captured_result['run_id']
                 revision_before = invoke('config', 'check')['data']['revision']
                 for kind in ('answer', 'judge'):
                     current = invoke('guidance', 'show', '--kind', kind, '--layer', 'core')['data']
@@ -328,27 +365,62 @@ jitter_seconds = 0
             if args.unanchored:
                 lock_key = hashlib.sha256(f'{chain}\n{address}'.encode()).hexdigest()
                 lock_root = pathlib.Path(pwd.getpwuid(os.geteuid()).pw_dir) / '.agmi-account-locks'
-                for entry in lock_root.glob(lock_key + '.*'):
-                    entry.unlink()
+                writer = lock_root / (lock_key + '.writer')
+                binding_path = lock_root / (lock_key + '.binding')
+                original_inode = writer.stat().st_ino
+                # Missing established writer is not a fresh account. Restore the
+                # SAME inode after this refusal probe, never manufacture a new one.
+                saved_writer = writer.with_suffix('.writer-held')
+                writer.rename(saved_writer)
+                try:
+                    for words in (['run', '--once'], ['recover', 'adopt']):
+                        denied = subprocess.run(command + words, capture_output=True,
+                                                text=True, timeout=10)
+                        assert denied.returncode != 0, 'missing established writer was accepted'
+                        assert not writer.exists(), 'missing established writer was recreated'
+                finally:
+                    saved_writer.rename(writer)
+                # Genuine first-anchor adoption: old four-field independent
+                # Binding, original permanent writer, and every required gate intact.
+                legacy_binding = json.loads(binding_path.read_text())
+                legacy_binding.pop('writer_inode')
+                binding_path.write_text(json.dumps(legacy_binding, separators=(',', ':')))
+                gates = {entry: entry.stat().st_ino for entry in lock_root.glob(lock_key + '.lane-*')}
+                assert gates, 'fixture lost required lane gates'
                 denied = subprocess.run(command + ['run', '--once'], capture_output=True,
                                         text=True, timeout=10)
                 assert denied.returncode != 0, 'unanchored journal silently rebound'
                 invoke('recover', 'adopt')
+                adopted_binding = json.loads(binding_path.read_text())
+                assert adopted_binding.pop('writer_inode')['inode'] == original_inode
+                assert adopted_binding == legacy_binding
+                assert all(entry.stat().st_ino == inode for entry, inode in gates.items())
             if args.old_binary:
                 legacy_config = root / 'legacy-config.toml'
                 legacy_config.write_bytes(config.read_bytes())
+                legacy_schema = int(invoke('build-info')['data']['journal_schema'])
                 command[0] = binary
-                enable_core_paths()
                 denied = subprocess.run(command + ['run', '--once'], capture_output=True, text=True, timeout=10)
-                assert denied.returncode != 0, 'legacy journal silently adopted'
-                invoke('recover', 'adopt')
+                assert denied.returncode != 0, 'legacy config/journal silently adopted'
+                request = {'caps': {'answer': 1, 'judge': 1, 'mine': 1}}
+                if legacy_schema == 1:
+                    request.update(adopt_legacy=True, initial_database_id=uuid.uuid4().hex)
+                writes_before = len(shared['writes'])
+                preview = invoke('config', 'migrate', 'preview', stdin=json.dumps(request))['data']
+                apply_words = ['config', 'migrate', 'apply', '--expected-token', preview['token']]
+                if preview['risk_change_required']:
+                    apply_words += ['--accept-risk-change', preview['token']]
+                invoke(*apply_words, stdin=json.dumps(preview['request']))
+                assert invoke('config', 'show')['data']['config']['schema_version'] == 2
+                assert len(shared['writes']) == writes_before, 'local migration submitted a wallet effect'
+                invoke('resume')
                 rollback = subprocess.run([initial_binary, '--config', str(legacy_config), '--json', 'resume'],
                                           capture_output=True, text=True, timeout=10)
                 assert rollback.returncode != 0, 'old binary accepted the upgraded journal'
             if args.bound_job:
                 prior_heartbeat = invoke('status')['data']['effective_runtime']['observed_at']
                 config.write_text(config.read_text().replace('= "active"', '= "off"')
-                                  .replace('[solver.answer]', '[solver.answer]\nguidance_file = "missing-guidance.md"'))
+                                  .replace('[capabilities.answer.model]', '[capabilities.answer.model]\nguidance_file = "missing-guidance.md"'))
                 (root / 'judge-core.md').unlink()
                 database = root / 'state' / 'state.sqlite3'
                 with sqlite3.connect(database.as_uri() + '?mode=ro', uri=True) as connection:
@@ -396,7 +468,7 @@ jitter_seconds = 0
             with guard:
                 shared['epoch'] = 11
             child = subprocess.Popen(command + ['run'], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
-            wait_until(lambda: (invoke('status')['data'].get('observation') or {}).get('epoch') == 11)
+            wait_until(lambda: observed_answer_epoch() == 11)
             # Allow multiple observer turns, not merely a single early snapshot.
             time.sleep(4)
             after = invoke('status')['data']
@@ -404,12 +476,22 @@ jitter_seconds = 0
             assert len(shared['writes']) == 1, 'uncertain effect replayed or bypassed'
             assert after['pending']['state'] == 'unknown', 'unknown erased on restart'
             assert before['pending']['created_at'] == after['pending']['created_at']
-            assert invoke('health')['data']['healthy'] is False, 'blocked participation reported healthy'
+            health = invoke('health')['data']
+            assert health['healthy'] is False, 'blocked participation reported healthy'
+            if not args.baseline:
+                assert health['risk']['unresolved_effects'] == 1
+                assert health['risk']['historical_eligible_answers'] == 0
+                assert health['risk']['capacity_exempt_answers'] == 0
             prepared = calls.count('answer')
             if args.baseline:
                 assert prepared == 0, 'baseline unexpectedly prepares an answer; reassess fixture'
             else:
                 assert prepared == 1, f'expected one bounded answer preparation, observed {prepared}'
+                admission = after['work']['answer']['admission']
+                assert not admission['allowed']
+                assert admission['reason'] == 'account_uncertainty' and admission['scope'] == 'account'
+                assert admission['own_count'] == 0 and admission['own_remaining'] == admission['own_limit']
+                assert after['pending']['operation_id'] in admission['blocker_ids']
                 assert any(row['kind'] == 'answer' and row['state'] == 'generated'
                            for row in after['operations']), 'answer draft was not durably captured'
                 if captured is not None:

@@ -14,7 +14,7 @@ CLI and installer defaults follow process `HOME`; the systemd unit resolves `%h`
 agmi --json config schema
 agmi --json config show
 # FILE_REVISION is data.file_revision from config show.
-printf '%s\n' '{"participation":{"mode":"participation_first","uncertainty_grace_seconds":300}}' |
+printf '%s\n' '{"capabilities":{"answer":{"participation":{"mode":"participation_first","uncertainty_grace_seconds":300}}}}' |
   agmi --json config apply --expected-revision "$FILE_REVISION" --dry-run
 # Remove --dry-run to save the validated patch.
 agmi --json status
@@ -41,7 +41,7 @@ agmi --json guidance set --kind answer \
 
 Guidance commands read/write private UTF-8 content, not model instructions in argv. An unconfigured route can create its conventional guidance file; `missing` is a create-only revision token. Guidance updates reload without restarting. Do not forward private guidance or `recover inspect` output. Operation and grant lists expose sanitized, bounded pages; use `next_before` as the next `--before` cursor. No administration command above calls a model or submits MinePOA work.
 
-`reads` reports bounded per-scope request state, last usable success, safe failure category/status, local retry deadline and retained server minimum. It never makes a network request. `status.data.work` explains each capability's phase, blocker, next action and deadline; no deadline means progress needs evidence or administration, not an immediate retry. Heartbeat, useful progress and current-epoch answer evidence remain separate.
+`reads` reports current identity, lane discovery, assignment and operation-binding read state without making requests. The view is bounded to 256 rows with `reads_truncated`; identity/discovery are prioritized, and retired binding history remains durable but is not presented as current. Local retry clocks, same-resource minima and `shared_not_before` remain distinct. `status.data.work` explains each lane's phase, canonical admission decision and next action; a deadline is not permission or a recovery promise. Heartbeat, useful progress and current-epoch answer evidence remain separate.
 
 For interrupted identity creation, inspect `identity status`. A complete retained success can provide `identity resume --confirm`, which validates and publishes only local files without the original registration options or network profile. Omit `--confirm` to inspect the plan. Missing/incomplete capture remains uncertain; resume never requests proof work or another registration.
 
@@ -54,7 +54,7 @@ For interrupted identity creation, inspect `identity status`. A complete retaine
 | `judge` | Observe assignments, prepare judgments and submit | Observe/reconcile; no new model or submission | No new participation or ordinary polling; safety reconciliation continues |
 | `mine` | Submit hosted attestation requests at configured cadence | Observe without invoking the mutating mine endpoint | No new participation or ordinary polling; safety reconciliation continues |
 
-All-on means setting these three modes to `active`. All-read-only means setting them to `read_only`. These are combinations of the same capability policy, not separate controller implementations.
+Set `capabilities.<lane>.mode` to choose each mode. Each lane has its own native controller; modes do not create additional runtimes or journal writers.
 
 Off and pause do not abandon already possibly-sent work: allowlisted identity, job and receipt reads continue. Stop the runtime for strict no-network operation; local status/health remain offline. This safety-read contract replaces the earlier off=no-polling behavior.
 
@@ -62,16 +62,13 @@ Off and pause do not abandon already possibly-sent work: allowlisted identity, j
 
 ## Configuration and reload
 
-Operator settings control capability modes, model/harness/reasoning, deadlines, cadence and participation risk. The network supplies epoch, challenge words, assignments and outcome evidence. Backoff never authorizes ignoring a server delay; explicit participation policy can authorize bounded risk without proving an old request failed.
+This source tree requires `schema_version = 2`. Released v0.1.1 configuration is not accepted by the normal reader; use [explicit migration](#atomic-capability-migration). Each `capabilities.answer`, `.judge` and `.mine` table owns `mode`, `timeouts`, `schedule` and `participation`. Answer/judge additionally own `model` and `preparation`; mining is model-free. Only shared identity read policy (`identity`) and shutdown policy (`runtime.shutdown_seconds`) remain outside the lanes.
 
-The `[schedule]` defaults are `poll_seconds = 120`, `retry_seconds = 180`, `backoff_max_seconds = 900`, `jitter_seconds = 30` and `mine_seconds = 86400`. Existing explicit values remain effective; omitted new fields use defaults. Failed upstream reads use durable, endpoint-scoped exponential backoff, so restarting does not reset a failing endpoint's delay and success on another endpoint does not clear it. The effective backoff cap cannot shorten the retry base or a server retry minimum.
-The bounded identity offset is added after the exponential cap and server minimum, so retries remain staggered during prolonged outages. The final wait can exceed `backoff_max_seconds` by up to `jitter_seconds`, or longer when the server requires it.
+Each lane's schedule defaults to 120-second polling, 180-second retry, a 900-second exponential-backoff cap and 30-second deterministic staggering. Mining additionally has `interval_seconds = 86400` and `each_epoch = false`. These are independent values, not references to a global schedule. Optional `discovery_retry_seconds` and `discovery_backoff_max_seconds` inherit that lane's retry/base-cap settings.
 
-Optional `schedule.challenge_retry_seconds` and `challenge_backoff_max_seconds` override only challenge-read backoff; omitted values inherit the generic settings. Hot changes recompute local delay from the original failure time, never from each reload and never below a retained server minimum. Legacy deadlines without separate provenance remain conservative. Inspect effective deadlines with `agmi --json reads`.
+Failures belong to identity, one lane's discovery, one assignment, or an operation's exact job/receipt binding revision. A slow or missing job does not impose local backoff on another job or lane. Rebinding retires the old read key; late completions cannot update the replacement binding's clocks or state. Genuine account/route/resource restrictions still constrain every applicable request.
 
-Optional `schedule.assignments_retry_seconds` and `assignments_backoff_max_seconds` similarly override assignment-read retry/backoff only. Both default to null/inherit in the configuration schema; omit them in TOML, which has no null literal. Neither these settings nor challenge overrides change write retry authority or shorten retained server minima.
-`reads` labels unattributed legacy deadlines as `retained_conservative_floor`, not server evidence. `server_not_before` retains observed server delays plus retry staggering. Operation blockers use `retained_retry_minimum` because older operation timing may also have unknown provenance.
-
+Hot changes recompute local delay from the original failure time, never from reload time. They cannot shorten a retained server minimum or conservative legacy floor. Deterministic identity staggering is added after the local exponential cap; final waits can exceed the cap when staggering or a genuine restriction requires it. `0` disables staggering.
 `reads` and operation evidence expose bounded error categories, never raw provider
 messages or credentials. HTTP status and transport/body failure remain separate
 evidence: an interrupted 503 body may be labeled `timeout`, not a proven halt.
@@ -82,13 +79,11 @@ evidence: an interrupted 503 body may be labeled `timeout`, not a proven halt.
 | `rate_limited`, `answer_global_ceiling`, `grade_queue_full` | Honor the retained retry floor; do not restart to bypass it. |
 | `authentication_rejected`, `permission_denied` | Inspect credential configuration with `config check` and recorded endpoint evidence with `reads`; neither validates a credential remotely. Do not move credentials into a URL or register a replacement identity. A 403 alone does not prove an invalid key. |
 | `redirect_refused`, `not_found`, `gone`, `request_rejected`, `upstream_rejected` | Inspect the configured network profile and operation evidence. A missing job or receipt is not proof a write failed. |
-| `invalid_json`, `body_interrupted`, `response_too_large`, `timeout`, `connect` | Preserve uncertainty and let endpoint-scoped read backoff run; escalate if evidence becomes stale or work overdue. |
+| `invalid_json`, `body_interrupted`, `response_too_large`, `timeout`, `connect` | Preserve uncertainty and let the owning read's backoff run; escalate if evidence becomes stale or work overdue. |
 
-The longest parseable `Retry-After` header (seconds or HTTP-date) and JSON
-`retry_after_seconds` wins. Displayed deadlines mean **retry no earlier than**,
-not “the service will be restored at this time.” Free-form outage prose is not
-parsed into a recovery timestamp. Unknown error bodies retain a safe HTTP or
-transport category; they never silently become success.
+The longest parseable `Retry-After` header (seconds or HTTP-date) and JSON `retry_after_seconds` wins. Headers are retained privately until the body completes or its deadline expires; classification then determines scope. A valid queued 202 minimum is resource-local, not a global pause. Malformed or interrupted bodies retain conservative header evidence. Restrictions are ingested before stale local-completion checks, so an obsolete binding cannot erase a genuine shared limit.
+
+A bare 429 without a valid minimum uses a fixed, versioned 30-second local cooldown anchored to the original observation—not a server-supplied duration or another lane's exponential backoff. Displayed deadlines mean **retry no earlier than**, not “the service will recover then.” Free-form outage prose never supplies a recovery timestamp.
 
 For submissions, a complete, structurally valid JSON HTTP 429 refusal or a 503
 with the exact halt middleware error on answer/judge submission permits retry
@@ -103,29 +98,33 @@ maintenance prose or an expected server fix does not shorten them.
 Accepted bound jobs can opt into a separate polling policy:
 
 ```toml
-[schedule.queued_job_polling]
+[capabilities.answer.schedule.queued_job_polling]
 initial_seconds = 15
 max_seconds = 120
 ```
 
-Both positive fields are required, with initial no greater than maximum. Intervals grow exponentially with elapsed queued-phase time; identity jitter stays within this local cap. Server/legacy retry minima and endpoint error backoff still win, and deadline rounding adds one conservative second. Missing retained phase evidence uses the cap rather than reopening an early polling window. Omission preserves the existing retry cadence. Hot reload affects subsequent queued observations without shortening already-scheduled deadlines; apply `{"schedule":{"queued_job_polling":null}}` through `config apply` to disable it. This policy changes job-status reads only, not write retries, identifier-less recovery, receipt cadence or participation authorization.
+Configure this separately for each lane. Both positive fields are required, with initial no greater than maximum. Intervals grow with queued-phase age; jitter stays within the local cap. Same-resource/server/legacy minima still win, and conversion to integer timestamps adds one conservative second. Missing phase evidence uses the cap. Omission preserves normal retry cadence. To disable answer's override, apply `{"capabilities":{"answer":{"schedule":{"queued_job_polling":null}}}}`. This affects bound-job reads, not write retries, receipt cadence or participation authorization.
 Already-due jobs continue through bounded reconciliation batches without the normal poll sleep. Polling intervals are scheduling targets, not upper bounds on upstream response latency.
 
-`timeouts.http_seconds` defaults to 90 seconds and controls writes, including the effectful GET mine endpoint. Optional `read_http_seconds` overrides read deadlines; omitted means reads inherit `http_seconds` (also 90 seconds by default). Explicit configured values remain authoritative. `schedule.mine_each_epoch = true` replaces daily cadence with one explicit mining attempt per freshly observed epoch, whether answered or not. [MinePOA permits mining anytime](https://minepoa.com/go.md), but rewards require an answered epoch; local permission is not an earnings claim. Proven nonacceptance may retry captured work; an uncertain mine is not repeatedly issued within that epoch. Neither mode guarantees upstream acceptance.
+Each lane has independent `timeouts.http_seconds` and `read_http_seconds`, both defaulting to 90; neither inherits the other's value. Effectful mining GET uses the effect deadline. Answer/judge independently default `model_seconds` to 300. `capabilities.mine.schedule.each_epoch = true` replaces interval cadence with one explicit mining attempt per freshly observed epoch, whether answered or not. [MinePOA permits mining anytime](https://minepoa.com/go.md), but rewards require an answered epoch; local permission is not an earnings claim. Proven nonacceptance can retry captured work; uncertain mining is not repeatedly issued within that epoch.
 
-Startup, polling and retries include deterministic identity-based staggering, bounded by `jitter_seconds` (`0` disables it). This spreads independent identities without peer discovery, shared state or coordination; it is not a guarantee of distinct request times. Answers retain priority; when no answer is selected, judge and mine are considered oldest-due first rather than allowing a busy judging queue to continually outrank due mining. Existing eligibility, pause and unresolved-operation boundaries still apply.
+Startup, polling and retries use deterministic identity-based staggering without peer coordination. Ready effects use the [served-in-round fairness policy](#configurable-uncertainty-policy), not fixed answer priority or a reservation for future work. Its successful-opportunity bound is not a wall-clock or upstream-availability guarantee.
 
-Preparation and wallet effects have separate lifecycles. One runtime owns transitions and serializes local network writes, with at most one local answer task and one local judging task. Epoch observation does not wait for a judge model call. Strict policy retains one outstanding effect; participation-first/manual policy can admit bounded new work while old effects remain unresolved. Pending mining recovery uses its own deadline, not the next mining cadence.
+One runtime and journal owner collect results. Each lane has one discovery/freshness pipeline and two reconciliation slots with its own due cursor. Answer and judge each have one independent native model task. Shared identity verification and account-effect admission each have one slot. Slow retained reads do not own the effect slot or consume another lane's reconciliation slots.
 
-Slow background job, receipt, inventory or hydration reads retain their request while urgent answer work proceeds; they are not repeatedly cancelled at polling boundaries. Observation uses an absolute poll deadline including configured staggering, and model completion wakes the controller. Useful transitions trigger another work turn without a full poll sleep. Fresh identity/challenge availability, server minima, existing answer-model capacity and an already-started write can still delay preparation or submission. A retained background request never owns the wallet-effect slot.
+The selected effect retains account and lane admission guards through response bookkeeping. Gate-dependent preparation, abstention and native launch defer without inventing failures or another attempt; result collection and safety recovery remain live. Global pause can wait for an in-flight bounded effect; lane pause waits for its own lane, not a sibling's effect. After acknowledgement, new starts require current authorization. Neither acknowledgement nor local shutdown recalls transmitted requests.
 
-`[preparation]` defaults to `answer_while_blocked = true`, `retry_uncertain = false`, and `max_attempts_per_work = 2` (1–8). A current answer may be prepared behind an uncertain effect; submission is governed separately by participation policy. The default budget permits one additional model attempt after a completed, bound invalid draft, at additional model cost; uncertain inference still requires opt-in and can duplicate model charges. Discarded generations still consume their model budget; a manual network grant does not increase it. Each launch has a distinct identity and late-result fencing. Local task bounds do not prove a disconnected remote model stopped.
+Answer/judge `preparation` defaults to `retry_uncertain = false` and `max_attempts_per_work = 2` (1–8). `while_blocked` defaults true for answer and false for judge. Preparing behind uncertainty does not authorize submission. Completed invalid drafts may use another model attempt; uncertain inference needs opt-in and can duplicate charges. Preflight and pending admission/revalidation waits consume the same fixed original execution budget and cannot renew it. The pending deadline is captured separately from later launch authorization; expiry before inference remains not-started, not a running-model timeout.
+
+`run --once` takes a finite entry-time plan: at most two entry-due recovery reads per lane, one model attempt per model lane and one effect per lane, with bounded discovery/freshness. It drains owned handles but does not wait for future grace/cadence deadlines, discover later grants or replenish completed work indefinitely. Ordinary `run` continues scheduling.
 
 The runtime reloads model guidance and ordinary participation policy at safe boundaries. Invalid edits are reported without partially applying them. Account, chain, credential reference and state directory remain identity boundaries for existing state. Network profile changes additionally require a stopped, drained runtime; see below. A different account needs separate configuration/state. Model changes apply to new model calls; in-flight work retains its captured configuration. Pause and capability policy are rechecked before dispatch.
 
+Valid lane-only reloads do not invalidate shared identity authority or another lane's observations. Diagnostics use captured effective lane revisions; they do not read guidance to reconstruct them or borrow desired settings when evidence is missing.
+
 Configuration inspection shows references and model names, not credential values. `agents` reports configured routes; it does not claim they are authenticated or invoke a model.
 
-`excluded_judging_assignments = []` is a root-level list of assignment transaction IDs, before any TOML table header. IDs must be 64 hexadecimal characters; matching ignores case. Use it to exclude known prior attempts from new judging work. Changes reload without restart. Exclusion is rechecked before local abstention so excluding an unjudgeable seat does not consume its attempt. Excluded, proven-unsent work releases its local pending boundary even during backoff or pause; queued or possibly-sent work still reconciles and cannot be cleared by this setting.
+`capabilities.judge.excluded_assignments = []` lists assignment transaction IDs. IDs must be 64 hexadecimal characters; matching ignores case. Exclusions reload and are checked before selection, abstention and admission. Only proven-unsent work is released; queued or possibly-sent work continues reconciling. A cooled or in-flight hydration candidate does not monopolize selection when another eligible assignment is available.
 
 ### Network profiles
 
@@ -148,61 +147,37 @@ An older journal without retry-link evidence cannot prove that routing is draine
 
 ### Configurable uncertainty policy
 
-| `participation.mode` | New work behind unresolved effects |
+Each lane has its own `capabilities.<lane>.participation` policy:
+
+| `mode` | New work behind account-wide unresolved effects |
 |---|---|
 | `strict` (default) | Wait for authoritative resolution |
-| `participation_first` | Permit configured capabilities after every blocker meets the grace period and server retry minimum |
-| `manual` | Require a stopped-writer, one-dispatch grant for the requested epoch/kind; overrides general grace, not server delays or answer retry grace |
+| `participation_first` | Permit risk after every applicable blocker meets this candidate lane's grace and genuine retry floors |
+| `manual` | Require a stopped-writer, epoch/lane/account-generation/lane-control-revision-bound one-dispatch grant; never bypass capacity, server minima or answer retry grace |
 
-`uncertainty_grace_seconds` defaults to 300. `max_unresolved_operations` defaults to 4 and includes the prospective dispatch. `allow_answer` and `allow_mine` default true; `allow_judge` defaults false. Live dispatches cannot be bypassed. All old unknowns remain recorded, reconciliation rotates among bound operations, and each risk admission captures its policy, revision and applicable blocker/accounting evidence atomically with dispatch intent.
+`max_unresolved_operations` defaults to 4 **per lane**, including the prospective dispatch. Another lane cannot consume or borrow that allowance. There is no shared capacity pool, answer reserve or `allow_*` alias. Separate quotas do not isolate a wallet: candidate admission still evaluates unresolved effects across the account using that candidate lane's policy. `uncertainty_grace_seconds` defaults to 300.
 
-`answer_reserved_slots` defaults to zero and must be smaller than `max_unresolved_operations`. With cap 8/reserve 2, a judge or mine dispatch may occupy at most six unresolved slots; answers may use all eight. Reservation persists after the current answer completes and applies to manual grants too. It does not evict existing unknowns or prevent unresolved answers exhausting capacity. `allow_judge = true` enables bounded judging overlap under the selected participation policy; it does not clear old judgments.
+`work.<lane>.admission` is the same canonical decision used for dispatch: `own_count`, `own_limit`, `own_remaining`, `scope`, `reason`, `blocker_ids`, `required_release`, `not_before` and account unresolved count. Blocker IDs are bounded with explicit truncation; counts remain exact. Missing evidence stays unknown. An allowed local projection is not fresh identity/eligibility proof or a reusable dispatch permit.
 
-`participation.historical_unknown_answer_capacity` defaults to `bounded`. In that mode, `max_historical_unknown_answers` (default zero) limits eligible historical answers excluded from active capacity; excess still counts. Active plus historical capacity bounds outstanding risk in this mode.
+Only answer owns historical capacity settings. `historical_unknown_answer_capacity = "bounded"` and `max_historical_unknown_answers = 0` are defaults. An explicit finite historical allowance excludes qualifying originals from answer's own active capacity. Participation-first may instead select `accepted_linked`, excluding all qualifying originals without a lifetime historical-count bound.
 
-Only `participation_first` may opt into `accepted_linked`: **all** eligible historical answers are excluded from active capacity, regardless of the numeric historical allowance. Eligibility requires a dispatched, identifier-less unknown answer and a directly linked later retry in the same recorded epoch with a transaction ID and recorded `included_pending`, `confirmed` or `final` state. Unrelated accepted answers, transitive retry ancestors, age alone, judgments and mining never qualify. The original remains unknown: this is **not settlement, nonexecution or finality evidence** for that request.
+Eligibility requires a dispatched, identifier-less unknown answer and a directly linked later retry in the same recorded epoch with a transaction ID and recorded `included_pending`, `confirmed` or `final` state. Unrelated acceptance, transitive ancestry, age, judging and mining never qualify. Originals remain unknown. This is **not settlement, nonexecution or finality evidence**.
 
-`accepted_linked` explicitly accepts accumulating historical uncertainty without a lifetime historical-count bound. Active unresolved capacity and answer reservation remain finite; grace, server floors, pause, identity, control generation, capability permissions and per-epoch attempt limits still apply. Unlinked unknowns can still exhaust capacity. Strict remains the default and gains no bypass; manual mode gains no historical allowance.
+Historical exemptions affect answer capacity only; they never become judge/mine capacity or erase account-wide uncertainty. Witness revocation can recharge original answers. Strict/manual gain no historical allowance. Accepted-linked mode explicitly accepts accumulating historical risk, while own-lane caps, account policy, identity, pause, genuine restrictions and per-epoch attempt budgets remain binding.
 
-For a queued or unknown answer with a retained payload but no transaction ID, `status.work.answer.retry` (also exposed by health) explains the separate retry-policy gate, even while a new attempt is being prepared. It reports `original_operation_id`, `policy_eligible`, `reason`, `next_action`, `next_at`, and `requires_fresh_eligibility`. Reasons distinguish retained retry minima, uncertainty grace, exhausted epoch attempts, unresolved capacity and unavailable fresh challenge evidence. Eligibility is not dispatch permission: a new attempt still requires fresh eligibility and all dispatch fences. The original operation remains uncertain; the retry projection does not replace its authoritative-recovery requirement. Expiry of a server floor never proves rejection or clears an unknown operation.
-
-Discover fields with `agmi --json config schema` and obtain `data.file_revision` with `agmi --json config show`. To opt in using the supported nested patch interface (there is no `config set` command):
+For an explicit answer-only policy patch:
 
 ```sh
-printf '%s\n' '{"participation":{"mode":"participation_first","historical_unknown_answer_capacity":"accepted_linked"}}' |
+printf '%s\n' '{"capabilities":{"answer":{"participation":{"mode":"participation_first","historical_unknown_answer_capacity":"accepted_linked"}}}}' |
   agmi --json config apply --expected-revision "$FILE_REVISION" --dry-run
 # Review the risk, then remove --dry-run to save.
 ```
 
-This patch does not enable capabilities, resume participation or enable same-epoch uncertain-answer retries. Check saved versus effective revisions as described above. To return to bounded accounting, apply `"historical_unknown_answer_capacity":"bounded"` within the same `participation` patch; existing uncertainty is never erased.
+This does not enable capability modes, resume participation, change judge/mine risk policy or enable uncertain-answer retries. Return to bounded accounting by setting `historical_unknown_answer_capacity` to `bounded` in the same answer policy. Existing uncertainty is never erased.
 
-Accepted-linked admissions retain active blocker IDs and a compact snapshot of accounting revision and total/eligible/exempt counts. Revisioned original-answer/accepted-retry links preserve the historical witness without copying every historical ID into every admission. Inspection reconstructs bounded examples at the captured revision and reports counts/truncation; status examples are limited to 20. This reduces repeated evidence growth, not journal retention: original operations and accounting history remain durable. Bounded-mode admissions retain their finite copied witness representation.
+Same-epoch uncertain-answer retries additionally require answer's `retry_uncertain_answers = true`, its `uncertain_answer_retry_seconds` (default 600) and remaining `max_answer_attempts_per_epoch` (default 2). Distinct dispatched operations consume that budget; model failures and safe retries of positively refused work do not create new distinct dispatch attempts. Matching captured payloads are reused; changed challenges require valid fresh preparation. Included, confirmed, final or freshly reported answered work is not retried merely because finality is slow.
 
-Local reconciliation cadence and jitter do not extend the risk-admission grace or override a manual grant. Only reported server minima add that fence. Older journals whose deadlines lack this distinction retain their inherited deadline conservatively until it expires.
-
-Status scopes `participation.uncertainty_blocks` to `observation_epoch` and the effective policy. A false value means uncertainty itself does not block that capability—not that fresh eligibility, upstream availability or acceptance is guaranteed. An already accepted answer is not labelled an uncertainty blocker.
-
-Retrying an uncertain answer in the **same epoch** additionally requires `retry_uncertain_answers = true`, `uncertain_answer_retry_seconds` (default 600), and remaining `max_answer_attempts_per_epoch` (default 2). The budget counts distinct dispatched operations, not model failures or safe retries of proven nonacceptance. Matching captured payloads are reused without new inference; a changed challenge requires current-valid preparation. Included, confirmed, final or freshly reported answered work is not retried for finality delay alone.
-
-A due, authorized current-epoch uncertain-answer retry temporarily reserves **new effect admission**, not model preparation or reads. The reservation begins only after the original answer's retained retry floor and its own applicable grace/retry delay; it does not stop judging for the original long `Retry-After`. New judging/mining submissions then wait rather than continually moving the retry's eligibility window. Already-started effects and bound jobs continue settling, prepared judgments are retained, and every other operation's floor/grace, capacity limit, fresh challenge/identity check and attempt budget still applies.
-
-This is derived priority, not another retry permission or resolution of the original. Both queued and unknown answers use the existing explicit uncertain-answer retry policy; known queued jobs keep their reconciliation. Strict mode never reserves for a risk retry; manual mode requires an unconsumed current-generation answer grant. The reservation ends when the answer is accepted/reported answered, the epoch changes, retry intent is disabled/paused, its dispatch budget is exhausted, or unsent preparation fails without a permitted model-retry transition. Discarding a stale draft or rejecting a dispatched retry does not end priority while another retry remains permitted. Upstream outages or unresolved capacity can still prolong the wait; no timer supplies fresh eligibility.
-
-`status.work.answer.retry` identifies the original and, for floor/grace/live-effect waits, the blocking local operation (`blocking_operation_id`) and `next_at` deadline. `reservation_active` and `reservation_retry_not_before` describe the derived reservation. Prepared lower-priority work waiting for admission reports `answer_retry_reserved`; reads and preparation retain their own progress phases. The separate `admission_reservation` exposes `original_operation_id` and `retry_not_before`; that timestamp is the original's earliest retry point, **not** a promised dispatch time. These are local journal numbers, never bearer-like job identifiers or payloads.
-
-A due, positively refused answer also reserves admission for retry of its same
-captured operation, including when no earlier unknown answer exists. Reusing
-that operation does not consume a new distinct-attempt slot; this never permits
-a fresh third attempt beyond the budget. Its own delay must expire first.
-Ordinary retries with no unresolved effects retain existing strict/manual
-permission; overlapping uncertain effects still require the existing policy
-and, in manual mode, an unused grant.
-`admission_reservation` on each work kind exposes `active`, `same_operation`,
-and `basis`; for a standalone refusal its `original_operation_id` identifies
-the refused operation itself, not a fabricated uncertain predecessor.
-Priority reservations are reported separately from `uncertainty_blocks`.
-Health uses `answer_retry_reserved` for this admission wait without inventing
-an unresolved effect.
+`work.answer.retry` distinguishes policy permission, original operation, retained floors, fresh-evidence waits and exhausted budgets. It is not resolution or dispatch authority. Ready effects use served-in-round fairness and earliest local observation-freshness deadlines, with due-time/stable-lane ties. A continuously eligible lane waits at most `2N−1` successful dispatch opportunities for `N` registered lanes, not a wall-clock bound. No lane reserves future capacity. Every dispatched overlap retains its original uncertain blockers and captured policy; arbitration evidence includes offered lanes and exclusions.
 
 Manual administration, with the runtime stopped:
 
@@ -212,9 +187,27 @@ agmi --json recover grants
 agmi --json recover revoke --grant "$GRANT_ID"
 ```
 
-Grants require manual policy and resumed intent; pause/resume invalidates their generation. They remain subject to capability flags, uncertainty caps, freshness and answer-attempt limits. Grant history is retained. Restart the supervisor after stopped-writer administration.
+The selected lane must be active with manual policy and resumed intent. Account pause/resume changes the shared generation; lane pause/resume changes only that lane's control revision. Either invalidates the corresponding grant authority without deleting history. Grants remain subject to lane quota, fresh evidence and answer-attempt limits. Legacy conversion revokes old grants; source-3 conversion preserves records without inventing a missing lane-control binding.
 
-**Grace authorizes risk, not certainty.** A delayed old request may execute after a new one, causing duplicate effects or nonce conflicts. A cap can halt participation again; it is not a lifetime-write budget. Hot-reloading strict policy stops new bypasses without erasing outstanding effects. Fresh challenge/account checks remain mandatory: stale API data cannot guarantee an answer every epoch during an upstream outage.
+**Grace authorizes risk, not certainty.** A delayed old request can execute after a new one, causing duplicate effects or nonce conflicts. Lowering a cap can stop new dispatches but never clears existing work. A cap is not a lifetime-write budget. Fresh identity and eligibility remain mandatory; no timer guarantees participation during an upstream outage.
+
+### Lane controls
+
+Pause one capability without changing modes or sibling controls. With `jq` available:
+
+```sh
+CONTROL_TOKEN="$(agmi --json lane show judge | jq -r '.data.desired.control_token')"
+agmi --json lane pause judge --expected-control "$CONTROL_TOKEN" --wait-seconds 30
+# When ready, read the current token again before removing this override:
+CONTROL_TOKEN="$(agmi --json lane show judge | jq -r '.data.desired.control_token')"
+agmi --json lane resume judge --expected-control "$CONTROL_TOKEN"
+```
+
+The opaque token is not a config-file or loaded-content revision. Stale-token changes conflict; a current-token no-op does not churn revision/events. Controls load metadata without requiring unrelated guidance or harness executables. `--wait-seconds` bounds local lock acquisition attempts, not stalled OS I/O.
+
+A pause ACK fences new selected-lane preflight, inference and effect admission. It does not stop already-started inference, settle a committed dispatch intent or cancel remote work. Unsettled dispatch and unresolved-sent counts remain explicit. Sibling lanes retain their own controls and can progress; ordinary shared identity, uncertainty and server restrictions still apply. Lane resume removes only the override, grants no retry right and never proves admission open. Global `pause`/`resume` remains account-wide and does not erase lane overrides.
+
+`lane show` and `status.lane_controls` separate desired control, authoritative closure and last runtime observation. Stopped, stale or unverifiable observations report unknown admission rather than an open permit. Config/guidance saves are not fence acknowledgements. Stop the controller, rather than pausing a lane, when no agmi network activity is required.
 
 
 ### Core and user guidance
@@ -222,7 +215,7 @@ Grants require manual policy and resumed intent; pause/resume invalidates their 
 Each model route has two separately editable layers:
 
 ```toml
-[solver.answer]
+[capabilities.answer.model]
 core_guidance_file = "answer/core-guidance.md"
 guidance_file = "answer/user-guidance.md"
 ```
@@ -242,6 +235,58 @@ Both layers are sent to the selected model and retained in private state: never 
 Local pause, recovery and diagnostics do not validate guidance paths or read their files, so broken guidance cannot disable these controls. They still require an otherwise valid configuration. Their configured revision is `null` when guidance has not been loaded; status still reports the runtime's effective revision. Use `config check` to validate the current file contents and obtain their revision. `run` and `resume` also require valid guidance.
 
 Configuration failures include a bounded `details.reason` and, where known, a source-defined field or answer/judge guidance-layer selector. `config check` suggests a repair path rather than repeatedly recommending the same failing check. Parser contents, private values and native diagnostics are not printed.
+
+### Atomic capability migration
+
+Configuration schema 2 and journal format 4 are an explicit breaking cutover from v0.1.1, not an automatic upgrade or legacy-bot importer. Preserve private backups for investigation; never restore older state to regain availability. Durably pause with the old binary and stop the writer before preview/apply. Existing IDs, dispatch witnesses, operations, binding history, uncertainty and budgets remain intact. Source-3 conversion preserves existing controls and rows while provisioning required lane state; older-layout conversion retains its explicit pause/grant-revocation semantics.
+
+For an existing managed **journal-2 or journal-3 installation**, invoke the independently verified new binary—not the installed old updater:
+
+```sh
+# NEW_AGMI is the approved new executable; EXPECTED_SHA256 is operator-trusted.
+"$NEW_AGMI" update --binary "$NEW_AGMI" --sha256 "$EXPECTED_SHA256" \
+  --stopped --migration-only
+```
+
+This permits only the supported stopped 2/3-to-4 release bootstrap. It disables boot activation for `agmi.service` and `agmi-health.timer` and verifies that the units remain stopped. It never repairs, converts configuration/state or resumes participation. Ordinary updates reject the crossing; downgrade to an older journal contract is refused. A direct local foreground installation can use the new binary without this systemd bootstrap.
+
+Bootstrap completes legacy backup and link publication before disabling boot activation. If disabling partially fails, it attempts to restore all missing unit-definition links against the still-selected release and reload the manager before reporting failure. It does not re-enable services; filesystem or manager errors can still require operator repair. Inspect service state before explicitly retrying or re-enabling the old release.
+
+Installer evidence includes `bootstrap_recovery` for the pre-selection recovery sequence: `disable_command_succeeded`, `definitions_restored` (including directory sync), and `manager_reload_succeeded`. A false value includes an unconfirmed action; command success alone does not prove disabled boot intent. `null` means no recovery evidence was captured. `bootstrap_recovery_failed` identifies incomplete restoration or reload even when disabling also failed. Later activation/reload failures have their own stage and failure code. Inspect the retained release, definition links and manager state before any retry; this evidence never authorizes an automatic enable/start.
+
+Prepare a private JSON proposal containing explicit positive `caps` for `answer`, `judge` and `mine`, or a complete `candidate_toml`. Caps are policy decisions, not automatically copied global capacity. Strict legacy configuration can use `{}` where preservation is provable. Inspect `config migrate preview --help` for the input shape. With `jq` available:
+
+```sh
+umask 077
+"$NEW_AGMI" --config "$CONFIG" --json config migrate preview \
+  < proposal.json > migration-preview.json
+TOKEN="$(jq -r '.data.token' migration-preview.json)"
+# Review candidate, risk, backlog and authority evidence before applying.
+jq '.data.request' migration-preview.json |
+  "$NEW_AGMI" --config "$CONFIG" --json config migrate apply --expected-token "$TOKEN"
+```
+
+Use the preview's exact returned `request`, not a reconstructed proposal. Approval binds source/candidate bytes, guidance, authority and journal evidence. Changed inputs require a fresh preview. If `risk_change_required` is true, application also requires explicit `--accept-risk-change "$TOKEN"` after reviewing that same preview. Historical exemptions and over-cap backlog can make preservation unprovable; current charged counts alone are not proof.
+
+Eligible initial unbound schema-1 authority additionally requires `adopt_legacy: true`. Preview returns the proposed initial database ID in `request`; reuse it. Conversion and initial authority sealing share one durable transaction. Missing or conflicting established schema-2 authority is never recreated.
+
+If interrupted, inspect the sealed migration without starting participation:
+
+```sh
+"$NEW_AGMI" --config "$CONFIG" --json config migrate status --state-dir "$STATE_DIR"
+"$NEW_AGMI" --config "$CONFIG" --json config migrate export \
+  --state-dir "$STATE_DIR" --expected-token "$TOKEN" > private-sealed-migration.json
+"$NEW_AGMI" --config "$CONFIG" --json config migrate resume \
+  --state-dir "$STATE_DIR" --expected-token "$TOKEN"
+```
+
+**`config migrate resume` finishes conversion; it does not resume participation.** Use the token from migration status. Exact old bytes can be replaced by the sealed candidate; exact new bytes can be verified and finished. Different configuration/guidance or authority is a conflict, never permission to overwrite. Keep stopped, inspect the private export and restore approved inputs deliberately; do not edit journal or authority records.
+
+A recognized historical seal without an explicit target resumes only its exact original target-3 conversion, retaining its token and archived seal. It then needs a separate explicit 3-to-current preview/apply. Never relabel that seal or run the intermediate journal with the current binary. New conversion approvals authenticate both permanent writer and account-admission inodes without resetting database identity or witness. Authentic earlier explicit-4 approvals finish their unchanged writer-only destination; stopped `recover adopt` separately establishes the missing account-gate anchor before ordinary use. Completed migration resume only acknowledges completion, never retrofits anchors. Missing or contradictory established authority is a refusal, not a repair opportunity.
+
+Pending migration fences ordinary mutators. Migration status/private export remain available even if the installed configuration conflicts. With no journal and no bound authority, conversion changes configuration only and creates neither journal nor authority. Retained legacy floors remain absolute and are never renewed by restart.
+
+After completion, run `config check` and inspect local status. For a managed installation, explicitly run `agmi service enable` and `agmi service start`; migration does not restore either boot activation or running intent. Participation remains paused: review fresh readiness before a separate `agmi resume`. Neither bootstrap nor migration authorizes a fleet rollout or fleet risk-policy changes by itself.
 
 ### Identity onboarding and recovery
 
@@ -295,11 +340,13 @@ The user service sets `PATH` to `$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin`;
 
 Unsupported native contracts fail explicitly; a matching product name alone does not establish compatibility. Hermes uses its existing authenticated Codex subscription route; the inspected OpenClaw route uses its native `openai` provider authentication. Other providers are not silently substituted. Reasoning values must be supported by the selected native model.
 
-`solver.answer.hermes_api_url` and `solver.judge.hermes_api_url` declare the expected authenticated Hermes URL, defaulted from [`defaults/model.toml`](../defaults/model.toml). The native authentication route must match it; changing this field never silently redirects a native key. OpenClaw obtains its endpoint from its existing Gateway configuration.
+`capabilities.answer.model.hermes_api_url` and `capabilities.judge.model.hermes_api_url` independently declare the expected authenticated Hermes URL, defaulted from [`defaults/model.toml`](../defaults/model.toml). It must match the native authentication route; changing it never silently redirects a native key. OpenClaw resolves its endpoint through its existing Gateway configuration.
 
 OpenClaw uses its existing Gateway and native authentication through a small embedded Node bridge to `callGatewayFromCli`. Prompts travel over stdin, never argv. Each request is a fresh one-shot raw model run with tools, bootstrap context and delivery disabled. The Gateway chooses its configured default agent; no shared configuration is changed. Model overrides require the native `operator.admin` scope; insufficient authority fails rather than silently using another model.
 
 Choosing OpenClaw trusts that Gateway's configuration, plugins and hooks. This is not isolated execution: hooks may influence routing before inference. agmi checks the returned model, reasoning, run binding and explicit no-tool/no-bootstrap/no-fallback evidence before accepting output; that cannot undo calls already made by the trusted Gateway. Hermes places policy in its native `system_message` channel. The inspected OpenClaw interface still combines policy and untrusted request data in one message; agmi does not claim privileged policy isolation or prompt-injection immunity there. Pause closes new admission and fences pre-pause results; already-started inference may continue. Timeout or shutdown cancels agmi's local adapter, not the shared Gateway. Remote inference may continue until its native deadline.
+
+`operations list` and private `recover inspect` expose separate model-attempt producer, launch and completion evidence. Requested harness/model/effort are not native-reported facts. Completion retains safely parsed reports even on invalid artifacts or provenance mismatch; missing provider, effort, fallback or run facts stay unknown. Launch permission is not proof inference started, and crash recovery never invents a completion.
 
 Native authentication and OS privilege isolation remain deployment prerequisites, not fixes delivered by this release. Provision authentication through the native harness; never copy another account's auth material. Same-user hostile processes and privileged Gateway access are not isolated by these adapters. Stronger OS identity/auth/container isolation is explicitly deferred; see [security boundaries](../SECURITY.md).
 
@@ -347,7 +394,7 @@ cannot be rechecked; this is an explicit recovery-policy decision, not newly
 observed upstream execution evidence. Any retained acceptance or contradiction
 evidence still excludes recovery.
 
-Model launch rechecks durable pause generation under the admission lock after native harness discovery, immediately before spawning inference. Pause therefore cannot acknowledge success and then allow a stale preflight to launch new inference.
+Preflight and inference start synchronously under account and selected-lane gates. Pending work retains its original deadline; waiting across pause, revalidation or SQLite contention consumes that budget rather than renewing it. Owning-lane revalidation must match unchanged task/config inputs and fresh observations. Store rechecks freshness after acquiring its transaction, and the host checks final bounds and continuity before native spawn. A pause ACK therefore fences subsequent starts, without claiming that already-started remote inference stopped.
 
 Assignments use the returned `answer_epoch`, never the inventory's current epoch. Bounded offset pagination deduplicates canonical transaction IDs, preserves partial coverage and prioritizes supplied expiry with deterministic ties. Moving/partial inventories never prove a sent operation failed. Missing target metadata triggers selected-transaction hydration; missing authoritative original words prevents judging. Supplied author history is candidate-bound and labelled missing, supplied or truncated; supplied does not mean exhaustive. Answer novelty context may include locally submitted text with unresolved acceptance.
 
@@ -362,6 +409,13 @@ agmi doctor --repair
 judge/mine progress, intervention requirements and eligible guarded repairs.
 It does not contact MinePOA, invoke a model or read credentials. Add `--json`
 for the same machine-readable assessment.
+
+Human diagnostics share a compact Core/answer/judge/mine view, separate retained
+risk and actionable next steps. `status` is a snapshot using default diagnostic
+thresholds, not a full health check. `health` names the selected readiness scope;
+`doctor` additionally reports repair eligibility/outcome. Default human output
+omits control tokens; `lane show` and structured JSON retain explicit control
+evidence. Shell-rendered actions preserve the selected configuration path.
 
 `status`, `health` and `doctor` share `work.{answer,judge,mine}.progress`
 (`working`, `idle`, `complete`, `waiting`, `blocked`) and an `intervention`
@@ -403,9 +457,7 @@ It does not infer why that old check failed, mark identity verified, rotate
 credentials or clear a classified authentication/account mismatch. Changed
 evidence between preview and application is not overwritten; the repair reports
 `skipped`, including through `update --repair`. Repeated repair is a no-op.
-Backoff-only legacy journals can be normalized in the same invocation that upgrades
-their local metadata. Retry deadlines, prepared work, uncertain submissions and
-model attempts remain intact. A later successful runtime identity check is still required.
+Legacy identity flags can be normalized within a supported current journal; doctor does not perform a schema conversion. Use explicit migration for older journals. Retry deadlines, prepared work, uncertain submissions and model attempts remain intact; normalization is not verification.
 
 Only when eligible work exists, doctor can stop a validated matching canonical
 Linux user-systemd runtime and restore its previous running state. A previously
@@ -443,6 +495,11 @@ agmi resume
 ```
 
 Fresh `install` stages and activates a verified release while stopped, then enables the user units; it does not start or resume participation and refuses an existing installation. Rust owns filesystem changes, hashing, unit rendering and cutover control flow; only system integration invokes `systemctl`/`systemd-analyze`. `service start|stop|restart|enable|disable|status` provides explicit supervision controls without changing participation pause. Linux user-systemd and the standard configuration layout are required; configure user lingering if supervision must survive logout.
+
+Disabling boot activation preserves the exact unit-definition symlink targets,
+including relative targets, so a later `service enable` remains possible without
+reinstallation. Unexpected replacement definitions are not overwritten or reported
+as successfully restored. Disable/enable does not start services or change pause.
 
 `cargo install` normally puts the administration CLI in `~/.cargo/bin`; service installation separately manages `~/.local/bin/agmi` through its release activation pointer. Updating the Cargo-installed CLI alone does not update a running service. `agmi update` updates the canonical managed service, not arbitrary executables on `PATH`; it inspects the selected managed release rather than assuming the invoking CLI is the installed version.
 
@@ -519,19 +576,17 @@ Updates preserve prior runtime/timer running intent and unit enablement. `--stop
 
 Release staging and activation use synced artifacts and atomic publication/pointer replacement. A failure during cutover stops the runtime/timer and reports failure; it never automatically reverts the activation pointer or journal. If the delegating parent is interrupted after the incoming installer completed, it reports `interrupted` while preserving the child's completed activation/service evidence—not claiming that services stopped or selection was undone. Inspect that evidence before another lifecycle action.
 
-Before manager-facing actions, agmi requires the OS account's canonical home, matching manager unit-search paths and loaded-unit file ownership. `manager_context_mismatch` requires correcting HOME/session selection or resolving conflicting units; `service_state_unavailable` requires readable, stable runtime/timer state before retrying. Stage-only does not contact the manager. Retained rendered units are checked against their binary's embedded template hashes, not just mutable checksum files.
+Before manager-facing actions, agmi requires the OS account's canonical home, matching manager unit-search paths and loaded-unit file ownership. `manager_context_mismatch` requires correcting HOME/session selection or resolving conflicting units; `service_state_unavailable` requires readable, stable runtime/timer state before retrying. Stage-only writes the release tree without creating binary-link/user-unit directories or contacting the manager. Retained rendered units are checked against their binary's embedded template hashes, not just mutable checksum files.
 
 Installer failures include a finite `failure_code` and relevant repair guidance without forwarding raw subprocess output. Installation needs an executable temporary filesystem for its private candidate copy; use an appropriate `TMPDIR` when the default temporary directory is mounted `noexec`. Do not disable host protections globally to install a release.
 
 Ordinary upgrades preserve pause intent and generation: use normal activation, not `pause`/`resume`. Completed unsent drafts survive stop/start and are revalidated before dispatch; explicitly paused/off or obsolete work is not silently revived. Clean shutdown captures completed model results; genuine unfinished execution remains uncertain.
 
-For a journal that requires explicit adoption, first use `agmi update --release "$RELEASE_ID" --stopped`, then `agmi recover adopt` and explicit `agmi service start`. Adoption is not part of an ordinary already-anchored upgrade.
+Older configuration/journals require [explicit stopped migration](#atomic-capability-migration), not `recover adopt` as an implicit conversion. Initial legacy adoption is an explicit migration approval. Current-format first anchoring requires intact writer, account gate, binding/UUID/witness and required lane evidence. Stop every controller and native task first: an unanchored gate cannot prove that an older detached gate has no owner. Writer-only anchoring is not complete account authority. Persisted inode continuity is not proof of a live process; inspect reported authority prerequisites before resuming. Missing established authority is never recreated, and adoption is not proof that an old snapshot is current.
 
-Adoption refuses missing, uninitialized or authority-less legacy journals; it never creates replacement history. An already-adopted intact journal is accepted idempotently. A fresh installation initializes paused state through normal `run`/control initialization instead.
+Missing or unsafe unanchored lock evidence reports `authority_incomplete`, not an adoptable first-anchor state. Do not delete or recreate locks to make adoption pass.
 
-An unanchored schema-2 journal cannot start normally. Explicit adoption validates its existing UUID and dispatch sequence; it never recreates missing authority data. Adoption is not proof that an unanchored snapshot is current: establish that separately, and never adopt an old backup to bypass uncertainty.
-
-Releases are retained, but binary rollback requires matching journal compatibility. Schema-1 binaries must not run schema-2 journals; use a compatible release, roll forward or stop—never rewind state. Staging checks actual space for artifacts/legacy retention plus a 256 MiB journal/WAL reserve, without pruning recovery history. The unit uses `TimeoutStopSec=infinity` so systemd does not truncate captured runtime deadlines; agmi bounds shutdown, but a shutdown bug still requires operator intervention.
+Retained binaries are rollback candidates only when journal compatibility matches. Older binaries must not write current format-4 journals; roll forward or stop, never rewind state. Staging checks artifact/retention space plus a 256 MiB journal/WAL reserve without pruning history. `TimeoutStopSec=infinity` prevents systemd truncating captured deadlines; agmi bounds shutdown, but a shutdown bug still needs operator intervention.
 
 The example uses control-group cleanup, restrictive umask, private temporary files and restart-on-failure. Account locks live under `.agmi-account-locks` in the operating-system user's canonical home, independently of the state directory and `HOME`/XDG overrides; a tighter sandbox must allow access there. The example is not a complete security sandbox for a compromised harness or local account.
 
@@ -599,14 +654,25 @@ guard. Legacy unknown evidence and successful doctor cleanup are not verificatio
 
 Thresholds are CLI options: `--stale-seconds`, `--work-seconds`, `--answer-grace-seconds`, `--min-free-mib` and `--expect-participation`. For deliberate read-only observation use `--expect-participation false`; a live controller is still required. Active work is evaluated against captured deadlines/effective policy rather than silently adopting a newly edited timeout. Health distinguishes desired/effective policy, heartbeat, progress and admission blocking. Repeated unchanged receipts are observations, not fresh transition events.
 
+Participation opt-out waives intentional pause/mode/reload expectations, not
+intrinsic controller faults, captured-work deadlines, current bound-read failures
+or active-lane accounting. Superseded, wrong-binding and unrelated discovery
+failures do not become current-operation dependencies.
+`participation.lanes.<lane>.pre_intent_blocker` retains the canonical blocker before
+intent overlays: explicit null means none; unavailable evidence is unknown.
+Strict uncertainty, manual authorization, quotas and server restrictions therefore
+remain visible beneath a pause. This diagnostic field is never a permit.
+Disk findings affect the core only and take precedence over start/resume/wait
+recommendations. Verified doctor restoration supersedes stale stopped evidence,
+not independent faults or the need for a new runtime observation.
+
 Missing captured timing policy yields `effective_policy_unavailable`, unknown controller/capability readiness and a failed health check—not freshness borrowed from desired configuration. `thresholds.timing_source` distinguishes effective evidence from unavailable timing; unknown effective timing and epoch freshness are null. Run a compatible controller normally to publish its loaded policy; never manufacture it by editing the journal.
 
 `operational.status` separates `clear` (no observed operational issue under the requested checks), `blocked` (admission fenced), `degraded` (other operational issues) and `unknown` (required policy or admission evidence unavailable). Top-level `healthy` and the exit status reflect these operational conditions. Retained unknown outcomes are warnings (`pending_outcome_uncertain`), not operational failures by themselves: healthy participation can report `attention_required = true` and `risk.attention_required = true`. Actual admission blocks still fail health, as do stale observations, overdue work and other operational faults. This classification never changes journal outcomes, risk counts, admission limits or replay safeguards.
 
-`contract_version = 1` adds one component contract under `components`: `controller`,
-`answer`, `judge`, `mine`, and `api.{challenge,identity,assignments,assignment_evidence,job,receipt}`.
-Each entry has `state`, bounded `reasons`, nullable `observed_at`/`age_seconds`
-and structured `next_actions`. Capability entries also report their effective `mode`.
+`contract_version = 2` exposes `components.controller`, `.answer`, `.judge`, `.mine` and `api.identity`, `api.lanes.{answer,judge,mine}`, plus per-binding `api.resources`. Each health entry has `state`, bounded `reasons`, nullable observation/age and structured next actions; lane entries include effective mode. Resource entries identify owner, purpose, local operation and binding revision—not raw bearer identifiers.
+
+`api.resources_truncated` discloses bounded read presentation; missing coverage is unknown, not proof of automatic recovery. Health still evaluates every `pending_work` operation independently of this presentation cap. Effective timing thresholds are lane-owned under `thresholds.lanes`; no lane borrows another's desired timeout.
 
 | State | Meaning |
 | --- | --- |
@@ -645,9 +711,11 @@ inventory or stale failure does not acquire that degradation.
 
 Health checks every entry in `pending_work`, not only the representative oldest `pending` operation, so an old unknown cannot hide later overdue queued, dispatching or model work. Missing admission evidence is reported as `admission_blocked = null` with `admission_unobserved`, never as an open admission boundary.
 
+Awaiting inference admission uses the captured original pending deadline, not a renewed budget or an absent launch timestamp. Expiry is a prelaunch failure condition; a missing historical bound is unknown. A future-dated judge assessment makes clock evidence unverifiable and fails aggregate health, even when the controller heartbeat itself is current.
+
 `oldest_unresolved_operation` and `oldest_unresolved_since` identify historical uncertainty; health also reports `oldest_unresolved_age_seconds`. They do not identify the current cause or duration of an admission block. Use `admission_blocked`, `affected_capabilities` and each `work` entry's reason/deadline for current policy waits.
 
-`work.judge.selection` records selection time, observed candidate count, inventory completeness and whether that observation contained eligible work. Eligibility requires a usable parsed assignment, not merely a selectable identifier. `no_eligible_in_observed_inventory` is an idle-selection reason, not a claim that no assignments exist globally. Partial inventories remain explicitly partial; new observations and policy changes invalidate stale selection evidence. Inventory retains its starting control generation, so a response spanning pause/resume cannot become current selection evidence. Read backoff, active preparation and capacity constraints take precedence.
+`work.judge.assessment` and `lane_participation.{answer,judge}` expose sourced opportunity assessments with original `observed_at`, finite `valid_until`, coverage, candidate/exclusion counts and explicit unobserved outcomes. Judge eligibility requires usable parsed input, not merely an identifier. Read-only assessment may hydrate evidence but creates no operations, grants, model calls or submissions. Partial inventory never proves global absence. Account generation, lane-control revision, loaded lane configuration and runtime authority fence stale snapshots; stopped/stale assessments remain visible but cannot claim current eligibility. Model attempts and operation outcomes are separate counts, not proof of correctness, payment or finality.
 
 Controller heartbeat advances before each bounded HTTP wait, not just at the start of a potentially long cycle. Manual recovery does not refresh it or reload model guidance. Missing both captured and effective model timing produces `model_deadline_unavailable`, not a deadline guessed from desired configuration.
 
@@ -708,6 +776,8 @@ Local protocol/model fixtures exercise deterministic lifecycle boundaries; they 
 Linux host acceptance has exercised authenticated Hermes and existing-Gateway OpenClaw answer/judge inference, authenticated hosted reads, guidance hot reload and repair, concurrent pause, second-writer rejection, crash/restart recovery and clean shutdown. A bounded live canary on two independent accounts submitted one current-epoch answer, one eligible judgment and one explicit mine request per account. Answers reached node-reported checkpoint coverage; judgments reached receipt inclusion, with checkpoint coverage not established in this canary. Queued judgments were recovered read-only after correcting the protocol's `answer_epoch` and grading-result `id` fields, without resubmission. Both accounts were paused after the bounded test. These observations are not independent cryptographic finality verification or proof of unattended operation.
 
 Historical pilot checks on three independent Linux identities across both harnesses exercised the shared installer, user services, graceful stop, automatic crash restart with preserved state/pause, and scheduled health execution. Answers and judgments reached node-reported inclusion or receipt confirmation. Upstream read failures and uncertain judging inference were retained without replay. These observations do not establish the deployed identity of the current checkout, public registration compatibility or a completed long-running stability study. Health findings remain local; no external notification channel or earnings verification is established.
+
+The unreleased atomic-capability completion has local macOS proof for independent lane pause/resume, read-only answer/judge assessment, deadline classification, authority replacement refusal and authentic pre-change migration/refusal. Authorized isolated Linux checks additionally exercised real systemd install/update/retained activation, cutover cancellation, post-switch cleanup, sealed conversion interruption/recovery, old-binary refusal and automatic crash restart with preserved work and pause intent. Actual preflight/inference handoffs retained their account gate under injected `execve` delay; replacement/unlink could not produce a pause acknowledgment. An authentic pre-gate executable generated an approval whose exact token, seal and writer-only destination survived recovery, followed by separate stopped gate adoption. A genuine dedicated-host kernel reboot preserved disabled boot intent, journal/evidence, authority inodes, configuration, guidance and credentials in the retained isolated environment. Historical executables were built from hash-verified preserved source, not represented as published releases. Native/provider and protocol endpoints were substitutes. **Installed-provider authentication/cancellation remain unproved for this checkout; no fleet rollout is implied.**
 
 agmi is [MIT-licensed](../LICENSE). Package publication is deliberately disabled in `Cargo.toml`. Before publishing: clear registry name availability if publishing to crates.io, review third-party license obligations, audit source/history and packaged files for secrets, and require explicit release approval. `.gitignore` and Cargo's package allowlist do not replace a secret audit.
 

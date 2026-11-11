@@ -37,8 +37,8 @@ def startup_race(binary, root, environment, chain, address, account_keys, lock_r
         account_keys.add(revision(f'{race_chain}\n{value}'.encode()))
     patch = {'state_dir': 'state', 'network': {'chain': race_chain, 'address': address,
              'base_url': origin, 'credential_file': str(root / 'credential')},
-             'capabilities': {'answer': 'off', 'judge': 'off', 'mine': 'off'},
-             'schedule': {'jitter_seconds': 0}}
+             'capabilities': {kind: {'mode': 'off', 'schedule': {'jitter_seconds': 0}}
+                              for kind in ('answer', 'judge', 'mine')}}
     changed = call('config', 'apply', '--expected-revision', token,
                    data=json.dumps(patch).encode())
     assert changed.returncode == 0, changed.stderr
@@ -164,13 +164,17 @@ def main():
             schema = invoke('config', 'schema')
             assert not config.exists() and not state.exists()
             settings = {entry['path']: entry for entry in schema['settings']}
-            for name in ('network.address', 'state_dir', 'solver.answer.guidance_file',
-                         'solver.answer.core_guidance_file', 'solver.judge.core_guidance_file',
-                         'solver.judge.harness', 'timeouts.read_http_seconds',
-                         'participation.retry_uncertain_answers', 'schedule.mine_each_epoch'):
+            assert schema['schema'] == 'agmi.config.v2'
+            assert schema['defaults']['schema_version'] == 2
+            for name in ('network.address', 'state_dir', 'capabilities.answer.model.guidance_file',
+                         'capabilities.answer.model.core_guidance_file',
+                         'capabilities.judge.model.core_guidance_file',
+                         'capabilities.judge.model.harness', 'capabilities.answer.timeouts.read_http_seconds',
+                         'capabilities.answer.participation.retry_uncertain_answers',
+                         'capabilities.mine.schedule.each_epoch'):
                 assert name in settings, name
             assert settings['network.address']['immutable_when_initialized']
-            assert settings['participation.mode']['enum'] == ['strict', 'participation_first', 'manual']
+            assert settings['capabilities.answer.participation.mode']['enum'] == ['strict', 'participation_first', 'manual']
             assert schema['guidance']['layers'] == ['core', 'user']
             assert schema['guidance']['default_layer'] == 'user'
             invoke('config', 'init')
@@ -187,7 +191,8 @@ def main():
                 'state_dir': 'state',
                 'network': {'base_url': f'http://127.0.0.1:{server.server_port}',
                             'chain': chain, 'address': address, 'credential_file': 'credential'},
-                'solver': {'answer': {'executable': './never-run'}, 'judge': {'executable': './never-run'}},
+                'capabilities': {kind: {'model': {'executable': './never-run'}}
+                                 for kind in ('answer', 'judge')},
             })
             assert populated['saved'] and populated['runtime_applied'] is None
             assert not state.exists()
@@ -195,7 +200,7 @@ def main():
             populated_bytes = config.read_bytes()
             assert 'credential_file = "credential"' in populated_bytes.decode()
             assert 'executable = "./never-run"' in populated_bytes.decode()
-            apply({'schedule': {'poll_seconds': 5}}, expected=initial['file_revision'],
+            apply({'capabilities': {'answer': {'schedule': {'poll_seconds': 5}}}}, expected=initial['file_revision'],
                   error='admin_revision_conflict')
             assert config.read_bytes() == populated_bytes
 
@@ -204,21 +209,21 @@ def main():
                            {'unknown': secret}, {'unknown': None},
                            {'network': {'token': secret}},
                            {'network': {'base_url': 'https://user:' + secret + '@minepoa.com'}},
-                           {'solver': {'answer': {'harness': secret}}},
-                           {'participation': {'max_unresolved_operations': 0}},
-                           {'timeouts': {'read_http_seconds': 0}},
-                           {'schedule': {'poll_seconds': -1}},
-                           {'excluded_judging_assignments': [secret]},
-                           {'timeouts': {'http_seconds': None}},
-                           {'solver': {'answer': {'guidance_file': 'missing.md'}}}]
+                           {'capabilities': {'answer': {'model': {'harness': secret}}}},
+                           {'capabilities': {'judge': {'participation': {'max_unresolved_operations': 0}}}},
+                           {'capabilities': {'mine': {'timeouts': {'read_http_seconds': 0}}}},
+                           {'capabilities': {'answer': {'schedule': {'poll_seconds': -1}}}},
+                           {'capabilities': {'judge': {'excluded_assignments': [secret]}}},
+                           {'schema_version': None},
+                           {'capabilities': {'answer': {'model': {'guidance_file': 'missing.md'}}}}]
             for patch in bad_patches:
                 before = config.read_bytes()
-                error = 'admin_guidance_missing' if isinstance(patch, dict) and patch.get('solver', {}).get('answer', {}).get('guidance_file') else 'admin_validation'
+                error = 'admin_guidance_missing' if isinstance(patch, dict) and patch.get('capabilities', {}).get('answer', {}).get('model', {}).get('guidance_file') else 'admin_validation'
                 apply(patch, error=error)
                 assert config.read_bytes() == before and not state.exists()
             apply(b' ' * 65537, error='admin_input_too_large')
             # Active routes cannot silently fall back to compiled-in core instructions.
-            apply({'capabilities': {'answer': 'active'}}, error='admin_validation')
+            apply({'capabilities': {'answer': {'mode': 'active'}}}, error='admin_validation')
             for kind in ('answer', 'judge'):
                 missing_core = guidance(kind, 'core')
                 assert missing_core['status'] == 'unconfigured' and missing_core['layer'] == 'core'
@@ -242,34 +247,40 @@ def main():
                 assert core_path.read_bytes() == core_text
             assert invoke('guidance', 'show', '--kind', 'answer')['layer'] == 'user'
             before = config.read_bytes()
-            dry = apply({'capabilities': {'answer': 'active'},
-                         'solver': {'answer': {'model': 'configured-model', 'reasoning': 'medium'}},
-                         'participation': {'mode': 'participation_first'},
-                         'schedule': {'mine_each_epoch': True}}, dry=True)
+            dry = apply({'capabilities': {
+                'answer': {'mode': 'active',
+                           'model': {'model': 'configured-model', 'reasoning': 'medium'},
+                           'participation': {'mode': 'participation_first'}},
+                'mine': {'schedule': {'each_epoch': True}}}}, dry=True)
             assert dry['dry_run'] and not dry['saved'] and dry['file_revision'] == revision(before)
             assert config.read_bytes() == before and not state.exists()
-            apply({'capabilities': {'answer': 'active', 'judge': 'off', 'mine': 'read_only'},
-                   'solver': {'answer': {'harness': 'openclaw', 'model': 'configured-model', 'reasoning': 'medium'},
-                              'judge': {'harness': 'hermes', 'model': 'judge-model', 'reasoning': 'high'}},
-                   'timeouts': {'read_http_seconds': 8},
-                   'preparation': {'max_attempts_per_work': 2},
-                   'participation': {'mode': 'participation_first', 'uncertainty_grace_seconds': 0,
-                                     'max_unresolved_operations': 6, 'allow_judge': True},
-                   'schedule': {'mine_each_epoch': True}})
-            applied = show()['config']
-            assert applied['participation']['mode'] == 'participation_first'
-            assert applied['solver']['answer']['model'] == 'configured-model'
-            assert applied['schedule']['mine_each_epoch']
-            apply({'timeouts': {'read_http_seconds': None}, 'participation': {'mode': None}})
-            restored = show()['config']
-            assert 'read_http_seconds' not in restored['timeouts']
-            assert restored['participation']['mode'] == 'strict'
+            apply({'capabilities': {
+                'answer': {'mode': 'active',
+                           'model': {'harness': 'openclaw', 'model': 'configured-model', 'reasoning': 'medium'},
+                           'timeouts': {'read_http_seconds': 8},
+                           'preparation': {'max_attempts_per_work': 2},
+                           'participation': {'mode': 'participation_first', 'uncertainty_grace_seconds': 0,
+                                             'max_unresolved_operations': 6}},
+                'judge': {'mode': 'off',
+                          'model': {'harness': 'hermes', 'model': 'judge-model', 'reasoning': 'high'}},
+                'mine': {'mode': 'read_only', 'schedule': {'each_epoch': True}}}})
+            applied = show()['config']['capabilities']
+            assert applied['answer']['participation']['mode'] == 'participation_first'
+            assert applied['answer']['model']['model'] == 'configured-model'
+            assert applied['mine']['schedule']['each_epoch']
+            assert applied['judge']['participation'] == schema['defaults']['capabilities']['judge']['participation']
+            apply({'capabilities': {'answer': {'timeouts': {'read_http_seconds': None},
+                                               'participation': {'mode': None}}}})
+            restored = show()['config']['capabilities']
+            assert restored['answer']['timeouts']['read_http_seconds'] == schema['defaults']['capabilities']['answer']['timeouts']['read_http_seconds']
+            assert restored['answer']['participation']['mode'] == 'strict'
+            assert restored['judge'] == applied['judge'] and restored['mine'] == applied['mine']
 
             # One of two cooperating writers wins; the stale writer cannot silently overwrite it.
             token = show()['file_revision']
             def race(seconds):
                 result = subprocess.run(base + ['config', 'apply', '--expected-revision', token],
-                                        input=json.dumps({'schedule': {'poll_seconds': seconds}}).encode(),
+                                        input=json.dumps({'capabilities': {'answer': {'schedule': {'poll_seconds': seconds}}}}).encode(),
                                         capture_output=True, timeout=15, env=environment)
                 return result.returncode, json.loads(result.stdout or result.stderr)
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
@@ -325,7 +336,7 @@ def main():
             core_path.unlink()
             assert guidance(layer='core')['status'] == 'missing'
             assert show()['guidance_validation'] == 'not_loaded'
-            apply({'schedule': {'poll_seconds': 5}}, error='admin_guidance_missing')
+            apply({'capabilities': {'answer': {'schedule': {'poll_seconds': 5}}}}, error='admin_guidance_missing')
             for words in (('status',), ('logs',), ('agents',), ('config', 'show')):
                 assert secret not in json.dumps(invoke(*words))
             checked = subprocess.run(base + ['config', 'check'], capture_output=True,
@@ -337,7 +348,7 @@ def main():
             assert answer_path.read_bytes() == text, 'core repair overwrote user guidance'
             core_path.write_bytes(b' \n')
             core_path.chmod(0o600)
-            apply({'schedule': {'poll_seconds': 5}}, error='admin_validation')
+            apply({'capabilities': {'answer': {'schedule': {'poll_seconds': 5}}}}, error='admin_validation')
             set_guidance(core_text, layer='core')
             assert invoke('config', 'check') is not None
             # Config/guidance files must not be symlinks, hardlinks, FIFOs or directories.
@@ -365,7 +376,7 @@ def main():
                 # The state directory need not exist for the credential/config cases.
                 if target.startswith('state/'):
                     state.mkdir(mode=0o700)
-                apply({'solver': {'answer': {'guidance_file': target}}}, error='admin_unsafe_target')
+                apply({'capabilities': {'answer': {'model': {'guidance_file': target}}}}, error='admin_unsafe_target')
             state.rmdir()
             original = config.read_bytes()
             real_config = root / 'original.toml'
@@ -377,7 +388,7 @@ def main():
             assert config.read_bytes() == original
 
             # Existing conventional files are not overwritten without their actual revision.
-            apply({'solver': {'judge': {'guidance_file': None}}})
+            apply({'capabilities': {'judge': {'model': {'guidance_file': None}}}})
             inactive = guidance('judge')
             assert inactive['status'] == 'unconfigured' and inactive['guidance_revision'] == revision(b'')
             set_guidance(b'new judge', kind='judge', config_rev=show()['file_revision'],
@@ -405,7 +416,8 @@ def main():
                 before = config.read_bytes()
                 apply(patch, error='admin_identity_immutable')
                 assert config.read_bytes() == before
-            apply({'participation': {'mode': 'manual'}, 'schedule': {'mine_each_epoch': False}})
+            apply({'capabilities': {'answer': {'participation': {'mode': 'manual'}},
+                                    'mine': {'schedule': {'each_epoch': False}}}})
             # A saved mutable patch must serialize with final wallet admission.
             token = show()['file_revision']
             before = config.read_bytes()
@@ -416,7 +428,7 @@ def main():
                     fcntl.flock(admission, fcntl.LOCK_EX)
                     try:
                         pending = executor.submit(invoke, 'config', 'apply', '--expected-revision', token,
-                                                  stdin=json.dumps({'participation': {'mode': 'strict'}}).encode())
+                                                  stdin=json.dumps({'capabilities': {'answer': {'participation': {'mode': 'strict'}}}}).encode())
                         time.sleep(0.4)
                         assert not pending.done() and config.read_bytes() == before, \
                             'mutable policy save bypassed the final admission gate'

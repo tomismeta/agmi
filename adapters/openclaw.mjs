@@ -8,6 +8,8 @@ import { randomUUID } from 'node:crypto';
 const emit = process.stdout.write.bind(process.stdout);
 process.stdout.write = process.stderr.write.bind(process.stderr);
 let started = false;
+let reported = {};
+const identifier = value => typeof value === 'string' && /^[A-Za-z0-9_.:/-]{1,256}$/.test(value) ? value : null;
 // Match solver.rs: one more JSON escaping pass over the complete request
 // allowance, plus envelope/policy/model metadata. Do not reduce guidance/task limits.
 const MAX_INPUT_BYTES = 2 * (128 * 1024 + 12 * 64 * 1024) + 16 * 1024;
@@ -53,12 +55,23 @@ try {
     progress: false,
   });
   const result = response?.result;
-  if (response?.status === 'timeout') throw 'timeout';
-  if (response?.result?.meta?.aborted === true) throw 'aborted';
+  // Collect independently of output validity, without retaining raw errors/prompts.
   const meta = result?.meta;
   const native = meta?.agentMeta;
   const report = meta?.systemPromptReport;
   const trace = meta?.executionTrace;
+  reported = {
+    provider: identifier(native?.provider), model: identifier(native?.model),
+    runId: identifier(response?.runId), requestedRunId: runId,
+    reasoning: identifier(meta?.requestShaping?.thinking),
+    aborted: typeof meta?.aborted === 'boolean' ? meta.aborted : null,
+    fallbackUsed: typeof trace?.fallbackUsed === 'boolean' ? trace.fallbackUsed : null,
+    winnerProvider: identifier(trace?.winnerProvider), winnerModel: identifier(trace?.winnerModel),
+    toolCount: Array.isArray(report?.tools?.entries) ? report.tools.entries.length : null,
+    bootstrapFileCount: Array.isArray(report?.injectedWorkspaceFiles) ? report.injectedWorkspaceFiles.length : null,
+  };
+  if (response?.status === 'timeout') throw 'timeout';
+  if (meta?.aborted === true) throw 'aborted';
   const payloads = result?.payloads;
   if (response?.status !== 'ok' || !Array.isArray(payloads) || payloads.length !== 1
       || typeof payloads[0].text !== 'string'
@@ -70,22 +83,12 @@ try {
   emit(JSON.stringify({
     ok: true,
     status: 'ok',
-    provider: native?.provider ?? null,
-    model: native?.model ?? null,
-    runId: response?.runId ?? null,
-    requestedRunId: runId,
-    reasoning: meta?.requestShaping?.thinking ?? null,
-    aborted: meta?.aborted ?? null,
-    fallbackUsed: trace?.fallbackUsed ?? null,
-    winnerProvider: trace?.winnerProvider ?? null,
-    winnerModel: trace?.winnerModel ?? null,
-    toolCount: Array.isArray(report?.tools?.entries) ? report.tools.entries.length : null,
-    bootstrapFileCount: Array.isArray(report?.injectedWorkspaceFiles) ? report.injectedWorkspaceFiles.length : null,
+    ...reported,
     final: payloads[0].text,
   }) + '\n');
 } catch (error) {
   // A disconnected CLI does not prove that shared-Gateway inference stopped.
   const kind = ['timeout', 'aborted', 'error_payload'].includes(error) ? error : 'exception';
-  emit(JSON.stringify({ok: false, status: 'error', error: {kind}}) + '\n');
+  emit(JSON.stringify({ok: false, status: 'error', ...reported, error: {kind}}) + '\n');
   process.exitCode = started ? 1 : 78;
 }

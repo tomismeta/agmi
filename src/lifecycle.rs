@@ -4,7 +4,7 @@ use crate::{
     admin,
     config::Config,
     protocol::Protocol,
-    store::{AccountLock, AdmissionGuard, Store, admin_identity_initialized},
+    store::{AccountAdmissionGuard, AccountLock, Store, admin_identity_initialized},
 };
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
@@ -229,12 +229,32 @@ async fn verify(config: &Config, bytes: &[u8]) -> Result<()> {
         message: "Cannot prepare identity verification; inspect the network configuration and private credential input.",
     })?;
     let response = protocol
-        .get(crate::endpoints::Endpoint::Identity, None)
+        .get(
+            crate::endpoints::Endpoint::Identity,
+            None,
+            crate::protocol::ReadDeadline::seconds(config.identity.read_http_seconds)?,
+            crate::protocol::RequestMeta {
+                request_id: format!(
+                    "credential-verification-{}-{}",
+                    std::process::id(),
+                    protocol.credential_instance()
+                ),
+                // Administrative verification establishes no journal or dispatch permit.
+                database_id: String::new(),
+                authority_epoch: 0,
+                owner: None,
+                operation_id: None,
+                read_key: None,
+                binding_revision: None,
+                dispatch_sequence: None,
+            },
+        )
         .await
         .map_err(|_| LifecycleError {
             code: "identity_verification_unavailable",
             message: "Identity verification is unavailable; no credential was changed.",
-        })?;
+        })?
+        .response;
     if !((200..300).contains(&response.status)
         && response.read_failure.is_none()
         && ["ok", "success"].iter().all(|field| {
@@ -311,10 +331,10 @@ async fn init_inner(path: &Path, options: InitOptions<'_>, bytes: &[u8]) -> Resu
             include_str!("../examples/judge/user-guidance.md"),
         ),
     ];
-    config.solver.answer.core_guidance_file = Some(guidance[0].0.clone());
-    config.solver.answer.guidance_file = Some(guidance[1].0.clone());
-    config.solver.judge.core_guidance_file = Some(guidance[2].0.clone());
-    config.solver.judge.guidance_file = Some(guidance[3].0.clone());
+    config.capabilities.answer.model.core_guidance_file = Some(guidance[0].0.clone());
+    config.capabilities.answer.model.guidance_file = Some(guidance[1].0.clone());
+    config.capabilities.judge.model.core_guidance_file = Some(guidance[2].0.clone());
+    config.capabilities.judge.model.guidance_file = Some(guidance[3].0.clone());
     ensure!(
         config.network.credential_file != path
             && !config
@@ -383,7 +403,7 @@ async fn init_inner(path: &Path, options: InitOptions<'_>, bytes: &[u8]) -> Resu
                 *guard = _directory.additional(target)?;
             }
         }
-        let _admission = AdmissionGuard::acquire(&config)?;
+        let _admission = AccountAdmissionGuard::for_provisioning(&config)?;
         ensure!(
             !admin_identity_initialized(&config)?,
             "account became initialized; keep its existing configuration"
@@ -454,6 +474,7 @@ async fn rotate_inner(path: &Path, bytes: &[u8], dry_run: bool) -> Result<Value>
             }.into()
         } else { error }
     })?;
+    crate::store::migration::ensure_no_pending(&config)?;
     let store = Store::read_only(&config)?
         .context("initialize and pause the account before credential rotation")?;
     if !store.control()?.paused {
@@ -473,7 +494,10 @@ async fn rotate_inner(path: &Path, bytes: &[u8], dry_run: bool) -> Result<Value>
         target != config_target && !target.starts_with(state),
         "credential target overlaps configuration or durable state"
     );
-    for model in [&config.solver.answer, &config.solver.judge] {
+    for model in [
+        &config.capabilities.answer.model,
+        &config.capabilities.judge.model,
+    ] {
         for guidance in [&model.guidance_file, &model.core_guidance_file]
             .into_iter()
             .flatten()
@@ -522,7 +546,8 @@ pub(crate) fn installer_preflight_error(code: &'static str) -> anyhow::Error {
 
 pub(crate) fn installer_evidence(value: Option<&Value>) -> Value {
     let mut result = json!({"stage":"unknown","staging":"unknown","activation":"unknown","service":"unknown",
-        "failure_code":"unknown","evidence":"this_invocation_only","installation_state":"not_inspected"});
+        "failure_code":"unknown","evidence":"this_invocation_only","installation_state":"not_inspected",
+        "bootstrap_recovery":null});
     for (key, allowed) in [
         (
             "failure_code",
@@ -540,11 +565,13 @@ pub(crate) fn installer_evidence(value: Option<&Value>) -> Value {
                 "preparation_failed",
                 "release_invalid",
                 "configuration_invalid",
+                "journal_incompatible",
                 "manager_context_mismatch",
                 "service_state_unavailable",
                 "insufficient_space",
                 "unit_invalid",
                 "stop_failed",
+                "bootstrap_recovery_failed",
                 "switch_failed",
                 "reload_failed",
                 "start_failed",
@@ -602,6 +629,19 @@ pub(crate) fn installer_evidence(value: Option<&Value>) -> Value {
         {
             result[key] = json!(text);
         }
+    }
+    if let Some(recovery) = value.and_then(|value| value.get("bootstrap_recovery"))
+        && let (Some(disable), Some(definitions), Some(reload)) = (
+            recovery["disable_command_succeeded"].as_bool(),
+            recovery["definitions_restored"].as_bool(),
+            recovery["manager_reload_succeeded"].as_bool(),
+        )
+    {
+        result["bootstrap_recovery"] = json!({
+            "disable_command_succeeded": disable,
+            "definitions_restored": definitions,
+            "manager_reload_succeeded": reload
+        });
     }
     result
 }

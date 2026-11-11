@@ -2,7 +2,7 @@
 FROM ubuntu:24.04
 ENV container=docker
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    systemd systemd-sysv dbus-user-session python3 ca-certificates coreutils util-linux \
+    systemd systemd-sysv dbus-user-session python3 ca-certificates coreutils util-linux strace \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --uid 17321 --create-home --shell /bin/sh agmi-systemd-fixture \
     && chmod 0700 /home/agmi-systemd-fixture \

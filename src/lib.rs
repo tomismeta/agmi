@@ -3,11 +3,13 @@
 //! Harness adapters generate judgments; only the runtime submits MinePOA work.
 
 pub mod admin;
+pub mod capability;
 pub mod config;
 pub mod doctor;
 pub mod endpoints;
 pub mod health;
 mod installer;
+pub mod journal;
 pub mod lifecycle;
 pub mod logs;
 pub mod protocol;

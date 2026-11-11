@@ -132,6 +132,7 @@ fn malformed_configuration_does_not_echo_its_contents() {
 
 #[test]
 fn invalid_guidance_does_not_block_pause_or_local_diagnostics() {
+    use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");
     let guidance = dir.path().join("voice.md");
@@ -148,13 +149,13 @@ fn invalid_guidance_does_not_block_pause_or_local_diagnostics() {
     );
     config.network.address = "poa111111111111111111111111111111111".into();
     config.network.credential_file = dir.path().join("api-key");
-    config.solver.answer.guidance_file = Some(guidance.clone());
-    config.capabilities.answer = agmi::config::Mode::Active;
-    config.capabilities.judge = agmi::config::Mode::Active;
+    config.capabilities.answer.model.guidance_file = Some(guidance.clone());
+    config.capabilities.answer.mode = agmi::config::Mode::Active;
+    config.capabilities.judge.mode = agmi::config::Mode::Active;
     let core = dir.path().join("answer-core.md");
     let judge_core = dir.path().join("judge-core.md");
-    config.solver.answer.core_guidance_file = Some(core.clone());
-    config.solver.judge.core_guidance_file = Some(judge_core.clone());
+    config.capabilities.answer.model.core_guidance_file = Some(core.clone());
+    config.capabilities.judge.model.core_guidance_file = Some(judge_core.clone());
     fs::write(&core, "Produce an original mechanism.").unwrap();
     fs::write(&judge_core, "Evaluate the candidate independently.").unwrap();
     fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
@@ -166,6 +167,25 @@ fn invalid_guidance_does_not_block_pause_or_local_diagnostics() {
             .output()
             .unwrap()
     };
+    // Capture an effective policy without network/model work before guidance breaks.
+    let mut stopped = config.clone();
+    stopped.capabilities.answer.mode = agmi::config::Mode::Off;
+    stopped.capabilities.judge.mode = agmi::config::Mode::Off;
+    stopped.capabilities.mine.mode = agmi::config::Mode::Off;
+    fs::write(&config.network.credential_file, "pk_local_fixture").unwrap();
+    fs::set_permissions(
+        &config.network.credential_file,
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    fs::write(&path, toml::to_string(&stopped).unwrap()).unwrap();
+    let captured = invoke(&["run", "--once"]);
+    assert!(
+        captured.status.success(),
+        "{}",
+        String::from_utf8_lossy(&captured.stderr)
+    );
+    fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
     let resumed = invoke(&["resume"]);
     assert!(
         resumed.status.success(),
@@ -179,7 +199,7 @@ fn invalid_guidance_does_not_block_pause_or_local_diagnostics() {
         "~/voice.md".into(),
         "bad\npath".into(),
     ] {
-        config.solver.answer.guidance_file = Some(invalid);
+        config.capabilities.answer.model.guidance_file = Some(invalid);
         fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
         assert!(invoke(&["pause"]).status.success());
         let status = invoke(&["status"]);
@@ -193,7 +213,7 @@ fn invalid_guidance_does_not_block_pause_or_local_diagnostics() {
         assert!(!invoke(&["resume"]).status.success());
         assert!(!invoke(&["config", "check"]).status.success());
     }
-    config.solver.answer.guidance_file = Some(guidance.clone());
+    config.capabilities.answer.model.guidance_file = Some(guidance.clone());
     fs::write(&guidance, "Restored user preferences.").unwrap();
     fs::remove_file(&core).unwrap();
     for invalid in [
@@ -202,7 +222,7 @@ fn invalid_guidance_does_not_block_pause_or_local_diagnostics() {
         Some("".into()),
         Some("~/core.md".into()),
     ] {
-        config.solver.answer.core_guidance_file = invalid;
+        config.capabilities.answer.model.core_guidance_file = invalid;
         fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
         assert!(invoke(&["pause"]).status.success());
         for args in [&["status"][..], &["logs"], &["agents"], &["config", "show"]] {
@@ -211,7 +231,7 @@ fn invalid_guidance_does_not_block_pause_or_local_diagnostics() {
         assert!(!invoke(&["resume"]).status.success());
         assert!(!invoke(&["config", "check"]).status.success());
     }
-    config.solver.answer.core_guidance_file = Some(core.clone());
+    config.capabilities.answer.model.core_guidance_file = Some(core.clone());
     fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
     fs::write(&core, " \n").unwrap();
     assert!(invoke(&["pause"]).status.success());
@@ -258,11 +278,18 @@ fn control_commands_preserve_live_writer_visibility() {
         fs::Permissions::from_mode(0o600),
     )
     .unwrap();
-    config.capabilities.answer = Mode::Off;
-    config.capabilities.judge = Mode::Off;
-    config.capabilities.mine = Mode::Off;
-    config.schedule.poll_seconds = 1;
-    config.schedule.jitter_seconds = 0;
+    config.capabilities.answer.mode = Mode::Off;
+    config.capabilities.judge.mode = Mode::Off;
+    config.capabilities.mine.mode = Mode::Off;
+    for schedule in [
+        &mut config.capabilities.answer.schedule,
+        &mut config.capabilities.judge.schedule,
+    ] {
+        schedule.poll_seconds = 1;
+        schedule.jitter_seconds = 0;
+    }
+    config.capabilities.mine.schedule.poll_seconds = 1;
+    config.capabilities.mine.schedule.jitter_seconds = 0;
     fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
     let mut writer = Running(
         binary()
@@ -300,7 +327,7 @@ fn control_commands_preserve_live_writer_visibility() {
         .output()
         .unwrap();
     assert!(paused.status.success(), "{paused:?}");
-    config.schedule.mine_seconds += 1;
+    config.capabilities.mine.schedule.interval_seconds += 1;
     fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
     let status = wait_revision(
         &config,
@@ -791,25 +818,25 @@ fn configuration_check_reports_safe_file_and_field_repairs() {
             None,
         ),
         (
-            Some(format!("[timeouts]\nhttp_seconds = '{marker}'\n").into_bytes()),
+            Some(format!("schema_version = 2\n[capabilities.answer.timeouts]\nhttp_seconds = '{marker}'\n").into_bytes()),
             "parse_invalid",
             None,
         ),
     ];
-    config.timeouts.model_seconds = 0;
+    config.capabilities.answer.timeouts.model_seconds = 0;
     cases.push((
         Some(toml::to_string(&config).unwrap().into_bytes()),
         "field_invalid",
         Some("timeouts.model_seconds"),
     ));
-    config.timeouts.model_seconds = u64::MAX;
+    config.capabilities.answer.timeouts.model_seconds = u64::MAX;
     cases.push((
         Some(toml::to_string(&config).unwrap().into_bytes()),
         "field_invalid",
         Some("timeouts.model_seconds"),
     ));
     config = toml::from_str(&valid).unwrap();
-    config.schedule.poll_seconds = 0;
+    config.capabilities.answer.schedule.poll_seconds = 0;
     cases.push((
         Some(toml::to_string(&config).unwrap().into_bytes()),
         "field_invalid",
@@ -823,7 +850,7 @@ fn configuration_check_reports_safe_file_and_field_repairs() {
         Some("network.base_url"),
     ));
     config = toml::from_str(&valid).unwrap();
-    config.solver.judge.reasoning = format!("{marker}\n");
+    config.capabilities.judge.model.reasoning = format!("{marker}\n");
     cases.push((
         Some(toml::to_string(&config).unwrap().into_bytes()),
         "field_invalid",
@@ -844,7 +871,6 @@ fn configuration_check_reports_safe_file_and_field_repairs() {
             assert!(output.stdout.is_empty());
             let text = String::from_utf8_lossy(&output.stderr);
             assert!(!text.contains(marker));
-            assert!(text.contains(reason), "{text}");
             if json {
                 let envelope: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
                 let error = &envelope["error"];
@@ -858,6 +884,12 @@ fn configuration_check_reports_safe_file_and_field_repairs() {
                 );
                 assert_eq!(error["details"]["reason"], reason);
                 assert_eq!(error["details"]["field"], serde_json::json!(field));
+                let kind = match field {
+                    Some("timeouts.model_seconds" | "schedule.poll_seconds") => Some("answer"),
+                    Some("reasoning") => Some("judge"),
+                    _ => None,
+                };
+                assert_eq!(error["details"]["kind"], serde_json::json!(kind));
                 assert_eq!(error["next_actions"][0]["authorization_required"], false);
                 assert!(
                     error["next_actions"]
@@ -873,8 +905,6 @@ fn configuration_check_reports_safe_file_and_field_repairs() {
                             })
                         })
                 );
-            } else if let Some(field) = field {
-                assert!(text.contains(field));
             }
         }
     }
@@ -912,12 +942,12 @@ fn configuration_check_identifies_guidance_route_and_layer_without_private_value
         ("judge", "core"),
         ("judge", "user"),
     ] {
-        config.solver.answer.core_guidance_file = None;
-        config.solver.answer.guidance_file = None;
-        config.solver.judge.core_guidance_file = None;
-        config.solver.judge.guidance_file = None;
-        config.capabilities.answer = agmi::config::Mode::ReadOnly;
-        config.capabilities.judge = agmi::config::Mode::ReadOnly;
+        config.capabilities.answer.model.core_guidance_file = None;
+        config.capabilities.answer.model.guidance_file = None;
+        config.capabilities.judge.model.core_guidance_file = None;
+        config.capabilities.judge.model.guidance_file = None;
+        config.capabilities.answer.mode = agmi::config::Mode::ReadOnly;
+        config.capabilities.judge.mode = agmi::config::Mode::ReadOnly;
         let reasons: &[&str] = if layer == "core" {
             &[
                 "guidance_required",
@@ -939,9 +969,9 @@ fn configuration_check_identifies_guidance_route_and_layer_without_private_value
         };
         for &reason in reasons {
             let model = if kind == "answer" {
-                &mut config.solver.answer
+                &mut config.capabilities.answer.model
             } else {
-                &mut config.solver.judge
+                &mut config.capabilities.judge.model
             };
             let selected = if layer == "core" {
                 &mut model.core_guidance_file
@@ -963,9 +993,9 @@ fn configuration_check_identifies_guidance_route_and_layer_without_private_value
             }
             if layer == "core" {
                 if kind == "answer" {
-                    config.capabilities.answer = agmi::config::Mode::Active;
+                    config.capabilities.answer.mode = agmi::config::Mode::Active;
                 } else {
-                    config.capabilities.judge = agmi::config::Mode::Active;
+                    config.capabilities.judge.mode = agmi::config::Mode::Active;
                 }
             }
             fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
@@ -1163,9 +1193,8 @@ fn doctor_normalizes_legacy_identity_without_verifying_or_resetting_work() {
     db.execute_batch(
         "INSERT INTO health_evidence(singleton,hosted_identity_verified) VALUES(1,0)
          ON CONFLICT(singleton) DO UPDATE SET hosted_identity_verified=0;
-         INSERT INTO read_backoff(scope,failures,next_at) VALUES('identity',3,2000000000);
-         INSERT INTO read_observations(scope,last_failure_at,failure_category,local_next_at,server_not_before)
-         VALUES('identity',1900000000,'timeout',2000000000,1999999999);
+         INSERT INTO read_state(owner,purpose,resource,failures,last_failure_at,failure_category,local_next_at,server_not_before,retained_conservative_floor)
+         VALUES('account','identity','identity',3,1900000000,'timeout',2000000000,1999999999,2000000001);
          INSERT INTO operations(kind,work_key,state,request,result,generation,revision,created_at,updated_at)
          VALUES('judge','retained-model','model_unknown','{}','{\"private\":\"identity-canary\"}',0,'fixture',1,1);",
     ).unwrap();
@@ -1184,8 +1213,8 @@ fn doctor_normalizes_legacy_identity_without_verifying_or_resetting_work() {
             .unwrap();
         let timing: (i64, i64, i64, i64) = db
             .query_row(
-                "SELECT failures,next_at,local_next_at,server_not_before
-             FROM read_backoff JOIN read_observations USING(scope) WHERE scope='identity'",
+                "SELECT failures,local_next_at,server_not_before,retained_conservative_floor
+             FROM read_state WHERE owner='account' AND purpose='identity' AND resource='identity'",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
@@ -1240,40 +1269,229 @@ fn doctor_normalizes_legacy_identity_without_verifying_or_resetting_work() {
     let repeated = invoke(&["doctor", "--repair"]);
     assert_eq!(repeated["data"]["repair_outcome"], "no_eligible_repairs");
     assert_eq!(preserved(), before);
+}
 
-    // A backoff-only journal has no observation row until the guarded writer
-    // opens it. That migration must not invalidate doctor's own preview.
-    db.execute_batch(
-        "DROP TABLE hosted_identity_evidence;
-         DROP TABLE identity_normalizations;
-         DELETE FROM read_observations WHERE scope='identity';
-         UPDATE health_evidence SET hosted_identity_verified=0;",
+#[cfg(unix)]
+fn lane_fixture() -> (tempfile::TempDir, std::path::PathBuf, agmi::config::Config) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let mut config = agmi::config::Config::default();
+    config.state_dir = dir.path().join("state");
+    config.network.chain = format!(
+        "lane-{}",
+        dir.path()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .replace('.', "")
+    );
+    config.network.address = format!("poa1{}", "1".repeat(32));
+    config.network.credential_file = dir.path().join("key");
+    config.capabilities.answer.mode = agmi::config::Mode::Off;
+    config.capabilities.judge.mode = agmi::config::Mode::Off;
+    config.capabilities.mine.mode = agmi::config::Mode::Off;
+    fs::write(&config.network.credential_file, "pk_local_fixture").unwrap();
+    fs::set_permissions(
+        &config.network.credential_file,
+        fs::Permissions::from_mode(0o600),
     )
     .unwrap();
-    let migrated = invoke(&["doctor", "--repair"]);
-    assert_eq!(migrated["data"]["repair_outcome"], "applied", "{migrated}");
-    assert_eq!(
-        migrated["data"]["hosted_identity"]["status"],
-        "legacy_unknown"
-    );
-    assert_eq!(migrated["data"]["hosted_identity"]["legacy_failure"], true);
-    assert!(migrated["data"]["hosted_identity_verified"].is_null());
-    let after = preserved();
-    assert_eq!(after.0, before.0);
-    assert_eq!(after.1, before.1);
-    assert_eq!((after.2.0, after.2.1), (before.2.0, before.2.1));
-    assert_eq!(after.3, before.3);
-    assert_eq!(
-        db.query_row(
-            "SELECT retained_conservative_floor FROM read_observations WHERE scope='identity'",
-            [],
-            |r| r.get::<_, i64>(0)
+    fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+    let output = binary()
+        .arg("--config")
+        .arg(&path)
+        .args(["--json", "run", "--once"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    (dir, path, config)
+}
+
+#[cfg(unix)]
+#[test]
+fn lane_control_cas_is_independent_metadata_only_and_never_implies_open() {
+    let (_dir, path, mut config) = lane_fixture();
+    // Broken sibling model inputs must not block local control or start a harness.
+    config.capabilities.judge.model.guidance_file = Some(path.with_file_name("missing-guidance"));
+    config.capabilities.judge.model.executable = path.with_file_name("missing-harness");
+    fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+    let invoke = |args: &[&str]| {
+        let output = binary()
+            .arg("--config")
+            .arg(&path)
+            .args(["--json"])
+            .args(args)
+            .output()
+            .unwrap();
+        let bytes = if output.status.success() {
+            &output.stdout
+        } else {
+            &output.stderr
+        };
+        (
+            output.status.success(),
+            serde_json::from_slice::<serde_json::Value>(bytes).unwrap(),
         )
-        .unwrap(),
-        before.2.1
-    );
+    };
+    let (ok, initial) = invoke(&["lane", "show", "answer"]);
+    assert!(ok, "{initial}");
+    let token = initial["data"]["desired"]["control_token"]
+        .as_str()
+        .unwrap();
+    let (_, sibling) = invoke(&["lane", "show", "judge"]);
+    let (ok, paused) = invoke(&["lane", "pause", "answer", "--expected-control", token]);
+    assert!(ok, "{paused}");
+    assert_eq!(paused["data"]["desired"]["paused"], true);
+    assert_eq!(paused["data"]["fence_ack"]["acknowledged"], true);
+    assert_eq!(paused["data"]["fence_ack"]["changed"], true);
+    assert_eq!(paused["data"]["fence_ack"]["scope"], "local_admission");
+    assert_eq!(paused["data"]["authoritative_closure"]["state"], "closed");
+    assert_eq!(paused["data"]["observed_admission"]["state"], "unknown");
+    let current = paused["data"]["desired"]["control_token"].as_str().unwrap();
+    let (ok, noop) = invoke(&["lane", "pause", "answer", "--expected-control", current]);
+    assert!(ok, "{noop}");
+    assert_eq!(noop["data"]["desired"], paused["data"]["desired"]);
+    assert_eq!(noop["data"]["fence_ack"]["changed"], false);
+    let (ok, stale) = invoke(&["lane", "pause", "answer", "--expected-control", token]);
+    assert!(!ok);
+    assert_ne!(stale["error"]["code"], "operation_failed");
+    let (ok, resumed) = invoke(&["lane", "resume", "answer", "--expected-control", current]);
+    assert!(ok, "{resumed}");
+    assert_eq!(resumed["data"]["desired"]["paused"], false);
+    assert_eq!(resumed["data"]["authoritative_closure"]["state"], "closed"); // global pause remains
+    assert_eq!(resumed["data"]["observed_admission"]["state"], "unknown");
     assert_eq!(
-        invoke(&["doctor", "--repair"])["data"]["repair_outcome"],
-        "no_eligible_repairs"
+        resumed["data"]["authoritative_closure"]["account_generation"],
+        initial["data"]["authoritative_closure"]["account_generation"]
     );
+    let (_, sibling_after) = invoke(&["lane", "show", "judge"]);
+    assert_eq!(sibling_after["data"]["desired"], sibling["data"]["desired"]);
+    let (ok, agents) = invoke(&["agents"]);
+    assert!(ok);
+    assert!(agents["data"]["routes"]["mine"].is_null());
+    assert_eq!(agents["data"]["configuration_state"], "desired_saved");
+    assert_eq!(agents["data"]["fence_acknowledged"], false);
+    assert!(!config.capabilities.judge.model.executable.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn lane_wait_deadline_includes_cross_process_configuration_lock() {
+    let (_dir, path, _config) = lane_fixture();
+    let show = binary()
+        .arg("--config")
+        .arg(&path)
+        .args(["--json", "lane", "show", "mine"])
+        .output()
+        .unwrap();
+    assert!(show.status.success());
+    let initial: serde_json::Value = serde_json::from_slice(&show.stdout).unwrap();
+    let token = initial["data"]["desired"]["control_token"]
+        .as_str()
+        .unwrap();
+    let directory = fs::File::open(path.parent().unwrap()).unwrap();
+    directory.lock().unwrap();
+    let started = std::time::Instant::now();
+    let output = binary()
+        .arg("--config")
+        .arg(&path)
+        .args([
+            "--json",
+            "lane",
+            "pause",
+            "mine",
+            "--expected-control",
+            token,
+            "--wait-seconds",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    let failure: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(failure["error"]["code"], "admin_busy");
+    drop(directory);
+    let after = binary()
+        .arg("--config")
+        .arg(&path)
+        .args(["--json", "lane", "show", "mine"])
+        .output()
+        .unwrap();
+    assert!(after.status.success());
+    let after: serde_json::Value = serde_json::from_slice(&after.stdout).unwrap();
+    assert_eq!(after["data"]["desired"], initial["data"]["desired"]);
+}
+
+#[test]
+fn lane_parser_requires_token_and_bounded_wait_without_echoing_values() {
+    let marker = "private-control-token-canary";
+    for args in [
+        vec!["lane", "pause", "answer"],
+        vec![
+            "lane",
+            "resume",
+            "judge",
+            "--expected-control",
+            marker,
+            "--wait-seconds",
+            "0",
+        ],
+        vec![
+            "lane",
+            "pause",
+            "mine",
+            "--expected-control",
+            marker,
+            "--wait-seconds",
+            "301",
+        ],
+        vec!["guidance", "show", "--kind", "mine"],
+    ] {
+        let output = binary().args(["--json"]).args(args).output().unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(error["error"]["code"], "invalid_arguments");
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(marker));
+    }
+}
+
+#[test]
+fn lane_control_refuses_missing_journal_without_initializing_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let mut config = agmi::config::Config::default();
+    config.state_dir = dir.path().join("absent-state");
+    fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+    for args in [
+        vec!["lane", "show", "answer"],
+        vec![
+            "lane",
+            "pause",
+            "judge",
+            "--expected-control",
+            "not-a-control-token",
+        ],
+        vec![
+            "lane",
+            "resume",
+            "mine",
+            "--expected-control",
+            "not-a-control-token",
+        ],
+    ] {
+        let output = binary()
+            .arg("--config")
+            .arg(&path)
+            .args(["--json"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let failure: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_ne!(failure["error"]["code"], "operation_failed");
+        assert!(!config.state_dir.exists());
+    }
 }

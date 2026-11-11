@@ -15,54 +15,12 @@ fn recovery_code(error: &anyhow::Error) -> &'static str {
 }
 
 fn unknown_report(reason: &str) -> Value {
-    json!({"contract_version":1,"components":health::unknown_components(),
+    json!({"contract_version":2,"components":health::unknown_components(),
         "healthy":false,"attention_required":true,"issues":[reason],
         "warnings":[],"initialized":null,"paused":null,"evidence":"local_only",
+        "operational":{"status":"unknown","issues":[reason]},
+        "risk":{"status":"unknown","attention_required":null,"unresolved_effects":null,"unresolved_model_attempts":null},
         "work":health::unknown_work(reason),"intervention":health::unknown_intervention(reason)})
-}
-
-fn qualify_restoration(report: &mut Value, repairs: &Value) {
-    if repairs["restoration"]["verified"] != true
-        || repairs["restoration"]["runtime"] != "restored"
-        || report["intervention"]["controller"]["reason"] != "controller_stopped"
-    {
-        return;
-    }
-    // A verified new process supersedes the old stopped marker, but is not yet
-    // fresh participation evidence. Never suggest starting a second controller.
-    let reason = "runtime_restored_observation_pending";
-    report["intervention"] = health::unknown_intervention(reason);
-    let paused = report["paused"] == true;
-    let inactive = ["answer", "judge", "mine"].iter().all(|name| {
-        matches!(
-            report["effective_capabilities"][name].as_str(),
-            Some("off" | "read_only")
-        )
-    });
-    for name in ["answer", "judge", "mine"] {
-        if report["work"][name]["intervention"]["reason"] == "controller_stopped" {
-            report["work"][name]["progress"] = json!("waiting");
-            report["work"][name]["intervention"] = json!({"status":"undetermined","reason":reason,
-                "next_action":"inspect_local_evidence","next_at":null,"evidence_fresh":null,
-                "observation_fresh":null,"evidence":"restored_process_not_yet_observed_by_controller"});
-            if paused && report["effective_capabilities"][name] == "active" {
-                report["work"][name]["progress"] = json!("blocked");
-                report["work"][name]["intervention"]["status"] = json!("operator_required");
-                report["work"][name]["intervention"]["reason"] = json!("admission_paused");
-                report["work"][name]["intervention"]["next_action"] = json!("resume");
-            }
-        }
-        report["intervention"]["lanes"][name] =
-            report["work"][name]["intervention"]["status"].clone();
-        if report["work"][name]["intervention"]["status"] == "operator_required" {
-            for field in ["status", "reason", "next_action", "next_at"] {
-                report["intervention"][field] = report["work"][name]["intervention"][field].clone();
-            }
-        }
-    }
-    if paused || inactive || report["intervention"]["status"] == "operator_required" {
-        report["intervention"]["unattended"] = json!(false);
-    }
 }
 
 /// No network/model calls. Repair may restore a previously running managed service;
@@ -105,10 +63,10 @@ pub fn check(path: &Path, repair: bool) -> Value {
         Err(_) => unknown_report("config_changed_during_doctor"),
     };
     report["repair_requested"] = json!(repair);
-    report["repair_outcome"] = json!(if !repairs["failure"].is_null() {
-        "failed"
-    } else if !repair {
+    report["repair_outcome"] = json!(if !repair {
         "not_requested"
+    } else if !repairs["failure"].is_null() {
+        "failed"
     } else if repairs["applied"]
         .as_array()
         .is_some_and(|rows| !rows.is_empty())
@@ -128,13 +86,7 @@ pub fn check(path: &Path, repair: bool) -> Value {
         "identity_verified":false,"read_deadlines_reset":false,
         "restored_runtime_may_participate":repairs["restoration"]["manager_action"]
             .as_str().is_some_and(|action| action != "none")});
-    qualify_restoration(&mut report, &repairs);
-    if !repairs["failure"].is_null() {
-        report["intervention"] = json!({"status":"operator_required","unattended":false,
-            "reason":"doctor_repair_unavailable","next_action":"inspect_repair_failure","next_at":null,
-            "evidence":"local_only"});
-        report["attention_required"] = json!(true);
-    }
+    health::qualify_doctor(&mut report, &repairs);
     repairs["counts"] = json!({
         "eligible":repairs["eligible"].as_array().map_or(0, Vec::len),
         "ineligible":repairs["ineligible"].as_array().map_or(0, Vec::len),
@@ -150,40 +102,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn restored_process_does_not_invent_readiness_or_suggest_another_start() {
-        let repairs = json!({"restoration":{"verified":true,"runtime":"restored"}});
-        let mut report = json!({"healthy":false,"intervention":{"status":"operator_required",
-            "controller":{"reason":"controller_stopped"}},"work":{"answer":{"phase":"stopped",
-            "intervention":{"status":"operator_required","reason":"controller_stopped","next_action":"start_controller"}},
-            "judge":{"intervention":{"status":"none_required","reason":"capability_off"}},
-            "mine":{"intervention":{"status":"operator_required","reason":"controller_stopped"}}}});
-        qualify_restoration(&mut report, &repairs);
-        assert_eq!(report["intervention"]["status"], "undetermined");
-        assert_eq!(report["intervention"]["unattended"], Value::Null);
-        assert_eq!(
-            report["work"]["answer"]["intervention"]["next_action"],
-            "inspect_local_evidence"
-        );
-        assert_eq!(
-            report["work"]["judge"]["intervention"]["status"],
-            "none_required"
-        );
-        assert_eq!(report["healthy"], false);
-        report["intervention"] = json!({"status":"operator_required",
-            "controller":{"reason":"identity_mismatch"}});
-        qualify_restoration(&mut report, &repairs);
-        assert_eq!(report["intervention"]["status"], "operator_required");
-        report["paused"] = json!(true);
-        report["effective_capabilities"] = json!({"answer":"active","judge":"off","mine":"off"});
-        report["intervention"]["controller"]["reason"] = json!("controller_stopped");
-        report["work"]["answer"]["intervention"]["reason"] = json!("controller_stopped");
-        qualify_restoration(&mut report, &repairs);
-        assert_eq!(report["intervention"]["status"], "operator_required");
-        assert_eq!(report["intervention"]["unattended"], false);
-        assert_eq!(report["intervention"]["controller"]["ready"], Value::Null);
-        assert_eq!(
-            report["work"]["answer"]["intervention"]["next_action"],
-            "resume"
-        );
+    fn failed_scan_without_requested_repair_retains_failure_and_diagnostic_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing-config.toml");
+        for requested in [false, true] {
+            let report = check(&path, requested);
+            assert_eq!(
+                report["repair_outcome"],
+                if requested { "failed" } else { "not_requested" }
+            );
+            assert!(report["repairs"]["failure"].is_string());
+            assert_eq!(report["intervention"]["status"], "operator_required");
+            assert_eq!(report["intervention"]["unattended"], false);
+            assert_eq!(
+                report["intervention"]["next_action"],
+                "inspect_repair_failure"
+            );
+            assert_eq!(report["intervention"]["controller"]["ready"], Value::Null);
+            for lane in crate::capability::LaneId::NAMES {
+                assert_eq!(report["intervention"]["lanes"][lane], "undetermined");
+                assert_eq!(
+                    report["work"][lane]["intervention"]["status"],
+                    "undetermined"
+                );
+            }
+            assert_eq!(report["issues"], report["operational"]["issues"]);
+            assert_eq!(report["risk"]["unresolved_effects"], Value::Null);
+        }
+        assert!(!path.exists());
     }
 }

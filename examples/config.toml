@@ -1,8 +1,7 @@
 # Copy outside the repository. Keep account credentials in a separate private file.
 # Paths are relative to this configuration file, except bare executables use PATH.
+schema_version = 2
 state_dir = "./agmi-state"
-# Known assignment IDs to exclude from new judging work; root-level, before tables.
-excluded_judging_assignments = []
 
 [network]
 base_url = "https://minepoa.com"
@@ -36,51 +35,86 @@ mine = "/api/hosted/mine"
 join_pow = "/api/join-pow"
 register = "/api/hosted/register"
 
-[capabilities]
-answer = "read_only"
-judge = "read_only"
-mine = "read_only"
+[runtime]
+shutdown_seconds = 30
 
-# Off stops new participation, not safety reads for already possibly-sent work.
-[preparation]
-answer_while_blocked = true
-# May repeat remote inference at additional cost; never retries a network write.
-retry_uncertain = false
-# Allows one replacement for a known-invalid draft; extra inference costs quota.
-max_attempts_per_work = 2
+# Shared account identity reads, not another lane's discovery policy.
+[identity]
+read_http_seconds = 90
+retry_seconds = 180
+backoff_max_seconds = 900
+jitter_seconds = 30
 
-# Strict is the default. Other modes accept bounded remote conflict risk;
-# elapsed time never proves an uncertain request failed.
-[participation]
-mode = "strict" # strict | participation_first | manual
-uncertainty_grace_seconds = 300
-max_unresolved_operations = 4
-# Participation-first capacity only; retains the original unknown plus witness.
-# Requires a linked later accepted same-epoch answer; never claims settlement.
-max_historical_unknown_answers = 0
-# Reserve unresolved capacity for answers even after this epoch's answer completes.
-# Must be smaller than max_unresolved_operations; zero preserves existing policy.
-answer_reserved_slots = 0
-allow_answer = true
-allow_mine = true
-allow_judge = false
-# Separate opt-in: may repeat an already accepted answer.
-retry_uncertain_answers = false
-uncertain_answer_retry_seconds = 600
-max_answer_attempts_per_epoch = 2
+# Each lane owns its mode and policy. Off stops new participation, not safety
+# reconciliation of already possibly-sent work. Fresh configuration is read-only.
+# Saved mode/model/guidance changes are desired configuration, not admission fences.
+# Inspect: agmi lane show answer
+# Fence: agmi lane pause answer --expected-control <desired.control_token>
+# Resume only that override with a fresh token: agmi lane resume answer --expected-control <token>
+# --wait-seconds 30 bounds acquisition (1..=300), not remote settlement or stalled OS I/O.
+# Already-started native/remote work can continue; resume grants no retry authority.
+# Eligible effects use durable served-in-round fairness, not permanent answer priority.
+[capabilities.answer]
+mode = "read_only"
 
-[solver.answer]
+[capabilities.answer.model]
 harness = "hermes"
 executable = "hermes"
 model = "gpt-6.1-sol"
 reasoning = "high"
-# Required nonempty core instructions for active routes. Copy the answer/judge
-# directories beside this config; each layer is limited to 64 KiB and hot reloads.
+# Copy the answer/judge directories beside this config. Active routes require
+# nonempty core instructions; user guidance is optional and subordinate.
+# Both layers are captured per attempt, hot-reloaded and limited to 64 KiB.
 core_guidance_file = "answer/core-guidance.md"
-# Optional user preferences, subordinate to core instructions and output/security.
 guidance_file = "answer/user-guidance.md"
 
-[solver.judge]
+[capabilities.answer.timeouts]
+http_seconds = 90
+read_http_seconds = 90 # Independent of the effect deadline; no inheritance.
+model_seconds = 300
+
+[capabilities.answer.schedule]
+poll_seconds = 120
+retry_seconds = 180
+backoff_max_seconds = 900
+jitter_seconds = 30 # Deterministic staggering; zero disables it.
+# Optional discovery-only overrides inherit this lane's retry/base-cap settings.
+# discovery_retry_seconds = 30
+# discovery_backoff_max_seconds = 120
+# Server minima and retained conservative floors always remain binding.
+
+# Optional accepted-job polling, separate from failures and receipt cadence.
+# Both positive fields are required; omit the table for normal retry cadence.
+# [capabilities.answer.schedule.queued_job_polling]
+# initial_seconds = 15
+# max_seconds = 120
+
+[capabilities.answer.preparation]
+while_blocked = true
+retry_uncertain = false # Opt-in can duplicate remote inference charges.
+max_attempts_per_work = 2 # Allows a replacement for a completed invalid draft.
+
+# Strict also checks unresolved effects across the account. The capacity cap
+# counts this lane's possibly-sent work, not a shared pool or answer reservation.
+# Other modes accept conflict risk; elapsed time never proves a request failed.
+[capabilities.answer.participation]
+mode = "strict" # strict | participation_first | manual
+uncertainty_grace_seconds = 300
+max_unresolved_operations = 4
+retry_uncertain_answers = false # Separate opt-in; may duplicate an accepted answer.
+uncertain_answer_retry_seconds = 600
+max_answer_attempts_per_epoch = 2
+historical_unknown_answer_capacity = "bounded"
+max_historical_unknown_answers = 0
+# Participation-first accepted_linked accounting affects answer capacity only.
+# It retains original unknowns and accepts accumulating historical uncertainty.
+
+[capabilities.judge]
+mode = "read_only"
+excluded_assignments = [] # Known assignment transaction IDs; never clears sent work.
+
+# This route can independently select another supported harness/model/reasoning.
+[capabilities.judge.model]
 harness = "hermes"
 executable = "hermes"
 model = "gpt-6.1-sol"
@@ -88,38 +122,50 @@ reasoning = "high"
 core_guidance_file = "judge/core-guidance.md"
 guidance_file = "judge/user-guidance.md"
 # Admin discovery: agmi config schema; guidance show/set --layer core|user.
-# Omitted --layer selects user. Both layers are captured per model attempt.
-# Missing/empty configured core files fail loading; no built-in prose fallback.
 
-[timeouts]
+[capabilities.judge.timeouts]
 http_seconds = 90
-# Optional read-only HTTP deadline; absent inherits http_seconds (90 by default).
-# Effectful mine GET requests always use http_seconds.
-# read_http_seconds = 60
+read_http_seconds = 90
 model_seconds = 300
-shutdown_seconds = 30
 
-[schedule]
+[capabilities.judge.schedule]
 poll_seconds = 120
-mine_seconds = 86400
-# Replaces the interval with one dispatched mine per freshly observed epoch.
-mine_each_epoch = false
 retry_seconds = 180
-# Caps exponential read backoff; base/server minimum wins, then jitter is added.
 backoff_max_seconds = 900
-# Optional challenge-only overrides; omitted fields inherit the generic values.
-# Hot changes never shorten retained server minima.
-# challenge_retry_seconds = 30
-# challenge_backoff_max_seconds = 120
-# Optional assignment-only overrides; null/inherit in JSON, omitted in TOML.
-# assignments_retry_seconds = 180
-# assignments_backoff_max_seconds = 900
-# Deterministic per-identity startup/poll/retry staggering; 0 disables staggering.
 jitter_seconds = 30
-
-# Optional accepted-job polling, independent of error retries and receipt cadence.
-# Both positive fields required. Omit the table to retain the existing cadence.
-# The local cap includes jitter; server minima and read backoff still win.
-# [schedule.queued_job_polling]
+# discovery_retry_seconds = 180
+# discovery_backoff_max_seconds = 900
+# [capabilities.judge.schedule.queued_job_polling]
 # initial_seconds = 15
 # max_seconds = 120
+
+[capabilities.judge.preparation]
+while_blocked = false
+retry_uncertain = false
+max_attempts_per_work = 2
+
+[capabilities.judge.participation]
+mode = "strict"
+uncertainty_grace_seconds = 300
+max_unresolved_operations = 4
+
+# Mining is deterministic: no model, harness or preparation configuration.
+[capabilities.mine]
+mode = "read_only"
+
+[capabilities.mine.timeouts]
+http_seconds = 90 # Effectful mine GET uses this deadline, not the read deadline.
+read_http_seconds = 90
+
+[capabilities.mine.schedule]
+poll_seconds = 120
+retry_seconds = 180
+backoff_max_seconds = 900
+jitter_seconds = 30
+interval_seconds = 86400
+each_epoch = false # Replaces interval cadence with one dispatched mine per epoch.
+
+[capabilities.mine.participation]
+mode = "strict"
+uncertainty_grace_seconds = 300
+max_unresolved_operations = 4
