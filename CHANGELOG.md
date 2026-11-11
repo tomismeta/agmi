@@ -28,6 +28,7 @@
 - **Bounded execution:** `run --once` retains its finite entry plan rather than waiting for future deadlines or replenishing work.
 - **Isolated Linux acceptance:** real systemd install/update/cancellation, sealed migration recovery, old-binary refusal, automatic crash restart and a genuine host kernel reboot preserve work and control intent. Guarded native handoff races and authentic pre-gate approval recovery were exercised with private substitutes.
 - **Bounded fleet-readiness proof:** protected copies of three real journals migrated offline without changing live participation. Authenticated Hermes/OpenClaw answer and grade routes returned valid bound artifacts against synthetic protocol endpoints; timeout/interruption retained unknown execution and stop evidence. This is not live fleet rollout or proof of remote cancellation; see the operating guide for scope and limits.
+- **Completed mining diagnostics:** status retains the latest current-epoch completion evidence while mining waits for its next eligible attempt, allowing health to distinguish successful idle work from missing evidence. Newer failed work, pending or uncertain work, epoch rollover and an expired interval still take precedence.
 
 These are source changes, not a release announcement or fleet rollout. Private substitute-based verification does not establish live provider authentication, earnings or remote finality.
 

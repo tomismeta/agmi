@@ -1085,6 +1085,11 @@ fn components(status: &Value, health: &Value, at: i64, stale: u64, options: Opti
                             work["phase"] == "completed"
                                 && status["observations"][name]["epoch"].as_u64().is_some()
                                 && work["operation_epoch"] == status["observations"][name]["epoch"]
+                                && (effective["policy"]["capabilities"]["mine"]["schedule"]["each_epoch"]
+                                    == true
+                                    || work["completion_valid_until"]
+                                        .as_i64()
+                                        .is_some_and(|deadline| at < deadline))
                         }
                     };
                 if read_only {
@@ -1269,6 +1274,7 @@ mod tests {
         config.capabilities.answer.mode = Mode::Active;
         config.capabilities.judge.mode = Mode::Active;
         config.capabilities.mine.mode = Mode::Active;
+        config.capabilities.mine.schedule.each_epoch = true;
         let mut status = json!({
             "initialized":true,"paused":false,"controller_stopped":false,
             "identity_matches_config":true,"admission_blocked":false,
@@ -1307,6 +1313,27 @@ mod tests {
             .unwrap()
             .iter()
             .any(|item| item == code)
+    }
+
+    #[test]
+    fn mining_completion_expires_at_interval_boundary() {
+        let (config, options, mut status) = fixture();
+        status["effective_runtime"]["policy"]["capabilities"]["mine"]["schedule"]["each_epoch"] =
+            json!(false);
+        status["work"]["mine"]["completion_valid_until"] = json!(10010);
+        assert_eq!(
+            evaluate(&config, options, &status, 10009)["components"]["mine"]["state"],
+            "ok"
+        );
+        assert_eq!(
+            evaluate(&config, options, &status, 10010)["components"]["mine"]["state"],
+            "unknown"
+        );
+        status["work"]["mine"]["completion_valid_until"] = Value::Null;
+        assert_eq!(
+            evaluate(&config, options, &status, 10009)["components"]["mine"]["state"],
+            "unknown"
+        );
     }
 
     #[test]

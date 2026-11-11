@@ -302,10 +302,39 @@ impl Store {
         for kind in LaneId::ALL {
             let observation = self.lane_observation(kind)?;
             let epoch = observation.as_ref().and_then(|o| o["epoch"].as_u64());
-            let id:Option<i64>=self.db.query_row("SELECT id FROM operations WHERE kind=?1
+            let mut id:Option<i64>=self.db.query_row("SELECT id FROM operations WHERE kind=?1
                 AND state IN ('generating','generated','prepared','retry','dispatching','queued','unknown','included_pending','confirmed','model_unknown')
                 ORDER BY CASE WHEN state IN ('generating','generated','prepared','retry') THEN 0 ELSE 1 END,id DESC LIMIT 1",
                 [kind.as_str()],|r|r.get(0)).optional()?;
+            let completion_valid_until = if id.is_none()
+                && kind == LaneId::Mine
+                && config.mode(kind) == Mode::Active
+                && !config.capabilities.mine.schedule.each_epoch
+            {
+                Some(self.participation_next_at(kind)?)
+            } else {
+                None
+            };
+            // Only the latest current-epoch mine can supply idle completion
+            // evidence; newer failed, pending or uncertain work must win.
+            if id.is_none()
+                && kind == LaneId::Mine
+                && config.mode(kind) == Mode::Active
+                && (config.capabilities.mine.schedule.each_epoch
+                    || completion_valid_until.is_some_and(|deadline| deadline > now()))
+                && let Some(epoch) = epoch
+            {
+                id = self
+                    .db
+                    .query_row(
+                        "SELECT CASE WHEN state='completed' THEN id END FROM operations
+                         WHERE kind='mine' AND work_key>=?1 AND work_key<?2 ORDER BY id DESC LIMIT 1",
+                        params![format!("{epoch}:"), format!("{epoch};")],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .flatten();
+            }
             let op = id.map(|id| self.operation(id)).transpose()?.flatten();
             let admission = self
                 .admission_projection_with(
@@ -414,6 +443,12 @@ impl Store {
                             });
                         }
                     }
+                    "completed" => {
+                        phase = "completed";
+                        reason = "current_epoch_completed";
+                        action = "observe_challenge";
+                        next = (!in_flight).then_some(discovery_at.max(now()));
+                    }
                     "dispatching" => {
                         phase = "dispatching";
                         reason = "effect_in_flight";
@@ -504,6 +539,7 @@ impl Store {
             }
             let mut lane = json!({"phase":phase,"reason":reason,"next_action":action,"next_at":next,"epoch":epoch,
                 "operation_id":id,"operation_epoch":op.as_ref().and_then(|o|o.request["solver"]["epoch"].as_u64()),
+                "completion_valid_until":if phase=="completed" { completion_valid_until } else { None },
                 "binding_revision":op.as_ref().map(|o|o.binding_revision),"read_key":self.read_key_projection(&key)?,
                 "admission":admission,"manual_authorized":self.manual_authorized(kind,epoch)?});
             let effect_since = id

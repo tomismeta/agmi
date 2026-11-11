@@ -840,9 +840,11 @@ def mine_retry_floor_scenario(f):
     assert f.writes[1]['received_at'] - f.writes[0]['received_at'] >= 8
     assert len(f.operations('mine')) == 1 and f.operations('mine')[0]['id'] == original['id']
     assert f.rows("SELECT next_at FROM schedule WHERE kind='mine:participation'")[0]['next_at'] == due
+    assert f.status()['work']['mine']['phase'] == 'completed'
+    assert f.invoke('health', '--min-free-mib', '0')['components']['mine']['state'] == 'ok'
     return dict(wallet_mutations=2, retry_after_seconds=8,
                 same_operation_retried=True, server_floor_survived_restart=True,
-                ordinary_interval_not_renewed=True)
+                ordinary_interval_not_renewed=True, completed_mining_health='ok')
 
 
 SCENARIOS = dict(rollover=rollover_scenario, retry=retry_scenario, fences=fences_scenario,

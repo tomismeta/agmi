@@ -68,6 +68,8 @@ Each lane's schedule defaults to 120-second polling, 180-second retry, a 900-sec
 
 The mining interval starts with a new operation's first durable dispatch intent, not preparation. A draft discarded during fresh challenge validation does not consume the interval; a possibly-sent request does, including an unknown outcome. This local cadence survives restart, while safe retries of that same operation do not restart it. `each_epoch = true` instead limits new mining attempts to one per observed epoch; neither mode bypasses server-imposed request minima.
 
+The latest completed mining operation remains visible in `status.work.mine` during the current epoch's scheduled wait. Health requires fresh matching epoch evidence; completion does not hide newer failed work or pending/uncertain work, or satisfy a new epoch or an already-due interval. For interval mining, `completion_valid_until` carries the deadline and health rechecks it at report time.
+
 Failures belong to identity, one lane's discovery, one assignment, or an operation's exact job/receipt binding revision. A slow or missing job does not impose local backoff on another job or lane. Rebinding retires the old read key; late completions cannot update the replacement binding's clocks or state. Genuine account/route/resource restrictions still constrain every applicable request.
 
 Hot changes recompute local delay from the original failure time, never from reload time. They cannot shorten a retained server minimum or conservative legacy floor. Deterministic identity staggering is added after the local exponential cap; final waits can exceed the cap when staggering or a genuine restriction requires it. `0` disables staggering.

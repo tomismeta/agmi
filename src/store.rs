@@ -6523,6 +6523,111 @@ mod tests {
     }
 
     #[test]
+    fn completed_mining_health_requires_current_idle_work() {
+        use crate::health::{self, Options};
+        let (_temp, mut config, mut store) = participation_fixture();
+        config.capabilities.answer.mode = Mode::Off;
+        config.capabilities.judge.mode = Mode::Off;
+        config.capabilities.mine.schedule.each_epoch = true;
+        let observe_mine = |store: &Store, epoch| {
+            store.set_authority_epoch(1).unwrap();
+            store
+                .seed_lane_observation_for_test(
+                    LaneId::Mine,
+                    LaneObservationStamp {
+                        authority_epoch: 1,
+                        generation: store.control().unwrap().generation,
+                        request_sequence: epoch,
+                        started_at: now(),
+                        completed_at: now(),
+                    },
+                    LaneObservation {
+                        epoch,
+                        answered: false,
+                        fingerprint: "fingerprint",
+                        challenge: &json!({}),
+                    },
+                )
+                .unwrap();
+        };
+        observe_mine(&store, 10);
+        observe_read_only_lanes(&store).unwrap();
+        let mut mine = dispatched_unknown(&mut store, &config, LaneId::Mine, 10);
+        mine.state = "completed".into();
+        store.save(&mine, "mine_completed").unwrap();
+        store.runtime_state(&config, false).unwrap();
+        store
+            .record_identity_outcome(HostedIdentityOutcome::Verified)
+            .unwrap();
+        let changes = store.db.total_changes();
+        let status = store.status(&config).unwrap();
+        assert_eq!(status["work"]["mine"]["phase"], "completed");
+        assert_eq!(status["work"]["mine"]["operation_id"], mine.id);
+        assert_eq!(status["work"]["mine"]["operation_epoch"], 10);
+        let options = Options {
+            min_free_mib: 0,
+            ..Options::default()
+        };
+        let health = health::check(&config, options).unwrap();
+        assert_eq!(health["components"]["mine"]["state"], "ok", "{health}");
+        assert_eq!(store.db.total_changes(), changes);
+
+        config.capabilities.mine.schedule.each_epoch = false;
+        store
+            .db
+            .execute(
+                "INSERT INTO schedule(kind,next_at) VALUES ('mine:participation',?1)",
+                [now() + 3600],
+            )
+            .unwrap();
+        store.runtime_state(&config, false).unwrap();
+        assert_eq!(
+            store.status(&config).unwrap()["work"]["mine"]["phase"],
+            "completed"
+        );
+        store
+            .db
+            .execute(
+                "UPDATE schedule SET next_at=0 WHERE kind='mine:participation'",
+                [],
+            )
+            .unwrap();
+        assert_ne!(
+            store.status(&config).unwrap()["work"]["mine"]["phase"],
+            "completed"
+        );
+        assert_ne!(
+            health::check(&config, options).unwrap()["components"]["mine"]["state"],
+            "ok"
+        );
+
+        let mut rejected = dispatched_unknown(&mut store, &config, LaneId::Mine, 10);
+        rejected.state = "rejected".into();
+        store.save(&rejected, "submission_rejected").unwrap();
+        assert!(store.participation_next_at(LaneId::Mine).unwrap() > now());
+        assert_ne!(
+            store.status(&config).unwrap()["work"]["mine"]["phase"],
+            "completed"
+        );
+        assert_ne!(
+            health::check(&config, options).unwrap()["components"]["mine"]["state"],
+            "ok"
+        );
+
+        config.capabilities.mine.schedule.each_epoch = true;
+        store.runtime_state(&config, false).unwrap();
+        observe_mine(&store, 11);
+        assert_ne!(
+            store.status(&config).unwrap()["work"]["mine"]["phase"],
+            "completed"
+        );
+        let current = dispatched_unknown(&mut store, &config, LaneId::Mine, 11);
+        let status = store.status(&config).unwrap();
+        assert_eq!(status["work"]["mine"]["operation_id"], current.id);
+        assert_eq!(status["work"]["mine"]["phase"], "unknown");
+    }
+
+    #[test]
     fn mine_each_epoch_and_safe_same_operation_retry_are_distinct() {
         let (_temp, mut config, mut store) = participation_fixture();
         config.capabilities.mine.schedule.each_epoch = true;
