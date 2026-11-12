@@ -723,6 +723,7 @@ def read_only_assessment_scenario(f, missing_words=False):
     f.assessment_hydration = True
     f.assessment_missing_words = missing_words
     f.configure()
+    f.invoke('pause')  # Provision the deliberately paused journal before inspecting it.
     f.start()  # Fresh account remains globally paused; ordinary bounded reads continue.
     def assessed(lane):
         return f.status().get('lane_participation', {}).get(lane, {}).get('assessment') or {}
