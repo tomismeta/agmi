@@ -22,18 +22,21 @@ pub(crate) fn hosted_identity(status: &Value) -> HostedIdentity<'_> {
     let state = if status["initialized"] == false {
         "unobserved"
     } else {
-        match evidence["status"].as_str() {
-            Some(
-                state @ ("verified"
-                | "unavailable"
-                | "authentication_failed"
-                | "identity_mismatch"
-                | "invalid_response"
-                | "legacy_unknown"
-                | "unobserved"),
-            ) => state,
-            _ => "unobserved",
-        }
+        evidence["status"]
+            .as_str()
+            .filter(|state| {
+                matches!(
+                    *state,
+                    "verified"
+                        | "unavailable"
+                        | "authentication_failed"
+                        | "identity_mismatch"
+                        | "invalid_response"
+                        | "legacy_unknown"
+                        | "unobserved"
+                )
+            })
+            .unwrap_or("unobserved")
     };
     let rejection = if status["initialized"] == false {
         None
@@ -2030,6 +2033,7 @@ mod tests {
         ] {
             status["hosted_identity"]["status"] = json!(state);
             let health = evaluate(&config, options, &status, 10000);
+            assert_eq!(health["hosted_identity"]["status"], state);
             assert!(health["hosted_identity_verified"].is_null());
             assert_eq!(health["components"]["answer"]["state"], "unknown");
         }
@@ -2045,6 +2049,35 @@ mod tests {
             assert_eq!(health["hosted_identity"]["legacy_failure"], false);
             assert!(health["hosted_identity_verified"].is_null());
         }
+    }
+
+    #[test]
+    fn identity_status_rejects_unknown_values_and_uninitialized_claims() {
+        let (config, options, mut status) = fixture();
+        for state in [
+            json!("unexpected"),
+            json!("Verified"),
+            json!(""),
+            Value::Null,
+            json!(true),
+            json!(42),
+            json!([]),
+            json!({}),
+        ] {
+            status["hosted_identity"]["status"] = state;
+            let health = evaluate(&config, options, &status, 10000);
+            assert_eq!(health["hosted_identity"]["status"], "unobserved");
+            assert!(health["hosted_identity_verified"].is_null());
+        }
+        status["initialized"] = json!(false);
+        status["hosted_identity"] = json!({
+            "status":"verified","rejection":"authentication_failed","legacy_failure":true
+        });
+        let health = evaluate(&config, options, &status, 10000);
+        assert_eq!(health["hosted_identity"]["status"], "unobserved");
+        assert!(health["hosted_identity_verified"].is_null());
+        assert!(health["hosted_identity"]["rejection"].is_null());
+        assert_eq!(health["hosted_identity"]["legacy_failure"], false);
     }
 
     #[test]
