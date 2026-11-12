@@ -84,9 +84,23 @@ impl Recovery {
         if runtime.stopping() {
             return Ok(());
         }
-        for op in runtime.store.reconciliation_batch(kind)? {
+        // Run-once owns its entry selection. Later fresh bindings must not
+        // displace that finite plan when the live priority order changes.
+        let operations = if let Some(plan) = runtime.once.as_ref() {
+            plan.lane(kind)
+                .recovery
+                .iter()
+                .filter_map(|id| runtime.store.operation(*id).transpose())
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            runtime.store.reconciliation_batch(kind)?
+        };
+        for op in operations {
             if self.reads.len() >= 2 {
                 break;
+            }
+            if op.next_at > runtime.deadline_now() {
+                continue;
             }
             let Some(key) = Store::operation_read_key(&op) else {
                 continue;
@@ -110,7 +124,6 @@ impl Recovery {
             if let Some(flight) =
                 runtime.launch_read(kind, key.clone(), endpoint, Some(resource), None)?
             {
-                runtime.store.reconciliation_attempted(kind, op.id)?;
                 if let Some(plan) = runtime.once.as_mut() {
                     plan.lane_mut(kind).reads.push(key);
                 }
@@ -198,7 +211,12 @@ impl HostAccess {
                 .request_not_before(&self.config, endpoint, resource)?
                 > cutoff
             || self.store.read_backoff(&key)?.next_at > cutoff
-            || !self.store.read_started(&key)?
+            || !(if matches!(key, ReadKey::Operation { .. }) {
+                self.store
+                    .reconciliation_read_started(&self.config, kind, &key)?
+            } else {
+                self.store.read_started(&key)?
+            })
         {
             return Ok(None);
         }

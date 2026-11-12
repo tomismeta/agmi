@@ -1,6 +1,94 @@
 use super::*;
 use crate::endpoints::Endpoint;
 
+/// Participation relevance, not permission to retry or settle a remote effect.
+/// Admission owns capacity/uncertainty gates; current work owns deduplication.
+#[derive(Clone, Copy, Default)]
+struct RemoteWorkScope {
+    admission_open: bool,
+    epoch: Option<u64>,
+    independent: bool,
+    completed: bool,
+    retry_epoch: Option<u64>,
+}
+
+impl RemoteWorkScope {
+    fn background(
+        self,
+        state: &str,
+        epoch: Option<u64>,
+        judge: Option<&Value>,
+        key: &str,
+    ) -> Option<bool> {
+        if !self.admission_open
+            || !matches!(
+                state,
+                "queued" | "unknown" | "included_pending" | "confirmed" | "model_unknown"
+            )
+        {
+            return Some(false);
+        }
+        if let Some(assessment) = judge {
+            return judging_work_current(assessment, key).map(|current| !current);
+        }
+        Some(
+            self.independent
+                || self.completed
+                || (matches!(state, "unknown" | "queued")
+                    && epoch.is_some()
+                    && epoch == self.retry_epoch)
+                || epoch
+                    .zip(self.epoch)
+                    .is_some_and(|(work, current)| work != current),
+        )
+    }
+}
+
+/// Aggregate exclusions cannot identify a retained operation. A positive
+/// witness remains useful when truncated; absence requires complete witnesses.
+fn judging_work_current(assessment: &Value, key: &str) -> Option<bool> {
+    if assessment["locally_judgeable"] == true {
+        return Some(false);
+    }
+    let relevant = |reason: &str| reason == "already_attempted" || reason.starts_with("model_");
+    let count: u64 = assessment["exclusions"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(reason, _)| relevant(reason))
+        .map(|(_, count)| count.as_u64().unwrap_or(0))
+        .sum();
+    if count == 0 {
+        return Some(false);
+    }
+    if assessment["completeness"] != "complete"
+        || assessment["valid_until"]
+            .as_i64()
+            .is_none_or(|until| until <= now())
+        || assessment["observed_at"]
+            .as_i64()
+            .is_none_or(|at| at > now())
+    {
+        return None;
+    }
+    let witnesses = assessment["excluded_work"].as_array()?;
+    if witnesses.iter().any(|row| {
+        row["reason"].as_str().is_some_and(relevant)
+            && row["work_key"]
+                .as_str()
+                .is_some_and(|current| current.eq_ignore_ascii_case(key))
+    }) {
+        return Some(true);
+    }
+    let covered = witnesses
+        .iter()
+        .filter(|row| {
+            row["reason"].as_str().is_some_and(relevant) && row["work_key"].as_str().is_some()
+        })
+        .count() as u64;
+    (assessment["excluded_work_truncated"] == false && covered >= count).then_some(false)
+}
+
 impl Store {
     fn lane_participation_projection(
         &self,
@@ -185,15 +273,21 @@ impl Store {
         }
         let reason = blocker.map(|b| b.0);
         let lane = reason == Some("lane_unresolved_capacity");
-        let required_release = match reason {
-            Some("lane_unresolved_capacity") => accounting
-                .active()
-                .saturating_add(1)
-                .saturating_sub(u64::from(policy.max_unresolved_operations)),
-            Some("account_uncertainty" | "manual_authorization_required") => accounting.total,
-            Some("effect_in_flight") => 1,
-            _ => 0,
-        };
+        let required_release =
+            match reason {
+                Some("lane_unresolved_capacity") => policy
+                    .max_unresolved_operations
+                    .finite()
+                    .map_or(0, |limit| {
+                        accounting
+                            .active()
+                            .saturating_add(1)
+                            .saturating_sub(u64::from(limit))
+                    }),
+                Some("account_uncertainty" | "manual_authorization_required") => accounting.total,
+                Some("effect_in_flight") => 1,
+                _ => 0,
+            };
         let blockers = if lane {
             &accounting.own_blockers
         } else {
@@ -208,7 +302,9 @@ impl Store {
             "blocker_ids":blockers,"required_release":required_release,"not_before":blocker.and_then(|b|b.1),
             "blocker_ids_truncated":(if lane{accounting.active()}else{accounting.total})>blockers.len() as u64,
             "next_at":blocker.and_then(|b|b.1),"own_count":accounting.active(),"own_limit":policy.max_unresolved_operations,
-            "own_remaining":u64::from(policy.max_unresolved_operations).saturating_sub(accounting.active()),
+            "own_remaining":policy.max_unresolved_operations.finite().map(|limit| u64::from(limit).saturating_sub(accounting.active())),
+            "historical_count_limiting":policy.max_unresolved_operations.finite().is_some(),
+            "retained_uncertainty_nonblocking":policy.mode==ParticipationMode::ParticipationFirst && policy.max_unresolved_operations.finite().is_none(),
             "account_unresolved":accounting.total,"historical_eligible_count":accounting.eligible,
             "capacity_exempt_count":accounting.exempt,"historical_unknown_answers":accounting.historical,
             "historical_unknown_answers_truncated":accounting.exempt>accounting.historical.len() as u64});
@@ -260,7 +356,9 @@ impl Store {
             AND (operation_id IS NULL OR EXISTS(SELECT 1 FROM operations o WHERE o.id=r.operation_id
                 AND o.binding_revision=r.binding_revision AND o.state IN ('queued','unknown','included_pending','confirmed')))
             AND (purpose!='assignment' OR in_flight=1 OR EXISTS(SELECT 1 FROM operations o
-                WHERE o.kind='judge' AND o.work_key=r.resource AND o.state IN ('generating','generated','prepared','retry','dispatching','queued','unknown','included_pending','confirmed')))
+                WHERE o.kind='judge' AND o.work_key=r.resource AND o.state IN ('generating','generated','prepared','retry','dispatching','queued','unknown','included_pending','confirmed'))
+                OR r.resource IN (SELECT json_extract(e.value,'$.work_key') FROM runtime_state s,
+                    json_each(s.lane_participation,'$.judge.assessment.excluded_work') e))
             ORDER BY CASE WHEN purpose='identity' THEN 0 WHEN purpose='discovery' THEN 1 ELSE 2 END,
                 in_flight DESC,CASE WHEN operation_id IS NOT NULL THEN 0 ELSE 1 END,owner,purpose,resource LIMIT 257")?;
         let mut rows=stmt.query_map([],|r|{
@@ -295,45 +393,125 @@ impl Store {
         stopped: bool,
         reload: bool,
         accounting: &accounting::AccountingReadSnapshot,
-    ) -> Result<Value> {
+    ) -> Result<(Value, [RemoteWorkScope; LaneId::COUNT])> {
         let control = self.control()?;
         let waits = self.wait_evidence()?;
         let mut work = json!({});
-        for kind in LaneId::ALL {
+        let mut scopes = [RemoteWorkScope::default(); LaneId::COUNT];
+        for (index, kind) in LaneId::ALL.into_iter().enumerate() {
             let observation = self.lane_observation(kind)?;
             let epoch = observation.as_ref().and_then(|o| o["epoch"].as_u64());
-            let mut id:Option<i64>=self.db.query_row("SELECT id FROM operations WHERE kind=?1
-                AND state IN ('generating','generated','prepared','retry','dispatching','queued','unknown','included_pending','confirmed','model_unknown')
-                ORDER BY CASE WHEN state IN ('generating','generated','prepared','retry') THEN 0 ELSE 1 END,id DESC LIMIT 1",
-                [kind.as_str()],|r|r.get(0)).optional()?;
-            let completion_valid_until = if id.is_none()
-                && kind == LaneId::Mine
-                && config.mode(kind) == Mode::Active
-                && !config.capabilities.mine.schedule.each_epoch
-            {
-                Some(self.participation_next_at(kind)?)
+            let lane_admission = self
+                .admission_projection_with(config, kind, epoch, None, accounting)?
+                .value;
+            let assessment = if kind == LaneId::Judge {
+                let raw: Option<String> = self.db.query_row(
+                    "SELECT json_extract(lane_participation,'$.judge') FROM runtime_state WHERE singleton=1",
+                    [], |r| r.get(0)).optional()?.flatten();
+                let record = raw
+                    .map(|raw| serde_json::from_str::<Value>(&raw))
+                    .transpose()?;
+                if let Some(record) = record {
+                    let stamp: AdmissionStampSnapshot =
+                        serde_json::from_value(record["stamp"].clone())?;
+                    if Self::observation_stamp_matches(&self.db, kind, &stamp)? {
+                        record["assessment"].clone()
+                    } else {
+                        Value::Null
+                    }
+                } else {
+                    Value::Null
+                }
+            } else {
+                Value::Null
+            };
+            let original = if kind == LaneId::Answer {
+                epoch
+                    .map(|epoch| self.uncertain_answer(epoch))
+                    .transpose()?
+                    .flatten()
             } else {
                 None
             };
-            // Only the latest current-epoch mine can supply idle completion
-            // evidence; newer failed, pending or uncertain work must win.
-            if id.is_none()
-                && kind == LaneId::Mine
+            let retry_blocker = if let Some(original) = &original {
+                let retry_epoch = original.request["solver"]["epoch"]
+                    .as_u64()
+                    .context("answer epoch missing")?;
+                if let Some(reason) =
+                    Self::answer_retry_policy_blocker(&self.db, config, retry_epoch, None)?
+                {
+                    Some((reason, None))
+                } else {
+                    let totals =
+                        accounting.accounting(&self.db, config, kind, None, Some(original.id))?;
+                    self.uncertainty_blocker_with(config, kind, Some(retry_epoch), &totals)?
+                }
+            } else {
+                None
+            };
+            let completion_valid_until = (kind == LaneId::Mine
+                && config.mode(kind) == Mode::Active
+                && !config.capabilities.mine.schedule.each_epoch)
+                .then(|| self.participation_next_at(kind))
+                .transpose()?;
+            // Only the latest current-epoch mine establishes completion; a newer
+            // failed or uncertain attempt must not be hidden by earlier success.
+            let completed_mine = if kind == LaneId::Mine
                 && config.mode(kind) == Mode::Active
                 && (config.capabilities.mine.schedule.each_epoch
                     || completion_valid_until.is_some_and(|deadline| deadline > now()))
                 && let Some(epoch) = epoch
             {
-                id = self
-                    .db
-                    .query_row(
-                        "SELECT CASE WHEN state='completed' THEN id END FROM operations
-                         WHERE kind='mine' AND work_key>=?1 AND work_key<?2 ORDER BY id DESC LIMIT 1",
-                        params![format!("{epoch}:"), format!("{epoch};")],
-                        |row| row.get(0),
-                    )
-                    .optional()?
-                    .flatten();
+                self.db.query_row(
+                    "SELECT CASE WHEN state IN ('completed','confirmed','final') THEN id END FROM operations
+                     WHERE kind='mine' AND work_key>=?1 AND work_key<?2 ORDER BY id DESC LIMIT 1",
+                    params![format!("{epoch}:"), format!("{epoch};")], |row| row.get::<_, Option<i64>>(0))
+                    .optional()?.flatten()
+            } else {
+                None
+            };
+            let scope = RemoteWorkScope {
+                admission_open: lane_admission["allowed"] == true,
+                epoch,
+                independent: match kind {
+                    LaneId::Judge => false,
+                    LaneId::Mine => {
+                        !config.capabilities.mine.schedule.each_epoch
+                            && completion_valid_until.is_some_and(|deadline| deadline <= now())
+                    }
+                    LaneId::Answer => false,
+                },
+                completed: completed_mine.is_some()
+                    || (kind == LaneId::Answer
+                        && observation
+                            .as_ref()
+                            .is_some_and(|row| row["answered"] == true)),
+                retry_epoch: original
+                    .as_ref()
+                    .filter(|_| retry_blocker.is_none())
+                    .and_then(|original| original.request["solver"]["epoch"].as_u64()),
+            };
+            scopes[index] = scope;
+            let mut candidates = self.db.prepare("SELECT id,state,request ->> '$.solver.epoch',work_key FROM operations WHERE kind=?1
+                AND state IN ('generating','generated','prepared','retry','dispatching','queued','unknown','included_pending','confirmed','model_unknown')
+                ORDER BY CASE WHEN state IN ('generating','generated','prepared','retry','dispatching') THEN 0 ELSE 1 END,id DESC")?;
+            let mut candidates = candidates.query([kind.as_str()])?;
+            let mut id = None;
+            while let Some(candidate) = candidates.next()? {
+                let state = candidate.get_ref(1)?.as_str()?;
+                if scope.background(
+                    state,
+                    candidate.get(2)?,
+                    (kind == LaneId::Judge).then_some(&assessment),
+                    candidate.get_ref(3)?.as_str()?,
+                ) == Some(false)
+                {
+                    id = Some(candidate.get::<_, i64>(0)?);
+                    break;
+                }
+            }
+            if id.is_none() {
+                id = completed_mine;
             }
             let op = id.map(|id| self.operation(id)).transpose()?.flatten();
             let admission = self
@@ -346,22 +524,47 @@ impl Store {
                     accounting,
                 )?
                 .value;
-            let key =
-                op.as_ref()
-                    .and_then(Self::operation_read_key)
-                    .unwrap_or(ReadKey::Discovery {
-                        lane: kind,
-                        source: if kind == LaneId::Judge {
-                            DiscoverySource::Assignments
-                        } else {
-                            DiscoverySource::Challenge
-                        },
-                    });
+            let key = op
+                .as_ref()
+                .filter(|op| Some(op.id) != completed_mine)
+                .and_then(Self::operation_read_key)
+                .or_else(|| {
+                    (kind == LaneId::Judge
+                        && op.is_none()
+                        && assessment["locally_judgeable"] == false)
+                        .then_some(&assessment["excluded_work"])
+                        .and_then(Value::as_array)
+                        .and_then(|rows| {
+                            rows.iter().find(|row| {
+                                matches!(
+                                    row["reason"].as_str(),
+                                    Some(
+                                        "assignment_read_backoff"
+                                            | "assignment_resource_restricted"
+                                    )
+                                )
+                            })
+                        })
+                        .and_then(|row| row["work_key"].as_str())
+                        .map(|assignment_id| ReadKey::Assignment {
+                            assignment_id: assignment_id.to_owned(),
+                        })
+                })
+                .unwrap_or(ReadKey::Discovery {
+                    lane: kind,
+                    source: if kind == LaneId::Judge {
+                        DiscoverySource::Assignments
+                    } else {
+                        DiscoverySource::Challenge
+                    },
+                });
             let backoff = self.read_backoff(&key)?;
-            let discovery_at = if matches!(key, ReadKey::Discovery { .. }) {
-                self.discovery_next_at(config, kind, &backoff)?
-            } else {
-                backoff.next_at
+            let discovery_at = match &key {
+                ReadKey::Discovery { .. } => self.discovery_next_at(config, kind, &backoff)?,
+                ReadKey::Assignment { assignment_id } => backoff.next_at.max(
+                    self.request_not_before(config, Endpoint::ExplorerTx, Some(assignment_id))?,
+                ),
+                _ => backoff.next_at,
             };
             let mut next = Some(discovery_at.max(now()));
             let (mut phase, mut reason, mut action) =
@@ -410,6 +613,12 @@ impl Store {
                             "await_model"
                         };
                         next = None;
+                    }
+                    "confirmed" | "final" if Some(op.id) == completed_mine => {
+                        phase = "completed";
+                        reason = "current_epoch_completed";
+                        action = "observe_challenge";
+                        next = (!in_flight).then_some(discovery_at.max(now()));
                     }
                     "generated" | "prepared" | "retry" => {
                         phase = "prepared";
@@ -563,109 +772,113 @@ impl Store {
                     effect_since,
                     now(),
                 );
-            if let Some(preparation) = config.preparation(kind) {
+            if config.preparation(kind).is_some() {
                 let latest:Option<(i64,String,String,Option<String>,String)>=self.db.query_row(
                     "SELECT o.id,o.work_key,o.state,e.evidence,o.revision FROM operations o LEFT JOIN operation_evidence e ON e.operation_id=o.id
-                     WHERE o.kind=?1 AND o.generation=?2 AND o.payload IS NULL AND o.job_id IS NULL AND o.txid IS NULL
-                     AND o.state IN ('model_unknown','superseded_model_unknown','rejected','retry_model','prelaunch_failed') ORDER BY o.id DESC LIMIT 1",
-                    params![kind.as_str(),control.generation],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
+                     WHERE o.kind=?1 AND (?2 IS NULL OR o.request ->> '$.solver.epoch' = ?2)
+                     AND (?3 IS NULL OR o.work_key=?3)
+                     AND (e.model_attempt IS NOT NULL OR o.state IN ('model_unknown','superseded_model_unknown','retry_model','prelaunch_failed','rejected'))
+                     ORDER BY o.id DESC LIMIT 1",
+                    params![kind.as_str(),if kind==LaneId::Answer { epoch } else { None },if kind==LaneId::Judge { op.as_ref().map(|op|op.key.as_str()) } else { None }],
+                    |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
                 if let Some((id, key, state, evidence, revision)) = latest {
-                    let used = self.model_budget_used(kind, &key)?;
+                    let assessment = self.model_retry_assessment(kind, &key, config, now())?;
                     let evidence = evidence.and_then(|e| serde_json::from_str::<Value>(&e).ok());
-                    lane["model"] = json!({"operation_id":id,"state":state,"budget_used":used,"budget_limit":preparation.max_attempts_per_work,
-                        "retry_eligible":used<preparation.max_attempts_per_work&&(state!="model_unknown"||preparation.retry_uncertain),
-                        "failure_category":evidence.as_ref().and_then(|e|e["reason"].as_str()).map(|reason|
-                            match reason {"model_unknown"|"model_spawn_failed"|"model_rejected"|"model_timeout"|"invalid_model_output"|"cancelled"=>reason,_=>"model_failure"}),
-                        "current_route":lane_revisions[kind.as_str()].as_str().map(|current| revision==current),
-                        "scope":if kind==LaneId::Answer{"current_work"}else{"historical_assignment"}});
+                    lane["model"] = serde_json::to_value(&assessment)?;
+                    let model = &mut lane["model"];
+                    model["operation_id"] = json!(id);
+                    model["state"] = json!(state);
+                    model["budget_used"] = json!(assessment.total_attempts);
+                    model["budget_limit"] = json!(assessment.attempt_limit);
+                    model["failure_category"] = json!(
+                        evidence
+                            .as_ref()
+                            .and_then(|e| e["reason"].as_str())
+                            .map(|reason| match reason {
+                                "model_unknown"
+                                | "model_spawn_failed"
+                                | "model_rejected"
+                                | "model_timeout"
+                                | "invalid_model_output"
+                                | "cancelled" => reason,
+                                _ => "model_failure",
+                            })
+                    );
+                    model["current_route"] = json!(
+                        lane_revisions[kind.as_str()]
+                            .as_str()
+                            .map(|current| revision == current)
+                    );
+                    model["scope"] = json!(if kind == LaneId::Answer
+                        || op.as_ref().is_some_and(|op| op.key == key)
+                    {
+                        "current_work"
+                    } else {
+                        "historical_assignment"
+                    });
                 }
             }
-            if kind == LaneId::Answer {
-                let original = epoch
-                    .map(|epoch| self.uncertain_answer(epoch))
-                    .transpose()?
-                    .flatten();
-                if let Some(original) = original {
-                    let retry_epoch = original.request["solver"]["epoch"]
-                        .as_u64()
-                        .context("answer epoch missing")?;
-                    let blocker = if let Some(reason) =
-                        Self::answer_retry_policy_blocker(&self.db, config, retry_epoch, None)?
-                    {
-                        Some((reason, None))
-                    } else {
-                        let totals = accounting.accounting(
-                            &self.db,
-                            config,
-                            kind,
-                            None,
-                            Some(original.id),
-                        )?;
-                        self.uncertainty_blocker_with(config, kind, Some(retry_epoch), &totals)?
-                    };
-                    let discovery = ReadKey::Discovery {
-                        lane: kind,
-                        source: DiscoverySource::Challenge,
-                    };
-                    let discovery_backoff = if matches!(key, ReadKey::Discovery { .. }) {
-                        backoff
-                    } else {
-                        self.read_backoff(&discovery)?
-                    };
-                    let discovery_at = self.discovery_next_at(config, kind, &discovery_backoff)?;
-                    let discovery_flight: bool = self.db.query_row(
-                        "SELECT COALESCE((SELECT in_flight FROM read_state
+            if kind == LaneId::Answer
+                && let Some(original) = original
+            {
+                let blocker = retry_blocker;
+                let discovery = ReadKey::Discovery {
+                    lane: kind,
+                    source: DiscoverySource::Challenge,
+                };
+                let discovery_backoff = if matches!(key, ReadKey::Discovery { .. }) {
+                    backoff
+                } else {
+                    self.read_backoff(&discovery)?
+                };
+                let discovery_at = self.discovery_next_at(config, kind, &discovery_backoff)?;
+                let discovery_flight: bool = self.db.query_row(
+                    "SELECT COALESCE((SELECT in_flight FROM read_state
                         WHERE owner='answer' AND purpose='discovery' AND resource='challenge'),0)",
-                        [],
-                        |r| r.get(0),
-                    )?;
-                    let (mut retry_reason, mut retry_at) = blocker
-                        .unwrap_or(("fresh_evidence_required", Some(now().max(discovery_at))));
-                    if blocker.is_none() {
-                        if observation.as_ref().is_some_and(|o| o["answered"] == true) {
-                            retry_reason = "hosted_answer_observed";
-                        } else if discovery_flight {
-                            retry_reason = "freshness_in_flight";
-                            retry_at = None;
-                        } else if discovery_backoff.next_at > now()
-                            || (discovery_backoff.failures > 0 && discovery_at > now())
-                        {
-                            retry_reason = "read_backoff";
-                            retry_at = Some(discovery_at);
-                        }
-                    }
-                    if stopped
-                        || reload
-                        || control.paused
-                        || lane_paused
-                        || config.mode(kind) != Mode::Active
+                    [],
+                    |r| r.get(0),
+                )?;
+                let (mut retry_reason, mut retry_at) =
+                    blocker.unwrap_or(("fresh_evidence_required", Some(now().max(discovery_at))));
+                if blocker.is_none() {
+                    if observation.as_ref().is_some_and(|o| o["answered"] == true) {
+                        retry_reason = "hosted_answer_observed";
+                    } else if discovery_flight {
+                        retry_reason = "freshness_in_flight";
+                        retry_at = None;
+                    } else if discovery_backoff.next_at > now()
+                        || (discovery_backoff.failures > 0 && discovery_at > now())
                     {
-                        retry_reason = reason;
-                        retry_at = next;
+                        retry_reason = "read_backoff";
+                        retry_at = Some(discovery_at);
                     }
-                    lane["retry"] = json!({"original_operation_id":original.id,"policy_eligible":blocker.is_none(),
+                }
+                if stopped
+                    || reload
+                    || control.paused
+                    || lane_paused
+                    || config.mode(kind) != Mode::Active
+                {
+                    retry_reason = reason;
+                    retry_at = next;
+                }
+                lane["retry"] = json!({"original_operation_id":original.id,"policy_eligible":blocker.is_none(),
                         "reason":retry_reason,"next_at":retry_at,
                         "next_action":if blocker.is_none(){"revalidate_challenge"}else{"await_retry_eligibility"},
                         "requires_fresh_eligibility":true,"manual_authorized":self.manual_authorized(kind,epoch)?});
-                }
             }
             if kind == LaneId::Judge {
-                let raw: Option<String> = self.db.query_row(
-                    "SELECT json_extract(lane_participation,'$.judge') FROM runtime_state WHERE singleton=1",
-                    [], |r| r.get(0)).optional()?.flatten();
-                let record = raw
-                    .map(|raw| serde_json::from_str::<Value>(&raw))
-                    .transpose()?;
-                lane["assessment"] = Value::Null;
-                if let Some(record) = record {
-                    let stamp: AdmissionStampSnapshot =
-                        serde_json::from_value(record["stamp"].clone())?;
-                    if Self::observation_stamp_matches(&self.db, kind, &stamp)? {
-                        lane["assessment"] = record["assessment"].clone();
-                    }
-                }
+                lane["assessment"] = assessment;
                 if op.is_none()
                     && lane["assessment"]["locally_judgeable"] == false
+                    && lane["assessment"]["exclusions"]["assignment_read_backoff"]
+                        .as_u64()
+                        .unwrap_or(0)
+                        == 0
+                    && lane["assessment"]["exclusions"]["assignment_resource_restricted"]
+                        .as_u64()
+                        .unwrap_or(0)
+                        == 0
                     && !in_flight
                     && backoff.next_at <= now()
                     && lane["phase"] == "observing"
@@ -675,7 +888,7 @@ impl Store {
             }
             work[kind.as_str()] = lane;
         }
-        Ok(work)
+        Ok((work, scopes))
     }
 
     pub(crate) fn status(&self, config: &Config) -> Result<Value> {
@@ -750,7 +963,7 @@ impl Store {
             .as_ref()
             .map(|config| accounting::AccountingReadSnapshot::load(&self.db, config))
             .transpose()?;
-        let mut work = if let Some(captured) = &effective_config {
+        let (mut work, work_scopes) = if let Some(captured) = &effective_config {
             self.work_projection(
                 captured,
                 policy
@@ -764,7 +977,7 @@ impl Store {
                     .context("effective accounting missing")?,
             )?
         } else {
-            json!({})
+            (json!({}), [RemoteWorkScope::default(); LaneId::COUNT])
         };
         let mut lanes = json!({});
         let mut affected = Vec::new();
@@ -798,7 +1011,7 @@ impl Store {
         let mut captured_work = Vec::new();
         let mut statement=self.db.prepare("SELECT o.id,o.kind,o.state,o.created_at,o.updated_at,o.next_at,o.revision,o.generation,o.binding_revision,
             e.model_deadline,e.http_deadline,e.blocked_since,e.evidence,e.policy,COALESCE(t.retry_not_before,0),
-            e.model_attempt,o.job_id IS NOT NULL,o.txid IS NOT NULL,o.request -> '$.solver.epoch'
+            e.model_attempt,o.job_id IS NOT NULL,o.txid IS NOT NULL,o.request -> '$.solver.epoch',o.work_key
             FROM operations o LEFT JOIN operation_evidence e ON e.operation_id=o.id LEFT JOIN operation_timing t ON t.operation_id=o.id
             WHERE o.state IN ('generating','generated','prepared','retry','dispatching','queued','unknown','included_pending','confirmed') ORDER BY o.id")?;
         let mut rows = statement.query([])?;
@@ -855,6 +1068,22 @@ impl Store {
                     .map(|value| serde_json::from_str::<Value>(&value))
                     .transpose()?
                     .and_then(|value| value.as_u64());
+                entry["epoch"] = json!(epoch);
+                entry["work_class"] = json!(match state.as_str() {
+                    "unknown" => "retained_uncertainty",
+                    "queued" | "included_pending" | "confirmed" => "pending_remote",
+                    _ => "active_local",
+                });
+                let scope = work_scopes[LaneId::ALL
+                    .iter()
+                    .position(|lane| *lane == kind)
+                    .expect("known lane")];
+                entry["nonblocking_for_fresh_work"] = json!(scope.background(
+                    &state,
+                    epoch,
+                    (kind == LaneId::Judge).then_some(&work["judge"]["assessment"]),
+                    row.get_ref(19)?.as_str()?
+                ));
                 entry["admission"] = self
                     .admission_projection_with(policy, kind, epoch, candidate.as_ref(), accounting)?
                     .value;

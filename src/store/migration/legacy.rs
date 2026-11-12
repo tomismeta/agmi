@@ -1,6 +1,8 @@
 //! The only reader of the retired configuration shape.
 use super::*;
-use crate::config::{HistoricalAnswerCapacity, ModelConfig, NetworkConfig, ParticipationMode};
+use crate::config::{
+    CountLimit, HistoricalAnswerCapacity, ModelConfig, NetworkConfig, ParticipationMode,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -202,12 +204,10 @@ impl Legacy {
             ("mine", self.capabilities.mine, p.allow_mine),
         ] {
             let cap = match caps {
-                Some(c) => c[lane]
-                    .as_u64()
-                    .context("explicit positive lane cap required")?,
-                None => u64::from(p.max_unresolved_operations),
+                Some(c) => serde_json::from_value::<CountLimit>(c[lane].clone())
+                    .context("explicit positive lane cap or unbounded required")?,
+                None => CountLimit::Bounded(p.max_unresolved_operations),
             };
-            ensure!(cap > 0 && cap <= u64::from(u32::MAX), "invalid lane cap");
             let out = &mut value["capabilities"][lane];
             out["mode"] = json!(mode);
             out["participation"]["mode"] = json!(if allowed {
@@ -267,8 +267,26 @@ impl Legacy {
     pub(super) fn risk(&self, candidate: &Config, unresolved: [u64; 3]) -> Value {
         let p = &self.participation;
         let kinds = LaneId::ALL;
-        let caps =
-            kinds.map(|kind| u64::from(candidate.participation(kind).max_unresolved_operations));
+        let caps = kinds.map(|kind| candidate.participation(kind).max_unresolved_operations);
+        let unbounded_exposure = caps.iter().any(|cap| cap.finite().is_none());
+        let model_cost_increased = [LaneId::Answer, LaneId::Judge].iter().any(|&kind| {
+            let preparation = candidate.preparation(kind).expect("model lane");
+            preparation
+                .max_attempts_per_work
+                .finite()
+                .is_none_or(|limit| limit > self.preparation.max_attempts_per_work)
+                || (preparation.retry_uncertain && !self.preparation.retry_uncertain)
+                || preparation.max_uncertain_replacements_per_work > 1
+                || (preparation.while_blocked
+                    && !match kind {
+                        LaneId::Answer => {
+                            self.preparation.answer_while_blocked
+                                || (p.mode != ParticipationMode::Strict && p.allow_answer)
+                        }
+                        LaneId::Judge => p.mode != ParticipationMode::Strict && p.allow_judge,
+                        LaneId::Mine => false,
+                    })
+        });
         let all_strict = kinds
             .iter()
             .all(|kind| candidate.participation(*kind).mode == ParticipationMode::Strict);
@@ -299,16 +317,27 @@ impl Legacy {
                     0
                 },
         );
-        let exposure: u64 = caps
+        let aggregate_caps = caps.iter().try_fold(0u64, |sum, cap| {
+            cap.finite().map(|limit| sum + u64::from(limit))
+        });
+        let exposure = caps
             .iter()
             .zip(unresolved)
-            .map(|(cap, u)| (*cap).max(u))
-            .sum();
-        let preserved = all_strict || (no_recharge && same_or_stricter && exposure <= bound);
+            .try_fold(0u64, |sum, (cap, used)| {
+                cap.finite().map(|limit| sum + u64::from(limit).max(used))
+            });
+        let preserved = !unbounded_exposure
+            && !model_cost_increased
+            && (all_strict
+                || (no_recharge
+                    && same_or_stricter
+                    && exposure.is_some_and(|value| value <= bound)));
         json!({"old_shared_max":p.max_unresolved_operations,"old_answer_reserved_slots":p.answer_reserved_slots,
-            "proposed_caps":caps,"aggregate_caps":caps.iter().sum::<u64>(),"unresolved_by_kind":unresolved,
+            "proposed_caps":caps,"aggregate_caps":aggregate_caps,"unresolved_by_kind":unresolved,
             "exposure_including_backlog":exposure,"conservative_old_bound":bound,
-            "over_cap":caps.iter().zip(unresolved).map(|(c,u)| u.saturating_sub(*c)).collect::<Vec<_>>(),
+            "over_cap":caps.iter().zip(unresolved).map(|(c,u)| c.finite().map(|limit| u.saturating_sub(u64::from(limit)))).collect::<Vec<_>>(),
+            "unbounded_exposure":unbounded_exposure,"model_cost_increased":model_cost_increased,
+            "recurring_inference_possible":([LaneId::Answer,LaneId::Judge].iter().any(|&kind| candidate.preparation(kind).is_some_and(|p|p.max_attempts_per_work.finite().is_none()))),
             "historical_recharge_possible":!no_recharge,"preservation_proven":preserved,
             "risk_change_required":!preserved,"old_policy":p,
             "new_policies":kinds.map(|kind| serde_json::to_value(candidate.participation(kind)).unwrap()),

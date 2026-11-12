@@ -3,6 +3,23 @@ use super::*;
 /// Additive DDL only. Migration owns legacy conversion and authority establishment.
 pub(super) fn initialize_schema(db: &Connection) -> Result<()> {
     db.execute_batch(SCHEMA)?;
+    initialize_query_indexes(db)
+}
+
+/// Rebuildable access paths, shared by fresh journals and validated writer opens.
+pub(super) fn initialize_query_indexes(db: &Connection) -> Result<()> {
+    db.execute_batch(
+        "CREATE INDEX IF NOT EXISTS operations_reconciliation ON operations(kind,id)
+         WHERE state IN ('queued','unknown','included_pending','confirmed')
+         AND (job_id IS NOT NULL OR txid IS NOT NULL);
+         CREATE INDEX IF NOT EXISTS operations_model_key ON operations(kind,work_key COLLATE NOCASE);
+         CREATE INDEX IF NOT EXISTS operations_model_retry_recent ON operations(kind,updated_at DESC,id DESC)
+         WHERE state IN ('rejected','model_unknown')
+         AND payload IS NULL AND job_id IS NULL AND txid IS NULL;
+         CREATE INDEX IF NOT EXISTS operations_model_retry_fair ON operations(kind,id DESC)
+         WHERE state IN ('rejected','model_unknown')
+         AND payload IS NULL AND job_id IS NULL AND txid IS NULL;",
+    )?;
     Ok(())
 }
 

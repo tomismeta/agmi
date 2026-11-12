@@ -312,7 +312,7 @@ credential_file = {json.dumps(str(self.key))}
         return result
 
     def status(self):
-        return self.invoke('status')
+        return self.invoke('status', '--verbose')
 
     def start(self, resume=False):
         assert self.child is None

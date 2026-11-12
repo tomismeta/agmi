@@ -370,10 +370,8 @@ fn prepare(path: &Path, input: &Value) -> Result<Prepared> {
         );
         for kind in LaneId::ALL {
             ensure!(
-                caps[kind.as_str()].as_u64()
-                    == Some(u64::from(
-                        config.participation(kind).max_unresolved_operations
-                    )),
+                caps[kind.as_str()]
+                    == serde_json::to_value(config.participation(kind).max_unresolved_operations)?,
                 "explicit caps and candidate caps differ"
             );
         }

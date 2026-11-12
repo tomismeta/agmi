@@ -443,6 +443,7 @@ pub(crate) fn diagnostics(data: &mut Value, config: Option<&Path>) {
                 Some("Legacy identity evidence does not establish the original failure or current verification. Doctor --repair can normalize an eligible legacy false flag while retaining uncertainty; it cannot verify identity or repair credentials."),
             "api_routing_mismatch" => Some("Restore the bound network.api profile shown by status. Routing changes require a stopped controller and no unresolved or reusable work; never erase evidence to bypass this boundary."),
             "model_execution_unresolved" => Some("Retained model uncertainty is risk evidence, not necessarily a current blocker. Inspect the affected lane before considering stopped-writer recover-model; never reset an unresolved network request."),
+            "background_remote_work_retained" => Some("Retained remote outcomes remain risk and reconciliation evidence, not a current participation dependency. Background follow-up does not authorize replay, clear uncertainty or require increasing budgets."),
             "no_active_capabilities" => Some("Review model authentication, routes, guidance and desired capability modes before explicitly changing configuration."),
             _ => None,
         };
@@ -462,6 +463,12 @@ pub(crate) fn diagnostics(data: &mut Value, config: Option<&Path>) {
         for detail in work.values_mut() {
             detail["next_actions"] =
                 intervention_actions(&detail["intervention"], &diagnostics, config, checked_at);
+            if detail["background_recovery"]["count"].as_u64().unwrap_or(0) > 0 {
+                detail["background_recovery"]["next_actions"] = json!([
+                    action(config, &["operations", "list"], false),
+                    action(config, &["reads"], false),
+                ]);
+            }
         }
     }
     for lane in agmi::capability::LaneId::NAMES {
@@ -656,7 +663,7 @@ fn intervention_actions(
             }
             if command == ["recover-model"] {
                 actions.push(json!({"kind":"instruction","authorization_required":false,
-                    "message":"Inspect retained model evidence and stop its controller before explicitly authorizing model-only abandonment. This may incur another model charge and never resets sent network requests."}));
+                    "message":"Inspect retained model evidence and stop its controller before explicitly authorizing model-only abandonment. Abandonment does not refund execution exposure or grant another attempt; eligible regeneration may incur another model charge. Sent network requests are never reset."}));
             }
             actions.push(action(
                 config,
@@ -718,12 +725,13 @@ pub(crate) fn human(kind: &str, data: &Value) {
         ),
         "status" => {
             println!(
-                "Local status: initialized={} paused={} (local snapshot; not a health verdict)",
+                "Local status: initialized={} paused={} (local evidence only)",
                 fmt_json(&data["initialized"]),
                 fmt_json(&data["paused"])
             );
             println!(
-                "Scope: controller/work evidence with default diagnostic thresholds; full health not assessed."
+                "Operational: {} (default diagnostic thresholds; state filesystem not assessed).",
+                data["operational"]["status"].as_str().unwrap_or("unknown")
             );
             print_core_row(data);
             for lane in agmi::capability::LaneId::NAMES {
@@ -1044,6 +1052,40 @@ fn print_risk_caveat(data: &Value) {
         && count > 0
     {
         println!("Risk admissions: {count} (retained history).");
+    }
+    if let Some(count) = data["risk"]["background_remote_work"].as_u64()
+        && count > 0
+    {
+        println!(
+            "Background follow-up: {count} remote operations; retained risk, not current participation blockers."
+        );
+    }
+    if data["healthy"] == true && data["attention_required"] == true {
+        println!(
+            "Operationally healthy; retained risk or warnings still require attention, not replay."
+        );
+    }
+    let mut first = true;
+    for lane in agmi::capability::LaneId::ALL {
+        let nonblocking = data["participation"]["lanes"][lane.as_str()]["retained_uncertainty_nonblocking"]
+            == true
+            || data["risk"]["retained_uncertainty_nonblocking_lanes"]
+                .as_array()
+                .is_some_and(|lanes| {
+                    lanes
+                        .iter()
+                        .any(|value| value.as_str() == Some(lane.as_str()))
+                });
+        if nonblocking {
+            if first {
+                print!("Risk policy: retained uncertainty does not block distinct fresh work in");
+                first = false;
+            }
+            print!(" {}", lane.as_str());
+        }
+    }
+    if !first {
+        println!("; same-work replay remains fenced.");
     }
     if let Some(warnings) = data["warnings"].as_array()
         && !warnings.is_empty()

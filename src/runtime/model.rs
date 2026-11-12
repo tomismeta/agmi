@@ -107,8 +107,7 @@ impl ModelSlot {
             || !host.active(kind)?
             || host.store.preparation(kind)?.is_some()
             || (retry.is_none() && host.store.attempted(kind, key)?)
-            || host.store.model_retry_not_before(kind, key)? > host.deadline_now()
-            || host.store.model_budget_used(kind, key)? >= host.model_attempt_limit(kind)?
+            || host.model_retry_blocker(kind, key)?.is_some()
             || !host.preparation_allowed(kind, request.request().epoch)?
         {
             return Ok(false);
@@ -134,7 +133,7 @@ impl ModelSlot {
             return Ok(false);
         }
         let max_attempts = host.model_attempt_limit(kind)?;
-        if host.store.model_budget_used(kind, key)? >= max_attempts
+        if host.model_retry_blocker(kind, key)?.is_some()
             || !host.preparation_allowed(kind, request.request().epoch)?
         {
             return Ok(false);
@@ -159,8 +158,22 @@ impl ModelSlot {
             .config
             .preparation(kind)
             .context("model preparation missing")?;
+        let entry_policy = host
+            .once
+            .as_ref()
+            .and_then(|plan| plan.entry_config.preparation(kind));
+        let retry_uncertain =
+            policy.retry_uncertain && entry_policy.is_none_or(|entry| entry.retry_uncertain);
+        let uncertain_replacements =
+            entry_policy.map_or(policy.max_uncertain_replacements_per_work, |entry| {
+                policy
+                    .max_uncertain_replacements_per_work
+                    .min(entry.max_uncertain_replacements_per_work)
+            });
         let captured = json!({"schema_version":2,"model":model,"lane_revision":stamp.lane_config_revision,
-            "model_seconds":timeout,"attempt":count+1,"retry_uncertain":policy.retry_uncertain,
+            "producer_revision":host.config.producer_revision(kind)?,
+            "model_seconds":timeout,"attempt":count+1,"retry_uncertain":retry_uncertain,
+            "max_uncertain_replacements_per_work":uncertain_replacements,
             "max_attempts_per_work":max_attempts,"configured_max_attempts_per_work":policy.max_attempts_per_work});
         let draft = ModelProducerDraft {
             task_kind: if kind == LaneId::Answer {
@@ -461,6 +474,7 @@ impl ModelSlot {
             .operation(work.op.id)?
             .context("pending operation missing")?;
         op.state = "discarded".into();
+        op.next_at = model_retry_deadline(host, &op)?;
         host.store
             .finish_model_attempt(&work.producer.operation, &op, &completion.evidence, reason)
     }

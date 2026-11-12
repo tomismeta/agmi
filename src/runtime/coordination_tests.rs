@@ -1246,3 +1246,97 @@ async fn detached_next_at_cannot_accelerate_answer_or_displace_an_eligible_mine_
         "completed"
     );
 }
+
+#[test]
+fn once_model_admission_intersects_entry_counts_uncertainty_and_retry_deadlines() {
+    use crate::config::CountLimit;
+    let (_temp, mut runtime, _stop) = fixture();
+    runtime
+        .config
+        .capabilities
+        .answer
+        .preparation
+        .max_attempts_per_work = 2.into();
+    runtime.once = Some(OncePlan::capture(&runtime).unwrap());
+    runtime
+        .config
+        .capabilities
+        .answer
+        .preparation
+        .max_attempts_per_work = CountLimit::Unbounded;
+    assert_eq!(
+        runtime.model_attempt_limit(LaneId::Answer).unwrap(),
+        2.into()
+    );
+
+    let mut unknown = runtime
+        .store
+        .seed_operation_for_test(
+            LaneId::Answer,
+            "8:once-policy",
+            "generating",
+            &json!({}),
+            runtime.store.control().unwrap(),
+            &runtime.config.lane_revision(LaneId::Answer).unwrap(),
+        )
+        .unwrap();
+    unknown.state = "model_unknown".into();
+    runtime
+        .store
+        .seed_transition_for_test(&unknown, "model_unknown")
+        .unwrap();
+    runtime
+        .config
+        .capabilities
+        .answer
+        .preparation
+        .retry_uncertain = true;
+    assert!(
+        runtime
+            .store
+            .model_retry_assessment(LaneId::Answer, &unknown.key, &runtime.config, now(),)
+            .unwrap()
+            .retry_eligible
+    );
+    assert_eq!(
+        runtime
+            .model_retry_blocker(LaneId::Answer, &unknown.key)
+            .unwrap(),
+        Some("model_uncertain_retry_disabled")
+    );
+
+    // A retry becoming due after entry is not part of this finite invocation.
+    runtime
+        .once
+        .as_mut()
+        .unwrap()
+        .entry_config
+        .capabilities
+        .answer
+        .preparation
+        .retry_uncertain = true;
+    let entry = runtime.once.as_ref().unwrap().entry_at;
+    unknown.next_at = entry + 60;
+    runtime
+        .store
+        .seed_transition_for_test(&unknown, "model_retry_deferred")
+        .unwrap();
+    assert_eq!(
+        runtime
+            .model_retry_blocker(LaneId::Answer, &unknown.key)
+            .unwrap(),
+        Some("model_retry_cooldown")
+    );
+    runtime
+        .config
+        .capabilities
+        .answer
+        .preparation
+        .max_attempts_per_work = 1.into();
+    assert_eq!(
+        runtime
+            .model_retry_blocker(LaneId::Answer, &unknown.key)
+            .unwrap(),
+        Some("model_budget_exhausted")
+    );
+}

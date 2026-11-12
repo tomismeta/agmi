@@ -17,6 +17,30 @@ fn run_health(config: &Config, args: &[&str]) -> (tempfile::TempDir, std::proces
 }
 
 #[test]
+fn default_health_omits_retained_trees_but_verbose_preserves_them() {
+    let (_dir, config, _db, _at) = initialized_health_fixture();
+    let (_config_dir, compact) = run_health(&config, &["--min-free-mib", "0"]);
+    let compact: Value = serde_json::from_slice(&compact.stdout).unwrap();
+    let (_config_dir, verbose) = run_health(&config, &["--min-free-mib", "0", "--verbose"]);
+    let verbose: Value = serde_json::from_slice(&verbose.stdout).unwrap();
+    assert!(compact["data"].get("pending_work").is_none());
+    assert!(verbose["data"]["pending_work"].is_array());
+    assert_eq!(
+        compact["data"]["pending_work_count"],
+        verbose["data"]["pending_work"].as_array().unwrap().len()
+    );
+    for field in [
+        "healthy",
+        "admission_blocked",
+        "effective_capabilities",
+        "observations",
+        "intervention",
+    ] {
+        assert_eq!(compact["data"][field], verbose["data"][field], "{field}");
+    }
+}
+
+#[test]
 fn missing_installation_is_nonzero_structured_and_does_not_initialize_state() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = Config::default();
@@ -162,10 +186,22 @@ fn health_before_onboarding_is_structured_read_only_and_preserves_config_selecti
         assert!(envelope["data"]["risk"]["unresolved_effects"].is_null());
         assert_eq!(envelope["data"]["intervention"]["status"], "undetermined");
         assert_eq!(envelope["data"]["intervention"]["unattended"], Value::Null);
+        assert_eq!(
+            envelope["data"]["assessment_scope"]["state_filesystem"],
+            "not_assessed"
+        );
         for kind in ["answer", "judge", "mine"] {
             assert_eq!(
                 envelope["data"]["work"][kind]["intervention"]["status"],
                 "undetermined"
+            );
+            assert_eq!(
+                envelope["data"]["work"][kind]["operational"]["state"],
+                "unknown"
+            );
+            assert_eq!(
+                envelope["data"]["work"][kind]["operational"]["reasons"],
+                serde_json::json!([code])
             );
         }
         assert_eq!(envelope["data"]["mutations"], false);
@@ -365,7 +401,7 @@ fn pending_execution_bound_reaches_health_cli_without_becoming_launch_authority(
         ],
     )
     .unwrap();
-    let (_config_dir, before) = run_health(&config, &["--min-free-mib", "0"]);
+    let (_config_dir, before) = run_health(&config, &["--min-free-mib", "0", "--verbose"]);
     assert!(before.status.success(), "{before:?}");
     let before: Value = serde_json::from_slice(&before.stdout).unwrap();
     for field in ["pending_work", "captured_work"] {
@@ -719,4 +755,873 @@ fn paused_current_bindings_keep_read_failures_without_folding_unrelated_reads() 
             }
         }
     }
+}
+
+fn persist_diagnostic_policy(config: &Config, db: &rusqlite::Connection) {
+    use serde_json::json;
+    let mut policy = serde_json::to_value(config).unwrap();
+    policy["schema_version"] = json!(2);
+    policy["lane_revisions"] = json!({"answer":"fixture","judge":"fixture","mine":"fixture"});
+    db.execute("UPDATE runtime_policy SET policy=?1", [policy.to_string()])
+        .unwrap();
+}
+
+fn diagnostic_lane(
+    config: &mut Config,
+    db: &rusqlite::Connection,
+    lane: &str,
+    limit: agmi::config::CountLimit,
+    at: i64,
+) {
+    use agmi::config::{Mode, ParticipationMode};
+    use serde_json::json;
+    config.capabilities.answer.mode = if lane == "answer" {
+        Mode::Active
+    } else {
+        Mode::Off
+    };
+    config.capabilities.judge.mode = if lane == "judge" {
+        Mode::Active
+    } else {
+        Mode::Off
+    };
+    config.capabilities.mine.mode = if lane == "mine" {
+        Mode::Active
+    } else {
+        Mode::Off
+    };
+    config.capabilities.answer.participation.mode = ParticipationMode::ParticipationFirst;
+    config
+        .capabilities
+        .answer
+        .participation
+        .uncertainty_grace_seconds = 0;
+    config
+        .capabilities
+        .answer
+        .participation
+        .max_unresolved_operations = limit;
+    config.capabilities.judge.participation.mode = ParticipationMode::ParticipationFirst;
+    config
+        .capabilities
+        .judge
+        .participation
+        .uncertainty_grace_seconds = 0;
+    config
+        .capabilities
+        .judge
+        .participation
+        .max_unresolved_operations = limit;
+    config.capabilities.mine.participation.mode = ParticipationMode::ParticipationFirst;
+    config
+        .capabilities
+        .mine
+        .participation
+        .uncertainty_grace_seconds = 0;
+    config
+        .capabilities
+        .mine
+        .participation
+        .max_unresolved_operations = limit;
+    config.capabilities.mine.schedule.each_epoch = true;
+    persist_diagnostic_policy(config, db);
+    if lane != "judge" {
+        db.execute("INSERT OR REPLACE INTO lane_observations
+            (lane,authority_epoch,generation,request_sequence,started_at,observed_at,epoch,first_observed_at,answered,fingerprint,challenge)
+            SELECT ?1,1,generation,1,?2,?2,2,?2,0,'fixture','{}' FROM control",
+            rusqlite::params![lane,at]).unwrap();
+    }
+    db.execute(
+        "INSERT OR REPLACE INTO read_state(owner,purpose,resource,last_success_at,status)
+        VALUES(?1,'discovery',?2,?3,200)",
+        rusqlite::params![
+            lane,
+            if lane == "judge" {
+                "assignments"
+            } else {
+                "challenge"
+            },
+            at
+        ],
+    )
+    .unwrap();
+    if lane == "judge" {
+        db.execute("UPDATE runtime_state SET lane_participation=json_set(lane_participation,
+            '$.judge.assessment.locally_judgeable',json('true'),
+            '$.judge.assessment.observed_opportunities',1,'$.judge.assessment.eligible_candidates',1)",
+            []).unwrap();
+    }
+    // Keep serialized effective modes coherent with the canonical policy.
+    db.execute(
+        "UPDATE runtime_state SET capabilities=?1",
+        [json!({"answer":config.capabilities.answer.mode,
+            "judge":config.capabilities.judge.mode,"mine":config.capabilities.mine.mode})
+        .to_string()],
+    )
+    .unwrap();
+}
+
+fn retained_remote(db: &rusqlite::Connection, lane: &str, state: &str, epoch: u64, at: i64) {
+    use serde_json::json;
+    let receipt = matches!(state, "included_pending" | "confirmed");
+    db.execute("INSERT INTO operations
+        (id,kind,work_key,state,request,payload,generation,revision,created_at,updated_at,job_id,txid,binding_revision)
+        SELECT 1,?1,?2,?3,?4,'{}',generation,'fixture',?5,?5,?6,?7,1 FROM control",
+        rusqlite::params![lane,format!("{epoch}:retained"),state,
+            json!({"solver":{"epoch":epoch}}).to_string(),at-10000,
+            if receipt {None} else {Some("retained-job")},
+            if receipt {Some("a".repeat(64))} else {None}]).unwrap();
+    db.execute("INSERT INTO read_state
+        (owner,purpose,resource,operation_id,binding_revision,failures,last_failure_at,failure_category,status,local_next_at)
+        VALUES(?1,?2,'1:1',1,1,3,?3,'http',404,?4)",
+        rusqlite::params![lane,if receipt {"receipt"} else {"job"},at,at+60]).unwrap();
+}
+
+fn diagnostic_health(config: &Config) -> Value {
+    agmi::health::check(
+        config,
+        agmi::health::Options {
+            min_free_mib: 0,
+            ..agmi::health::Options::default()
+        },
+    )
+    .unwrap()
+}
+
+#[test]
+fn finite_and_unbounded_remote_history_is_risk_across_every_lane_and_surface() {
+    use agmi::config::CountLimit;
+    for lane in ["answer", "judge", "mine"] {
+        for limit in [CountLimit::Bounded(4), CountLimit::Unbounded] {
+            for state in ["unknown", "queued", "included_pending", "confirmed"] {
+                let (_dir, mut config, db, at) = initialized_health_fixture();
+                diagnostic_lane(&mut config, &db, lane, limit, at);
+                retained_remote(&db, lane, state, 1, at);
+                let version: i64 = db
+                    .query_row("PRAGMA data_version", [], |row| row.get(0))
+                    .unwrap();
+                let health = diagnostic_health(&config);
+                let status = agmi::runtime::status(&config).unwrap();
+                for report in [&health, &status] {
+                    assert_eq!(
+                        report["healthy"], true,
+                        "{lane}/{limit:?}/{state}: {report}"
+                    );
+                    assert_eq!(report["operational"]["status"], "clear");
+                    assert_eq!(report["components"][lane]["state"], "ok");
+                    assert_eq!(report["work"][lane]["operational"]["state"], "ok");
+                    assert_eq!(report["risk"]["background_remote_work"], 1);
+                    assert_eq!(report["risk"]["attention_required"], true);
+                    assert_eq!(report["attention_required"], true);
+                    assert_eq!(
+                        report["work"][lane]["background_recovery"]["bound_count"],
+                        1
+                    );
+                    assert_eq!(report["pending_work"][0]["state"], state);
+                    assert_eq!(
+                        report["pending_work"][0]["nonblocking_for_fresh_work"],
+                        true
+                    );
+                    assert_eq!(report["participation"]["lanes"][lane]["allowed"], true);
+                    assert_ne!(report["work"][lane]["next_action"], "read_job");
+                    assert_ne!(report["work"][lane]["next_action"], "read_receipt");
+                    assert_eq!(
+                        report["components"]["api"]["resources"][0]["health"]["state"],
+                        "degraded"
+                    );
+                }
+                assert_eq!(
+                    status["assessment_scope"]["state_filesystem"],
+                    "not_assessed"
+                );
+                if limit == CountLimit::Bounded(4) && state == "queued" {
+                    let path = config
+                        .state_dir
+                        .parent()
+                        .unwrap()
+                        .join("diagnostic-config.toml");
+                    fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+                    for command in ["status", "health", "doctor"] {
+                        let mut process = Command::new(env!("CARGO_BIN_EXE_agmi"));
+                        process.arg("--config").arg(&path).args(["--json", command]);
+                        if command == "health" {
+                            process.args(["--min-free-mib", "0"]);
+                        }
+                        let output = process.output().unwrap();
+                        assert!(
+                            output.status.success(),
+                            "{command}: {}",
+                            String::from_utf8_lossy(&output.stdout)
+                        );
+                        let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+                        let report = &envelope["data"];
+                        assert_eq!(report["operational"]["status"], "clear");
+                        assert_eq!(report["risk"]["background_remote_work"], 1);
+                        assert_eq!(
+                            report["work"][lane]["background_recovery"]["bound_count"],
+                            1
+                        );
+                        assert!(
+                            report["work"][lane]["background_recovery"]["next_actions"].is_array()
+                        );
+                        assert_eq!(
+                            report["components"]["api"]["background_resources"]["degraded"],
+                            1
+                        );
+                    }
+                }
+                let after: i64 = db
+                    .query_row("PRAGMA data_version", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(after, version, "diagnostics mutated the journal");
+            }
+        }
+    }
+}
+
+#[test]
+fn finite_capacity_and_strict_gates_survive_background_recovery() {
+    use agmi::config::{CountLimit, ParticipationMode};
+    for lane in ["answer", "judge", "mine"] {
+        let (_dir, mut config, db, at) = initialized_health_fixture();
+        diagnostic_lane(&mut config, &db, lane, CountLimit::Bounded(1), at);
+        retained_remote(&db, lane, "unknown", 1, at);
+        let full = diagnostic_health(&config);
+        assert_eq!(full["healthy"], false, "{full}");
+        assert_eq!(
+            full["participation"]["lanes"][lane]["reason"],
+            "lane_unresolved_capacity"
+        );
+        assert_eq!(full["work"][lane]["background_recovery"]["count"], 0);
+        assert_eq!(full["components"][lane]["state"], "blocked");
+        diagnostic_lane(&mut config, &db, lane, CountLimit::Bounded(4), at);
+        assert_eq!(diagnostic_health(&config)["healthy"], true);
+        match lane {
+            "answer" => config.capabilities.answer.participation.mode = ParticipationMode::Strict,
+            "judge" => config.capabilities.judge.participation.mode = ParticipationMode::Strict,
+            _ => config.capabilities.mine.participation.mode = ParticipationMode::Strict,
+        }
+        persist_diagnostic_policy(&config, &db);
+        let strict = diagnostic_health(&config);
+        assert_eq!(strict["healthy"], false);
+        assert_eq!(
+            strict["participation"]["lanes"][lane]["reason"],
+            "account_uncertainty"
+        );
+        assert_eq!(strict["pending_work"][0]["state"], "unknown");
+    }
+}
+
+#[test]
+fn same_work_without_a_viable_path_is_not_background_or_healthy() {
+    use agmi::config::CountLimit;
+    for lane in ["answer", "judge", "mine"] {
+        let (_dir, mut config, db, at) = initialized_health_fixture();
+        diagnostic_lane(&mut config, &db, lane, CountLimit::Bounded(4), at);
+        retained_remote(&db, lane, "unknown", 2, at);
+        // Isolate the work obligation from a transport failure.
+        db.execute("DELETE FROM read_state WHERE purpose='job'", [])
+            .unwrap();
+        if lane == "judge" {
+            db.execute(
+                "UPDATE runtime_state SET lane_participation=json_set(lane_participation,
+                '$.judge.assessment.locally_judgeable',json('false'),
+                '$.judge.assessment.eligible_candidates',0,
+                '$.judge.assessment.exclusions',json('{\"already_attempted\":1}'),
+                '$.judge.assessment.excluded_work',json('[{\"work_key\":\"2:retained\",\"reason\":\"already_attempted\"}]'),
+                '$.judge.assessment.excluded_work_truncated',json('false'))",
+                [],
+            )
+            .unwrap();
+        }
+        let health = diagnostic_health(&config);
+        assert_eq!(health["healthy"], false, "{lane}: {health}");
+        assert_eq!(health["components"][lane]["state"], "blocked");
+        assert_eq!(health["work"][lane]["background_recovery"]["count"], 0);
+        assert_eq!(
+            health["pending_work"][0]["nonblocking_for_fresh_work"],
+            false
+        );
+        assert!(
+            health["issues"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|issue| issue == "current_work_outcome_unresolved")
+        );
+        assert!(
+            !health["issues"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|issue| issue == "pending_work_overdue")
+        );
+    }
+}
+
+#[test]
+fn accepted_linked_answer_and_current_confirmed_receipt_are_followup_not_failure() {
+    use agmi::config::{CountLimit, HistoricalAnswerCapacity};
+    let (_dir, mut config, db, at) = initialized_health_fixture();
+    diagnostic_lane(&mut config, &db, "answer", CountLimit::Bounded(1), at);
+    config
+        .capabilities
+        .answer
+        .participation
+        .historical_unknown_answer_capacity = HistoricalAnswerCapacity::AcceptedLinked;
+    persist_diagnostic_policy(&config, &db);
+    retained_remote(&db, "answer", "unknown", 2, at);
+    db.execute("UPDATE operations SET job_id=NULL WHERE id=1", [])
+        .unwrap();
+    db.execute("DELETE FROM read_state WHERE purpose='job'", [])
+        .unwrap();
+    db.execute(
+        "INSERT INTO operation_evidence(operation_id,dispatch_sequence) VALUES(1,1)",
+        [],
+    )
+    .unwrap();
+    db.execute("INSERT INTO operations
+        (id,kind,work_key,state,request,payload,generation,revision,created_at,updated_at,txid,binding_revision)
+        SELECT 2,'answer','2:accepted','confirmed',request,payload,generation,revision,created_at,updated_at,?1,1
+        FROM operations WHERE id=1", ["b".repeat(64)]).unwrap();
+    db.execute(
+        "INSERT INTO operation_links(operation_id,retry_of,payload_reused) VALUES(2,1,1)",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE lane_observations SET answered=1 WHERE lane='answer'",
+        [],
+    )
+    .unwrap();
+    db.execute("INSERT INTO read_state
+        (owner,purpose,resource,operation_id,binding_revision,failures,last_failure_at,failure_category,status)
+        VALUES('answer','receipt','2:1',2,1,2,?1,'transport',503)", [at]).unwrap();
+    let report = diagnostic_health(&config);
+    assert_eq!(report["healthy"], true, "{report}");
+    assert_eq!(
+        report["participation"]["lanes"]["answer"]["capacity_exempt_count"],
+        1
+    );
+    assert_eq!(report["risk"]["unresolved_effects"], 1);
+    assert_eq!(report["risk"]["background_remote_work"], 2);
+    assert_eq!(
+        report["work"]["answer"]["background_recovery"]["unbound_count"],
+        1
+    );
+    assert_eq!(
+        report["work"]["answer"]["background_recovery"]["bound_count"],
+        1
+    );
+    assert_eq!(report["components"]["answer"]["state"], "ok");
+    assert_eq!(report["work"]["answer"]["progress"], "complete");
+    assert_eq!(report["pending_work"][0]["state"], "unknown");
+    assert_eq!(report["pending_work"][1]["state"], "confirmed");
+}
+
+#[test]
+fn background_history_cannot_supply_missing_inventory_or_hide_current_failures() {
+    use agmi::config::CountLimit;
+    let (_dir, mut config, db, at) = initialized_health_fixture();
+    diagnostic_lane(&mut config, &db, "judge", CountLimit::Bounded(4), at);
+    retained_remote(&db, "judge", "queued", 1, at);
+    db.execute("UPDATE runtime_state SET lane_participation=json_set(lane_participation,
+        '$.judge.assessment.locally_judgeable',json('false'),'$.judge.assessment.observed_opportunities',0,
+        '$.judge.assessment.eligible_candidates',0)", []).unwrap();
+    let idle = diagnostic_health(&config);
+    assert_eq!(idle["healthy"], true, "{idle}");
+    assert_eq!(idle["work"]["judge"]["progress"], "idle");
+    for mutation in [
+        "UPDATE runtime_state SET lane_participation=json_set(lane_participation,'$.judge.assessment.completeness','bounded_partial')",
+        "UPDATE runtime_state SET lane_participation=json_set(lane_participation,'$.judge.assessment.completeness','complete','$.judge.assessment.valid_until',0)",
+        "UPDATE runtime_state SET lane_participation=NULL",
+    ] {
+        db.execute(mutation, []).unwrap();
+        let missing = diagnostic_health(&config);
+        assert_eq!(missing["healthy"], false, "{missing}");
+        assert_eq!(missing["components"]["judge"]["state"], "unknown");
+        assert_ne!(missing["work"]["judge"]["progress"], "idle");
+        assert_eq!(missing["risk"]["background_remote_work"], 1);
+        assert!(
+            !missing["issues"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|issue| issue == "pending_work_overdue")
+        );
+    }
+    db.execute("UPDATE read_state SET last_failure_at=?1,failures=1,status=503,failure_category='transport'
+        WHERE purpose='discovery'", [at]).unwrap();
+    let failed = diagnostic_health(&config);
+    assert_eq!(failed["healthy"], false);
+    assert_eq!(failed["components"]["judge"]["state"], "degraded");
+    assert!(
+        failed["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| issue == "api_dependency_unavailable")
+    );
+    db.execute(
+        "UPDATE hosted_identity_evidence SET rejection='authentication_failed'",
+        [],
+    )
+    .unwrap();
+    let rejected = diagnostic_health(&config);
+    assert_eq!(rejected["healthy"], false);
+    assert_ne!(rejected["components"]["controller"]["state"], "ok");
+}
+
+#[test]
+fn current_local_deadlines_survive_background_history_and_intent_overlays() {
+    use agmi::config::{CountLimit, Mode};
+    for lane in ["answer", "judge", "mine"] {
+        for intent in ["active", "paused", "off", "read_only", "stopped"] {
+            let (_dir, mut config, db, at) = initialized_health_fixture();
+            diagnostic_lane(&mut config, &db, lane, CountLimit::Unbounded, at);
+            retained_remote(&db, lane, "unknown", 1, at);
+            db.execute("INSERT INTO operations
+                (id,kind,work_key,state,request,generation,revision,created_at,updated_at)
+                SELECT 2,?1,'current-dispatch','dispatching','{}',generation,'fixture',?2,?2 FROM control",
+                rusqlite::params![lane,at-10000]).unwrap();
+            db.execute(
+                "INSERT INTO operation_evidence(operation_id,http_deadline) VALUES(2,?1)",
+                [at - 10000],
+            )
+            .unwrap();
+            match intent {
+                "paused" => {
+                    db.execute("UPDATE control SET paused=1", []).unwrap();
+                }
+                "stopped" => {
+                    db.execute("UPDATE runtime_state SET controller_stopped=1", [])
+                        .unwrap();
+                }
+                "off" | "read_only" => {
+                    let mode = if intent == "off" {
+                        Mode::Off
+                    } else {
+                        Mode::ReadOnly
+                    };
+                    match lane {
+                        "answer" => config.capabilities.answer.mode = mode,
+                        "judge" => config.capabilities.judge.mode = mode,
+                        _ => config.capabilities.mine.mode = mode,
+                    }
+                    persist_diagnostic_policy(&config, &db);
+                }
+                _ => {}
+            }
+            let report = diagnostic_health(&config);
+            assert_eq!(report["healthy"], false, "{lane}/{intent}: {report}");
+            assert_eq!(report["components"][lane]["state"], "degraded");
+            assert!(
+                report["issues"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|issue| issue == "dispatch_outcome_uncertain")
+            );
+            assert_eq!(
+                report["work"][lane]["intervention"]["next_action"],
+                "inspect_operations"
+            );
+            assert_eq!(report["pending_work"][0]["state"], "unknown");
+            assert_eq!(report["pending_work"][1]["state"], "dispatching");
+            if lane != "mine" {
+                db.execute("UPDATE operations SET state='generating' WHERE id=2", [])
+                    .unwrap();
+                db.execute("UPDATE operation_evidence SET model_deadline=?1,http_deadline=NULL WHERE operation_id=2",
+                    [at-10000]).unwrap();
+                let model = diagnostic_health(&config);
+                assert_eq!(model["healthy"], false);
+                assert_eq!(model["components"][lane]["state"], "degraded");
+                assert!(
+                    model["issues"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|issue| issue == "model_work_overdue")
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn eligible_same_epoch_answer_retry_does_not_make_its_old_job_a_dependency() {
+    use agmi::config::CountLimit;
+    let (_dir, mut config, db, at) = initialized_health_fixture();
+    diagnostic_lane(&mut config, &db, "answer", CountLimit::Bounded(4), at);
+    config
+        .capabilities
+        .answer
+        .participation
+        .retry_uncertain_answers = true;
+    config
+        .capabilities
+        .answer
+        .participation
+        .uncertain_answer_retry_seconds = 0;
+    persist_diagnostic_policy(&config, &db);
+    retained_remote(&db, "answer", "unknown", 2, at);
+    let report = diagnostic_health(&config);
+    assert_eq!(report["healthy"], true, "{report}");
+    assert_eq!(report["work"]["answer"]["retry"]["policy_eligible"], true);
+    assert_eq!(
+        report["pending_work"][0]["nonblocking_for_fresh_work"],
+        true
+    );
+    assert_eq!(
+        report["work"]["answer"]["intervention"]["next_action"],
+        "revalidate_challenge"
+    );
+    assert_eq!(
+        report["work"]["answer"]["intervention"]["requires_fresh_eligibility"],
+        true
+    );
+    config
+        .capabilities
+        .answer
+        .participation
+        .max_answer_attempts_per_epoch = 1;
+    persist_diagnostic_policy(&config, &db);
+    let exhausted = diagnostic_health(&config);
+    assert_eq!(exhausted["healthy"], false);
+    assert_eq!(
+        exhausted["work"]["answer"]["retry"]["policy_eligible"],
+        false
+    );
+    assert_eq!(
+        exhausted["pending_work"][0]["nonblocking_for_fresh_work"],
+        false
+    );
+    assert_eq!(exhausted["pending_work"][0]["state"], "unknown");
+}
+
+#[test]
+fn confirmed_current_mine_is_completed_participation_with_retained_finality_followup() {
+    use agmi::config::CountLimit;
+    let (_dir, mut config, db, at) = initialized_health_fixture();
+    diagnostic_lane(&mut config, &db, "mine", CountLimit::Bounded(4), at);
+    retained_remote(&db, "mine", "confirmed", 2, at);
+    let report = diagnostic_health(&config);
+    assert_eq!(report["healthy"], true, "{report}");
+    assert_eq!(report["work"]["mine"]["phase"], "completed");
+    assert_eq!(report["work"]["mine"]["progress"], "complete");
+    assert_eq!(
+        report["work"]["mine"]["background_recovery"]["bound_count"],
+        1
+    );
+    assert_eq!(report["pending_work"][0]["state"], "confirmed");
+    assert_eq!(report["risk"]["attention_required"], true);
+    db.execute(
+        "UPDATE lane_observations SET observed_at=1 WHERE lane='mine'",
+        [],
+    )
+    .unwrap();
+    let stale = diagnostic_health(&config);
+    assert_eq!(stale["healthy"], false);
+    assert_eq!(stale["components"]["mine"]["state"], "unknown");
+    assert_ne!(stale["work"]["mine"]["progress"], "complete");
+}
+
+#[test]
+fn current_discovery_and_identity_faults_remain_separate_from_background_sibling_reads() {
+    use agmi::config::{CountLimit, Mode};
+    let (_dir, mut config, db, at) = initialized_health_fixture();
+    for lane in ["answer", "judge", "mine"] {
+        diagnostic_lane(&mut config, &db, lane, CountLimit::Bounded(4), at - 2);
+    }
+    config.capabilities.answer.mode = Mode::Active;
+    config.capabilities.judge.mode = Mode::Active;
+    config.capabilities.mine.mode = Mode::Active;
+    persist_diagnostic_policy(&config, &db);
+    retained_remote(&db, "judge", "queued", 1, at);
+    assert_eq!(diagnostic_health(&config)["healthy"], true);
+    for lane in ["answer", "judge", "mine"] {
+        db.execute("UPDATE read_state SET last_failure_at=?1,failures=1,status=503,failure_category='transport'
+            WHERE owner=?2 AND purpose='discovery'", rusqlite::params![at,lane]).unwrap();
+        let report = diagnostic_health(&config);
+        assert_eq!(report["healthy"], false);
+        assert_eq!(report["components"][lane]["state"], "degraded", "{report}");
+        assert_eq!(report["work"][lane]["operational"]["state"], "degraded");
+        for sibling in ["answer", "judge", "mine"]
+            .into_iter()
+            .filter(|other| *other != lane)
+        {
+            assert_eq!(report["components"][sibling]["state"], "ok", "{report}");
+        }
+        db.execute(
+            "UPDATE read_state SET last_failure_at=NULL,failures=0,status=200,failure_category=NULL
+            WHERE owner=?1 AND purpose='discovery'",
+            [lane],
+        )
+        .unwrap();
+    }
+    db.execute(
+        "UPDATE hosted_identity_evidence SET rejection='authentication_failed'",
+        [],
+    )
+    .unwrap();
+    let identity = diagnostic_health(&config);
+    assert_eq!(identity["healthy"], false);
+    assert_eq!(identity["components"]["controller"]["state"], "blocked");
+    assert_eq!(identity["work"]["judge"]["background_recovery"]["count"], 0);
+    assert_eq!(identity["pending_work"][0]["state"], "queued");
+}
+
+#[test]
+fn complete_inventory_excluding_uncertain_models_is_not_empty_healthy_inventory() {
+    use agmi::config::CountLimit;
+    let (_dir, mut config, db, at) = initialized_health_fixture();
+    diagnostic_lane(&mut config, &db, "judge", CountLimit::Bounded(4), at);
+    db.execute("INSERT INTO operations
+        (id,kind,work_key,state,request,generation,revision,created_at,updated_at)
+        SELECT 1,'judge','current-assignment','model_unknown','{}',generation,'fixture',?1,?1 FROM control",
+        [at-10000]).unwrap();
+    db.execute("UPDATE runtime_state SET lane_participation=json_set(lane_participation,
+        '$.judge.assessment.locally_judgeable',json('false'),'$.judge.assessment.eligible_candidates',0,
+        '$.judge.assessment.exclusions',json('{\"model_uncertain_retry_disabled\":1}'))", []).unwrap();
+    let report = diagnostic_health(&config);
+    assert_eq!(report["healthy"], false, "{report}");
+    assert_ne!(report["components"]["judge"]["state"], "ok");
+    assert_eq!(report["risk"]["unresolved_model_attempts"], 1);
+    assert_eq!(
+        report["work"]["judge"]["intervention"]["status"],
+        "operator_required"
+    );
+    assert_ne!(report["work"]["judge"]["progress"], "idle");
+}
+
+#[test]
+fn judging_exclusion_witnesses_keep_unrelated_history_background_and_current_reads_actionable() {
+    use agmi::config::CountLimit;
+    use serde_json::json;
+    let assignment_b = "b".repeat(64);
+    for reason in [
+        "assignment_read_backoff",
+        "assignment_resource_restricted",
+        "already_attempted",
+    ] {
+        let (_dir, mut config, db, at) = initialized_health_fixture();
+        diagnostic_lane(&mut config, &db, "judge", CountLimit::Bounded(4), at);
+        retained_remote(&db, "judge", "queued", 1, at);
+        let witnesses = json!([{"work_key":assignment_b,"reason":reason}]);
+        db.execute(
+            "UPDATE runtime_state SET lane_participation=json_set(lane_participation,
+            '$.judge.assessment.locally_judgeable',json('false'),
+            '$.judge.assessment.eligible_candidates',0,
+            '$.judge.assessment.exclusions',json(?1),
+            '$.judge.assessment.excluded_work',json(?2),
+            '$.judge.assessment.excluded_work_truncated',json('false'))",
+            rusqlite::params![json!({(reason):1}).to_string(), witnesses.to_string()],
+        )
+        .unwrap();
+        if reason == "already_attempted" {
+            db.execute(
+                "INSERT INTO operations
+                (id,kind,work_key,state,request,generation,revision,created_at,updated_at)
+                SELECT 2,'judge',?1,'completed','{}',generation,'fixture',?2,?2 FROM control",
+                rusqlite::params![assignment_b, at],
+            )
+            .unwrap();
+        } else {
+            db.execute("INSERT INTO read_state
+                (owner,purpose,resource,failures,last_failure_at,failure_category,status,local_next_at)
+                VALUES('judge','assignment',?1,1,?2,'http',404,?3)",
+                rusqlite::params![assignment_b,at,at+300]).unwrap();
+        }
+        let report = diagnostic_health(&config);
+        assert_eq!(
+            report["pending_work"][0]["nonblocking_for_fresh_work"], true,
+            "{report}"
+        );
+        assert_eq!(report["work"]["judge"]["background_recovery"]["count"], 1);
+        assert_eq!(report["pending_work"][0]["state"], "queued");
+        assert_eq!(report["healthy"], reason == "already_attempted", "{report}");
+        if reason == "already_attempted" {
+            assert_eq!(report["work"]["judge"]["progress"], "idle");
+            assert_eq!(report["components"]["judge"]["state"], "ok");
+        } else {
+            assert_eq!(report["components"]["judge"]["state"], "degraded");
+            assert_ne!(report["work"]["judge"]["progress"], "idle");
+            assert_eq!(report["work"]["judge"]["read_key"]["purpose"], "assignment");
+            assert_eq!(
+                report["work"]["judge"]["read_key"]["resource"],
+                assignment_b
+            );
+            assert!(
+                report["issues"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|issue| issue == "api_dependency_unavailable")
+            );
+            let (_config_dir, output) = run_health(&config, &["--min-free-mib", "0"]);
+            assert!(!output.status.success());
+            let cli: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(
+                cli["data"]["work"]["judge"]["background_recovery"]["count"],
+                1
+            );
+            assert_eq!(
+                cli["data"]["work"]["judge"]["read_key"]["resource"],
+                assignment_b
+            );
+            assert_ne!(cli["data"]["work"]["judge"]["progress"], "idle");
+            assert!(
+                cli["data"]["work"]["judge"]["next_actions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|action| action["authorization_required"] != true)
+            );
+            // C offers a viable path despite B's still-failing hydration.
+            db.execute(
+                "UPDATE runtime_state SET lane_participation=json_set(lane_participation,
+                '$.judge.assessment.locally_judgeable',json('true'),
+                '$.judge.assessment.eligible_candidates',1,
+                '$.judge.assessment.observed_opportunities',2)",
+                [],
+            )
+            .unwrap();
+            let available = diagnostic_health(&config);
+            assert_eq!(available["healthy"], true, "{available}");
+            assert_eq!(available["components"]["judge"]["state"], "ok");
+            assert_eq!(
+                available["work"]["judge"]["read_key"]["purpose"],
+                "discovery"
+            );
+            assert_eq!(
+                available["work"]["judge"]["background_recovery"]["count"],
+                1
+            );
+            assert!(
+                available["components"]["api"]["resources"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row["purpose"] == "assignment"
+                        && row["resource"] == assignment_b
+                        && row["health"]["state"] == "degraded")
+            );
+            // The current assignment disappears; A's failed job cannot take its
+            // place as an operational dependency or force replay.
+            db.execute("UPDATE runtime_state SET lane_participation=json_set(lane_participation,
+                '$.judge.assessment.observed_opportunities',0,'$.judge.assessment.exclusions',json('{}'),
+                '$.judge.assessment.locally_judgeable',json('false'),'$.judge.assessment.eligible_candidates',0,
+                '$.judge.assessment.excluded_work',json('[]'))", []).unwrap();
+            let idle = diagnostic_health(&config);
+            assert_eq!(idle["healthy"], true, "{idle}");
+            assert_eq!(idle["work"]["judge"]["progress"], "idle");
+            assert_eq!(idle["work"]["judge"]["background_recovery"]["count"], 1);
+        }
+    }
+}
+
+#[test]
+fn judging_legacy_or_truncated_exclusions_do_not_invent_current_operation_identity() {
+    use agmi::config::CountLimit;
+    use serde_json::json;
+    let (_dir, mut config, db, at) = initialized_health_fixture();
+    diagnostic_lane(&mut config, &db, "judge", CountLimit::Bounded(4), at);
+    retained_remote(&db, "judge", "queued", 1, at);
+    db.execute(
+        "UPDATE runtime_state SET lane_participation=json_set(lane_participation,
+        '$.judge.assessment.locally_judgeable',json('false'),
+        '$.judge.assessment.eligible_candidates',0,
+        '$.judge.assessment.exclusions',json('{\"already_attempted\":1}'))",
+        [],
+    )
+    .unwrap();
+    for witnesses in [
+        Value::Null,
+        json!([{"work_key":"b".repeat(64),"reason":"already_attempted"}]),
+    ] {
+        db.execute(
+            "UPDATE runtime_state SET lane_participation=json_set(lane_participation,
+            '$.judge.assessment.excluded_work',json(?1),
+            '$.judge.assessment.excluded_work_truncated',json('true'))",
+            [witnesses.to_string()],
+        )
+        .unwrap();
+        let unknown = diagnostic_health(&config);
+        assert_eq!(
+            unknown["pending_work"][0]["nonblocking_for_fresh_work"],
+            Value::Null
+        );
+        assert_eq!(unknown["healthy"], false, "{unknown}");
+        assert_eq!(unknown["components"]["judge"]["state"], "unknown");
+        assert_ne!(unknown["work"]["judge"]["next_action"], "read_job");
+        assert!(
+            !unknown["issues"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|issue| issue == "api_dependency_unavailable")
+        );
+    }
+    // A positive same-work witness is conclusive even if other witnesses were
+    // truncated. Its original is still not replay authority.
+    db.execute("UPDATE runtime_state SET lane_participation=json_set(lane_participation,
+        '$.judge.assessment.excluded_work',json('[{\"work_key\":\"1:retained\",\"reason\":\"already_attempted\"}]'))", []).unwrap();
+    db.execute("DELETE FROM read_state WHERE purpose='job'", [])
+        .unwrap();
+    let current = diagnostic_health(&config);
+    assert_eq!(
+        current["pending_work"][0]["nonblocking_for_fresh_work"],
+        false
+    );
+    assert_eq!(current["components"]["judge"]["state"], "blocked");
+    assert!(
+        current["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| issue == "current_work_outcome_unresolved")
+    );
+    assert_eq!(current["pending_work"][0]["state"], "queued");
+}
+
+#[test]
+fn unreadable_journal_evidence_does_not_claim_empty_history_or_assessed_filesystem() {
+    let (_dir, config, db, _at) = initialized_health_fixture();
+    drop(db);
+    let path = config.state_dir.join("state.sqlite3");
+    let corrupt = b"unreadable journal fixture";
+    fs::write(&path, corrupt).unwrap();
+    let report = diagnostic_health(&config);
+    assert_eq!(report["healthy"], false);
+    assert_eq!(report["operational"]["status"], "unknown");
+    assert_eq!(
+        report["assessment_scope"]["state_filesystem"],
+        "not_assessed"
+    );
+    assert_eq!(report["risk"]["unresolved_effects"], Value::Null);
+    for field in [
+        "background_remote_work",
+        "retained_uncertainty_nonblocking_lanes",
+    ] {
+        assert_eq!(report["risk"].get(field), Some(&Value::Null));
+    }
+    for lane in ["answer", "judge", "mine"] {
+        assert_eq!(report["work"][lane]["operational"]["state"], "unknown");
+        assert_eq!(
+            report["work"][lane]["operational"]["reasons"],
+            serde_json::json!(["local_evidence_unavailable"])
+        );
+        for field in [
+            "count",
+            "bound_count",
+            "unbound_count",
+            "required_for_participation",
+        ] {
+            assert_eq!(
+                report["work"][lane]["background_recovery"].get(field),
+                Some(&Value::Null)
+            );
+        }
+    }
+    assert_eq!(fs::read(&path).unwrap(), corrupt);
 }

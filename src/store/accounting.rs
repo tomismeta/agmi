@@ -136,6 +136,58 @@ pub(super) fn uncertainty_accounting(
     if retry_of.is_some() {
         result.retry_origin_floor = origin_floor(db, retry_of)?;
     }
+    result.history_evaluated = true;
+    Ok(result)
+}
+
+/// Explicit unbounded participation-first fresh-work admission. Cumulative
+/// historical counts and account-wide uncertainty grace are not evaluated
+/// and must not limit distinct new work. One local effect, server floors,
+/// and the same-work retry ceiling still bind; every check below is an
+/// indexed existence, primary-key, or bounded floor lookup.
+pub(super) fn uncertainty_accounting_unbounded(
+    db: &Connection,
+    config: &Config,
+    kind: LaneId,
+    excluding: Option<i64>,
+    retry_of: Option<i64>,
+) -> Result<UncertaintyAccounting> {
+    let mut result = UncertaintyAccounting {
+        writing: db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM operations WHERE state='dispatching'
+            AND (?1 IS NULL OR id!=?1))",
+            [excluding],
+            |row| row.get(0),
+        )?,
+        ..Default::default()
+    };
+    apply_floor(db, config, kind, &mut result)?;
+    if let Some(origin) = retry_of {
+        if Some(origin) != excluding {
+            let since: Option<i64> = db
+                .query_row(
+                    "SELECT COALESCE(e.blocked_since,o.created_at) FROM operations o
+                    LEFT JOIN operation_evidence e ON e.operation_id=o.id WHERE o.id=?1",
+                    [origin],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten();
+            if let Some(since) = since {
+                result.retry_grace_until = since.saturating_add(
+                    i64::try_from(
+                        config
+                            .capabilities
+                            .answer
+                            .participation
+                            .uncertain_answer_retry_seconds,
+                    )
+                    .unwrap_or(i64::MAX),
+                );
+            }
+        }
+        result.retry_origin_floor = origin_floor(db, retry_of)?;
+    }
     Ok(result)
 }
 
@@ -176,6 +228,7 @@ impl AccountingReadSnapshot {
         })?;
         for (&lane, result) in &mut lanes {
             apply_floor(db, config, lane, result)?;
+            result.history_evaluated = true;
         }
         Ok(Self {
             rows,
@@ -205,6 +258,7 @@ impl AccountingReadSnapshot {
             result.retry_not_before = base.retry_not_before;
             result.legacy_floor = base.legacy_floor;
             result.restriction_scope = base.restriction_scope.clone();
+            result.history_evaluated = true;
             result
         } else {
             base.clone()
@@ -295,7 +349,7 @@ pub(super) fn risk_decision_with(
         .optional()?;
     let accounting = match snapshot {
         Some(snapshot) => snapshot.accounting(db, config, op.kind, Some(op.id), retry_of)?,
-        None => uncertainty_accounting(db, config, op.kind, Some(op.id), retry_of, true)?,
+        None => Store::uncertainty_accounting(db, config, op.kind, Some(op.id), retry_of, true)?,
     };
     let grant: Option<i64> = if policy.mode == ParticipationMode::Manual {
         db.query_row(
@@ -430,7 +484,7 @@ mod tests {
             .capabilities
             .answer
             .participation
-            .max_unresolved_operations = 100;
+            .max_unresolved_operations = CountLimit::Bounded(100);
         config
             .capabilities
             .answer
@@ -466,7 +520,8 @@ mod tests {
     }
 
     fn view(a: &UncertaintyAccounting) -> Value {
-        json!({"total":a.total,"own_total":a.own_total,"own_exempt":a.own_exempt,
+        json!({"total":a.total,"history_evaluated":a.history_evaluated,"own_total":a.own_total,
+            "own_exempt":a.own_exempt,
             "own_blockers":a.own_blockers,"eligible":a.eligible,"exempt":a.exempt,
             "historical":a.historical,"blockers":a.blockers,"writing":a.writing,
             "retry_not_before":a.retry_not_before,"grace_until":a.grace_until,

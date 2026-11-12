@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Real-CLI queued polling and health acceptance; localhost and dummy credentials only."""
 import argparse
+import hashlib
 import json
 import pathlib
 import sqlite3
@@ -60,6 +61,149 @@ class QueuedFixture(Fixture):
     def close(self):
         self.slow_release.set()
         super().close()
+
+
+class TransientJudgingFixture(QueuedFixture):
+    def __init__(self, binary, root):
+        self.lost_job = 'grade-10'
+        self.lost_job_reads = []
+        self.remaining_404s = 2
+        self.queued_floor_sent = False
+        self.recovery_release = threading.Event()
+        super().__init__(binary, root)
+
+    def handler(self):
+        parent = super().handler()
+        fixture = self
+
+        class Upstream(parent):
+            def do_POST(self):
+                if self.path.endswith('/api/hosted/grade'):
+                    # Publish one assignment at a time, with no discovery race.
+                    with fixture.lock:
+                        fixture.assignments = False
+                        super().do_POST()
+                    return
+                super().do_POST()
+
+            def do_GET(self):
+                if self.path.endswith('/api/job/' + fixture.lost_job):
+                    with fixture.lock:
+                        fixture.lost_job_reads.append(time.time())
+                        if fixture.remaining_404s:
+                            fixture.remaining_404s -= 1
+                            self.reply(404, {'error': 'unknown job'})
+                            return
+                        queued_floor = not fixture.queued_floor_sent
+                        fixture.queued_floor_sent = True
+                    if queued_floor:
+                        fixture.recovery_release.wait(20)
+                        # Only a valid queued response establishes a resource
+                        # minimum; Retry-After on a 404 is account-scoped.
+                        self.reply(202, {'state': 'queued'}, 12)
+                        return
+                super().do_GET()
+
+        return Upstream
+
+    def close(self):
+        self.recovery_release.set()
+        super().close()
+
+
+def transient_job_loss(f):
+    f.pending_polls = 0
+    f.queued_grades, f.assignments = True, True
+    f.receipt_state = 'final'
+    f.lanes['answer']['mode'] = 'off'
+    f.lanes['judge']['mode'] = 'active'
+    f.lanes['judge']['timeouts']['read_http_seconds'] = 15
+    f.lanes['judge']['schedule'].update(
+        retry_seconds=1, backoff_max_seconds=4,
+        queued_job_polling=dict(initial_seconds=1, max_seconds=1))
+    f.configure('judge', mode='participation_first',
+                max_unresolved_operations='unbounded', uncertainty_grace_seconds=3600)
+    f.start(resume=True)
+
+    def lost_read():
+        rows = f.rows("SELECT * FROM read_state WHERE owner='judge' AND purpose='job' "
+                      "AND operation_id=? AND retired=0", (original['id'],))
+        return rows[0] if rows else None
+
+    f.wait(lambda: len(f.dispatched('judge')) == 1, 'judgment A was not dispatched')
+    original = f.dispatched('judge')[0]
+    f.wait(lambda: lost_read() is not None and lost_read()['failures'] == 2,
+           'two transient 404s were not retained')
+    before = lost_read()
+    assert before['status'] == 404 and before['local_next_at'] > time.time(), before
+    original = f.dispatched('judge')[0]
+    assert original['state'] == 'unknown' and original['job_id'] == f.lost_job
+    assert original['txid'] is None and len(f.lost_job_reads) == 2
+
+    with f.lock:
+        f.assignments = True
+    f.wait(lambda: len(f.dispatched('judge')) == 2 and f.dispatched('judge')[1]['job_id'],
+           'retained uncertainty or grace blocked distinct judgment B')
+    second = f.dispatched('judge')[1]
+    assert second['work_key'] != original['work_key']
+    assert f.dispatched('judge')[0]['state'] == 'unknown'
+    assert len(f.writes) == 2 and f.model_calls('judge') == 2
+    f.recovery_release.set()
+    f.wait(lambda: lost_read()['status'] == 202
+           and lost_read()['server_not_before'] > time.time(),
+           'valid queued response did not retain its resource minimum')
+    before = lost_read()
+    assert len(f.lost_job_reads) == 3
+    f.stop()
+    # Match a current-format journal created by the previous binary. The new
+    # writer must provision its access paths, not require fresh initialization.
+    with sqlite3.connect(f.database) as db:
+        db.executescript("""
+            DROP INDEX operations_reconciliation;
+            DROP INDEX operations_model_key;
+            DROP INDEX operations_model_retry_recent;
+            DROP INDEX operations_model_retry_fair;
+        """)
+
+    # Observe real binary clocks and persisted floors, without rewriting time,
+    # deadlines, binding evidence, or runtime state in the isolated journal.
+    stopped = lost_read()
+    floors = ('local_next_at', 'server_not_before', 'retained_conservative_floor')
+    assert {key: stopped[key] for key in floors} == {key: before[key] for key in floors}
+    services = f.rows("SELECT kind,next_at FROM schedule WHERE kind IN "
+                      "('reconciliation:judge','reconciliation:fair:judge',"
+                      "'reconciliation:missing:judge')")
+    eligible_at = max(*(stopped[key] for key in floors),
+                      *(row['next_at'] for row in services))
+    assert time.time() < stopped['server_not_before'], 'fixture missed the restart fence window'
+    for job in (original['job_id'], second['job_id']):
+        f.jobs[job] = 'final'
+    started_at = time.monotonic()
+    f.start()
+
+    # Two bound jobs: allow a complete recent/fair/missing service rotation,
+    # followed by their receipts, after the retained effective floor.
+    service_rotation = 4 * (f.lanes['judge']['schedule']['backoff_max_seconds'] + 1)
+    window = max(0, eligible_at - time.time()) + service_rotation + 4
+    f.wait(lambda: all(op['state'] == 'final' for op in f.dispatched('judge'))
+           and len(f.dispatched('judge')) == 2,
+           'matching evidence did not reconcile both original bindings', seconds=window)
+    f.stop()
+    final = f.dispatched('judge')
+    assert len(f.writes) == 2 and f.model_calls('judge') == 2
+    assert len(f.lost_job_reads) == 4
+    assert f.lost_job_reads[3] >= eligible_at, 'restart refunded a retained polling floor'
+    for old, current in zip((original, second), final):
+        for field in ('id', 'work_key', 'payload', 'request', 'result', 'dispatch_sequence'):
+            assert current[field] == old[field], (field, old, current)
+        assert current['txid'] == hashlib.sha256(old['job_id'].encode()).hexdigest()
+        assert f.rows("SELECT retired FROM read_state WHERE owner='judge' AND purpose='job' "
+                      "AND operation_id=? AND binding_revision=?",
+                      (old['id'], old['binding_revision'])) == [{'retired': 1}]
+    return dict(fresh_judgment_during_uncertainty=True, cold_restart=True,
+                server_floor_preserved=True, matching_jobs_reconciled=True,
+                original_submissions=2, model_calls=2,
+                recovery_seconds=round(time.monotonic() - started_at, 3))
 
 
 def fast_polling(f):
@@ -203,19 +347,26 @@ def due_backlog(f):
             with f.lock:
                 f.epoch += 1
     f.stop()
-    f.apply_config({'capabilities': {'answer': {'mode': 'off', 'schedule': {'poll_seconds': 30}}}})
+    # Recovery now has an aggregate two-slot cadence, independent of discovery.
+    # Request a short service interval rather than expecting a 60-second budget
+    # to drain an arbitrary batch immediately.
+    f.apply_config({'capabilities': {'answer': {'mode': 'off', 'schedule': {
+        'poll_seconds': 30, 'queued_job_polling': {'initial_seconds': 2, 'max_seconds': 60}}}}})
     # Isolated fixture only: model three deadlines becoming due together,
     # without changing payloads, bindings, server minima or transition evidence.
     with sqlite3.connect(f.database) as db:
         db.execute("UPDATE operations SET next_at=0 WHERE state='queued'")
         db.execute("UPDATE read_state SET local_next_at=0 WHERE owner='answer' AND purpose='job' AND retired=0")
     before = len(f.job_polls)
+    requests_before = len(f.job_requests)
     f.start()
-    f.wait(lambda: len(f.job_polls) >= before + 3,
-           'third actionable queued job slept behind the ordinary poll interval', seconds=5)
+    f.wait(lambda: {job for job, _ in f.job_requests[requests_before:]} ==
+           {'answer-10', 'answer-11', 'answer-12'},
+           'paced recovery failed to serve all three due jobs ahead of discovery', seconds=8)
+    assert len(f.job_polls) >= before + 3
     assert len(f.writes) == 3 and f.model_calls('answer') == 3
-    return {'three_due_jobs_drained': True, 'ordinary_poll_seconds': 30,
-            'writes_unchanged': 3}
+    return {'three_due_jobs_served': True, 'ordinary_poll_seconds': 30,
+            'recovery_service_seconds': 2, 'writes_unchanged': 3}
 
 
 def independent_scope(f):
@@ -308,7 +459,8 @@ def retry_age(f):
 SCENARIOS = {'fast_polling': fast_polling, 'retained_floor': retained_floor,
              'risk_health': risk_health, 'policy_administration': policy_administration,
              'due_backlog': due_backlog, 'independent_scope': independent_scope,
-             'slow_bad_jobs': slow_bad_jobs, 'retry_age': retry_age}
+             'slow_bad_jobs': slow_bad_jobs, 'retry_age': retry_age,
+             'transient_job_loss': transient_job_loss}
 
 
 def main():
@@ -319,7 +471,8 @@ def main():
     scenarios = SCENARIOS if args.scenario == 'all' else {args.scenario: SCENARIOS[args.scenario]}
     for name, scenario in scenarios.items():
         with tempfile.TemporaryDirectory(prefix='agmi-queued-polling-') as directory:
-            fixture = QueuedFixture(args.binary.resolve(), pathlib.Path(directory))
+            fixture_type = TransientJudgingFixture if name == 'transient_job_loss' else QueuedFixture
+            fixture = fixture_type(args.binary.resolve(), pathlib.Path(directory))
             try:
                 print(json.dumps({'scenario': name, **scenario(fixture)}), flush=True)
             finally:

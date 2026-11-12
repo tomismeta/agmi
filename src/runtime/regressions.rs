@@ -270,6 +270,43 @@ async fn once_launches_only_entry_due_recoveries_and_never_waits_for_future_work
     );
 }
 
+#[tokio::test]
+async fn once_keeps_entry_recoveries_when_newer_bound_work_arrives() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut config = Config::default();
+    config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
+    config.capabilities.answer.mode = Mode::Off;
+    config.capabilities.judge.mode = Mode::Off;
+    config.capabilities.mine.mode = Mode::Off;
+    let (_temp, mut runtime, _stop) = fixture_with(config);
+    let first = seed_bound(&mut runtime, LaneId::Judge, "entry-first", "entry-first");
+    let second = seed_bound(&mut runtime, LaneId::Judge, "entry-second", "entry-second");
+    runtime.once = Some(OncePlan::capture(&runtime).unwrap());
+    let later = seed_bound(&mut runtime, LaneId::Judge, "later", "later");
+    runtime.plan().unwrap();
+    let db = rusqlite::Connection::open(runtime.config.state_dir.join("state.sqlite3")).unwrap();
+    for op in [first, second, later.clone()] {
+        let started: bool = db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM read_state WHERE operation_id=?1 AND in_flight=1)",
+                [op.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(started, op.id != later.id);
+    }
+    assert_eq!(
+        runtime
+            .once
+            .as_ref()
+            .unwrap()
+            .lane(LaneId::Judge)
+            .reads
+            .len(),
+        2
+    );
+}
+
 #[test]
 fn lane_error_backoff_and_model_settings_are_independent() {
     let (_temp, mut runtime, _stop) = fixture();
@@ -848,7 +885,7 @@ fn invalid_reload_keeps_effective_snapshot_and_cap_lowering_keeps_unknowns() {
         .capabilities
         .judge
         .participation
-        .max_unresolved_operations = 1;
+        .max_unresolved_operations = 1.into();
     persist(&runtime);
     runtime.reload().unwrap();
     assert!(!runtime.reload_blocked);

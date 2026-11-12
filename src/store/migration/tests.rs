@@ -219,6 +219,48 @@ fn historical_recharge_and_over_cap_backlog_require_bound_acknowledgment() {
     assert_eq!(legacy.risk(&safe, [0, 0, 0])["risk_change_required"], false);
     assert_eq!(legacy.risk(&safe, [0, 6, 0])["risk_change_required"], true);
 }
+
+#[test]
+fn strict_mode_does_not_hide_unbounded_exposure_or_recurring_inference_risk() {
+    let legacy = legacy::Legacy::default();
+    let baseline: Config = toml::from_str(&legacy.candidate(None).unwrap()).unwrap();
+    assert_eq!(
+        legacy.risk(&baseline, [0; 3])["risk_change_required"],
+        false
+    );
+    let mut candidate = baseline.clone();
+    candidate
+        .capabilities
+        .answer
+        .participation
+        .max_unresolved_operations = crate::config::CountLimit::Unbounded;
+    let risk = legacy.risk(&candidate, [10, 0, 0]);
+    assert_eq!(risk["risk_change_required"], true);
+    assert_eq!(risk["unbounded_exposure"], true);
+    assert!(risk["exposure_including_backlog"].is_null());
+    candidate = baseline;
+    candidate
+        .capabilities
+        .judge
+        .preparation
+        .max_attempts_per_work = crate::config::CountLimit::Unbounded;
+    let risk = legacy.risk(&candidate, [0; 3]);
+    assert_eq!(risk["risk_change_required"], true);
+    assert_eq!(risk["model_cost_increased"], true);
+    assert_eq!(risk["recurring_inference_possible"], true);
+    let proposal = legacy
+        .candidate(Some(&json!({"answer":"unbounded","judge":1,"mine":1})))
+        .unwrap();
+    let candidate: Config = toml::from_str(&proposal).unwrap();
+    assert_eq!(
+        candidate
+            .capabilities
+            .answer
+            .participation
+            .max_unresolved_operations,
+        crate::config::CountLimit::Unbounded
+    );
+}
 #[test]
 fn config_only_conversion_never_bootstraps_and_absence_race_rejects() {
     let fixture = Fixture::new(None);
@@ -532,6 +574,14 @@ impl Fixture {
             .as_object_mut()
             .unwrap()
             .remove("target_journal_format");
+        // These fields were not part of historical target-3 approval bytes.
+        for field in [
+            "unbounded_exposure",
+            "model_cost_increased",
+            "recurring_inference_possible",
+        ] {
+            sealed["risk"].as_object_mut().unwrap().remove(field);
+        }
         let token = format!("{FORMAT}:{}", digest(serde_json::to_vec(&sealed).unwrap()));
         let db = open_existing(&fixture.config.state_dir, true)
             .unwrap()

@@ -250,7 +250,10 @@ impl HostAccess {
         let op = self.validate_binding(lane, &binding)?;
         anyhow::ensure!(intent.lane() == lane, "typed intent lane mismatch");
         anyhow::ensure!(
-            self.store.operation_lane_revision(&binding)? == observation.stamp.lane_config_revision,
+            self.config.lane_revision(lane)? == observation.stamp.lane_config_revision
+                && self
+                    .store
+                    .operation_config_current(&self.config, &binding)?,
             "prepared configuration changed"
         );
         let due_at = self.store.operation_ready_at(op.id)?;
@@ -446,16 +449,11 @@ impl HostAccess {
         if self.assignment_excluded(id) {
             return Ok(Some("configured_exclusion"));
         }
+        if let Some(blocker) = self.model_retry_blocker(LaneId::Judge, id)? {
+            return Ok(Some(blocker));
+        }
         if self.store.attempted(LaneId::Judge, id)? {
             return Ok(Some("already_attempted"));
-        }
-        if self.store.model_retry_not_before(LaneId::Judge, id)? > self.deadline_now() {
-            return Ok(Some("model_retry_cooldown"));
-        }
-        if self.store.model_budget_used(LaneId::Judge, id)?
-            >= self.model_attempt_limit(LaneId::Judge)?
-        {
-            return Ok(Some("model_budget_exhausted"));
         }
         if self
             .store

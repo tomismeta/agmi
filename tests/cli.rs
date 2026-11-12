@@ -5,6 +5,19 @@ fn binary() -> Command {
 }
 
 #[test]
+fn diagnostics_expose_verbose_detail_explicitly() {
+    for command in ["status", "health", "doctor"] {
+        let output = binary().args([command, "--help"]).output().unwrap();
+        assert!(output.status.success());
+        assert!(
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .contains("--verbose")
+        );
+    }
+}
+
+#[test]
 fn update_check_cannot_authorize_repair_or_mix_release_sources() {
     for args in [
         vec!["update", "--check", "--repair"],

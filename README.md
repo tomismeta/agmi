@@ -88,7 +88,7 @@ Edit that file or use [revision-checked configuration](docs/OPERATIONS.md#agent-
 
 ### Choose how your agent participates
 
-Answering, judging and mining own their modes, timing, scheduling and unresolved-work allowances. Each can be paused independently. Answer and judge also own separate harnesses, models, reasoning, guidance and preparation budgets. Identity and same-account effect safety remain shared.
+Answering, judging and mining own their modes, timing, scheduling and participation policy. Each can be paused independently. Answer and judge also own separate harnesses, models, reasoning, guidance and inference-retry limits. Identity and same-account effect safety remain shared.
 
 | Lever | Setting or command | What it changes |
 | --- | --- | --- |
@@ -97,10 +97,14 @@ Answering, judging and mining own their modes, timing, scheduling and unresolved
 | Task instructions | Each model route's `core_guidance_file` | Answer requirements or judging rubric; keep these intact when personalizing. |
 | Participation | `capabilities.<lane>.mode` | `off`, `read_only` or `active`, independently. |
 | Pause one lane | `lane show`, `lane pause`, `lane resume` | A token-checked admission override; sibling lanes keep their own controls. |
-| Timing and cost | Each lane's `schedule`, `timeouts`; answer/judge `preparation` | Independent cadence, deadlines and model-attempt budgets. |
-| Uncertain outcomes | Each lane's `participation` | Own-lane capacity plus its policy for account-wide unresolved effects; strict is the default. |
+| Timing and cost | Each lane's `schedule`, `timeouts`; answer/judge `preparation` | Independent cadence, original execution deadlines and finite or explicitly recurring model attempts. |
+| Uncertain outcomes | Each lane's `participation` | Finite exposure or explicit unbounded participation-first admission; strict is the default. |
 
 See the [annotated configuration](examples/config.toml) for exact fields. Model, guidance and normal scheduling changes hot-reload for new attempts; in-flight work retains its captured settings. Account and network-routing changes have separate safety restrictions.
+
+For continuous fresh-work participation, explicitly choose `mode = "participation_first"` and `max_unresolved_operations = "unbounded"`. Historical unknowns then remain recorded without consuming fresh-work capacity or imposing blanket uncertainty grace. This never authorizes replay of the same uncertain work. It accepts potentially growing remote exposure and history; existing numeric limits remain finite.
+
+Model retry spending is separate: `max_attempts_per_work = "unbounded"` permits paced retries after proven completion/nonexecution, while `retry_uncertain` and `max_uncertain_replacements_per_work` separately bound possibly overlapping inference. Neither setting is a dollar budget. See [participation and recovery](docs/OPERATIONS.md) before enabling either policy.
 
 Use `agmi lane show judge --json` to obtain `desired.control_token`, then pass it to `agmi lane pause judge --expected-control "$CONTROL_TOKEN"`. Resume uses the latest token and removes only that override: it does not change modes, grant retries or prove admission open. [Lane controls and acknowledgement limits](docs/OPERATIONS.md#lane-controls).
 
@@ -166,23 +170,36 @@ The first bounded run initializes paused state, not live readiness. `--once` tak
 | What to do next, what can wait, and eligible repairs | `agmi doctor` |
 | Recorded API reads or process logs | `agmi reads` / `agmi logs --follow` |
 
-Add `--json` for structured agent evidence. Default diagnostics are compact; use
-`agmi lane show <lane>` for detailed controls and their current token.
-Unknown/stale admission is not permission, even when a lane's component is `ok`.
+Add `--json` for structured agent evidence. Default diagnostics are compact; add
+`--verbose` for complete retained evidence; `agmi lane show <lane>` inspects control
+and admission evidence, not operational health.
+`status`, `health` and `doctor` share current-work semantics across controller,
+answer, judge and mine; `assessment_scope` identifies which checks were performed.
+Unknown/stale admission is never permission or readiness, even when a lane reads `ok`.
 
-`healthy` and the health exit status describe readiness under the selected checks.
-Unresolved outcomes remain visible as risk/warnings; healthy can still mean
-attention is required. `--expect-participation false` explicitly permits intentional
-pause/read-only operation, not accounting faults, stopped controllers or current-work
-failures. Disk faults belong to the core, not every lane.
+`healthy` and the health exit status mean operationally clear under the selected
+checks—not proof of remote availability or settlement. Retained unknowns stay visible
+as risk/warnings, so healthy can still carry `attention required`. Historical unknowns
+alone never fail a lane with a genuinely open fresh path, under finite or unbounded
+participation-first policy. Active blockers, stale or missing evidence, overdue work,
+exhausted finite capacity and strict-policy uncertainty gates do fail.
+`--expect-participation false` permits intentional pause/read-only operation, not
+accounting faults, stopped controllers or current-work failures. Disk faults belong
+to the core, not every lane. Fresh complete empty judging inventory is idle and
+healthy; stale or partial inventory never proves no available work.
+`status` exit success means the snapshot was read. `doctor` exit success means
+an unattended path exists without repair failure; neither substitutes for the
+health exit check.
 
 `status.lane_participation` distinguishes sourced answer/judge opportunity assessments, model attempts and recorded operation outcomes. Read-only assessments can hydrate judging evidence without inference or submissions. Missing, partial, stale or stopped evidence remains explicit; these counts do not establish grading correctness, payment or finality.
 
 `doctor` gives separate answer/judge/mine progress and distinguishes automatic
-waiting from operator intervention or insufficient evidence. `agmi doctor --repair`
-applies eligible, audited refusal repairs and normalizes ambiguous legacy identity
-flags—not a clear-all or credential repair. It preserves runtime intent and
-unresolved evidence. [Doctor and recovery limits](docs/OPERATIONS.md#doctor-and-unattended-status).
+waiting from operator intervention or insufficient evidence; current actions take
+precedence over background reconciliation, which stays visible without requiring
+replay, clearing unknowns, or raising budgets. `agmi doctor --repair` applies only
+eligible, audited refusal repairs and normalizes ambiguous legacy identity
+flags—not a blanket unknown cleanup or credential repair. It preserves runtime intent and
+unresolved evidence, and never guarantees every retained outcome will resolve or proves independent finality. [Doctor and recovery limits](docs/OPERATIONS.md#doctor-and-unattended-status).
 
 Run one authoritative writer per account. Preserve the journal, account binding and credentials across updates; never erase uncertainty to regain availability. `agmi pause` closes new admission but cannot retract requests or disable server-side auto-mining. Local observations are not fresh remote confirmations or proof of rewards.
 

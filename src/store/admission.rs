@@ -58,6 +58,7 @@ impl Store {
         Ok(binding)
     }
 
+    #[cfg(test)]
     pub(crate) fn operation_lane_revision(&self, binding: &OperationBinding) -> Result<String> {
         ensure!(
             Self::validate_operation_binding_in(&self.db, binding)?,
@@ -132,16 +133,16 @@ impl Store {
             if binding.lane_id != kind || !Self::validate_operation_binding_in(db, binding)? {
                 return Ok(false);
             }
-            let matching: bool = db.query_row(
-                "SELECT generation=?2 AND revision=?3 FROM operations WHERE id=?1",
-                params![
-                    binding.operation_id,
-                    stamp.account_generation,
-                    stamp.lane_config_revision
-                ],
+            // Admission-only config changes must not invalidate a valid
+            // unsent capture: match its generation, then let the canonical
+            // config-current helper judge binding, state, provenance, and
+            // immutable producer evidence. Never rewrite original evidence.
+            let generation_current: bool = db.query_row(
+                "SELECT generation=?1 FROM operations WHERE id=?2",
+                params![stamp.account_generation, binding.operation_id],
                 |r| r.get(0),
             )?;
-            if !matching {
+            if !generation_current || !Self::operation_config_current_in(db, config, binding)? {
                 return Ok(false);
             }
         }

@@ -54,7 +54,11 @@ pub(super) fn unknown_work(reason: &str) -> Value {
     let finding = Finding::unknown(reason);
     let mut work = json!({});
     for name in LANES {
-        work[name] = json!({"progress":finding.progress,"intervention":finding.value(None, None)});
+        work[name] = json!({"progress":finding.progress,"intervention":finding.value(None, None),
+            "operational":{"state":"unknown","reasons":[reason]},
+            "background_recovery":{"count":null,"bound_count":null,"unbound_count":null,
+                "required_for_participation":null,"next_action":"inspect_local_evidence",
+                "next_at":null,"evidence":"unavailable"}});
     }
     work
 }
@@ -185,6 +189,7 @@ fn release_path<'a>(
     let mut automatic = 0_u64;
     let mut uncertain = 0_u64;
     let mut authentication_blocked = false;
+    let mut truncated_reads = false;
     let mut next: Option<i64> = None;
     for id in ids {
         let Some(row) = rows.iter().find(|row| row["operation_id"] == *id) else {
@@ -208,6 +213,7 @@ fn release_path<'a>(
         let dependency = super::api::bound(status, row);
         if bound && dependency.is_none() && status["reads_truncated"] == true {
             uncertain += 1;
+            truncated_reads = true;
             continue;
         }
         if let Some(dependency) = dependency
@@ -248,7 +254,11 @@ fn release_path<'a>(
     if automatic >= needed {
         Finding::automatic("bound_reconciliation_pending", "await_reconciliation", next)
     } else if automatic + uncertain >= needed || detail["blocker_ids_truncated"] == true {
-        Finding::unknown("reconciliation_evidence_unavailable")
+        Finding::unknown(if truncated_reads {
+            "reconciliation_evidence_truncated"
+        } else {
+            "reconciliation_evidence_unavailable"
+        })
     } else if authentication_blocked {
         Finding::blocked("reconciliation_authentication_failed", "review_credentials")
     } else {
@@ -375,7 +385,7 @@ fn lane<'a>(
     for pending in std::iter::once(&status["pending"])
         .chain(status["pending_work"].as_array().into_iter().flatten())
         .chain(status["captured_work"].as_array().into_iter().flatten())
-        .filter(|row| row["kind"] == name)
+        .filter(|row| row["kind"] == name && row["nonblocking_for_fresh_work"] != true)
     {
         if timestamp(&pending["created_at"]).is_some_and(|time| time > at)
             || timestamp(&pending["updated_at"]).is_some_and(|time| time > at)
@@ -417,20 +427,7 @@ fn lane<'a>(
     if observed.is_some_and(|time| time > at) {
         return Finding::unknown("clock_regressed");
     }
-    let complete = fresh(observed, at, stale)
-        && match name {
-            "answer" => super::observation(status, name)["answered"] == true,
-            "judge" => {
-                super::assessment_fresh(&work["assessment"], at, stale)
-                    && work["assessment"]["completeness"] == "complete"
-                    && work["assessment"]["locally_judgeable"] == false
-            }
-            _ => {
-                phase == Some("completed")
-                    && super::observation(status, name)["epoch"].as_u64().is_some()
-                    && work["operation_epoch"] == super::observation(status, name)["epoch"]
-            }
-        };
+    let complete = super::work_complete(status, name, at, stale);
     if complete
         && !read_only
         && phase != Some("blocked")
@@ -447,6 +444,14 @@ fn lane<'a>(
             action,
             next_at: next,
         };
+    }
+    // Current admission blockers outrank background job/receipt maintenance.
+    if !read_only
+        && work["admission"]["allowed"] == false
+        && matches!(action, "read_job" | "read_receipt")
+    {
+        return blocker(status, name, work, &work["admission"], at, stale, timing)
+            .unwrap_or_else(|| Finding::unknown("admission_recovery_unproven"));
     }
     // A bound original can be reconciled even when policy forbids a distinct
     // risk-admitted retry. Never equate disabling retries with disabling reads.
@@ -501,16 +506,36 @@ fn lane<'a>(
         }
         // Assignment-specific failures do not fence other eligible judgments.
         // Only current-route setup/auth evidence applies across assignments.
-        if name != "judge" || model["scope"] == "current_work" {
-            if model["budget_used"]
-                .as_u64()
-                .zip(model["budget_limit"].as_u64())
-                .is_some_and(|(used, limit)| used >= limit)
-            {
+        if (name != "judge" || model["scope"] == "current_work")
+            && matches!(
+                model["state"].as_str(),
+                Some(
+                    "model_unknown"
+                        | "superseded_model_unknown"
+                        | "abandoned_model"
+                        | "rejected"
+                        | "retry_model"
+                        | "prelaunch_failed"
+                )
+            )
+        {
+            if model["blocker"] == "model_budget_exhausted" {
                 return Finding::blocked(
                     "model_attempt_budget_exhausted",
                     "inspect_model_attempts",
                 );
+            }
+            if matches!(
+                model["blocker"].as_str(),
+                Some("model_uncertain_retry_disabled" | "model_uncertain_replacement_exhausted")
+            ) {
+                return Finding::blocked(
+                    model["blocker"].as_str().unwrap(),
+                    "inspect_model_attempts",
+                );
+            }
+            if model["blocker"] == "model_preparation_reserved" {
+                return Finding::automatic("model_preparation_reserved", "await_model", None);
             }
             match model["retry_eligible"].as_bool() {
                 Some(true) => {
@@ -527,6 +552,13 @@ fn lane<'a>(
                     return Finding::automatic(
                         "model_retry_eligible",
                         "retry_model",
+                        timestamp(&model["next_at"]),
+                    );
+                }
+                Some(false) if timestamp(&model["next_at"]).is_some() => {
+                    return Finding::automatic(
+                        model["blocker"].as_str().unwrap_or("model_retry_backoff"),
+                        "await_retry_eligibility",
                         timestamp(&model["next_at"]),
                     );
                 }
@@ -547,11 +579,11 @@ fn lane<'a>(
             Finding::unknown("model_retry_evidence_unavailable")
         };
     }
+    let retry = &work["retry"];
     if !read_only && work["admission"]["allowed"] == false {
         return blocker(status, name, work, &work["admission"], at, stale, timing)
             .unwrap_or_else(|| Finding::unknown("admission_recovery_unproven"));
     }
-    let retry = &work["retry"];
     if !read_only && retry.is_object() {
         let retry_reason = retry["reason"]
             .as_str()
@@ -815,6 +847,143 @@ pub(super) fn project(status: &Value, options: Options, at: i64) -> (Value, Valu
         &status["paused"],
     );
     (work, root)
+}
+
+/// Reconcile action guidance with the shared readiness result. Background
+/// recovery stays visible separately and never wins the primary recommendation.
+pub(super) fn qualify_operational(report: &mut Value, status: &Value) {
+    let observed = report["checked_at"].as_i64();
+    // Index bounded read evidence once; retained operation counts can be large.
+    let mut reads = std::collections::HashMap::new();
+    for row in status["reads"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|row| {
+            row["retired"] != true && matches!(row["purpose"].as_str(), Some("job" | "receipt"))
+        })
+    {
+        if let (Some(owner), Some(purpose), Some(resource)) = (
+            row["owner"].as_str(),
+            row["purpose"].as_str(),
+            row["resource"].as_str(),
+        ) {
+            reads
+                .entry((owner, purpose, resource))
+                .and_modify(|entry| *entry = None)
+                .or_insert(Some(row));
+        }
+    }
+    for name in LANES {
+        let component = &report["components"][name];
+        let state = component["state"].as_str().unwrap_or("unknown");
+        let reason = component["reasons"][0]
+            .as_str()
+            .unwrap_or("work_evidence_unavailable");
+        let existing = &report["work"][name]["intervention"];
+        let replacement = match reason {
+            "model_work_overdue" | "dispatch_outcome_uncertain" => Some(Finding {
+                progress: "blocked",
+                status: "undetermined",
+                reason: "in_flight_outcome_overdue",
+                action: "inspect_operations",
+                next_at: None,
+            }),
+            "pending_model_execution_expired" => Some(Finding::unknown(reason)),
+            "pending_work_overdue" => Some(Finding {
+                progress: "blocked",
+                status: "undetermined",
+                reason,
+                action: "inspect_operations",
+                next_at: None,
+            }),
+            "model_attempt_budget_exhausted"
+            | "model_uncertain_retry_disabled"
+            | "model_uncertain_replacement_exhausted" => {
+                Some(Finding::blocked(reason, "inspect_model_attempts"))
+            }
+            "current_work_outcome_unresolved"
+                if existing["status"] != "operator_required"
+                    && existing["status"] != "automatic_recovery" =>
+            {
+                Some(Finding::blocked(reason, "inspect_operations"))
+            }
+            _ if state == "unknown"
+                && matches!(
+                    reason,
+                    "work_evidence_unavailable"
+                        | "admission_evidence_unavailable"
+                        | "model_deadline_unavailable"
+                        | "clock_regressed"
+                )
+                && existing["status"] != "operator_required" =>
+            {
+                Some(Finding::unknown(reason))
+            }
+            _ => None,
+        };
+        let replacement =
+            replacement.map(|finding| (finding.progress, finding.value(observed, None)));
+        if let Some((progress, Value::Object(fields))) = replacement {
+            report["work"][name]["progress"] = json!(progress);
+            report["work"][name]["intervention"]
+                .as_object_mut()
+                .expect("projected intervention")
+                .extend(fields);
+        }
+        let mut count = 0_u64;
+        let mut bound = 0_u64;
+        let mut next = None::<i64>;
+        for row in status["pending_work"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|row| row["kind"] == name && row["nonblocking_for_fresh_work"] == true)
+        {
+            count += 1;
+            if matches!(row["read_key"]["purpose"].as_str(), Some("job" | "receipt")) {
+                bound += 1;
+                let due = timestamp(&row["next_at"])
+                    .into_iter()
+                    .chain(timestamp(&row["retry_not_before"]))
+                    .chain(
+                        row["read_key"]["owner"]
+                            .as_str()
+                            .zip(row["read_key"]["purpose"].as_str())
+                            .zip(row["read_key"]["resource"].as_str())
+                            .and_then(|((owner, purpose), resource)| {
+                                reads.get(&(owner, purpose, resource))
+                            })
+                            .and_then(|read| *read)
+                            .filter(|read| {
+                                row["binding_revision"].as_i64().is_some()
+                                    && row["binding_revision"] == read["binding_revision"]
+                            })
+                            .and_then(|read| timestamp(&read["next_at"])),
+                    )
+                    .max();
+                if let Some(at) = due {
+                    next = Some(next.map_or(at, |previous| previous.min(at)));
+                }
+            }
+        }
+        report["work"][name]["background_recovery"] = json!({
+            "count":count,"bound_count":bound,"unbound_count":count-bound,
+            "required_for_participation":false,
+            "next_action":if bound > 0 {"await_reconciliation"} else if count > 0 {"inspect_operations"} else {"none"},
+            "next_at":next,"evidence":"retained_outcomes_not_retry_authority",
+        });
+    }
+    let mut root = report["intervention"].take();
+    let core = core_finding(&root["controller"]);
+    reduce(
+        &mut root,
+        &report["work"],
+        &core,
+        &report["effective_capabilities"],
+        &report["paused"],
+    );
+    report["intervention"] = root;
 }
 
 fn rank(status: &str) -> u8 {
@@ -1272,16 +1441,20 @@ mod tests {
             "model_retry_eligible"
         );
         status["work"]["answer"]["model"]["budget_used"] = json!(2);
+        status["work"]["answer"]["model"]["blocker"] = json!("model_budget_exhausted");
+        status["work"]["answer"]["model"]["retry_eligible"] = json!(false);
         assert_eq!(
             projection(&status).0["answer"]["intervention"]["reason"],
             "model_attempt_budget_exhausted"
         );
         status["work"]["answer"]["model"]["budget_used"] = json!(1);
+        status["work"]["answer"]["model"]["blocker"] = json!("model_uncertain_retry_disabled");
         status["work"]["answer"]["model"]["retry_eligible"] = json!(false);
         assert_eq!(
             projection(&status).0["answer"]["intervention"]["next_action"],
-            "recover_model"
+            "inspect_model_attempts"
         );
+        status["work"]["answer"]["model"]["blocker"] = Value::Null;
         status["work"]["answer"]["model"]["retry_eligible"] = Value::Null;
         assert_eq!(
             projection(&status).0["answer"]["intervention"]["status"],
@@ -1296,6 +1469,29 @@ mod tests {
             "state":"model_unknown","budget_used":2,"budget_limit":2,"retry_eligible":false});
         assert_ne!(
             projection(&status).0["judge"]["intervention"]["status"],
+            "operator_required"
+        );
+    }
+
+    #[test]
+    fn model_unbounded_retry_uses_canonical_cooldown_and_uncertainty_limits() {
+        let mut status = fixture();
+        status["work"]["answer"]["model"] = json!({
+            "state":"retry_model","budget_used":9000,"budget_limit":"unbounded",
+            "retry_eligible":false,"scope":"current_work",
+            "blocker":"model_retry_cooldown","next_at":12000
+        });
+        let work = projection(&status).0;
+        assert_eq!(
+            work["answer"]["intervention"]["status"],
+            "automatic_recovery"
+        );
+        assert_eq!(work["answer"]["intervention"]["next_at"], 12000);
+        status["work"]["answer"]["model"]["next_at"] = Value::Null;
+        status["work"]["answer"]["model"]["blocker"] =
+            json!("model_uncertain_replacement_exhausted");
+        assert_eq!(
+            projection(&status).0["answer"]["intervention"]["status"],
             "operator_required"
         );
     }

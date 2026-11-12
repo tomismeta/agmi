@@ -242,7 +242,10 @@ impl HostAccess {
         Ok(true)
     }
 
-    pub(in crate::runtime) fn model_attempt_limit(&self, kind: LaneId) -> Result<u32> {
+    pub(in crate::runtime) fn model_attempt_limit(
+        &self,
+        kind: LaneId,
+    ) -> Result<crate::config::CountLimit> {
         let current = self
             .config
             .preparation(kind)
@@ -252,7 +255,29 @@ impl HostAccess {
             .once
             .as_ref()
             .and_then(|plan| plan.entry_config.preparation(kind))
-            .map_or(current, |entry| current.min(entry.max_attempts_per_work)))
+            .map_or(current, |entry| {
+                current.intersect(entry.max_attempts_per_work)
+            }))
+    }
+
+    pub(in crate::runtime) fn model_retry_blocker(
+        &self,
+        kind: LaneId,
+        key: &str,
+    ) -> Result<Option<&'static str>> {
+        let current =
+            self.store
+                .model_retry_assessment(kind, key, &self.config, self.deadline_now())?;
+        if current.blocker.is_some() {
+            return Ok(current.blocker);
+        }
+        if let Some(plan) = &self.once {
+            return Ok(self
+                .store
+                .model_retry_assessment(kind, key, &plan.entry_config, plan.entry_at)?
+                .blocker);
+        }
+        Ok(None)
     }
 
     pub(in crate::runtime) fn fresh_allowed(&mut self, kind: LaneId, id: i64) -> bool {
@@ -325,10 +350,9 @@ impl HostAccess {
         if op.generation != self.store.control()?.generation
             || self.config.mode(kind) == Mode::Off
             || (kind == LaneId::Judge && self.config.judging_assignment_excluded(&op.key))
-            || self
+            || !self
                 .store
-                .operation_lane_revision(&self.store.operation_binding(&op)?)?
-                != self.config.lane_revision(kind)?
+                .operation_config_current(&self.config, &self.store.operation_binding(&op)?)?
         {
             let binding = self.store.operation_binding(&op)?;
             self.store

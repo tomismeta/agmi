@@ -83,6 +83,18 @@ pub(super) fn evaluate(status: &Value, at: i64, stale: u64) -> Value {
         let local_stale = super::cycle_floor(status, lane).unwrap_or(0).max(stale);
         result["lanes"][lane] = project(discovery(status, lane), at, local_stale);
     }
+    let background: std::collections::HashSet<_> = status["pending_work"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|work| work["nonblocking_for_fresh_work"] == true)
+        .filter_map(|work| {
+            Some((
+                work["operation_id"].as_i64()?,
+                work["binding_revision"].as_i64()?,
+            ))
+        })
+        .collect();
     result["resources"] = json!(
         status["reads"]
             .as_array()
@@ -98,9 +110,12 @@ pub(super) fn evaluate(status: &Value, at: i64, stale: u64) -> Value {
                     .and_then(|lane| super::cycle_floor(status, lane))
                     .unwrap_or(0)
                     .max(stale);
+                let background = row["operation_id"].as_i64().zip(row["binding_revision"].as_i64())
+                    .is_some_and(|binding| background.contains(&binding));
                 json!({"owner":row["owner"],"purpose":row["purpose"],"resource":row["resource"],
                 "operation_id":row["operation_id"],"binding_revision":row["binding_revision"],
                 "retired":row["retired"],
+                "dependency":if background {"background_remote_work"}else{"current_or_unclassified"},
                 "health":project(Some(row),at,local_stale)})
             })
             .collect::<Vec<_>>()

@@ -66,6 +66,32 @@ fn resource_target(endpoint: Endpoint, resource: &str) -> Result<String> {
     Ok(format!("{}:{resource}", endpoint_name(endpoint)?))
 }
 
+const RECONCILIATION_PAGE_SIZE: usize = 64;
+const RECONCILIATION_SELECT: &str = "WITH page AS MATERIALIZED (
+    SELECT id,binding_revision,txid,job_id,next_at
+    FROM operations INDEXED BY operations_reconciliation
+    WHERE kind=?1 AND id<=?3
+    AND state IN ('queued','unknown','included_pending','confirmed')
+    AND (job_id IS NOT NULL OR txid IS NOT NULL)
+    ORDER BY id DESC LIMIT ?6)
+    SELECT o.id,COALESCE(o.txid IS NULL AND r.status=404 AND r.failures>=2,0),
+        o.next_at<=?2 AND COALESCE(r.in_flight,0)=0
+        AND MAX(COALESCE(r.local_next_at,0),COALESCE(r.server_not_before,0),
+            COALESCE(r.retained_conservative_floor,0))<=?2
+        AND NOT EXISTS(SELECT 1 FROM request_restrictions rr
+            WHERE rr.authority=?4 AND rr.origin=?5
+            AND rr.scope='account_authenticated'
+            AND rr.read_class=1 AND rr.not_before>?2)
+        AND NOT EXISTS(SELECT 1 FROM request_restrictions rr
+            WHERE rr.authority=?4 AND rr.origin=?5 AND rr.scope='resource'
+            AND rr.target=CASE WHEN o.txid IS NOT NULL
+                THEN 'receipt:'||o.txid ELSE 'job:'||o.job_id END
+            AND rr.read_class=1 AND rr.not_before>?2)
+    FROM page o LEFT JOIN read_state r
+    ON r.operation_id=o.id AND r.binding_revision=o.binding_revision AND r.retired=0
+    AND r.purpose=CASE WHEN o.txid IS NOT NULL THEN 'receipt' ELSE 'job' END
+    ORDER BY o.id DESC";
+
 impl Store {
     pub(crate) fn operation_read_key(op: &Operation) -> Option<ReadKey> {
         let phase = if op.txid.is_some() {
@@ -239,17 +265,21 @@ impl Store {
     pub(crate) fn read_started(&self, key: &ReadKey) -> Result<bool> {
         self.continuity()?;
         let tx = self.db.unchecked_transaction()?;
-        if !self.ensure_read_row(key)? || self.read_backoff(key)?.next_at > now() {
+        let started = self.start_read_in(key, now())?;
+        tx.commit()?;
+        Ok(started)
+    }
+
+    fn start_read_in(&self, key: &ReadKey, at: i64) -> Result<bool> {
+        if !self.ensure_read_row(key)? || self.read_backoff(key)?.next_at > at {
             return Ok(false);
         }
         let (owner, purpose, resource, _) = self.read_parts(key)?;
-        let changed = tx.execute(
+        Ok(self.db.execute(
             "UPDATE read_state SET in_flight=1,started_at=?4
             WHERE owner=?1 AND purpose=?2 AND resource=?3 AND retired=0 AND in_flight=0",
-            params![owner, purpose, resource, now()],
-        )?;
-        tx.commit()?;
-        Ok(changed == 1)
+            params![owner, purpose, resource, at],
+        )? == 1)
     }
 
     pub(crate) fn cancel_read(&self, key: &ReadKey) -> Result<()> {
@@ -574,11 +604,23 @@ impl Store {
             endpoint.authenticated() || matches!(endpoint, Endpoint::Job | Endpoint::Receipt);
         Ok(db
             .query_row(
-                "SELECT not_before,basis='retained_legacy_floor',scope FROM request_restrictions
-            WHERE authority=?1 AND origin=?2 AND ((?3 AND effect_class) OR (NOT ?3 AND read_class))
-            AND ((scope='account_authenticated' AND ?4) OR (scope='resource' AND target=?5)
-                OR (scope='answer_judge_effects' AND ?6) OR (scope='legacy_account_effect' AND ?3))
-            ORDER BY not_before DESC LIMIT 1",
+                "SELECT not_before,basis='retained_legacy_floor',scope FROM (
+                    SELECT not_before,basis,scope FROM request_restrictions
+                    WHERE authority=?1 AND origin=?2 AND scope='account_authenticated'
+                        AND ?4 AND ((?3 AND effect_class) OR (NOT ?3 AND read_class))
+                    UNION ALL
+                    SELECT not_before,basis,scope FROM request_restrictions
+                    WHERE authority=?1 AND origin=?2 AND scope='resource' AND target=?5
+                        AND ((?3 AND effect_class) OR (NOT ?3 AND read_class))
+                    UNION ALL
+                    SELECT not_before,basis,scope FROM request_restrictions
+                    WHERE authority=?1 AND origin=?2 AND scope='answer_judge_effects'
+                        AND ?6 AND ((?3 AND effect_class) OR (NOT ?3 AND read_class))
+                    UNION ALL
+                    SELECT not_before,basis,scope FROM request_restrictions
+                    WHERE authority=?1 AND origin=?2 AND scope='legacy_account_effect'
+                        AND ?3 AND effect_class)
+                ORDER BY not_before DESC LIMIT 1",
                 params![
                     authority,
                     origin,
@@ -602,15 +644,51 @@ impl Store {
     }
 
     pub(crate) fn reconciliation_batch(&self, lane: LaneId) -> Result<Vec<Operation>> {
-        let cursor: i64 = self
+        self.reconciliation_candidates(lane, now())?
+            .into_iter()
+            .map(|id| {
+                self.operation(id)?
+                    .context("recovery operation disappeared")
+            })
+            .collect()
+    }
+
+    fn reconciliation_schedule(&self, name: &str) -> Result<(i64, i64, bool)> {
+        Ok(self
             .db
             .query_row(
-                "SELECT COALESCE(CAST(cursor AS INTEGER),0) FROM schedule WHERE kind=?1",
-                [format!("reconciliation:{}", lane.as_str())],
-                |r| r.get(0),
+                "SELECT next_at,COALESCE(CAST(cursor AS INTEGER),0),served_in_round
+                FROM schedule WHERE kind=?1",
+                [name],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?
-            .unwrap_or(0);
+            .unwrap_or_default())
+    }
+
+    fn set_reconciliation_cursor(&self, name: &str, cursor: i64) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO schedule(kind,next_at,cursor) VALUES (?1,0,?2)
+            ON CONFLICT(kind) DO UPDATE SET cursor=excluded.cursor
+            WHERE schedule.cursor IS NOT excluded.cursor",
+            params![name, cursor.to_string()],
+        )?;
+        Ok(())
+    }
+
+    fn reconciliation_candidates(&self, lane: LaneId, at: i64) -> Result<Vec<i64>> {
+        let recent_name = format!("reconciliation:{}", lane.as_str());
+        let fair_name = format!("reconciliation:fair:{}", lane.as_str());
+        let missing_name = format!("reconciliation:missing:{}", lane.as_str());
+        let recent = self.reconciliation_schedule(&recent_name)?;
+        let fair = self.reconciliation_schedule(&fair_name)?;
+        if recent.0 > at && fair.0 > at {
+            return Ok(Vec::new());
+        }
+        let missing = self.reconciliation_schedule(&missing_name)?;
+        // Cursor selection now writes durable progress. Acquire the writer before
+        // reading a snapshot; a deferred upgrade can fail during live config/control writes.
+        let tx = rusqlite::Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
         let identity: String =
             self.db
                 .query_row("SELECT identity FROM control WHERE singleton=1", [], |r| {
@@ -629,39 +707,214 @@ impl Store {
         )?
         .origin()
         .ascii_serialization();
-        let mut stmt=self.db.prepare("SELECT o.id FROM operations o LEFT JOIN read_state r
-            ON r.operation_id=o.id AND r.binding_revision=o.binding_revision AND r.retired=0
-            AND r.purpose=CASE WHEN o.txid IS NOT NULL THEN 'receipt' ELSE 'job' END
-            WHERE o.kind=?1 AND o.state IN ('queued','unknown','included_pending','confirmed')
-            AND (o.job_id IS NOT NULL OR o.txid IS NOT NULL) AND o.next_at<=?2
-            AND COALESCE(r.in_flight,0)=0 AND MAX(COALESCE(r.local_next_at,0),COALESCE(r.server_not_before,0),COALESCE(r.retained_conservative_floor,0))<=?2
-            AND NOT EXISTS(SELECT 1 FROM request_restrictions rr WHERE rr.authority=?4 AND rr.origin=?5
-                AND rr.read_class=1 AND rr.not_before>?2 AND (rr.scope='account_authenticated'
-                    OR (rr.scope='resource' AND rr.target=CASE WHEN o.txid IS NOT NULL
-                        THEN 'receipt:'||o.txid ELSE 'job:'||o.job_id END)))
-            ORDER BY CASE WHEN o.id>?3 THEN 0 ELSE 1 END,o.id LIMIT 2")?;
-        let ids = stmt
-            .query_map(
-                params![lane.as_str(), now(), cursor, authority, origin],
-                |r| r.get::<_, i64>(0),
-            )?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        ids.into_iter()
-            .map(|id| {
-                self.operation(id)?
-                    .context("recovery operation disappeared")
-            })
-            .collect()
+        // LIMIT belongs to the base ID page, before any eligibility predicate.
+        // Every walk advances past ineligible rows, independently of whether a
+        // request starts. A page with no match must not turn into a history scan.
+        let mut stmt = self.db.prepare(RECONCILIATION_SELECT)?;
+        let mut select = |cursor: i64, exclude: i64, missing_only: bool| -> Result<_> {
+            let mut page = |ceiling| -> Result<(Option<i64>, i64)> {
+                let rows = stmt.query_map(
+                    params![
+                        lane.as_str(),
+                        at,
+                        ceiling,
+                        authority,
+                        origin,
+                        RECONCILIATION_PAGE_SIZE as i64
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, bool>(1)?,
+                            row.get::<_, bool>(2)?,
+                        ))
+                    },
+                )?;
+                let mut candidate = None;
+                let mut last = 0;
+                for row in rows {
+                    let (id, missing, eligible) = row?;
+                    last = id;
+                    if candidate.is_none() && id != exclude && missing == missing_only && eligible {
+                        candidate = Some(id);
+                    }
+                }
+                Ok((candidate, last))
+            };
+            let result = page(if cursor > 0 { cursor - 1 } else { i64::MAX })?;
+            // An exhausted walk wraps at most once, never until a match.
+            if result.1 == 0 && cursor > 0 {
+                page(i64::MAX)
+            } else {
+                Ok(result)
+            }
+        };
+        let mut candidates = Vec::with_capacity(2);
+        if recent.0 <= at {
+            let head_name = format!("reconciliation:head:{}", lane.as_str());
+            let head = self.reconciliation_schedule(&head_name)?.1;
+            let newest = self
+                .db
+                .query_row(
+                    "SELECT id FROM operations INDEXED BY operations_reconciliation
+                    WHERE kind=?1 AND state IN ('queued','unknown','included_pending','confirmed')
+                    AND (job_id IS NOT NULL OR txid IS NOT NULL)
+                    ORDER BY id DESC LIMIT 1",
+                    [lane.as_str()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+                .unwrap_or(0);
+            // New work jumps ahead immediately; otherwise continue the recent
+            // walk rather than repeatedly classifying the newest missing page.
+            let cursor = if newest > head { 0 } else { recent.1 };
+            let (candidate, last) = select(cursor, 0, false)?;
+            // Keep ready recent work on its reserved cadence. Only an empty
+            // eligible page advances this walk; ordinary history has its own.
+            self.set_reconciliation_cursor(
+                &recent_name,
+                candidate.map_or(last, |id| id.saturating_add(1)),
+            )?;
+            if newest > head {
+                self.set_reconciliation_cursor(&head_name, newest)?;
+            }
+            if let Some(candidate) = candidate {
+                candidates.push(candidate);
+            }
+        }
+        if fair.0 <= at {
+            let exclude = candidates.first().copied().unwrap_or(0);
+            let (ordinary, ordinary_last) = select(fair.1, exclude, false)?;
+            // Missing work owns a separate descending walk. Alternation and
+            // its sparse service floor are independent of traversal progress.
+            let historical = if missing.0 <= at && (!fair.2 || ordinary.is_none()) {
+                let (candidate, last) = select(missing.1, exclude, true)?;
+                self.set_reconciliation_cursor(&missing_name, candidate.unwrap_or(last))?;
+                candidate
+            } else {
+                None
+            };
+            self.set_reconciliation_cursor(
+                &fair_name,
+                match ordinary {
+                    // Preserve an eligible ordinary candidate when missing
+                    // work takes this slot; only skipped rows are consumed.
+                    Some(id) if historical.is_some() => id.saturating_add(1),
+                    Some(id) => id,
+                    None => ordinary_last,
+                },
+            )?;
+            if let Some(candidate) = historical.or(ordinary) {
+                candidates.push(candidate);
+            }
+        }
+        drop(stmt);
+        tx.commit()?;
+        Ok(candidates)
     }
-    pub(crate) fn reconciliation_attempted(&self, lane: LaneId, operation: i64) -> Result<()> {
+
+    /// Reserve durable lane service before starting the request. Completion,
+    /// cancellation, restart and policy reload do not refund an occupied slot.
+    pub(crate) fn reconciliation_read_started(
+        &self,
+        config: &Config,
+        lane: LaneId,
+        key: &ReadKey,
+    ) -> Result<bool> {
+        self.reconciliation_read_started_at(config, lane, key, now())
+    }
+
+    fn reconciliation_read_started_at(
+        &self,
+        config: &Config,
+        lane: LaneId,
+        key: &ReadKey,
+        at: i64,
+    ) -> Result<bool> {
         self.continuity()?;
-        self.db.execute("INSERT INTO schedule(kind,next_at,cursor) VALUES (?1,0,?2) ON CONFLICT(kind) DO UPDATE SET cursor=excluded.cursor",
-            params![format!("reconciliation:{}",lane.as_str()),operation.to_string()])?;
-        Ok(())
+        let ReadKey::Operation { operation_id, .. } = key else {
+            bail!("reconciliation requires an operation binding");
+        };
+        let tx = rusqlite::Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
+        if !self.read_current(key)? {
+            return Ok(false);
+        }
+        let (next_at, missing): (i64, bool) = self.db.query_row(
+            "SELECT o.next_at,COALESCE(o.txid IS NULL AND r.status=404 AND r.failures>=2,0)
+            FROM operations o LEFT JOIN read_state r
+                ON r.operation_id=o.id AND r.binding_revision=o.binding_revision AND r.retired=0
+                AND r.purpose=CASE WHEN o.txid IS NOT NULL THEN 'receipt' ELSE 'job' END
+            WHERE o.id=?1 AND o.kind=?2",
+            params![operation_id, lane.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let recent = self.reconciliation_schedule(&format!("reconciliation:{}", lane.as_str()))?;
+        let fair = missing || recent.0 > at;
+        if next_at > at
+            || (fair
+                && self
+                    .reconciliation_schedule(&format!("reconciliation:fair:{}", lane.as_str()))?
+                    .0
+                    > at)
+            || (missing
+                && self
+                    .reconciliation_schedule(&format!("reconciliation:missing:{}", lane.as_str()))?
+                    .0
+                    > at)
+        {
+            return Ok(false);
+        }
+        let (_, purpose, _, remote) = self.read_parts(key)?;
+        let endpoint = if purpose == "receipt" {
+            Endpoint::Receipt
+        } else {
+            Endpoint::Job
+        };
+        if self.request_not_before(config, endpoint, remote.as_deref())? > at {
+            return Ok(false);
+        }
+        if !self.start_read_in(key, at)? {
+            return Ok(false);
+        }
+        let schedule = config.schedule(lane);
+        let interval = schedule
+            .queued_job_polling
+            .map_or(schedule.retry_seconds, |policy| policy.initial_seconds)
+            .max(1);
+        let deadline = |seconds: u64| {
+            at.saturating_add(seconds.min(i64::MAX as u64) as i64)
+                .saturating_add(1)
+        };
+        let name = if fair {
+            format!("reconciliation:fair:{}", lane.as_str())
+        } else {
+            format!("reconciliation:{}", lane.as_str())
+        };
+        tx.execute(
+            "INSERT INTO schedule(kind,next_at,served_in_round) VALUES (?1,?2,?3)
+            ON CONFLICT(kind) DO UPDATE SET next_at=excluded.next_at,
+                served_in_round=excluded.served_in_round",
+            params![name, deadline(interval), missing],
+        )?;
+        if missing {
+            tx.execute(
+                "INSERT INTO schedule(kind,next_at) VALUES (?1,?2)
+                ON CONFLICT(kind) DO UPDATE SET next_at=excluded.next_at",
+                params![
+                    format!("reconciliation:missing:{}", lane.as_str()),
+                    deadline(schedule.backoff_max_seconds.max(interval))
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(true)
     }
 
     pub(crate) fn wake_delay(&self, config: &Config, fallback: u64) -> Result<u64> {
-        let current = now();
+        self.wake_delay_at(config, fallback, now())
+    }
+
+    fn wake_delay_at(&self, config: &Config, fallback: u64, current: i64) -> Result<u64> {
         let mut deadline = current.saturating_add(fallback.min(i64::MAX as u64) as i64);
         for lane in [LaneId::Answer, LaneId::Judge, LaneId::Mine] {
             if config.mode(lane) != Mode::Off {
@@ -678,18 +931,45 @@ impl Store {
                     deadline = deadline.min(next);
                 }
             }
+            // Probe lane presence, not every retained resource floor. Selection
+            // and claim still enforce those floors; the configured cadence is
+            // a conservative wake bound while an unfinished walk has work.
+            let pending: bool = self.db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM operations INDEXED BY operations_reconciliation
+                WHERE kind=?1 AND state IN ('queued','unknown','included_pending','confirmed')
+                AND (job_id IS NOT NULL OR txid IS NOT NULL))",
+                [lane.as_str()],
+                |row| row.get(0),
+            )?;
+            if pending {
+                let schedule = config.schedule(lane);
+                let interval = schedule
+                    .queued_job_polling
+                    .map_or(schedule.retry_seconds, |policy| policy.initial_seconds)
+                    .max(1);
+                deadline =
+                    deadline.min(current.saturating_add(interval.min(i64::MAX as u64) as i64));
+                for name in [
+                    format!("reconciliation:{}", lane.as_str()),
+                    format!("reconciliation:fair:{}", lane.as_str()),
+                    format!("reconciliation:missing:{}", lane.as_str()),
+                ] {
+                    let next = self.reconciliation_schedule(&name)?.0;
+                    if next > current {
+                        deadline = deadline.min(next);
+                    }
+                }
+            }
         }
-        let next:Option<i64>=self.db.query_row("SELECT MIN(MAX(o.next_at,COALESCE(r.local_next_at,0),COALESCE(r.server_not_before,0),COALESCE(r.retained_conservative_floor,0)))
-            FROM operations o LEFT JOIN read_state r ON r.operation_id=o.id AND r.binding_revision=o.binding_revision AND r.retired=0
-            WHERE o.state IN ('queued','unknown','included_pending','confirmed') AND (o.job_id IS NOT NULL OR o.txid IS NOT NULL) AND COALESCE(r.in_flight,0)=0",[],|r|r.get(0))?;
-        if let Some(next) = next.filter(|next| *next > current) {
-            deadline = deadline.min(next);
-        }
-        let restriction: Option<i64> = self.db.query_row(
-            "SELECT MIN(not_before) FROM request_restrictions WHERE not_before>?1",
-            [current],
-            |r| r.get(0),
-        )?;
+        let restriction: Option<i64> = self
+            .db
+            .query_row(
+                "SELECT not_before FROM request_restrictions WHERE not_before>?1
+                ORDER BY not_before LIMIT 1",
+                [current],
+                |row| row.get(0),
+            )
+            .optional()?;
         if let Some(next) = restriction {
             deadline = deadline.min(next);
         }
@@ -824,3 +1104,7 @@ impl Store {
             .optional()?.map(|(mut value,challenge)| -> Result<Value>{value["challenge"]=serde_json::from_str(&challenge)?;Ok(value)}).transpose()
     }
 }
+
+#[cfg(test)]
+#[path = "reconciliation_tests.rs"]
+mod tests;

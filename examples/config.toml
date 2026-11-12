@@ -92,7 +92,9 @@ jitter_seconds = 30 # Deterministic staggering; zero disables it.
 [capabilities.answer.preparation]
 while_blocked = true
 retry_uncertain = false # Opt-in can duplicate remote inference charges.
-max_attempts_per_work = 2 # Allows a replacement for a completed invalid draft.
+max_attempts_per_work = 2 # Or "unbounded": explicitly authorize paced recurring attempts.
+# Replacements for possibly-running same-work inference remain separately bounded.
+# max_uncertain_replacements_per_work = 1 # Requires retry_uncertain = true; 0 disables replacements.
 
 # Strict also checks unresolved effects across the account. The capacity cap
 # counts this lane's possibly-sent work, not a shared pool or answer reservation.
@@ -101,6 +103,9 @@ max_attempts_per_work = 2 # Allows a replacement for a completed invalid draft.
 mode = "strict" # strict | participation_first | manual
 uncertainty_grace_seconds = 300
 max_unresolved_operations = 4
+# Explicit participation_first + "unbounded" permits distinct fresh work despite
+# retained unknowns, without blanket uncertainty grace. It never grants same-work
+# replay and can accumulate remote exposure indefinitely. Numeric limits stay finite.
 retry_uncertain_answers = false # Separate opt-in; may duplicate an accepted answer.
 uncertain_answer_retry_seconds = 600
 max_answer_attempts_per_epoch = 2
@@ -143,6 +148,7 @@ jitter_seconds = 30
 while_blocked = false
 retry_uncertain = false
 max_attempts_per_work = 2
+# max_uncertain_replacements_per_work = 1
 
 [capabilities.judge.participation]
 mode = "strict"

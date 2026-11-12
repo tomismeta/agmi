@@ -441,7 +441,7 @@ fn rejected_stamps_freshness_and_stale_operation_cas_do_not_spend_a_turn() {
         .retire_unsent(&binding, "unsent_admission_closed")
         .unwrap();
     // Keep the old ready value to exercise a genuine selection-to-CAS race.
-    assert!(fixture.admit(&ready, 0).is_err());
+    assert!(!matches!(fixture.admit(&ready, 0), Ok(Some(_))));
     fixture.assert_round(&[]);
     assert_eq!(fixture.sequence(), 0);
     assert_eq!(fixture.dispatch_events(), 0);
@@ -757,6 +757,96 @@ fn writer_replacement_during_sqlite_wait_rolls_back_dispatch_authority() {
         )
         .unwrap();
     assert_eq!(retained_risk, 0);
+    assert_eq!(
+        fixture
+            .store
+            .operation(ready.operation.id)
+            .unwrap()
+            .unwrap()
+            .state,
+        "prepared"
+    );
+}
+
+#[test]
+fn current_stamp_dispatches_prepared_capture_and_preserves_its_revision() {
+    let mut fixture = Fixture::new();
+    let ready = fixture.prepare(LaneId::Answer, 7);
+    let binding = fixture.store.operation_binding(&ready.operation).unwrap();
+    // The helper accepts the unchanged full revision without any producer
+    // proof beyond the binding itself.
+    assert!(
+        Store::operation_config_current_in(&fixture.store.db, &fixture.config, &binding).unwrap()
+    );
+    // A stale generation stamp cannot dispatch the same capture: root
+    // generation and current controls remain mandatory.
+    let mut stale = ready.clone();
+    stale.stamp.account_generation += 1;
+    assert_eq!(fixture.select(std::slice::from_ref(&stale)), None);
+    // The current stamp dispatches without rewriting the captured revision.
+    let revision_before: String = fixture
+        .store
+        .db
+        .query_row(
+            "SELECT revision FROM operations WHERE id=?1",
+            [ready.operation.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(fixture.select(std::slice::from_ref(&ready)), Some(0));
+    fixture.dispatch(&ready);
+    let after = fixture
+        .store
+        .operation(ready.operation.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.state, "dispatching");
+    let revision_after: String = fixture
+        .store
+        .db
+        .query_row(
+            "SELECT revision FROM operations WHERE id=?1",
+            [ready.operation.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(revision_after, revision_before);
+    let policy = fixture.policy(ready.operation.id);
+    assert_eq!(
+        policy["dispatch_admission"]["lane_config_revision"],
+        ready.stamp.lane_config_revision
+    );
+}
+
+#[test]
+fn admission_only_config_change_without_producer_proof_stays_fenced() {
+    let mut fixture = Fixture::new();
+    let mut ready = fixture.prepare(LaneId::Answer, 7);
+    let producer_before = fixture.config.producer_revision(LaneId::Answer).unwrap();
+    // Grace is scheduling intent, not producer input: it moves the full
+    // lane revision while the producer revision is unchanged.
+    fixture
+        .config
+        .capabilities
+        .answer
+        .participation
+        .uncertainty_grace_seconds += 1;
+    assert_ne!(
+        fixture.config.lane_revision(LaneId::Answer).unwrap(),
+        ready.stamp.lane_config_revision
+    );
+    assert_eq!(
+        fixture.config.producer_revision(LaneId::Answer).unwrap(),
+        producer_before
+    );
+    // A legacy capture carrying no producer hash must not gain the exception:
+    // provenance is never invented.
+    ready.stamp.lane_config_revision = fixture.config.lane_revision(LaneId::Answer).unwrap();
+    let binding = fixture.store.operation_binding(&ready.operation).unwrap();
+    assert!(
+        !Store::operation_config_current_in(&fixture.store.db, &fixture.config, &binding).unwrap()
+    );
+    assert_eq!(fixture.select(std::slice::from_ref(&ready)), None);
     assert_eq!(
         fixture
             .store

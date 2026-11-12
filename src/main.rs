@@ -166,15 +166,25 @@ enum Command {
         once: bool,
     },
     /// Inspect local durable state without contacting MinePOA or a model.
-    Status,
+    #[command(
+        after_help = "Local snapshot only; no network or model calls. Exit zero means the snapshot was\nread successfully, not that participation is healthy; use health for that check.\nOperational health and retained risk are separate. Historical unknowns do not fail\nan open fresh-work path; actual blockers and unavailable current evidence still do.\nCurrent actions precede background reconciliation. --verbose shows retained detail."
+    )]
+    Status {
+        /// Include complete retained diagnostic evidence.
+        #[arg(long)]
+        verbose: bool,
+    },
     /// Diagnose unattended progress; optionally apply guarded local evidence repairs.
     #[command(
-        after_help = "EXAMPLES\n  agmi doctor\n  agmi --json doctor\n  agmi doctor --repair\n\nRead-only by default. --repair authorizes guarded refusal recovery and eligible\nlegacy identity-evidence normalization; it preserves ambiguous writes, model history,\nguidance and pause intent. Identity normalization retains the original uncertain\nfailure; it never clears a recorded rejection, verifies identity, replaces credentials\nor changes retry deadlines. Timeouts are not credential rejection. Automatic recovery\nrequires a retained retry or in-flight read and is not a guarantee of success.\nFollow the reported next action for operator-required or undetermined evidence."
+        after_help = "EXAMPLES\n  agmi doctor\n  agmi --json doctor\n  agmi doctor --repair\n\nRead-only by default. Exit zero means an unattended path exists and repair did not\nfail; it is not a healthy or settled outcome. Inspect operational health separately.\n--repair authorizes only evidence-proven refusal recovery and eligible legacy\nidentity normalization. It never clears blanket unknowns, replays uncertain work,\nverifies identity, replaces credentials, raises budgets or changes retry deadlines.\nCurrent blockers take precedence over background reconciliation. Automatic recovery\nis a retained path, not a promise that old outcomes will ever resolve."
     )]
     Doctor {
         /// Apply eligible local repairs, briefly stopping/restoring a matching managed runtime if needed.
         #[arg(long)]
         repair: bool,
+        /// Include complete retained diagnostic evidence.
+        #[arg(long)]
+        verbose: bool,
     },
     /// Inspect sanitized read progress, failures and retry deadlines without network access.
     Reads,
@@ -184,11 +194,17 @@ enum Command {
         command: OperationsCommand,
     },
     /// Check sanitized local liveness and participation evidence without side effects.
+    #[command(
+        after_help = "Local checks for controller, answer, judge and mine; no network or model calls.\nExit zero means operationally clear under the selected checks, not remote finality.\nRetained unknowns can require risk attention while healthy remains true, under\nfinite or unbounded policy. Actual capacity/strict-policy blockers, overdue local\nexecution and unavailable current evidence still fail the check. Fresh complete\nempty judging inventory is healthy idle; stale or partial inventory is not proof\nof no work. Unknown outcomes never authorize replay. --verbose shows full evidence."
+    )]
     Health {
+        /// Include complete retained diagnostic evidence.
+        #[arg(long)]
+        verbose: bool,
         /// Stale heartbeat/observation limit; raised to the configured cycle timing floor.
         #[arg(long, default_value_t = 180, value_parser = clap::value_parser!(u64).range(1..))]
         stale_seconds: u64,
-        /// Maximum total age of queued or pending work (not reset by polling).
+        /// Maximum age of current queued/pending work; excludes background recovery.
         #[arg(long, default_value_t = 1800, value_parser = clap::value_parser!(u64).range(1..))]
         work_seconds: u64,
         /// Grace from first observation of the current epoch before requiring an answer.
@@ -223,7 +239,7 @@ enum Command {
     Pause,
     /// Explicitly resume configured capabilities (does not change their modes).
     Resume,
-    /// Abandon interrupted model-only work while stopped; never resets a sent request.
+    /// Abandon interrupted model-only work while stopped; never refunds execution exposure or resets sent requests.
     RecoverModel,
     /// Read sanitized local runtime events.
     #[command(
@@ -267,6 +283,8 @@ fn model_lane_parser() -> clap::builder::PossibleValuesParser {
 #[derive(Subcommand)]
 enum LaneCommand {
     /// Read desired control, authoritative closure and sourced runtime observation.
+    ///
+    /// Control/admission evidence only; use status or health for per-lane operational health.
     Show {
         #[arg(value_parser = lane_parser())]
         lane: String,
@@ -553,8 +571,9 @@ fn health_prerequisite(code: &'static str) -> Value {
         "contract_version":2,"components":health::unknown_components(),
         "healthy":false,"attention_required":true,"issues":[code],"warnings":[],
         "readiness":"prerequisites_missing","evidence":"local_only",
+        "assessment_scope":{"evidence":"local_only","state_filesystem":"not_assessed"},
         "operational":{"status":"unknown","issues":[code]},
-        "risk":{"status":"unknown","attention_required":null,"unresolved_effects":null,"unresolved_model_attempts":null},
+        "risk":health::unknown_risk(),
         "initialized":null,"paused":null,"mutations":false,
         "work":health::unknown_work(code),"intervention":health::unknown_intervention(code)
     })
@@ -603,9 +622,9 @@ fn discovery() -> Value {
         {"name":"update","network_reads":"latest stable metadata/assets unless explicit local source","network_writes":false,"model_calls":false,"local_writes":"unless --check or --dry-run","confirmation_flag":"--repair for guarded refusal recovery","purpose":"verified same-format update then doctor; --migration-only --stopped requires an explicit verified source, permits supported older journal formats to current, disables boot activation and never starts, repairs or converts state; configuration, guidance, credentials and pause unchanged"},
         {"name":"service","network_reads":false,"network_writes":false,"local_writes":"unless status or --dry-run","purpose":"status/start/stop/restart/enable/disable; does not resume participation"},
         {"name":"run","network_reads":true,"model_calls":"active capabilities only","network_writes":"active capabilities and resumed state only","local_writes":true},
-        {"name":"status","network_reads":false,"network_writes":false,"purpose":"local state and blockers"},
+        {"name":"status","network_reads":false,"network_writes":false,"purpose":"local operational state, current blockers and separate retained risk; success means snapshot read, not healthy"},
         {"name":"reads","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":false,"purpose":"sanitized read progress, failure categories and retry deadlines"},
-        {"name":"health","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":false,"purpose":"sanitized local health; unhealthy exits nonzero"},
+        {"name":"health","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":false,"purpose":"local operational health for core and each lane; retained risk alone does not fail health; unhealthy exits nonzero"},
         {"name":"doctor","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":"only with --repair","confirmation_flag":"--repair","purpose":"local unattended/intervention diagnosis; --repair orchestrates existing guarded refusal recovery, preserving runtime intent; a restored runtime may resume its configured network/model work"},
         {"name":"config init","network_writes":false,"local_writes":true},
         {"name":"config show","network_writes":false,"local_writes":false},
@@ -623,10 +642,10 @@ fn discovery() -> Value {
         {"name":"build-info","network_writes":false,"local_writes":false,"purpose":"compiled release identity; --manifest emits installer manifest verbatim"},
         {"name":"pause","network_writes":false,"local_writes":true},
         {"name":"resume","network_writes":false,"local_writes":true,"purpose":"authorize configured capabilities"},
-        {"name":"lane show","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":false,"purpose":"<lane>; read desired.control_token, journal closure, sourced runtime admission observation and dispatch uncertainty; metadata-only configuration"},
+        {"name":"lane show","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":false,"purpose":"<lane>; read desired.control_token, journal closure, sourced admission observation and dispatch uncertainty; control evidence, not health certification; use status or health for operational readiness"},
         {"name":"lane pause","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":true,"purpose":"<lane> --expected-control <control-token> [--wait-seconds 30]; commit local admission fence only; no cancellation, settlement or uncertainty erasure"},
         {"name":"lane resume","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":true,"purpose":"<lane> --expected-control <control-token> [--wait-seconds 30]; remove only lane pause override; no retry authority or proof of open admission"},
-        {"name":"recover-model","network_writes":false,"local_writes":true,"purpose":"allow regeneration of model-only work; requires stopped writer"},
+        {"name":"recover-model","network_writes":false,"local_writes":true,"purpose":"abandon local model preparation; requires stopped writer; retry policy and recorded execution exposure remain binding"},
         {"name":"recover inspect","network_reads":false,"network_writes":false,"local_writes":false,"purpose":"private captured operation and evidence; may contain payload/model text"},
         {"name":"recover adopt","network_reads":false,"network_writes":false,"local_writes":true,"purpose":"stopped-writer anchoring of compatible intact state; legacy schema conversion uses config migrate"},
         {"name":"recover resolve","network_reads":true,"network_writes":false,"local_writes":true,"purpose":"verify already-bound terminal evidence; --operation ID --refusal --dry-run is local-only and nonmutating; --refusal --apply TOKEN retires the reviewed refusal while stopped without network calls or replay"},
@@ -679,7 +698,7 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
             return Ok(("health", health_prerequisite("config_location_unavailable")));
         }
         Err(_) if matches!(cli.command, Command::Doctor { .. }) => {
-            let Command::Doctor { repair } = cli.command else {
+            let Command::Doctor { repair, .. } = cli.command else {
                 unreachable!()
             };
             return Ok((
@@ -1045,7 +1064,7 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
             if matches!(cli.command, Command::Health { .. }) {
                 return Ok(("health", health_prerequisite(code)));
             }
-            if let Command::Doctor { repair } = cli.command {
+            if let Command::Doctor { repair, .. } = cli.command {
                 return Ok(("doctor", doctor_prerequisite(code, repair)));
             }
             return Err(error);
@@ -1143,8 +1162,8 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
                 },
             )),
         },
-        Command::Status => Ok(("status", runtime::status(&config)?)),
-        Command::Doctor { repair } => Ok(("doctor", doctor::check(&path, *repair))),
+        Command::Status { .. } => Ok(("status", runtime::status(&config)?)),
+        Command::Doctor { repair, .. } => Ok(("doctor", doctor::check(&path, *repair))),
         Command::Reads => Ok(("reads", runtime::reads(&config)?)),
         Command::Health {
             stale_seconds,
@@ -1152,6 +1171,7 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
             answer_grace_seconds,
             expect_participation,
             min_free_mib,
+            ..
         } => Ok((
             "health",
             health::check(
@@ -1182,7 +1202,8 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
         Command::RecoverModel => Ok((
             "recover_model",
             json!({"abandoned_models":runtime::recover_model(&config)?,
-                "network_requests_reset":false,"note":"Regeneration may incur another model charge."}),
+                "network_requests_reset":false,"model_exposure_reset":false,
+                "note":"Abandonment does not prove inference stopped or grant another attempt. Eligible regeneration may incur another model charge."}),
         )),
         Command::Logs {
             limit,
@@ -1228,6 +1249,71 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
             command: ConfigCommand::Init,
         } => unreachable!(),
     }
+}
+
+// Reduce only at the presentation boundary; readiness and repair decisions use
+// the complete internal evidence above.
+fn compact_diagnostics(data: &mut Value) {
+    if let Some(object) = data.as_object_mut() {
+        for field in [
+            "pending_work",
+            "captured_work",
+            "reads",
+            "request_restrictions",
+        ] {
+            if let Some(value) = object.remove(field) {
+                object.insert(
+                    format!("{field}_count"),
+                    json!(value.as_array().map(Vec::len)),
+                );
+            }
+        }
+    }
+    fn reduce(value: &mut Value) {
+        match value {
+            Value::Object(object) => {
+                for field in ["blocker_ids", "historical_unknown_answers"] {
+                    object.remove(field);
+                }
+                // Component evidence duplicates canonical top-level work, routing
+                // and observations; its classification and reasons remain visible.
+                if object.contains_key("status")
+                    && object.get("evidence").is_some_and(Value::is_object)
+                {
+                    object.remove("evidence");
+                }
+                for child in object.values_mut() {
+                    reduce(child);
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    reduce(value);
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(api) = data
+        .pointer_mut("/components/api")
+        .and_then(Value::as_object_mut)
+        && let Some(Value::Array(mut resources)) = api.remove("resources")
+    {
+        let mut background = json!({"count":0,"degraded":0,"unknown":0});
+        resources.retain(|resource| {
+            if resource["dependency"] != "background_remote_work" {
+                return true;
+            }
+            background["count"] = json!(background["count"].as_u64().unwrap() + 1);
+            if let Some(state @ ("degraded" | "unknown")) = resource["health"]["state"].as_str() {
+                background[state] = json!(background[state].as_u64().unwrap() + 1);
+            }
+            false
+        });
+        api.insert("resources".into(), json!(resources));
+        api.insert("background_resources".into(), background);
+    }
+    reduce(data);
 }
 
 #[tokio::main]
@@ -1367,7 +1453,7 @@ async fn main() {
                 cli.command,
                 Command::Pause
                     | Command::Resume
-                    | Command::Doctor { repair: true }
+                    | Command::Doctor { repair: true, .. }
                     | Command::Run { .. }
                     | Command::Init { .. }
                     | Command::Install { .. }
@@ -1405,11 +1491,26 @@ async fn main() {
                 "update" => data["success"] == true,
                 _ => true,
             };
+            let verbose = matches!(
+                cli.command,
+                Command::Status { verbose: true }
+                    | Command::Health { verbose: true, .. }
+                    | Command::Doctor { verbose: true, .. }
+            );
+            if matches!(kind, "status" | "health" | "doctor") && !verbose {
+                compact_diagnostics(&mut data);
+            }
             let value = json!({"schema":SCHEMA,"ok":ok,"type":kind,"data":data});
             if cli.json {
                 println!("{value}");
             } else {
                 cli_error::human(kind, &value["data"]);
+                if verbose {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&value["data"]).expect("diagnostic JSON")
+                    );
+                }
             }
             if !ok {
                 std::process::exit(1);
@@ -1433,6 +1534,45 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_diagnostics_preserves_essentials_without_mutating_internal_evidence() {
+        let full = json!({
+            "last_reported_build":{"version":"fixture"},
+            "writer_authority":{"status":"valid"},
+            "effective_runtime":{"policy":{"capabilities":{"answer":{"preparation":{"max_attempts_per_work":"unbounded"}}}}},
+            "observations":{"answer":{"epoch":7}},
+            "work":{"answer":{"phase":"observing","admission":{"allowed":true,"own_count":2000,"own_limit":"unbounded","blocker_ids":[1,2],"historical_unknown_answers":[1,2]}}},
+            "intervention":{"unattended":true},
+            "pending_work":[{"model_attempt":{"producer":{"requested":{}}}}],
+            "captured_work":[],
+            "reads":[{},{}]
+        });
+        let mut compact = full.clone();
+        compact_diagnostics(&mut compact);
+        for field in [
+            "last_reported_build",
+            "writer_authority",
+            "effective_runtime",
+            "observations",
+            "intervention",
+        ] {
+            assert_eq!(compact[field], full[field]);
+        }
+        assert_eq!(compact["pending_work_count"], 1);
+        assert_eq!(compact["reads_count"], 2);
+        assert!(compact.get("pending_work").is_none());
+        assert!(
+            compact["work"]["answer"]["admission"]
+                .get("blocker_ids")
+                .is_none()
+        );
+        assert_eq!(compact["work"]["answer"]["admission"]["own_count"], 2000);
+        assert!(full["pending_work"][0]["model_attempt"].is_object());
+        for command in ["status", "health", "doctor"] {
+            assert!(Cli::try_parse_from(["agmi", command, "--verbose"]).is_ok());
+        }
+    }
 
     #[test]
     fn refusal_resolution_requires_explicit_preview_approval_and_excludes_bound_recovery() {

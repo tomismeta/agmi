@@ -33,6 +33,13 @@ struct InventorySource {
     completed_at: i64,
     rows: std::ops::Range<usize>,
 }
+#[derive(Default)]
+struct CandidateSelection {
+    candidates: Vec<String>,
+    exclusions: std::collections::BTreeMap<&'static str, usize>,
+    excluded_work: Vec<(usize, &'static str)>,
+}
+
 struct Inventory {
     response: Response,
     ids: Vec<String>,
@@ -45,6 +52,9 @@ struct Inventory {
     usable: bool,
     eligible_candidates: usize,
     exclusions: std::collections::BTreeMap<&'static str, usize>,
+    // Bounded diagnostic witnesses, indexed into the canonical inventory IDs.
+    // These identify current dependencies; they never authorize another attempt.
+    excluded_work: Vec<(usize, &'static str)>,
     target: Option<Target>,
 }
 impl Inventory {
@@ -181,6 +191,7 @@ impl JudgeLane {
                         usable: true,
                         eligible_candidates: 0,
                         exclusions: Default::default(),
+                        excluded_work: Vec::new(),
                         target: read.target,
                     });
                 }
@@ -376,13 +387,10 @@ impl JudgeLane {
         }
         Ok(())
     }
-    fn candidates(
-        &self,
-        services: &GradeServices<'_>,
-    ) -> Result<(Vec<String>, std::collections::BTreeMap<&'static str, usize>)> {
-        let mut exclusions = std::collections::BTreeMap::new();
+    fn candidates(&self, services: &GradeServices<'_>) -> Result<CandidateSelection> {
+        let mut selection = CandidateSelection::default();
         let Some(inventory) = &self.inventory else {
-            return Ok((Vec::new(), exclusions));
+            return Ok(selection);
         };
         let rows = inventory.response.body["assignments"]
             .as_array()
@@ -396,11 +404,17 @@ impl JudgeLane {
             }
             let source = inventory.source(index);
             if !services.observation_current(&source.observation)? {
-                *exclusions.entry("observation_stale").or_insert(0) += 1;
+                *selection.exclusions.entry("observation_stale").or_insert(0) += 1;
+                if selection.excluded_work.len() < 32 {
+                    selection.excluded_work.push((index, "observation_stale"));
+                }
             } else if inventory.target.is_none()
                 && let Some(reason) = services.assignment_blocker(id)?
             {
-                *exclusions.entry(reason).or_insert(0) += 1;
+                *selection.exclusions.entry(reason).or_insert(0) += 1;
+                if selection.excluded_work.len() < 32 {
+                    selection.excluded_work.push((index, reason));
+                }
             } else {
                 ranked.push((
                     row["pending_meta"]["expires_at_epoch"]
@@ -411,10 +425,8 @@ impl JudgeLane {
             }
         }
         ranked.sort_unstable();
-        Ok((
-            ranked.into_iter().map(|(_, id)| id.clone()).collect(),
-            exclusions,
-        ))
+        selection.candidates = ranked.into_iter().map(|(_, id)| id.clone()).collect();
+        Ok(selection)
     }
     fn report(
         &self,
@@ -445,18 +457,27 @@ impl JudgeLane {
             "valid_until":valid_until,
             "completeness":if complete {"complete"} else {"bounded_partial"},
             "observed_opportunities":count,"eligible_candidates":inventory.eligible_candidates,"exclusions":inventory.exclusions,"locally_judgeable":selected,
+            "excluded_work":inventory.excluded_work.iter().map(|(index,reason)|json!({
+                "work_key":inventory.ids[*index],"reason":reason
+            })).collect::<Vec<_>>(),
+            "excluded_work_truncated":inventory.exclusions.values().sum::<usize>()>inventory.excluded_work.len(),
             "assessment_reason":reason,"assessment_creates_model_work":false,"outcome":"unobserved"}))
     }
     fn select(&mut self, services: &mut GradeServices<'_>) -> Result<()> {
         if !self.inventory_current(services)? {
             return Ok(());
         }
-        let (candidates, exclusions) = self.candidates(services)?;
+        let CandidateSelection {
+            candidates,
+            exclusions,
+            excluded_work,
+        } = self.candidates(services)?;
         let Some(inventory) = &mut self.inventory else {
             return Ok(());
         };
         inventory.eligible_candidates = candidates.len();
         inventory.exclusions = exclusions;
+        inventory.excluded_work = excluded_work;
         if candidates.is_empty() {
             if let Some(target) = inventory.target.clone() {
                 let mut complete = inventory.complete && inventory.usable;
@@ -735,7 +756,65 @@ mod tests {
             usable: true,
             eligible_candidates: 0,
             exclusions: Default::default(),
+            excluded_work: Vec::new(),
             target: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn excluded_assignment_witnesses_are_public_bounded_and_explicitly_truncated() {
+        let mut config = Config::default();
+        config.capabilities.judge.mode = Mode::ReadOnly;
+        let (_temp, mut runtime, _stop) = tests::fixture_with(config.clone());
+        let mut inventory = paged_inventory(&runtime, 1);
+        for index in 2..=40 {
+            let id = format!("{index:064x}");
+            inventory.ids.push(id.clone());
+            let mut row = inventory.response.body["assignments"][0].clone();
+            row["answer_txid"] = json!(id);
+            inventory.response.body["assignments"]
+                .as_array_mut()
+                .unwrap()
+                .push(row);
+        }
+        inventory.sources[0].as_mut().unwrap().rows = 0..40;
+        inventory.complete = true;
+        inventory.more = false;
+        let revision = GradeServices::new(&mut runtime).lane_revision().unwrap();
+        for id in &inventory.ids {
+            let store = tests::store(&mut runtime);
+            let mut operation = store
+                .seed_operation_for_test(
+                    LaneId::Judge,
+                    id,
+                    "prepared",
+                    &json!({}),
+                    store.control().unwrap(),
+                    &revision,
+                )
+                .unwrap();
+            operation.state = "completed".into();
+            operation.payload = Some(json!({"grade": 50}));
+            store
+                .seed_transition_for_test(&operation, "fixture_completed_judgment")
+                .unwrap();
+        }
+        let mut lane = JudgeLane {
+            inventory: Some(inventory),
+            ..Default::default()
+        };
+        lane.select(&mut GradeServices::new(&mut runtime)).unwrap();
+        let status = tests::store(&mut runtime).status(&config).unwrap();
+        let assessment = &status["work"]["judge"]["assessment"];
+        assert_eq!(assessment["locally_judgeable"], false);
+        assert_eq!(assessment["exclusions"]["already_attempted"], 40);
+        assert_eq!(assessment["excluded_work_truncated"], true);
+        let witnesses = assessment["excluded_work"].as_array().unwrap();
+        assert_eq!(witnesses.len(), 32);
+        for (index, witness) in witnesses.iter().enumerate() {
+            assert_eq!(witness["work_key"], format!("{:064x}", index + 1));
+            assert_eq!(witness["reason"], "already_attempted");
+            assert_eq!(witness.as_object().unwrap().len(), 2);
         }
     }
 

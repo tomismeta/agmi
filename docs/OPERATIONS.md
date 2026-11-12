@@ -118,7 +118,7 @@ One runtime and journal owner collect results. Each lane has one discovery/fresh
 
 The selected effect retains account and lane admission guards through response bookkeeping. Gate-dependent preparation, abstention and native launch defer without inventing failures or another attempt; result collection and safety recovery remain live. Global pause can wait for an in-flight bounded effect; lane pause waits for its own lane, not a sibling's effect. After acknowledgement, new starts require current authorization. Neither acknowledgement nor local shutdown recalls transmitted requests.
 
-Answer/judge `preparation` defaults to `retry_uncertain = false` and `max_attempts_per_work = 2` (1–8). `while_blocked` defaults true for answer and false for judge. Preparing behind uncertainty does not authorize submission. Completed invalid drafts may use another model attempt; uncertain inference needs opt-in and can duplicate charges. Preflight and pending admission/revalidation waits consume the same fixed original execution budget and cannot renew it. The pending deadline is captured separately from later launch authorization; expiry before inference remains not-started, not a running-model timeout.
+Answer/judge `preparation` defaults to `retry_uncertain = false`, `max_attempts_per_work = 2` (finite values 1–8), and `max_uncertain_replacements_per_work = 1` (0–8). `while_blocked` defaults true for answer and false for judge. Explicit `max_attempts_per_work = "unbounded"` authorizes paced recurring attempts after conclusively finished unusable output while work remains eligible; it is not a monetary budget. Possibly-running same-work inference remains separately limited to the original unresolved launch plus the configured replacement allowance, and requires `retry_uncertain`. Proven nonexecution does not consume an inference attempt; age, restart and manual abandonment do not refund possible execution. Existing retry schedules remain binding. Preparing behind uncertainty never authorizes submission. Preflight and pending admission/revalidation waits consume the same original execution deadline and cannot renew it.
 
 `run --once` takes a finite entry-time plan: at most two entry-due recovery reads per lane, one model attempt per model lane and one effect per lane, with bounded discovery/freshness. It drains owned handles but does not wait for future grace/cadence deadlines, discover later grants or replenish completed work indefinitely. Ordinary `run` continues scheduling.
 
@@ -156,20 +156,33 @@ Each lane has its own `capabilities.<lane>.participation` policy:
 | `mode` | New work behind account-wide unresolved effects |
 |---|---|
 | `strict` (default) | Wait for authoritative resolution |
-| `participation_first` | Permit risk after every applicable blocker meets this candidate lane's grace and genuine retry floors |
+| `participation_first` | With a numeric exposure cap, permit overlap after applicable uncertainty grace; with explicit `"unbounded"`, admit distinct fresh work without a historical-count ceiling or blanket grace |
 | `manual` | Require a stopped-writer, epoch/lane/account-generation/lane-control-revision-bound one-dispatch grant; never bypass capacity, server minima or answer retry grace |
 
 `manual` governs overlap with unresolved effects, not approval of every submission: otherwise-safe first work can dispatch without a grant. It is not a model-only execution mode. Use lane controls to stop participation, and isolate protocol endpoints when testing real model execution.
 
-`max_unresolved_operations` defaults to 4 **per lane**, including the prospective dispatch. Another lane cannot consume or borrow that allowance. There is no shared capacity pool, answer reserve or `allow_*` alias. Separate quotas do not isolate a wallet: candidate admission still evaluates unresolved effects across the account using that candidate lane's policy. `uncertainty_grace_seconds` defaults to 300.
+`max_unresolved_operations` defaults to 4 **per lane**, including the prospective dispatch. Another lane cannot consume or borrow a numeric allowance. There is no shared capacity pool, answer reserve or `allow_*` alias. `uncertainty_grace_seconds` defaults to 300 for bounded participation-first overlap. Strict/manual retain their independent account-uncertainty controls.
 
-`work.<lane>.admission` is the same canonical decision used for dispatch: `own_count`, `own_limit`, `own_remaining`, `scope`, `reason`, `blocker_ids`, `required_release`, `not_before` and account unresolved count. Blocker IDs are bounded with explicit truncation; counts remain exact. Missing evidence stays unknown. An allowed local projection is not fresh identity/eligibility proof or a reusable dispatch permit.
+Explicit `mode = "participation_first"` plus `max_unresolved_operations = "unbounded"` accepts potentially growing remote exposure and retained history so missing old outcomes cannot indefinitely stop distinct fresh work. It removes neither same-work/epoch fences nor active local-effect, identity, pause, freshness or scoped server restrictions. The count ceiling and blanket uncertainty grace no longer govern that lane's new-work admission. Existing numeric files stay bounded; omission does not silently select unbounded behavior.
+
+`work.<lane>.admission` uses the canonical dispatch policy, with current counts/limits, scope, reason and next timing evidence. An unbounded limit is not zero capacity. Historical counts omitted from the admission fast path are explicitly unevaluated, not proof of no uncertainty. Diagnostic snapshots may still compute exact retained totals. An allowed local projection is not fresh identity/eligibility proof or a reusable dispatch permit.
+
+For a reviewed judge-only exposure change:
+
+```sh
+printf '%s\n' '{"capabilities":{"judge":{"participation":{"mode":"participation_first","max_unresolved_operations":"unbounded"}}}}' |
+  agmi --json config apply --expected-revision "$FILE_REVISION" --dry-run
+```
+
+Remove `--dry-run` only after approving the exposure change. Recurring model spending is a separate decision: set the model lane's `preparation.max_attempts_per_work` to `"unbounded"` explicitly if desired. Neither patch activates an inactive lane or resumes participation.
+
+These opt-ins require a binary that understands them. Older numeric-only parsers reject `"unbounded"` and do not understand the new uncertain-replacement field; matching journal formats alone does not make such a configuration backward-compatible. Never restore an older journal to undo a policy choice.
 
 Only answer owns historical capacity settings. `historical_unknown_answer_capacity = "bounded"` and `max_historical_unknown_answers = 0` are defaults. An explicit finite historical allowance excludes qualifying originals from answer's own active capacity. Participation-first may instead select `accepted_linked`, excluding all qualifying originals without a lifetime historical-count bound.
 
 Eligibility requires a dispatched, identifier-less unknown answer and a directly linked later retry in the same recorded epoch with a transaction ID and recorded `included_pending`, `confirmed` or `final` state. Unrelated acceptance, transitive ancestry, age, judging and mining never qualify. Originals remain unknown. This is **not settlement, nonexecution or finality evidence**.
 
-Historical exemptions affect answer capacity only; they never become judge/mine capacity or erase account-wide uncertainty. Witness revocation can recharge original answers. Strict/manual gain no historical allowance. Accepted-linked mode explicitly accepts accumulating historical risk, while own-lane caps, account policy, identity, pause, genuine restrictions and per-epoch attempt budgets remain binding.
+Historical exemptions affect finite answer capacity only; they never become judge/mine capacity or erase account-wide uncertainty. Witness revocation can recharge original answers. Strict/manual gain no historical allowance. Accepted-linked accounting accepts accumulating historical risk but grants no same-epoch replay. Unbounded participation-first does not need an exemption to proceed with distinct work; the original outcome and any witness history remain intact.
 
 For an explicit answer-only policy patch:
 
@@ -183,7 +196,7 @@ This does not enable capability modes, resume participation, change judge/mine r
 
 Same-epoch uncertain-answer retries additionally require answer's `retry_uncertain_answers = true`, its `uncertain_answer_retry_seconds` (default 600) and remaining `max_answer_attempts_per_epoch` (default 2). Distinct dispatched operations consume that budget; model failures and safe retries of positively refused work do not create new distinct dispatch attempts. Matching captured payloads are reused; changed challenges require valid fresh preparation. Included, confirmed, final or freshly reported answered work is not retried merely because finality is slow.
 
-`work.answer.retry` distinguishes policy permission, original operation, retained floors, fresh-evidence waits and exhausted budgets. It is not resolution or dispatch authority. Ready effects use served-in-round fairness and earliest local observation-freshness deadlines, with due-time/stable-lane ties. A continuously eligible lane waits at most `2N−1` successful dispatch opportunities for `N` registered lanes, not a wall-clock bound. No lane reserves future capacity. Every dispatched overlap retains its original uncertain blockers and captured policy; arbitration evidence includes offered lanes and exclusions.
+`work.answer.retry` distinguishes policy permission, original operation, retained floors, fresh-evidence waits and exhausted answer-attempt limits. It is not resolution or dispatch authority. Ready effects use served-in-round fairness and earliest local observation-freshness deadlines, with due-time/stable-lane ties. A continuously eligible lane waits at most `2N−1` successful dispatch opportunities for `N` registered lanes, not a wall-clock bound. No lane reserves future capacity. Every dispatch retains its captured policy and evaluated authorization evidence; omitted historical scans are marked unevaluated rather than empty.
 
 Manual administration, with the runtime stopped:
 
@@ -196,6 +209,10 @@ agmi --json recover revoke --grant "$GRANT_ID"
 The selected lane must be active with manual policy and resumed intent. Account pause/resume changes the shared generation; lane pause/resume changes only that lane's control revision. Either invalidates the corresponding grant authority without deleting history. Grants remain subject to lane quota, fresh evidence and answer-attempt limits. Legacy conversion revokes old grants; source-3 conversion preserves records without inventing a missing lane-control binding.
 
 **Grace authorizes risk, not certainty.** A delayed old request can execute after a new one, causing duplicate effects or nonce conflicts. Lowering a cap can stop new dispatches but never clears existing work. A cap is not a lifetime-write budget. Fresh identity and eligibility remain mandatory; no timer guarantees participation during an upstream outage.
+
+Reconciliation is separately paced per lane with bounded read slots, fair service for recent/ordinary bound work and sparse service for repeatedly missing jobs. Fresh discovery remains independent. Repeated 404s can reduce polling urgency but never establish failure or permit a duplicate POST. A bound `408 job_expired` is different: it supplies positive nonprocessing evidence. Upstream finished-job retention is not a local retirement timer measured from submission. Identifierless uncertainty has no job to poll.
+
+Capacity/scheduling changes need not discard valid unsent model output: reuse requires unchanged producer/input provenance, nonrevoked authority and fresh dispatch checks. Genuine model/guidance changes and insufficient historical provenance remain fences. The immutable producer record is not retagged with the new dispatch policy.
 
 ### Lane controls
 
@@ -272,7 +289,7 @@ jq '.data.request' migration-preview.json |
   "$NEW_AGMI" --config "$CONFIG" --json config migrate apply --expected-token "$TOKEN"
 ```
 
-Use the preview's exact returned `request`, not a reconstructed proposal. Approval binds source/candidate bytes, guidance, authority and journal evidence. Changed inputs require a fresh preview. If `risk_change_required` is true, application also requires explicit `--accept-risk-change "$TOKEN"` after reviewing that same preview. Historical exemptions and over-cap backlog can make preservation unprovable; current charged counts alone are not proof.
+Use the preview's exact returned `request`, not a reconstructed proposal. Approval binds source/candidate bytes, guidance, authority and journal evidence. Changed inputs require a fresh preview. If `risk_change_required` is true, application also requires explicit `--accept-risk-change "$TOKEN"` after reviewing that same preview. Historical exemptions and over-cap backlog can make preservation unprovable; current charged counts alone are not proof. Migration evaluates effect exposure and model spending independently: an unbounded effect allowance, recurring inference or increased uncertain-replacement allowance cannot hide behind an otherwise strict participation mode.
 
 Eligible initial unbound schema-1 authority additionally requires `adopt_legacy: true`. Preview returns the proposed initial database ID in `request`; reuse it. Conversion and initial authority sealing share one durable transaction. Missing or conflicting established schema-2 authority is never recreated.
 
@@ -394,7 +411,7 @@ Native authentication and OS privilege isolation remain deployment prerequisites
 
 Before live activation, stop other client writers for the account. Preserve unresolved legacy records; never call them resolved without evidence. agmi-managed uncertainty can be bypassed only under explicit participation policy, not by deleting history. There is no legacy-bot importer or state-reset command. Existing journals require intact stopped-writer adoption where applicable. Preserve the state directory and canonical account binding; never restore an older database to regain availability.
 
-`model_unknown` means no MinePOA request was dispatched for that attempt. Configured uncertain-model retries are disabled by default. For explicit manual regeneration, stop the runtime, run `agmi --config ./config.local.toml recover-model`, then restart it. This preserves pause and never clears an unknown network request.
+`model_unknown` means no MinePOA request was dispatched for that attempt. Configured uncertain-model retries are disabled by default. With the runtime stopped, `agmi --config ./config.local.toml recover-model` can abandon uncertain local preparation so policy may reconsider it; this is not proof that native inference stopped. It preserves pause, never clears an unknown network request, and does not refund the attempt or uncertain-replacement allowance. Current policy may still prohibit regeneration. Inspect model evidence and deliberately change the relevant policy rather than repeatedly abandoning attempts to bypass spending limits.
 
 `recover inspect --operation N` exposes **private** captured payloads, admission evidence and identifiers; do not forward it. With the writer stopped, `recover resolve --operation N` performs authenticated read-only reconciliation of an already-bound job/transaction. Optional `--job-id` or `--txid` must match the existing binding, never a guessed identifier. Identifier-less outcomes can remain unknown indefinitely without upstream attribution. A classifier upgrade, nonce snapshot, timeout, assignment disappearance, model opinion or risk grant cannot supply terminal proof.
 
@@ -443,9 +460,23 @@ for the same machine-readable assessment.
 Human diagnostics share a compact Core/answer/judge/mine view, separate retained
 risk and actionable next steps. `status` is a snapshot using default diagnostic
 thresholds, not a full health check. `health` names the selected readiness scope;
-`doctor` additionally reports repair eligibility/outcome. Default human output
-omits control tokens; `lane show` and structured JSON retain explicit control
-evidence. Shell-rendered actions preserve the selected configuration path.
+`doctor` additionally reports repair eligibility/outcome. Default output retains
+operational essentials rather than duplicating full evidence trees; use
+`agmi --json status --verbose` (or `health --verbose` / `doctor --verbose`) for detailed evidence.
+Nonblocking historical uncertainty is still reported as risk, not as a current
+new-work blocker, under finite as well as unbounded policy. Current actions take
+precedence over background reconciliation. Shell-rendered actions preserve the selected configuration path.
+Exit codes retain distinct purposes: `status` succeeds when its snapshot is read;
+`health` succeeds when its selected operational checks pass; `doctor` succeeds
+when an unattended path exists and repair did not fail. A scheduled automatic
+retry can coexist with degraded health. None is proof of remote finality.
+`status.assessment_scope` makes its local snapshot scope explicit; it does not
+probe filesystem headroom. `health`/`doctor` include their configured disk check.
+Each `work.<lane>.operational` describes current lane health;
+`work.<lane>.background_recovery` separately describes retained outcome follow-up
+and inspection actions, not retry authority or a requirement to clear history.
+`lane show`, `lane pause` and `lane resume` report control/admission evidence;
+they do not certify operational health.
 
 `status`, `health` and `doctor` share `work.{answer,judge,mine}.progress`
 (`working`, `idle`, `complete`, `waiting`, `blocked`) and an `intervention`
@@ -474,11 +505,13 @@ still exits nonzero because participation is paused or other blockers remain.
 
 `--repair` explicitly authorizes token-fenced refusal recovery and local legacy
 identity-evidence normalization. It discovers candidates and rechecks them under the configuration,
-account and admission locks; no IDs or copied tokens are required. Human previews
+account and admission locks; no IDs or copied tokens are required. It never clears
+blanket unknowns, replays uncertain work, raises budgets, or guarantees every
+retained outcome will resolve. Human previews
 show each candidate's classification and evidence limitation. Legacy 429 retirement
 uses the developer-reported rejection policy: the original response body was not
 retained, hidden contradictions cannot be ruled out, and no new upstream
-verification is performed.
+verification is performed. This proves no independent finality.
 
 Older builds used the same identity flag for a timeout and an actual rejection.
 Doctor can normalize an eligible legacy `false` flag into explicit
@@ -658,7 +691,7 @@ systemctl --user status agmi.service agmi-health.timer
 journalctl --user --user-unit=agmi-health.service
 ```
 
-Health is a local, read-only check: no network requests, model calls, credential/guidance reads or state initialization. Unhealthy checks return nonzero with structured issues for stale/stopped execution, blocked or unobserved admission, overdue work, missed-answer evidence, identity failures, inactive participation and low disk space. Evidence reflects local observations, not a fresh network verification or proof of rewards. Warnings are reported separately from health failures: a healthy runtime may have warnings, and warnings alone preserve a successful exit status. Neither warnings nor a healthy result permit replaying uncertain work.
+Health is a local, read-only check: no network requests, model calls, credential/guidance reads or state initialization. Unhealthy checks return nonzero with structured issues for stale/stopped execution, blocked or unobserved admission, overdue work, missed-answer evidence, identity failures, inactive participation and low disk space. Evidence reflects local observations, not a fresh network verification or proof of rewards. Warnings are reported separately from health failures: a healthy runtime may have warnings, and warnings alone preserve a successful exit status. Healthy with warnings still reports attention required. Historical unknowns alone never fail a lane with a genuinely open fresh path, under finite as well as explicitly unbounded policy; this never turns age, missing jobs, or unrelated acceptance into terminal evidence. Neither warnings nor a healthy result permit replaying uncertain work.
 
 `hosted_identity_unobserved` means no identity result exists yet for unpaused active participation. It is an operational readiness failure, not a fabricated mismatch; the evidence stays null. Paused or read-only installations do not acquire this failure merely for avoiding upstream requests.
 
@@ -698,7 +731,7 @@ not independent faults or the need for a new runtime observation.
 
 Missing captured timing policy yields `effective_policy_unavailable`, unknown controller/capability readiness and a failed health check—not freshness borrowed from desired configuration. `thresholds.timing_source` distinguishes effective evidence from unavailable timing; unknown effective timing and epoch freshness are null. Run a compatible controller normally to publish its loaded policy; never manufacture it by editing the journal.
 
-`operational.status` separates `clear` (no observed operational issue under the requested checks), `blocked` (admission fenced), `degraded` (other operational issues) and `unknown` (required policy or admission evidence unavailable). Top-level `healthy` and the exit status reflect these operational conditions. Retained unknown outcomes are warnings (`pending_outcome_uncertain`), not operational failures by themselves: healthy participation can report `attention_required = true` and `risk.attention_required = true`. Actual admission blocks still fail health, as do stale observations, overdue work and other operational faults. This classification never changes journal outcomes, risk counts, admission limits or replay safeguards.
+`operational.status` separates `clear` (no observed operational issue under the requested checks), `blocked` (admission fenced), `degraded` (other operational issues) and `unknown` (required policy or admission evidence unavailable). Top-level `healthy` and the exit status reflect these operational conditions. Retained unknown outcomes are warnings (`pending_outcome_uncertain`), not operational failures by themselves: healthy participation can report `attention_required = true` and `risk.attention_required = true`. Actual admission blocks still fail health, as do stale or missing observations, overdue work, exhausted finite capacity, strict-policy uncertainty gates and other operational faults. Background-resource failure never poisons a healthy sibling lane. This classification never changes journal outcomes, risk counts, admission limits or replay safeguards, and never guarantees every retained outcome will resolve or proves independent finality.
 
 `contract_version = 2` exposes `components.controller`, `.answer`, `.judge`, `.mine` and `api.identity`, `api.lanes.{answer,judge,mine}`, plus per-binding `api.resources`. Each health entry has `state`, bounded `reasons`, nullable observation/age and structured next actions; lane entries include effective mode. Resource entries identify owner, purpose, local operation and binding revision—not raw bearer identifiers.
 
@@ -727,7 +760,7 @@ because existing journals do not independently date them. Cancellation/recovery
 must not make an old status appear newly observed. `retry_at` is a retained
 scheduling deadline, not a recovery prediction. Component actions never authorize replay.
 
-Fresh complete judging inventory with no eligible work is `ok`, even when it
+Fresh complete judging inventory with no eligible work is `ok` under any participation policy, even when it
 contains ineligible entries, unless overdue work or recent hydration failure
 needs attention. Partial coverage is not proof of an empty work queue.
 Retained unknown effects remain in `risk`/warnings independently of component state.

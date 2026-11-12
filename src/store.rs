@@ -1,5 +1,7 @@
 use crate::capability::LaneId;
-use crate::config::{Config, HistoricalAnswerCapacity, Mode, Participation, ParticipationMode};
+use crate::config::{
+    Config, CountLimit, HistoricalAnswerCapacity, Mode, Participation, ParticipationMode,
+};
 use crate::journal::CURRENT_JOURNAL_FORMAT;
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -15,6 +17,7 @@ mod accounting;
 mod admission;
 mod lane_control;
 mod model_attempt;
+mod model_retry;
 pub(crate) use admission::{
     AdmissionStampSnapshot, EffectCandidate, OperationBinding, PreparationInputs,
 };
@@ -1230,6 +1233,10 @@ const HISTORICAL_ANSWERS: &str = "
 #[derive(Clone, Default)]
 struct UncertaintyAccounting {
     total: u64,
+    /// False when cumulative historical counts and account-wide grace were
+    /// deliberately not evaluated (unbounded participation-first fresh work).
+    /// Counts read as zero then; evidence must say so instead of implying it.
+    history_evaluated: bool,
     own_total: u64,
     own_exempt: u64,
     own_blockers: Vec<i64>,
@@ -1632,13 +1639,26 @@ impl Store {
             Some((binding, writer)) => (Some(binding), Some(writer)),
             None => (None, None),
         };
-        let store = Self {
+        let mut store = Self {
             db,
             binding,
             writer_path,
             database_file: Some((path, metadata)),
         };
         store.continuity()?;
+        if !fresh {
+            let tx = store
+                .db
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            schema::initialize_query_indexes(&tx)?;
+            Self::continuity_in(
+                &tx,
+                &store.binding,
+                &store.writer_path,
+                &store.database_file,
+            )?;
+            tx.commit()?;
+        }
         Ok(store)
     }
 
@@ -1664,18 +1684,45 @@ impl Store {
         if !self.has_table("operation_links")? {
             return Ok(true);
         }
-        // Keep this retry predicate aligned with retry_models and model_budget_used.
-        Ok(self.db.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE state IN
-            ('generating','model_unknown','generated','prepared','retry','dispatching','queued','unknown','included_pending','confirmed')
-            OR (state IN ('rejected','retry_model','superseded_model_unknown')
-                AND payload IS NULL AND job_id IS NULL AND txid IS NULL
-                AND (SELECT COUNT(*) FROM operations b WHERE b.kind=operations.kind
-                    AND b.work_key=operations.work_key COLLATE NOCASE
-                    AND b.state NOT IN ('prelaunch_failed','abandoned_model')
-                    AND NOT EXISTS(SELECT 1 FROM operation_links l WHERE l.operation_id=b.id AND l.payload_reused=1))
-                    < CASE operations.kind WHEN 'answer' THEN ?1 WHEN 'judge' THEN ?2 ELSE 0 END))",
-            params![config.capabilities.answer.preparation.max_attempts_per_work,
-                config.capabilities.judge.preparation.max_attempts_per_work], |row| row.get(0))?)
+        // Retained unresolved native work stays busy independent of eligibility.
+        let unresolved: bool = self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM operations WHERE state IN
+            ('generating','model_unknown','generated','prepared','retry','dispatching','queued','unknown','included_pending','confirmed'))",
+            [],
+            |row| row.get(0),
+        )?;
+        if unresolved {
+            return Ok(true);
+        }
+        // Reusable payloadless attempts use the canonical model retry assessment.
+        let mut statement = self.db.prepare(
+            "SELECT kind,work_key FROM operations
+            WHERE state IN ('rejected','retry_model','superseded_model_unknown')
+            AND payload IS NULL AND job_id IS NULL AND txid IS NULL",
+        )?;
+        let mut reusable: std::collections::BTreeSet<(String, String)> =
+            std::collections::BTreeSet::new();
+        for row in statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })? {
+            let (kind, key) = row?;
+            reusable.insert((kind, key.to_lowercase()));
+        }
+        drop(statement);
+        let at = now();
+        for (kind, key) in reusable {
+            let lane = match kind.as_str() {
+                "answer" => LaneId::Answer,
+                "judge" => LaneId::Judge,
+                _ => continue,
+            };
+            if Self::model_retry_assessment_in(&self.db, lane, &key, config, at, None)?
+                .retry_eligible
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub(crate) fn routing_change_allowed(&self, config: &Config) -> Result<()> {
@@ -2141,18 +2188,31 @@ impl Store {
                 } else {
                     serde_json::to_value(config.participation(op.kind))?
                 };
-                if decision.accounting.total > 0 || decision.retry_of.is_some() {
+                if decision.accounting.total > 0
+                    || decision.retry_of.is_some()
+                    || !decision.accounting.history_evaluated
+                {
+                    // A skipped historical scan must not present zero as a
+                    // measured count: null counts with history_evaluated=false
+                    // say the scan did not run and did not limit this dispatch.
+                    let evaluated = decision.accounting.history_evaluated;
+                    let own_count = evaluated.then(|| decision.accounting.active());
+                    let account_unresolved = evaluated.then_some(decision.accounting.total);
                     tx.execute(
                         "INSERT INTO risk_admissions
                         VALUES ((SELECT dispatch_sequence FROM authority WHERE singleton=1),?1,?2,?3,?4,?5,?6,?7)",
                         params![op.id,serde_json::to_string(&json!({"schema_version":2,"lane":op.kind,
-                            "participation":participation,"own_count":decision.accounting.active(),
+                            "participation":participation,"history_evaluated":evaluated,
+                            "own_count":own_count,
                             "own_limit":config.participation(op.kind).max_unresolved_operations,
-                            "account_unresolved":decision.accounting.total,
+                            "account_unresolved":account_unresolved,
                             "blocker_ids_truncated":decision.accounting.total>decision.accounting.blockers.len() as u64}))?,lane_revision,
                             serde_json::to_string(&decision.accounting.blockers)?,decision.retry_of,decision.grant,now()],
                     )?;
-                    if op.kind == LaneId::Answer
+                    // Snapshots record evaluated counts only. A skipped scan
+                    // reports zeros that would fabricate absence of history.
+                    if decision.accounting.history_evaluated
+                        && op.kind == LaneId::Answer
                         && config
                             .capabilities
                             .answer
@@ -2393,6 +2453,9 @@ impl Store {
 
     /// Shared by preparation, transactional admission, and read-only status.
     /// Stream narrow evidence columns; never load historical operation payloads.
+    /// Explicit unbounded participation-first skips the cumulative historical
+    /// scan for fresh work; the skip path keeps one local effect, server
+    /// floors, and the same-work retry ceiling on indexed point lookups.
     fn uncertainty_accounting(
         db: &Connection,
         config: &Config,
@@ -2401,6 +2464,14 @@ impl Store {
         retry_of: Option<i64>,
         capture_blockers: bool,
     ) -> Result<UncertaintyAccounting> {
+        let policy = config.participation(kind);
+        if policy.mode == ParticipationMode::ParticipationFirst
+            && policy.max_unresolved_operations == CountLimit::Unbounded
+        {
+            return accounting::uncertainty_accounting_unbounded(
+                db, config, kind, excluding, retry_of,
+            );
+        }
         accounting::uncertainty_accounting(db, config, kind, excluding, retry_of, capture_blockers)
     }
 
@@ -2772,8 +2843,21 @@ impl Store {
                 Some(accounting.retry_not_before),
             ));
         }
-        if accounting.active().saturating_add(1) > u64::from(policy.max_unresolved_operations) {
+        // Unbounded participation-first never charges cumulative history against
+        // distinct fresh work: allows() admits any active count, while a finite
+        // cap keeps the previous active()+1<=limit admission boundary.
+        if !policy.max_unresolved_operations.allows(accounting.active()) {
             return Some(("lane_unresolved_capacity", None));
+        }
+        // The same-work retry ceiling binds even when cumulative history was
+        // not evaluated: a skipped scan always reports total zero, so the
+        // grace must be checked before the empty-history fast path. Evaluated
+        // histories keep the previous strict-first precedence below.
+        if !accounting.history_evaluated && accounting.retry_grace_until > cutoff.at {
+            return Some((
+                "uncertain_answer_retry_delay",
+                Some(accounting.retry_grace_until),
+            ));
         }
         if accounting.total == 0 {
             return None;
@@ -2791,7 +2875,9 @@ impl Store {
             if !granted {
                 return Some(("manual_authorization_required", None));
             }
-        } else if accounting.grace_until > cutoff.at {
+        } else if policy.max_unresolved_operations.finite().is_some()
+            && accounting.grace_until > cutoff.at
+        {
             return Some(("account_uncertainty_grace", Some(accounting.grace_until)));
         }
         None
@@ -2954,42 +3040,6 @@ impl Store {
             params![kind.as_str(), key],
             |r| r.get(0),
         )?)
-    }
-
-    pub(crate) fn model_budget_used(&self, kind: LaneId, key: &str) -> Result<u32> {
-        Ok(self.db.query_row(
-            "SELECT COUNT(*) FROM operations WHERE kind=?1 AND work_key=?2 COLLATE NOCASE
-            AND state NOT IN ('prelaunch_failed','abandoned_model')
-            AND NOT EXISTS(SELECT 1 FROM operation_links l WHERE l.operation_id=operations.id AND l.payload_reused=1)",
-            params![kind.as_str(), key],
-            |r| r.get(0),
-        )?)
-    }
-
-    pub(crate) fn model_retry_not_before(&self, kind: LaneId, key: &str) -> Result<i64> {
-        Ok(self.db.query_row("SELECT COALESCE(MAX(next_at),0) FROM operations
-            WHERE kind=?1 AND work_key=?2 COLLATE NOCASE
-            AND payload IS NULL AND job_id IS NULL AND txid IS NULL
-            AND state IN ('rejected','model_unknown','superseded_model_unknown','retry_model','prelaunch_failed','discarded')",
-            params![kind.as_str(),key],|r|r.get(0))?)
-    }
-
-    pub(crate) fn retry_models(&mut self, config: &Config) -> Result<()> {
-        self.continuity()?;
-        for kind in [LaneId::Answer, LaneId::Judge] {
-            let preparation = config
-                .preparation(kind)
-                .context("model preparation policy missing")?;
-            self.db.execute("UPDATE operations SET state=CASE WHEN state='model_unknown'
-                THEN 'superseded_model_unknown' ELSE 'retry_model' END,updated_at=?1
-                WHERE kind=?4 AND (state='rejected' OR (state='model_unknown' AND ?3))
-                AND next_at<=?1 AND payload IS NULL AND job_id IS NULL AND txid IS NULL
-                AND (SELECT COUNT(*) FROM operations b WHERE b.kind=operations.kind AND b.work_key=operations.work_key
-                    AND b.state NOT IN ('prelaunch_failed','abandoned_model')
-                    AND NOT EXISTS(SELECT 1 FROM operation_links l WHERE l.operation_id=b.id AND l.payload_reused=1)) < ?2",
-                params![now(),preparation.max_attempts_per_work,preparation.retry_uncertain,kind.as_str()])?;
-        }
-        Ok(())
     }
 
     pub(crate) fn attempted(&self, kind: LaneId, key: &str) -> Result<bool> {
@@ -4353,7 +4403,7 @@ mod tests {
         observe(&store, 2, false).unwrap();
         config.capabilities.answer.participation.mode = ParticipationMode::Manual;
         config.capabilities.answer.preparation.retry_uncertain = true;
-        config.capabilities.answer.preparation.max_attempts_per_work = 1;
+        config.capabilities.answer.preparation.max_attempts_per_work = CountLimit::Bounded(1);
         let mut model = store
             .begin(
                 LaneId::Answer,
@@ -4378,7 +4428,7 @@ mod tests {
             status["work"]["answer"]["admission"]["reason"],
             "manual_authorization_required"
         );
-        config.capabilities.answer.preparation.max_attempts_per_work = 2;
+        config.capabilities.answer.preparation.max_attempts_per_work = CountLimit::Bounded(2);
         // Desired configuration alone must not make the old loaded budget larger.
         assert_eq!(
             store.status(&config).unwrap()["work"]["answer"]["model"]["retry_eligible"],
@@ -5283,7 +5333,7 @@ mod tests {
             .capabilities
             .answer
             .participation
-            .max_unresolved_operations = 2;
+            .max_unresolved_operations = CountLimit::Bounded(2);
         config
             .capabilities
             .answer
@@ -5322,7 +5372,7 @@ mod tests {
             .capabilities
             .answer
             .participation
-            .max_unresolved_operations = 1;
+            .max_unresolved_operations = CountLimit::Bounded(1);
         assert!(store.admission_allowed(&config, &next).unwrap());
         for mode in [ParticipationMode::Strict, ParticipationMode::Manual] {
             config.capabilities.answer.participation.mode = mode;
@@ -5443,7 +5493,7 @@ mod tests {
             .capabilities
             .answer
             .participation
-            .max_unresolved_operations = 3;
+            .max_unresolved_operations = CountLimit::Bounded(3);
         accepted[0].state = "rejected".into();
         store.save(&accepted[0], "receipt_rejected").unwrap();
         let accounting =
@@ -5461,6 +5511,147 @@ mod tests {
         assert_eq!(
             store.inspect(next.id).unwrap()["risk_admissions"][0]["accounting"]["capacity_exempt_count"],
             24
+        );
+    }
+
+    #[test]
+    fn unbounded_first_admits_fresh_work_without_measuring_history() {
+        let (_temp, mut config, mut store) = participation_fixture();
+        config
+            .capabilities
+            .answer
+            .participation
+            .max_unresolved_operations = CountLimit::Bounded(4);
+        config
+            .capabilities
+            .answer
+            .participation
+            .uncertainty_grace_seconds = 3600;
+        // Thousands of recent unknowns block every bounded policy by count
+        // and by account-wide grace alike.
+        for epoch in 1..=1500u64 {
+            store
+                .db
+                .execute(
+                    "INSERT INTO operations(kind,work_key,state,request,generation,revision,created_at,updated_at)
+                     VALUES('answer',?1,'unknown',?2,1,'bulk',?3,?3)",
+                    params![
+                        format!("{epoch}:bulk"),
+                        json!({"solver":{"epoch":epoch}}).to_string(),
+                        now()
+                    ],
+                )
+                .unwrap();
+        }
+        let mut fresh = prepared_epoch(&mut store, LaneId::Answer, 999_999, "fresh");
+        assert!(!store.dispatch_intent(&mut fresh, &config).unwrap());
+        // Explicit unbounded participation-first skips the cumulative count
+        // and the account-wide grace for distinct new work.
+        config
+            .capabilities
+            .answer
+            .participation
+            .max_unresolved_operations = CountLimit::Unbounded;
+        let skipped =
+            Store::uncertainty_accounting(&store.db, &config, LaneId::Answer, None, None, false)
+                .unwrap();
+        assert!(!skipped.history_evaluated);
+        assert_eq!(skipped.total, 0);
+        store.runtime_state(&config, false).unwrap();
+        let status = store.status(&config).unwrap();
+        assert_eq!(status["participation"]["lanes"]["answer"]["allowed"], true);
+        assert_eq!(
+            status["participation"]["lanes"]["answer"]["own_count"],
+            1500
+        );
+        assert_eq!(status["work"]["answer"]["admission"]["allowed"], true);
+        assert!(store.dispatch_intent(&mut fresh, &config).unwrap());
+        let policy: Value = serde_json::from_str(
+            store.inspect(fresh.id).unwrap()["risk_admissions"][0]["policy"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(policy["history_evaluated"], false);
+        assert!(policy["own_count"].is_null());
+        assert!(policy["account_unresolved"].is_null());
+        assert_eq!(policy["own_limit"], "unbounded");
+        // No zero-count snapshot may fabricate absence of historical exposure.
+        let snapshots: u64 = store
+            .db
+            .query_row("SELECT COUNT(*) FROM risk_accounting_snapshots", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(snapshots, 0);
+        // Same-work and epoch fences still bind under the skip.
+        fresh.state = "unknown".into();
+        store.save(&fresh, "dispatch_outcome_unknown").unwrap();
+        let mut same_epoch = prepared_epoch(&mut store, LaneId::Answer, 999_999, "second");
+        assert!(!store.dispatch_intent(&mut same_epoch, &config).unwrap());
+    }
+
+    #[test]
+    fn unbounded_first_preserves_effect_floor_and_retry_ceiling() {
+        let (_temp, mut config, store) = participation_fixture();
+        config
+            .capabilities
+            .answer
+            .participation
+            .max_unresolved_operations = CountLimit::Unbounded;
+        let policy = config.participation(LaneId::Answer);
+        let cutoff = AdmissionCutoff::current();
+        let evaluate = |store: &Store| {
+            Store::uncertainty_accounting(&store.db, &config, LaneId::Answer, None, None, false)
+                .unwrap()
+        };
+        // One locally dispatching effect still blocks distinct fresh work.
+        store
+            .db
+            .execute(
+                "INSERT INTO operations(kind,work_key,state,request,generation,revision,created_at,updated_at)
+                 VALUES('answer','1:effect','dispatching','{}',1,'bulk',0,0)",
+                [],
+            )
+            .unwrap();
+        let accounting = evaluate(&store);
+        assert!(!accounting.history_evaluated);
+        assert!(accounting.writing);
+        assert_eq!(
+            Store::account_blocker_at(policy, &accounting, false, cutoff),
+            Some(("effect_in_flight", None))
+        );
+        store
+            .db
+            .execute("DELETE FROM operations WHERE state='dispatching'", [])
+            .unwrap();
+        // A retained server floor still binds.
+        shared_floor(&store, &config, now() + 300);
+        let accounting = evaluate(&store);
+        assert!(accounting.retry_not_before > cutoff.at);
+        assert_eq!(
+            Store::account_blocker_at(policy, &accounting, false, cutoff),
+            Some((
+                "shared_server_restriction",
+                Some(accounting.retry_not_before)
+            ))
+        );
+        // The same-work retry ceiling binds even though history was not
+        // evaluated: the skipped scan reports total zero.
+        let mut ceiling = UncertaintyAccounting::default();
+        assert!(!ceiling.history_evaluated);
+        ceiling.retry_grace_until = now() + 60;
+        assert_eq!(
+            Store::account_blocker_at(policy, &ceiling, false, cutoff),
+            Some((
+                "uncertain_answer_retry_delay",
+                Some(ceiling.retry_grace_until)
+            ))
+        );
+        ceiling.retry_grace_until = now() - 60;
+        assert_eq!(
+            Store::account_blocker_at(policy, &ceiling, false, cutoff),
+            None
         );
     }
 
@@ -5763,7 +5954,8 @@ mod tests {
         for initial in ["rejected", "model_unknown"] {
             for convert in [false, true] {
                 let (_temp, mut config, mut store) = participation_fixture();
-                config.capabilities.answer.preparation.max_attempts_per_work = 2;
+                config.capabilities.answer.preparation.max_attempts_per_work =
+                    CountLimit::Bounded(2);
                 config.capabilities.answer.preparation.retry_uncertain = true;
                 store.bind_routing(&config).unwrap();
                 let op = begin(&mut store, LaneId::Answer, "7:retry", initial);
@@ -5789,7 +5981,7 @@ mod tests {
                     .capabilities
                     .answer
                     .preparation
-                    .max_attempts_per_work = 1;
+                    .max_attempts_per_work = CountLimit::Bounded(1);
                 store.bind_routing(&changed).unwrap();
                 assert_eq!(store.model_budget_used(LaneId::Answer, &op.key).unwrap(), 1);
             }
@@ -5816,7 +6008,7 @@ mod tests {
             .capabilities
             .answer
             .participation
-            .max_unresolved_operations = 1;
+            .max_unresolved_operations = CountLimit::Bounded(1);
         let mut next = prepared_epoch(&mut store, LaneId::Answer, 8, "next");
         assert!(!store.dispatch_intent(&mut next, &config).unwrap());
         config
@@ -5864,7 +6056,7 @@ mod tests {
             .capabilities
             .answer
             .participation
-            .max_unresolved_operations = 1;
+            .max_unresolved_operations = CountLimit::Bounded(1);
         config
             .capabilities
             .answer
@@ -6002,13 +6194,13 @@ mod tests {
             .capabilities
             .answer
             .participation
-            .max_unresolved_operations = 2;
+            .max_unresolved_operations = CountLimit::Bounded(2);
         assert!(store.authorize(&config, 3, LaneId::Mine).is_err());
         config
             .capabilities
             .answer
             .participation
-            .max_unresolved_operations = 4;
+            .max_unresolved_operations = CountLimit::Bounded(4);
         config
             .capabilities
             .answer
@@ -6476,7 +6668,7 @@ mod tests {
                 .capabilities
                 .answer
                 .participation
-                .max_unresolved_operations = capacity;
+                .max_unresolved_operations = CountLimit::from(capacity);
             config
                 .capabilities
                 .answer
@@ -6592,13 +6784,10 @@ mod tests {
                 [],
             )
             .unwrap();
+        // Completion expires, but a viable scheduled path need not be unhealthy.
         assert_ne!(
             store.status(&config).unwrap()["work"]["mine"]["phase"],
             "completed"
-        );
-        assert_ne!(
-            health::check(&config, options).unwrap()["components"]["mine"]["state"],
-            "ok"
         );
 
         let mut rejected = dispatched_unknown(&mut store, &config, LaneId::Mine, 10);
@@ -6608,10 +6797,6 @@ mod tests {
         assert_ne!(
             store.status(&config).unwrap()["work"]["mine"]["phase"],
             "completed"
-        );
-        assert_ne!(
-            health::check(&config, options).unwrap()["components"]["mine"]["state"],
-            "ok"
         );
 
         config.capabilities.mine.schedule.each_epoch = true;
@@ -6736,7 +6921,7 @@ mod tests {
             .capabilities
             .answer
             .participation
-            .max_unresolved_operations = 4;
+            .max_unresolved_operations = CountLimit::Bounded(4);
         let old = dispatched_unknown(&mut store, &config, LaneId::Judge, 1);
         let old_since = now() - 86400;
         store
@@ -6854,7 +7039,14 @@ mod tests {
         store
             .record_assignment_selection(&revision, generation, 0, true, false)
             .unwrap();
-        config.capabilities.answer.preparation.max_attempts_per_work += 1;
+        config.capabilities.answer.preparation.max_attempts_per_work = config
+            .capabilities
+            .answer
+            .preparation
+            .max_attempts_per_work
+            .finite()
+            .map(|limit| CountLimit::Bounded(limit + 1))
+            .unwrap_or(CountLimit::Unbounded);
         store.runtime_state(&config, false).unwrap();
         assert_eq!(
             store.status(&config).unwrap()["work"]["judge"]["assessment"]["observed_opportunities"],
@@ -8608,7 +8800,7 @@ mod tests {
     #[test]
     fn bounded_model_retry_never_changes_effect_uncertainty() {
         let (_dir, mut config) = fixture();
-        config.capabilities.answer.preparation.max_attempts_per_work = 2;
+        config.capabilities.answer.preparation.max_attempts_per_work = CountLimit::Bounded(2);
         let mut store = Store::open(&config).unwrap();
         store.set_paused_unbound(false).unwrap();
         let mut model = begin(&mut store, LaneId::Answer, "1:word", "generating");
@@ -8640,64 +8832,6 @@ mod tests {
             store.operation(retry.id).unwrap().unwrap().state,
             "model_unknown"
         );
-    }
-
-    #[test]
-    fn completed_model_retry_budget_survives_restart_without_retrying_uncertain_work() {
-        let (_temp, config, mut store) = participation_fixture();
-        assert_eq!(
-            config.capabilities.answer.preparation.max_attempts_per_work,
-            2
-        );
-        assert!(!config.capabilities.answer.preparation.retry_uncertain);
-        let mut first = begin(&mut store, LaneId::Answer, "7:words", "generating");
-        first.result = Some(json!({"answer":"invalid completed draft"}));
-        first.state = "rejected".into();
-        store.save(&first, "model_output_invalid").unwrap();
-        drop(store);
-        let mut store = Store::open(&config).unwrap();
-        store.retry_models(&config).unwrap();
-        assert_eq!(
-            store.operation(first.id).unwrap().unwrap().state,
-            "retry_model"
-        );
-        assert!(!store.answer_epoch_attempted(7).unwrap());
-        assert_eq!(
-            store.model_budget_used(LaneId::Answer, "7:words").unwrap(),
-            1
-        );
-
-        let mut second = begin(&mut store, LaneId::Answer, "7:words", "generating");
-        second.result = first.result.clone();
-        second.state = "rejected".into();
-        store.save(&second, "model_output_invalid").unwrap();
-        let mut uncertain = begin(&mut store, LaneId::Judge, "uncertain-model", "generating");
-        uncertain.state = "model_unknown".into();
-        store.save(&uncertain, "model_launch_unknown").unwrap();
-        let mut dispatched = dispatched_unknown(&mut store, &config, LaneId::Answer, 9);
-        dispatched.state = "rejected".into();
-        store.save(&dispatched, "submission_rejected").unwrap();
-        drop(store);
-        let mut store = Store::open(&config).unwrap();
-        store.retry_models(&config).unwrap();
-        assert_eq!(
-            store.model_budget_used(LaneId::Answer, "7:words").unwrap(),
-            2
-        );
-        assert!(store.answer_epoch_attempted(7).unwrap());
-        assert_eq!(
-            store.operation(second.id).unwrap().unwrap().state,
-            "rejected"
-        );
-        assert_eq!(
-            store.operation(uncertain.id).unwrap().unwrap().state,
-            "model_unknown"
-        );
-        let retained = store.operation(dispatched.id).unwrap().unwrap();
-        assert_eq!(retained.state, "rejected");
-        assert_eq!(retained.payload, dispatched.payload);
-        assert_eq!(store.attempt_count(LaneId::Answer, "7:words").unwrap(), 2);
-        assert!(store.effect().unwrap().is_none());
     }
 
     #[test]

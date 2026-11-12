@@ -726,3 +726,55 @@ async fn shutdown_native_cleanup_keeps_original_deadline_and_effect_gates() {
         }
     }
 }
+
+#[tokio::test]
+async fn unbounded_once_still_reserves_at_most_one_model_attempt_per_lane() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut config = Config::default();
+    config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
+    config.capabilities.answer.mode = Mode::Active;
+    config.capabilities.answer.preparation.max_attempts_per_work =
+        crate::config::CountLimit::Unbounded;
+    config.capabilities.answer.model.executable = "/nonexistent/atomic-once-native".into();
+    let (_temp, mut host, _stop) = fixture_with(config);
+    identity_fixture(&mut host, &listener).await;
+    host.once = Some(OncePlan::capture(&host).unwrap());
+    let observed = observation(&host, LaneId::Answer);
+    let mut slot = AnswerModelSlot::default();
+    let task = AnswerTask::new(task_request(&host, LaneId::Answer)).unwrap();
+    assert!(
+        host.begin_answer_model(
+            &mut slot,
+            task,
+            "fingerprint".into(),
+            "8:once",
+            None,
+            &observed,
+        )
+        .unwrap()
+    );
+    assert!(!slot.occupied());
+    let first = host
+        .store
+        .model_retry_assessment(LaneId::Answer, "8:once", &host.config, now())
+        .unwrap();
+    assert_eq!((first.total_attempts, first.unresolved_attempts), (0, 0));
+    assert_eq!(first.blocker, Some("model_retry_cooldown"));
+    assert!(first.next_at.is_some_and(|at| at > now()));
+    assert!(!host.model_allowed(LaneId::Answer));
+    // Even different fresh work cannot turn finite run --once into a retry loop.
+    let task = AnswerTask::new(task_request(&host, LaneId::Answer)).unwrap();
+    assert!(
+        !host
+            .begin_answer_model(&mut slot, task, "other".into(), "8:other", None, &observed,)
+            .unwrap()
+    );
+    assert_eq!(
+        host.store.attempt_count(LaneId::Answer, "8:once").unwrap(),
+        1
+    );
+    assert_eq!(
+        host.store.attempt_count(LaneId::Answer, "8:other").unwrap(),
+        0
+    );
+}

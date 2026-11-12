@@ -92,7 +92,7 @@ fn lane_capacity_and_account_risk_are_independent_decisions() {
         .capabilities
         .judge
         .participation
-        .max_unresolved_operations = 1;
+        .max_unresolved_operations = CountLimit::Bounded(1);
     let judge = unknown(&mut store, &config, LaneId::Judge, 1, Some("a"));
     config.capabilities.answer.participation.mode = ParticipationMode::Strict;
     let answer = prepared(&mut store, LaneId::Answer, 2);
@@ -217,13 +217,24 @@ fn recovery_round_robin_is_lane_owned_and_includes_off_finality() {
     config.capabilities.answer.mode = Mode::Off;
     let batch = store.reconciliation_batch(LaneId::Judge).unwrap();
     assert_eq!(batch.len(), 2);
-    let key = Store::operation_read_key(&batch[0]).unwrap();
-    assert!(store.read_started(&key).unwrap());
-    store
-        .reconciliation_attempted(LaneId::Judge, batch[0].id)
-        .unwrap();
-    let next = store.reconciliation_batch(LaneId::Judge).unwrap();
-    assert_eq!(next[0].id, ids[1]);
+    // Newest-first service with a fair cursor that cannot be overtaken.
+    assert_eq!(batch[0].id, ids[3]);
+    assert_eq!(batch[1].id, ids[2]);
+    for op in &batch {
+        let key = Store::operation_read_key(op).unwrap();
+        assert!(
+            store
+                .reconciliation_read_started(&config, LaneId::Judge, &key)
+                .unwrap()
+        );
+    }
+    // Both slots are durably occupied until their reads finish or fail.
+    assert!(
+        store
+            .reconciliation_batch(LaneId::Judge)
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(
         store.reconciliation_batch(LaneId::Answer).unwrap()[0].id,
         finality.id
@@ -231,9 +242,13 @@ fn recovery_round_robin_is_lane_owned_and_includes_off_finality() {
     drop(store);
     let mut store = Store::open(&config).unwrap();
     store.recover().unwrap();
-    assert_eq!(
-        store.reconciliation_batch(LaneId::Judge).unwrap()[0].id,
-        ids[1]
+    // Occupied slots are not refunded by restart: recovery clears in-flight
+    // reads but the durable service reservation stands.
+    assert!(
+        store
+            .reconciliation_batch(LaneId::Judge)
+            .unwrap()
+            .is_empty()
     );
 }
 
@@ -602,7 +617,7 @@ fn manual_grant_cannot_borrow_a_full_lane_but_can_accept_foreign_uncertainty() {
         .capabilities
         .judge
         .participation
-        .max_unresolved_operations = 1;
+        .max_unresolved_operations = CountLimit::Bounded(1);
     let judge = unknown(&mut store, &config, LaneId::Judge, 1, None);
     config.capabilities.judge.participation.mode = ParticipationMode::Manual;
     assert!(store.authorize(&config, 2, LaneId::Judge).is_err());
@@ -611,7 +626,7 @@ fn manual_grant_cannot_borrow_a_full_lane_but_can_accept_foreign_uncertainty() {
         .capabilities
         .answer
         .participation
-        .max_unresolved_operations = 1;
+        .max_unresolved_operations = CountLimit::Bounded(1);
     config
         .capabilities
         .answer
@@ -625,55 +640,6 @@ fn manual_grant_cannot_borrow_a_full_lane_but_can_accept_foreign_uncertainty() {
     store.save(&answer, "dispatch_outcome_unknown").unwrap();
     assert!(store.authorize(&config, 3, LaneId::Answer).is_err());
     assert_eq!(store.operation(judge.id).unwrap().unwrap().state, "unknown");
-}
-
-#[test]
-fn model_retry_clock_is_per_work_and_does_not_advance_discovery() {
-    let (_dir, config, mut store) = fixture();
-    let mut model = store
-        .begin(
-            LaneId::Answer,
-            "retry-model",
-            "generating",
-            &json!({}),
-            store.control().unwrap(),
-            "route",
-        )
-        .unwrap();
-    model.state = "rejected".into();
-    model.next_at = now() + 300;
-    store.save(&model, "model_result_invalid").unwrap();
-    assert_eq!(
-        store
-            .model_retry_not_before(LaneId::Answer, "retry-model")
-            .unwrap(),
-        model.next_at
-    );
-    assert_eq!(
-        store
-            .model_retry_not_before(LaneId::Answer, "other-model")
-            .unwrap(),
-        0
-    );
-    assert_eq!(
-        store
-            .model_retry_not_before(LaneId::Judge, "retry-model")
-            .unwrap(),
-        0
-    );
-    assert_eq!(store.next_at(LaneId::Answer).unwrap(), 0);
-    store.retry_models(&config).unwrap();
-    assert_eq!(
-        store.operation(model.id).unwrap().unwrap().state,
-        "rejected"
-    );
-    model.next_at = 0;
-    store.save(&model, "model_retry_ready").unwrap();
-    store.retry_models(&config).unwrap();
-    assert_eq!(
-        store.operation(model.id).unwrap().unwrap().state,
-        "retry_model"
-    );
 }
 
 #[test]

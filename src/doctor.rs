@@ -18,8 +18,9 @@ fn unknown_report(reason: &str) -> Value {
     json!({"contract_version":2,"components":health::unknown_components(),
         "healthy":false,"attention_required":true,"issues":[reason],
         "warnings":[],"initialized":null,"paused":null,"evidence":"local_only",
+        "assessment_scope":{"evidence":"local_only","state_filesystem":"not_assessed"},
         "operational":{"status":"unknown","issues":[reason]},
-        "risk":{"status":"unknown","attention_required":null,"unresolved_effects":null,"unresolved_model_attempts":null},
+        "risk":health::unknown_risk(),
         "work":health::unknown_work(reason),"intervention":health::unknown_intervention(reason)})
 }
 

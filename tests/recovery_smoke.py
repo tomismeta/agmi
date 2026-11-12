@@ -471,7 +471,7 @@ mode = "off"
             wait_until(lambda: observed_answer_epoch() == 11)
             # Allow multiple observer turns, not merely a single early snapshot.
             time.sleep(4)
-            after = invoke('status')['data']
+            after = invoke('status', *([] if args.baseline else ['--verbose']))['data']
             calls = (root / 'calls').read_text().splitlines()
             assert len(shared['writes']) == 1, 'uncertain effect replayed or bypassed'
             assert after['pending']['state'] == 'unknown', 'unknown erased on restart'

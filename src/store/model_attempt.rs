@@ -261,10 +261,21 @@ impl Store {
                 && policy["model_seconds"].as_u64() == config.model_seconds(lane),
             "model captured policy mismatch"
         );
+        if let Some(revision) = policy.get("producer_revision") {
+            ensure!(
+                revision.as_str() == Some(config.producer_revision(lane)?.as_str()),
+                "model captured producer revision mismatch"
+            );
+        }
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         if !Self::validate_admission_in(&tx, config, account, lane_guard, stamp, None)? {
+            return Ok(None);
+        }
+        if !Self::model_retry_admission_in(&tx, lane, key, config, now(), None, policy)?
+            .retry_eligible
+        {
             return Ok(None);
         }
         let id = Self::begin_linked_in(
@@ -364,21 +375,34 @@ impl Store {
             captured_deadline.is_none(),
             "model deadline has no launch provenance"
         );
-        if record.producer.lane_config_revision != stamp.lane_config_revision
-            || !Self::validate_admission_in(&tx, config, account, lane_guard, stamp, Some(binding))?
-        {
+        if !Self::validate_admission_in(&tx, config, account, lane_guard, stamp, Some(binding))? {
             return Ok(false);
         }
         let admitted_at = now();
         if deadline <= admitted_at {
             return Ok(false);
         }
-        let pending_deadline: Option<i64> = tx.query_row(
-            "SELECT json_extract(policy,'$.pending_execution_deadline')
-             FROM operation_evidence WHERE operation_id=?1",
+        let (key, policy): (String, String) = tx.query_row(
+            "SELECT o.work_key,e.policy FROM operations o
+             JOIN operation_evidence e ON e.operation_id=o.id WHERE o.id=?1",
             [binding.operation_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
+        let policy: Value = serde_json::from_str(&policy)?;
+        if !Self::model_retry_admission_in(
+            &tx,
+            binding.lane_id,
+            &key,
+            config,
+            admitted_at,
+            Some(binding.operation_id),
+            &policy,
+        )?
+        .retry_eligible
+        {
+            return Ok(false);
+        }
+        let pending_deadline = policy["pending_execution_deadline"].as_i64();
         ensure!(
             pending_deadline == Some(deadline),
             "model launch differs from captured execution deadline"
@@ -587,6 +611,79 @@ impl Store {
 
     pub(crate) fn model_attempt(&self, id: i64) -> Result<Option<ModelAttemptRecord>> {
         Ok(read_attempt_in(&self.db, id)?.map(|(_, record)| record))
+    }
+
+    pub(crate) fn operation_config_current(
+        &self,
+        config: &Config,
+        binding: &OperationBinding,
+    ) -> Result<bool> {
+        Self::operation_config_current_in(&self.db, config, binding)
+    }
+
+    /// Fresh admission may use an old unsent capture, never retag its producer.
+    /// Discarded work and previously dispatched work cannot gain this exception.
+    pub(super) fn operation_config_current_in(
+        db: &Connection,
+        config: &Config,
+        binding: &OperationBinding,
+    ) -> Result<bool> {
+        if !Self::validate_operation_binding_in(db, binding)? {
+            return Ok(false);
+        }
+        let (state, generation_current, revision, producer_revision, dispatched): (
+            String,
+            bool,
+            String,
+            Option<String>,
+            bool,
+        ) = db.query_row(
+            "SELECT o.state,o.generation=c.generation,o.revision,
+                    json_extract(e.policy,'$.producer_revision'),e.dispatch_sequence IS NOT NULL
+                 FROM operations o JOIN control c ON c.singleton=1
+                 LEFT JOIN operation_evidence e ON e.operation_id=o.id WHERE o.id=?1",
+            [binding.operation_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )?;
+        if !generation_current
+            || !matches!(
+                state.as_str(),
+                "generating" | "generated" | "prepared" | "retry"
+            )
+        {
+            return Ok(false);
+        }
+        if revision == config.lane_revision(binding.lane_id)? {
+            return Ok(true);
+        }
+        if dispatched
+            || binding.lane_id == LaneId::Mine
+            || producer_revision.as_deref()
+                != Some(config.producer_revision(binding.lane_id)?.as_str())
+        {
+            return Ok(false);
+        }
+        let Some((_, record)) = read_attempt_in(db, binding.operation_id)? else {
+            // Legacy producers have no immutable input/route proof.
+            return Ok(false);
+        };
+        validate_bound_attempt_in(db, binding, &record)?;
+        Ok(if state == "generating" {
+            record.launch.is_none() && record.completion.is_none()
+        } else {
+            record.completion.as_ref().is_some_and(|completion| {
+                completion.execution == NativeExecution::Completed
+                    && completion.outcome == NativeOutcome::Captured
+            })
+        })
     }
 
     /// Called inside the existing startup recovery transaction, before its
@@ -1211,5 +1308,1021 @@ mod tests {
             store.recover().unwrap();
             assert_eq!(store.model_attempt(op.id).unwrap().unwrap(), retained);
         }
+    }
+
+    fn append_completion(
+        store: &mut Store,
+        source: &ModelAttemptRecord,
+        execution: NativeExecution,
+        outcome: NativeOutcome,
+        next_at: i64,
+    ) -> Operation {
+        let created_at = now();
+        store.db.execute(
+            "INSERT INTO operations(kind,work_key,state,request,generation,revision,created_at,updated_at)
+             SELECT kind,work_key,'generating',request,generation,revision,?2,?2
+             FROM operations WHERE id=?1",
+            params![source.producer.operation.operation_id, created_at],
+        ).unwrap();
+        let id = store.db.last_insert_rowid();
+        let mut record = source.clone();
+        record.producer.operation.operation_id = id;
+        record.producer.created_at = created_at;
+        record.completion = None;
+        if execution == NativeExecution::NotStarted {
+            record.launch = None;
+        }
+        store
+            .db
+            .execute(
+                "INSERT INTO operation_evidence(operation_id,model_attempt) VALUES(?1,?2)",
+                params![id, encode_attempt(&record).unwrap()],
+            )
+            .unwrap();
+        let mut op = store.operation(id).unwrap().unwrap();
+        op.state = match execution {
+            NativeExecution::NotStarted => "prelaunch_failed",
+            NativeExecution::Unknown => "model_unknown",
+            NativeExecution::Completed if outcome == NativeOutcome::Captured => "generated",
+            NativeExecution::Completed => "rejected",
+        }
+        .into();
+        if outcome == NativeOutcome::Captured {
+            op.result = Some(json!({"answer":"retained"}));
+            op.payload = op.result.clone();
+        }
+        op.next_at = next_at;
+        store
+            .finish_model_attempt(
+                &record.producer.operation,
+                &op,
+                &completion(execution, outcome),
+                "model_test_completed",
+            )
+            .unwrap();
+        op
+    }
+
+    #[test]
+    fn completed_model_retry_budget_survives_restart_without_retrying_uncertain_work() {
+        let (_dir, config, mut store, mut first, record) = fixture(true);
+        first.state = "rejected".into();
+        store
+            .finish_model_attempt(
+                &record.producer.operation,
+                &first,
+                &completion(NativeExecution::Completed, NativeOutcome::Invalid),
+                "model_output_invalid",
+            )
+            .unwrap();
+        drop(store);
+        let mut store = Store::open(&config).unwrap();
+        store.retry_models(&config).unwrap();
+        assert_eq!(
+            store.operation(first.id).unwrap().unwrap().state,
+            "retry_model"
+        );
+        assert_eq!(
+            store.model_budget_used(LaneId::Answer, &first.key).unwrap(),
+            1
+        );
+
+        let second = append_completion(
+            &mut store,
+            &record,
+            NativeExecution::Completed,
+            NativeOutcome::Invalid,
+            0,
+        );
+        let uncertain = append_completion(
+            &mut store,
+            &record,
+            NativeExecution::Unknown,
+            NativeOutcome::Unknown,
+            0,
+        );
+        store
+            .db
+            .execute(
+                "UPDATE operations SET work_key='different-uncertain-work' WHERE id=?1",
+                [uncertain.id],
+            )
+            .unwrap();
+        drop(store);
+        let mut store = Store::open(&config).unwrap();
+        store.retry_models(&config).unwrap();
+        assert_eq!(
+            store.model_budget_used(LaneId::Answer, &first.key).unwrap(),
+            2
+        );
+        assert_eq!(
+            store.operation(second.id).unwrap().unwrap().state,
+            "rejected"
+        );
+        assert_eq!(
+            store.operation(uncertain.id).unwrap().unwrap().state,
+            "model_unknown"
+        );
+        assert_eq!(
+            store
+                .model_retry_assessment(LaneId::Answer, "different-uncertain-work", &config, now())
+                .unwrap()
+                .blocker,
+            Some("model_uncertain_retry_disabled"),
+        );
+        assert!(store.effect().unwrap().is_none());
+    }
+
+    #[test]
+    fn model_retry_maintenance_preserves_cooldown_evidence_and_discovery_across_restart() {
+        use crate::config::CountLimit;
+        let (_dir, mut config, mut store, mut op, record) = fixture(true);
+        config.capabilities.answer.preparation.max_attempts_per_work = CountLimit::Unbounded;
+        let at = now();
+        op.state = "rejected".into();
+        op.next_at = at + 300;
+        store
+            .finish_model_attempt(
+                &record.producer.operation,
+                &op,
+                &completion(NativeExecution::Completed, NativeOutcome::Invalid),
+                "model_output_invalid",
+            )
+            .unwrap();
+        let evidence = store.model_attempt(op.id).unwrap().unwrap();
+        assert_eq!(
+            store
+                .model_retry_not_before(LaneId::Answer, &op.key)
+                .unwrap(),
+            op.next_at
+        );
+        assert_eq!(
+            store
+                .model_retry_not_before(LaneId::Answer, "other-work")
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .model_retry_not_before(LaneId::Judge, &op.key)
+                .unwrap(),
+            0
+        );
+        store.retry_models_at(&config, at).unwrap();
+        assert_eq!(store.operation(op.id).unwrap().unwrap().state, "rejected");
+        assert_eq!(store.next_at(LaneId::Answer).unwrap(), 0);
+        // A current-format journal from the previous binary has no new query
+        // indexes. Diagnostics must remain read-only; the next writer provisions
+        // access paths without refunding cooldowns or changing model evidence.
+        store
+            .db
+            .execute_batch(
+                "DROP INDEX operations_reconciliation;
+                 DROP INDEX operations_model_key;
+                 DROP INDEX operations_model_retry_recent;
+                 DROP INDEX operations_model_retry_fair;",
+            )
+            .unwrap();
+        let schema_before: i64 = store
+            .db
+            .query_row("PRAGMA schema_version", [], |row| row.get(0))
+            .unwrap();
+        drop(store);
+        let readonly = Store::read_only(&config).unwrap().unwrap();
+        assert_eq!(
+            readonly
+                .db
+                .query_row("PRAGMA schema_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            schema_before
+        );
+        drop(readonly);
+
+        let mut store = Store::open(&config).unwrap();
+        store.retry_models_at(&config, at + 1).unwrap();
+        config.capabilities.answer.preparation.max_attempts_per_work = 1.into();
+        store.retry_models_at(&config, at + 1).unwrap();
+        assert_eq!(
+            store
+                .model_retry_assessment(LaneId::Answer, &op.key, &config, op.next_at)
+                .unwrap()
+                .blocker,
+            Some("model_budget_exhausted")
+        );
+        config.capabilities.answer.preparation.max_attempts_per_work = CountLimit::Unbounded;
+        store.retry_models_at(&config, at + 2).unwrap();
+        assert_eq!(store.operation(op.id).unwrap().unwrap().state, "rejected");
+        let cooling = store
+            .model_retry_assessment(LaneId::Answer, &op.key, &config, op.next_at - 1)
+            .unwrap();
+        assert_eq!(cooling.blocker, Some("model_retry_cooldown"));
+        assert_eq!(cooling.next_at, Some(op.next_at));
+        store
+            .retry_models_at(
+                &config,
+                op.next_at + config.schedule(LaneId::Answer).retry_seconds as i64,
+            )
+            .unwrap();
+        assert_eq!(
+            store.operation(op.id).unwrap().unwrap().state,
+            "retry_model"
+        );
+        assert_eq!(store.model_budget_used(LaneId::Answer, &op.key).unwrap(), 1);
+        assert_eq!(
+            store
+                .model_retry_not_before(LaneId::Answer, &op.key)
+                .unwrap(),
+            op.next_at
+        );
+        assert_eq!(store.model_attempt(op.id).unwrap().unwrap(), evidence);
+        assert_eq!(store.next_at(LaneId::Answer).unwrap(), 0);
+        assert_eq!(store.next_at(LaneId::Judge).unwrap(), 0);
+    }
+
+    #[test]
+    fn model_retry_maintenance_bounds_blocked_history_and_fairly_serves_old_work() {
+        use crate::config::CountLimit;
+        let (_dir, mut config, mut store, mut recent, record) = fixture(true);
+        config.capabilities.answer.preparation.max_attempts_per_work = CountLimit::Unbounded;
+        config.capabilities.answer.schedule.retry_seconds = 1;
+        config.capabilities.answer.schedule.backoff_max_seconds = 2;
+        let at = now();
+        let older = append_completion(
+            &mut store,
+            &record,
+            NativeExecution::Completed,
+            NativeOutcome::Invalid,
+            0,
+        );
+        store
+            .db
+            .execute(
+                "UPDATE operations SET work_key='older-eligible',updated_at=0 WHERE id=?1",
+                [older.id],
+            )
+            .unwrap();
+        // Legacy incomplete attempts are real unresolved history. Half also
+        // have future cooldowns; both classes must advance the historical walk.
+        store
+            .db
+            .execute(
+                "WITH RECURSIVE history(n) AS (
+                SELECT 1 UNION ALL SELECT n+1 FROM history WHERE n<1024
+             ) INSERT INTO operations(
+                kind,work_key,state,request,generation,revision,next_at,created_at,updated_at
+             ) SELECT 'answer','blocked-'||n,'model_unknown','{}',0,'legacy',
+                CASE WHEN n%2=0 THEN ?1 ELSE 0 END,0,1 FROM history",
+                [at + 100_000],
+            )
+            .unwrap();
+        recent.state = "rejected".into();
+        store
+            .finish_model_attempt(
+                &record.producer.operation,
+                &recent,
+                &completion(NativeExecution::Completed, NativeOutcome::Invalid),
+                "model_output_invalid",
+            )
+            .unwrap();
+        let evidence = store.model_attempt(recent.id).unwrap().unwrap();
+        store.retry_models_at(&config, at).unwrap();
+        // This just-finished attempt has the oldest ID, so recency must be
+        // completion/update recency rather than an ID-only shortcut.
+        assert_eq!(
+            store.operation(recent.id).unwrap().unwrap().state,
+            "retry_model"
+        );
+        assert_eq!(
+            store.operation(older.id).unwrap().unwrap().state,
+            "rejected"
+        );
+        drop(store);
+        let mut store = Store::open(&config).unwrap();
+        store.retry_models_at(&config, at).unwrap();
+        assert_eq!(
+            store.operation(older.id).unwrap().unwrap().state,
+            "rejected"
+        );
+
+        let mut older_served = false;
+        for round in 1..=34 {
+            let fresh = append_completion(
+                &mut store,
+                &record,
+                NativeExecution::Completed,
+                NativeOutcome::Invalid,
+                0,
+            );
+            store
+                .db
+                .execute(
+                    "UPDATE operations SET work_key=?2,updated_at=?3 WHERE id=?1",
+                    params![fresh.id, format!("fresh-{round}"), at + round * 2],
+                )
+                .unwrap();
+            store.retry_models_at(&config, at + round * 2).unwrap();
+            assert_eq!(
+                store.operation(fresh.id).unwrap().unwrap().state,
+                "retry_model"
+            );
+            if store.operation(older.id).unwrap().unwrap().state == "retry_model" {
+                older_served = true;
+                break;
+            }
+            if round == 16 {
+                drop(store);
+                store = Store::open(&config).unwrap();
+            }
+        }
+        assert!(
+            older_served,
+            "new arrivals or ineligible rows starved the durable cursor"
+        );
+        let retained: i64 = store.db.query_row(
+            "SELECT COUNT(*) FROM operations WHERE work_key LIKE 'blocked-%' AND state='model_unknown'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(retained, 1024);
+        let blocked = store
+            .model_retry_assessment(LaneId::Answer, "blocked-1", &config, at + 100_000)
+            .unwrap();
+        assert_eq!(blocked.unresolved_attempts, 1);
+        assert_eq!(blocked.blocker, Some("model_uncertain_retry_disabled"));
+        assert_eq!(store.model_attempt(recent.id).unwrap().unwrap(), evidence);
+        assert_eq!(store.next_at(LaneId::Answer).unwrap(), 0);
+    }
+
+    #[test]
+    fn model_retry_maintenance_bounds_same_work_updates_without_refunding_attempts() {
+        use crate::config::CountLimit;
+        let (_dir, mut config, mut store, mut first, record) = fixture(true);
+        config.capabilities.answer.preparation.max_attempts_per_work = CountLimit::Unbounded;
+        first.state = "rejected".into();
+        store
+            .finish_model_attempt(
+                &record.producer.operation,
+                &first,
+                &completion(NativeExecution::Completed, NativeOutcome::Invalid),
+                "model_output_invalid",
+            )
+            .unwrap();
+        for _ in 0..64 {
+            append_completion(
+                &mut store,
+                &record,
+                NativeExecution::Completed,
+                NativeOutcome::Invalid,
+                0,
+            );
+        }
+        store.retry_models_at(&config, now()).unwrap();
+        let promoted: i64 = store
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM operations WHERE state='retry_model'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(promoted > 0 && promoted <= 64);
+        assert_eq!(
+            store.operation(first.id).unwrap().unwrap().state,
+            "rejected"
+        );
+        let assessment = store
+            .model_retry_assessment(LaneId::Answer, &first.key, &config, now())
+            .unwrap();
+        assert_eq!(assessment.total_attempts, 65);
+        assert_eq!(assessment.unresolved_attempts, 0);
+        assert!(assessment.retry_eligible);
+    }
+
+    #[test]
+    fn model_retry_maintenance_does_not_take_a_writer_transaction_before_durable_due_time() {
+        let (_dir, config, mut store, _, _) = fixture(false);
+        let at = now();
+        store.retry_models_at(&config, at).unwrap();
+        drop(store);
+        let mut store = Store::open(&config).unwrap();
+        let mut other = Store::open(&config).unwrap();
+        let tx = other
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        store.db.busy_timeout(std::time::Duration::ZERO).unwrap();
+        store.retry_models_at(&config, at).unwrap();
+        tx.rollback().unwrap();
+    }
+
+    #[test]
+    fn model_retry_maintenance_pages_before_filtering_future_cooldowns() {
+        let (_dir, mut config, mut store, mut older, record) = fixture(true);
+        config.capabilities.answer.schedule.retry_seconds = 1;
+        config.capabilities.answer.schedule.backoff_max_seconds = 2;
+        let at = now();
+        older.state = "rejected".into();
+        store
+            .finish_model_attempt(
+                &record.producer.operation,
+                &older,
+                &completion(NativeExecution::Completed, NativeOutcome::Invalid),
+                "model_output_invalid",
+            )
+            .unwrap();
+        store
+            .db
+            .execute("UPDATE operations SET updated_at=0 WHERE id=?1", [older.id])
+            .unwrap();
+        store
+            .db
+            .execute(
+                "WITH RECURSIVE history(n) AS (
+                SELECT 1 UNION ALL SELECT n+1 FROM history WHERE n<128
+             ) INSERT INTO operations(
+                kind,work_key,state,request,generation,revision,next_at,created_at,updated_at
+             ) SELECT 'answer','cooling-'||n,'model_unknown','{}',0,'legacy',?1,0,1 FROM history",
+                [at + 100_000],
+            )
+            .unwrap();
+        store.retry_models_at(&config, at).unwrap();
+        // Filtering cooldowns before LIMIT would walk all 128 ineligible rows
+        // and promote this old attempt in the first maintenance turn.
+        assert_eq!(
+            store.operation(older.id).unwrap().unwrap().state,
+            "rejected"
+        );
+        assert!(
+            store
+                .model_retry_assessment(LaneId::Answer, &older.key, &config, at)
+                .unwrap()
+                .retry_eligible
+        );
+        for round in 1..=4 {
+            store.retry_models_at(&config, at + round * 2).unwrap();
+        }
+        assert_eq!(
+            store.operation(older.id).unwrap().unwrap().state,
+            "retry_model"
+        );
+        assert_eq!(
+            store
+                .model_retry_not_before(LaneId::Answer, "cooling-1")
+                .unwrap(),
+            at + 100_000
+        );
+    }
+
+    #[test]
+    fn model_assessment_counts_retired_work_but_not_proven_nonexecution_and_paces_unbounded() {
+        use crate::config::CountLimit;
+        let (_dir, mut config, mut store, mut op, record) = fixture(true);
+        config.capabilities.answer.preparation.max_attempts_per_work = CountLimit::Unbounded;
+        op.state = "rejected".into();
+        op.next_at = now() + 600;
+        store
+            .finish_model_attempt(
+                &record.producer.operation,
+                &op,
+                &completion(NativeExecution::Completed, NativeOutcome::Invalid),
+                "model_result_invalid",
+            )
+            .unwrap();
+        let before = store
+            .model_retry_assessment(LaneId::Answer, &op.key, &config, now())
+            .unwrap();
+        assert_eq!(before.total_attempts, 1);
+        assert_eq!(before.unresolved_attempts, 0);
+        assert_eq!(before.blocker, Some("model_retry_cooldown"));
+        assert_eq!(before.next_at, Some(op.next_at));
+        assert!(!before.retry_eligible);
+        store.retry_models(&config).unwrap();
+        assert_eq!(store.operation(op.id).unwrap().unwrap().state, "rejected");
+        assert!(
+            store
+                .model_retry_assessment(LaneId::Answer, &op.key, &config, op.next_at)
+                .unwrap()
+                .retry_eligible
+        );
+
+        // Keep the original retry anchor; neither generations nor more failures refund it.
+        for _ in 0..3 {
+            append_completion(
+                &mut store,
+                &record,
+                NativeExecution::Completed,
+                NativeOutcome::Invalid,
+                0,
+            );
+        }
+        append_completion(
+            &mut store,
+            &record,
+            NativeExecution::NotStarted,
+            NativeOutcome::NotStarted,
+            0,
+        );
+        let captured = append_completion(
+            &mut store,
+            &record,
+            NativeExecution::Completed,
+            NativeOutcome::Captured,
+            0,
+        );
+        let binding = store.operation_binding(&captured).unwrap();
+        store.retire_unsent(&binding, "capture_revoked").unwrap();
+        store.set_paused_unbound(true).unwrap();
+        store.set_paused_unbound(false).unwrap();
+        store.recover().unwrap();
+        let total = store
+            .model_retry_assessment(LaneId::Answer, &op.key.to_uppercase(), &config, op.next_at)
+            .unwrap();
+        assert_eq!(
+            (
+                total.total_attempts,
+                total.unresolved_attempts,
+                total.reserved_attempts
+            ),
+            (5, 0, 0)
+        );
+        assert!(total.retry_eligible);
+        config.capabilities.answer.preparation.max_attempts_per_work = 5.into();
+        let limited = store
+            .model_retry_assessment(LaneId::Answer, &op.key, &config, op.next_at)
+            .unwrap();
+        assert_eq!(limited.blocker, Some("model_budget_exhausted"));
+        assert_eq!(limited.next_at, None);
+        assert_eq!(store.model_budget_used(LaneId::Answer, &op.key).unwrap(), 5);
+        drop(store);
+        let reopened = Store::read_only(&config).unwrap().unwrap();
+        assert_eq!(
+            reopened
+                .model_retry_assessment(LaneId::Answer, &op.key, &config, op.next_at)
+                .unwrap()
+                .total_attempts,
+            5
+        );
+    }
+
+    #[test]
+    fn uncertain_replacements_survive_recovery_abandonment_and_limit_changes() {
+        use crate::config::CountLimit;
+        let (_dir, mut config, mut store, mut op, record) = fixture(true);
+        config.capabilities.answer.preparation.max_attempts_per_work = CountLimit::Unbounded;
+        op.state = "model_unknown".into();
+        store
+            .finish_model_attempt(
+                &record.producer.operation,
+                &op,
+                &completion(NativeExecution::Unknown, NativeOutcome::Unknown),
+                "native_process_failed",
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .model_retry_assessment(LaneId::Answer, &op.key, &config, now())
+                .unwrap()
+                .blocker,
+            Some("model_uncertain_retry_disabled")
+        );
+        assert_eq!(store.abandon_models().unwrap(), 1);
+        assert_eq!(store.model_budget_used(LaneId::Answer, &op.key).unwrap(), 1);
+        assert_eq!(
+            store
+                .model_retry_assessment(LaneId::Answer, &op.key, &config, now())
+                .unwrap()
+                .unresolved_attempts,
+            1
+        );
+        config.capabilities.answer.preparation.retry_uncertain = true;
+        assert!(
+            store
+                .model_retry_assessment(LaneId::Answer, &op.key, &config, now())
+                .unwrap()
+                .retry_eligible
+        );
+        append_completion(
+            &mut store,
+            &record,
+            NativeExecution::Unknown,
+            NativeOutcome::Unknown,
+            0,
+        );
+        store.retry_models(&config).unwrap();
+        store.abandon_models().unwrap();
+        store.recover().unwrap();
+        config
+            .capabilities
+            .answer
+            .preparation
+            .max_uncertain_replacements_per_work = 0;
+        let blocked = store
+            .model_retry_assessment(LaneId::Answer, &op.key, &config, now())
+            .unwrap();
+        assert_eq!(
+            (blocked.total_attempts, blocked.unresolved_attempts),
+            (2, 2)
+        );
+        assert_eq!(
+            blocked.blocker,
+            Some("model_uncertain_replacement_exhausted")
+        );
+        drop(store);
+        let reopened = Store::read_only(&config).unwrap().unwrap();
+        assert_eq!(
+            reopened
+                .model_retry_assessment(LaneId::Answer, &op.key, &config, now())
+                .unwrap()
+                .unresolved_attempts,
+            2
+        );
+    }
+
+    #[test]
+    fn incomplete_legacy_execution_is_not_cleared_by_terminal_scheduling_labels() {
+        use crate::config::CountLimit;
+        let (_dir, mut config, store, op, _) = fixture(false);
+        config.capabilities.answer.preparation.max_attempts_per_work = CountLimit::Unbounded;
+        config.capabilities.answer.preparation.retry_uncertain = true;
+        for state in ["discarded", "abandoned_model", "retry_model"] {
+            store.db.execute(
+                "INSERT INTO operations(kind,work_key,state,request,generation,revision,created_at,updated_at)
+                 SELECT kind,'legacy-work',?2,request,generation,revision,created_at,updated_at FROM operations WHERE id=?1",
+                params![op.id, state],
+            ).unwrap();
+        }
+        let assessment = store
+            .model_retry_assessment(LaneId::Answer, "LEGACY-WORK", &config, now())
+            .unwrap();
+        assert_eq!(
+            (assessment.total_attempts, assessment.unresolved_attempts),
+            (3, 3)
+        );
+        assert_eq!(
+            assessment.blocker,
+            Some("model_uncertain_replacement_exhausted")
+        );
+    }
+
+    #[test]
+    fn recovered_unlaunched_producer_is_retryable_without_uncertain_opt_in() {
+        let (_dir, config, mut store, op, _) = fixture(false);
+        let reserved = store
+            .model_retry_assessment(LaneId::Answer, &op.key, &config, now())
+            .unwrap();
+        assert_eq!(
+            (
+                reserved.total_attempts,
+                reserved.unresolved_attempts,
+                reserved.reserved_attempts
+            ),
+            (0, 0, 1)
+        );
+        assert_eq!(reserved.blocker, Some("model_preparation_reserved"));
+        store.recover().unwrap();
+        store.retry_models(&config).unwrap();
+        let recovered = store
+            .model_retry_assessment(LaneId::Answer, &op.key, &config, now())
+            .unwrap();
+        assert_eq!(
+            (
+                recovered.total_attempts,
+                recovered.unresolved_attempts,
+                recovered.reserved_attempts
+            ),
+            (0, 0, 0)
+        );
+        assert!(recovered.retry_eligible);
+        assert_eq!(
+            store.operation(op.id).unwrap().unwrap().state,
+            "superseded_model_unknown"
+        );
+    }
+
+    #[test]
+    fn admission_only_capture_reuse_preserves_producer_policy_and_cannot_revive_revocation() {
+        use crate::config::CountLimit;
+        let (_dir, mut config, mut store, mut op, record) = fixture(true);
+        store.db.execute(
+            "UPDATE operation_evidence SET policy=json_set(policy,'$.producer_revision',?2) WHERE operation_id=?1",
+            params![op.id, config.producer_revision(LaneId::Answer).unwrap()],
+        ).unwrap();
+        op.state = "generated".into();
+        op.result = Some(json!({"answer":"original"}));
+        op.payload = op.result.clone();
+        store
+            .finish_model_attempt(
+                &record.producer.operation,
+                &op,
+                &completion(NativeExecution::Completed, NativeOutcome::Captured),
+                "model_result_captured",
+            )
+            .unwrap();
+        let binding = store.operation_binding(&op).unwrap();
+        let before = store.model_attempt(op.id).unwrap().unwrap();
+        let original_revision = store.operation_lane_revision(&binding).unwrap();
+        let policy: String = store
+            .db
+            .query_row(
+                "SELECT policy FROM operation_evidence WHERE operation_id=?1",
+                [op.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        config
+            .capabilities
+            .answer
+            .participation
+            .max_unresolved_operations = CountLimit::Unbounded;
+        config.capabilities.answer.preparation.max_attempts_per_work = CountLimit::Unbounded;
+        config.capabilities.answer.timeouts.model_seconds += 1;
+        config.capabilities.answer.schedule.retry_seconds += 1;
+        assert_ne!(
+            config.lane_revision(LaneId::Answer).unwrap(),
+            original_revision
+        );
+        assert!(store.operation_config_current(&config, &binding).unwrap());
+        assert_eq!(store.model_attempt(op.id).unwrap().unwrap(), before);
+        assert_eq!(
+            store.operation_lane_revision(&binding).unwrap(),
+            original_revision
+        );
+        assert_eq!(
+            store
+                .db
+                .query_row(
+                    "SELECT policy FROM operation_evidence WHERE operation_id=?1",
+                    [op.id],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            policy
+        );
+        let mut different = config.clone();
+        different.capabilities.answer.model.core_guidance = "different producer guidance".into();
+        assert!(
+            !store
+                .operation_config_current(&different, &binding)
+                .unwrap()
+        );
+        let mut different_route = config.clone();
+        different_route.capabilities.answer.model.executable = "/different/native-route".into();
+        assert!(
+            !store
+                .operation_config_current(&different_route, &binding)
+                .unwrap()
+        );
+        store.retire_unsent(&binding, "capture_revoked").unwrap();
+        assert!(!store.operation_config_current(&config, &binding).unwrap());
+    }
+
+    #[test]
+    fn legacy_capture_requires_unchanged_full_revision_and_account_generation() {
+        let (_dir, mut config, mut store, mut op, record) = fixture(true);
+        op.state = "generated".into();
+        op.result = Some(json!({"answer":"original"}));
+        op.payload = op.result.clone();
+        store
+            .finish_model_attempt(
+                &record.producer.operation,
+                &op,
+                &completion(NativeExecution::Completed, NativeOutcome::Captured),
+                "model_result_captured",
+            )
+            .unwrap();
+        let binding = store.operation_binding(&op).unwrap();
+        assert!(store.operation_config_current(&config, &binding).unwrap());
+        config.capabilities.answer.schedule.retry_seconds += 1;
+        assert!(!store.operation_config_current(&config, &binding).unwrap());
+        config.capabilities.answer.schedule.retry_seconds -= 1;
+        store.set_paused_unbound(true).unwrap();
+        store.set_paused_unbound(false).unwrap();
+        assert!(!store.operation_config_current(&config, &binding).unwrap());
+    }
+
+    fn reserve_answer(
+        store: &mut Store,
+        config: &Config,
+        account: &AccountAdmissionGuard,
+        gate: &LaneAdmissionGuard,
+        key: &str,
+    ) -> Option<(Operation, ModelProducerProvenance)> {
+        let stamp = AdmissionStampSnapshot {
+            account_generation: store.control().unwrap().generation,
+            lane_control_revision: store.lane_control(LaneId::Answer).unwrap().control_revision,
+            authority_epoch: 1,
+            lane_config_revision: config.lane_revision(LaneId::Answer).unwrap(),
+        };
+        let model = config.model(LaneId::Answer).unwrap();
+        let native = NativeRequest::Answer(
+            AnswerTask::new(SolverRequest {
+                id: format!(
+                    "reservation-{}",
+                    store.attempt_count(LaneId::Answer, key).unwrap()
+                ),
+                kind: LaneId::Answer,
+                epoch: 8,
+                words: vec!["clock".into()],
+                min_chars: 5,
+                max_chars: 200,
+                assignment: None,
+                candidate: None,
+                history: Vec::new(),
+                guidance: model.guidance.to_string(),
+                core_guidance: model.core_guidance.to_string(),
+                candidate_author: None,
+                author_history: None,
+            })
+            .unwrap(),
+        );
+        let preparation = config.preparation(LaneId::Answer).unwrap();
+        let policy = json!({
+            "lane_revision":stamp.lane_config_revision,
+            "producer_revision":config.producer_revision(LaneId::Answer).unwrap(),
+            "model_seconds":config.model_seconds(LaneId::Answer).unwrap(),
+            "max_attempts_per_work":preparation.max_attempts_per_work,
+            "retry_uncertain":preparation.retry_uncertain,
+            "max_uncertain_replacements_per_work":preparation.max_uncertain_replacements_per_work,
+        });
+        store
+            .begin_model_attempt(
+                config,
+                account,
+                gate,
+                &stamp,
+                LaneId::Answer,
+                key,
+                &json!({"solver":native.request()}),
+                None,
+                &policy,
+                ModelProducerDraft {
+                    task_kind: "answer".into(),
+                    request_id: native.request().id.clone(),
+                    request_digest: native.digest().unwrap(),
+                    lane_config_revision: stamp.lane_config_revision.clone(),
+                    requested: ModelSelection::new(model).unwrap(),
+                    preflight_admission: stamp.clone(),
+                },
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn transactional_reservation_and_launch_recheck_current_and_captured_limits() {
+        use crate::config::CountLimit;
+        use std::time::{Duration, Instant};
+        let (_dir, mut config) = super::super::tests::bound_fixture();
+        config.capabilities.answer.mode = Mode::Active;
+        config.capabilities.answer.model.core_guidance = "Answer the supplied task.".into();
+        let (_writer, mut store) = AccountLock::acquire(&config).unwrap();
+        let account = AccountAdmissionGuard::try_acquire(&config).unwrap();
+        store.set_paused(false, &account).unwrap();
+        store.set_authority_epoch(1).unwrap();
+        store.runtime_state(&config, false).unwrap();
+        let gate = LaneAdmissionGuard::try_acquire(&config, LaneId::Answer).unwrap();
+        let key = "8:atomic-retry";
+        let (first, first_producer) =
+            reserve_answer(&mut store, &config, &account, &gate, key).unwrap();
+        assert!(reserve_answer(&mut store, &config, &account, &gate, key).is_none());
+        let deadline = now() + 60;
+        store
+            .capture_model_pending(first.id, 1000, deadline)
+            .unwrap();
+        assert!(
+            store
+                .admit_model_launch(
+                    &config,
+                    &account,
+                    &gate,
+                    &first_producer.preflight_admission,
+                    &first_producer.operation,
+                    deadline,
+                    Instant::now() + Duration::from_secs(5),
+                )
+                .unwrap()
+        );
+        let mut first = first;
+        first.state = "rejected".into();
+        store
+            .finish_model_attempt(
+                &first_producer.operation,
+                &first,
+                &completion(NativeExecution::Completed, NativeOutcome::Invalid),
+                "model_result_invalid",
+            )
+            .unwrap();
+        let (second, second_producer) =
+            reserve_answer(&mut store, &config, &account, &gate, key).unwrap();
+        let reserved = store
+            .model_retry_assessment(LaneId::Answer, key, &config, now())
+            .unwrap();
+        assert_eq!(
+            (reserved.total_attempts, reserved.reserved_attempts),
+            (1, 1)
+        );
+        assert!(reserve_answer(&mut store, &config, &account, &gate, key).is_none());
+        store
+            .capture_model_pending(second.id, 1000, deadline)
+            .unwrap();
+        config.capabilities.answer.preparation.max_attempts_per_work = 1.into();
+        let mut stamp = second_producer.preflight_admission.clone();
+        stamp.lane_config_revision = config.lane_revision(LaneId::Answer).unwrap();
+        assert!(
+            !store
+                .admit_model_launch(
+                    &config,
+                    &account,
+                    &gate,
+                    &stamp,
+                    &second_producer.operation,
+                    deadline,
+                    Instant::now() + Duration::from_secs(5),
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .model_attempt(second.id)
+                .unwrap()
+                .unwrap()
+                .launch
+                .is_none()
+        );
+        config.capabilities.answer.preparation.max_attempts_per_work = CountLimit::Unbounded;
+        stamp.lane_config_revision = config.lane_revision(LaneId::Answer).unwrap();
+        assert!(
+            store
+                .admit_model_launch(
+                    &config,
+                    &account,
+                    &gate,
+                    &stamp,
+                    &second_producer.operation,
+                    deadline,
+                    Instant::now() + Duration::from_secs(5),
+                )
+                .unwrap()
+        );
+        assert!(
+            !store
+                .admit_model_launch(
+                    &config,
+                    &account,
+                    &gate,
+                    &stamp,
+                    &second_producer.operation,
+                    deadline,
+                    Instant::now() + Duration::from_secs(5),
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            store.model_attempt(second.id).unwrap().unwrap().producer,
+            second_producer
+        );
+        let mut second = second;
+        second.state = "model_unknown".into();
+        store
+            .finish_model_attempt(
+                &second_producer.operation,
+                &second,
+                &completion(NativeExecution::Unknown, NativeOutcome::Unknown),
+                "native_process_failed",
+            )
+            .unwrap();
+        assert!(reserve_answer(&mut store, &config, &account, &gate, key).is_none());
+        config.capabilities.answer.preparation.retry_uncertain = true;
+        let (replacement, producer) =
+            reserve_answer(&mut store, &config, &account, &gate, key).unwrap();
+        store
+            .capture_model_pending(replacement.id, 1000, deadline)
+            .unwrap();
+        config
+            .capabilities
+            .answer
+            .preparation
+            .max_uncertain_replacements_per_work = 0;
+        stamp = producer.preflight_admission.clone();
+        stamp.lane_config_revision = config.lane_revision(LaneId::Answer).unwrap();
+        assert!(
+            !store
+                .admit_model_launch(
+                    &config,
+                    &account,
+                    &gate,
+                    &stamp,
+                    &producer.operation,
+                    deadline,
+                    Instant::now() + Duration::from_secs(5),
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .model_attempt(replacement.id)
+                .unwrap()
+                .unwrap()
+                .launch
+                .is_none()
+        );
     }
 }

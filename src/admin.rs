@@ -433,6 +433,8 @@ fn defaults() -> Value {
         let model = &mut value["capabilities"][lane]["model"];
         model["guidance_file"] = Value::Null;
         model["core_guidance_file"] = Value::Null;
+        value["capabilities"][lane]["preparation"]["max_uncertain_replacements_per_work"] =
+            json!(1);
     }
     value
 }
@@ -490,6 +492,17 @@ fn describe(path: &str, value: &Value, settings: &mut Vec<Value>) {
             "immutable_when_initialized":matches!(path,
                 "network.base_url" | "network.chain" | "network.address"
                 | "network.credential_file" | "state_dir")});
+    if path.ends_with(".max_unresolved_operations") || path.ends_with(".max_attempts_per_work") {
+        setting["type"] = json!("integer|string");
+        setting["one_of"] = json!([
+            {"type":"integer","minimum":1,"maximum":if path.ends_with(".max_attempts_per_work"){8}else{u32::MAX}},
+            {"const":"unbounded"}
+        ]);
+    }
+    if path.ends_with(".max_uncertain_replacements_per_work") {
+        setting["minimum"] = json!(0);
+        setting["maximum"] = json!(8);
+    }
     if path.starts_with("network.api.") {
         setting["change_conditions"] = json!({
             "when_initialized": ["controller_stopped", "journal_drained"],
@@ -799,6 +812,22 @@ mod tests {
             json!(["strict", "participation_first", "manual"])
         );
         assert!(setting("capabilities.judge.model.model")["enum"].is_null());
+        assert_eq!(
+            setting("capabilities.answer.participation.max_unresolved_operations")["type"],
+            "integer|string"
+        );
+        assert_eq!(
+            setting("capabilities.judge.preparation.max_attempts_per_work")["one_of"][1]["const"],
+            "unbounded"
+        );
+        assert_eq!(
+            setting("capabilities.judge.preparation.max_uncertain_replacements_per_work")["default"],
+            1
+        );
+        assert_eq!(
+            setting("capabilities.judge.preparation.max_uncertain_replacements_per_work")["maximum"],
+            8
+        );
         for lane in ["answer", "judge", "mine"] {
             assert_eq!(
                 setting(&format!("capabilities.{lane}.timeouts.read_http_seconds"))["type"],

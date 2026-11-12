@@ -91,6 +91,95 @@ impl std::fmt::Display for ConfigDiagnostic {
 }
 impl std::error::Error for ConfigDiagnostic {}
 
+/// A finite count policy or an explicit absence of a cumulative count ceiling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CountLimit {
+    Bounded(u32),
+    Unbounded,
+}
+
+impl CountLimit {
+    pub fn finite(self) -> Option<u32> {
+        match self {
+            Self::Bounded(value) => Some(value),
+            Self::Unbounded => None,
+        }
+    }
+
+    pub fn allows(self, used: u64) -> bool {
+        self.finite().is_none_or(|limit| used < u64::from(limit))
+    }
+
+    pub fn intersect(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Bounded(a), Self::Bounded(b)) => Self::Bounded(a.min(b)),
+            (Self::Unbounded, limit) | (limit, Self::Unbounded) => limit,
+        }
+    }
+}
+
+impl From<u32> for CountLimit {
+    fn from(value: u32) -> Self {
+        Self::Bounded(value)
+    }
+}
+
+impl Serialize for CountLimit {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        match self {
+            Self::Bounded(0) => Err(serde::ser::Error::custom("count limit must be positive")),
+            Self::Bounded(value) => serializer.serialize_u32(*value),
+            Self::Unbounded => serializer.serialize_str("unbounded"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for CountLimit {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = CountLimit;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a positive u32 or \"unbounded\"")
+            }
+            fn visit_u64<E: serde::de::Error>(
+                self,
+                value: u64,
+            ) -> std::result::Result<Self::Value, E> {
+                u32::try_from(value)
+                    .ok()
+                    .filter(|value| *value > 0)
+                    .map(CountLimit::Bounded)
+                    .ok_or_else(|| E::custom("count limit must be a positive u32"))
+            }
+            fn visit_i64<E: serde::de::Error>(
+                self,
+                value: i64,
+            ) -> std::result::Result<Self::Value, E> {
+                self.visit_u64(
+                    u64::try_from(value).map_err(|_| E::custom("count limit must be positive"))?,
+                )
+            }
+            fn visit_str<E: serde::de::Error>(
+                self,
+                value: &str,
+            ) -> std::result::Result<Self::Value, E> {
+                if value == "unbounded" {
+                    Ok(CountLimit::Unbounded)
+                } else {
+                    Err(E::custom("expected \"unbounded\""))
+                }
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Mode {
@@ -261,14 +350,16 @@ fn deserialize_judge_preparation<'de, D: serde::Deserializer<'de>>(
     struct JudgePreparation {
         while_blocked: bool,
         retry_uncertain: bool,
-        max_attempts_per_work: u32,
+        max_attempts_per_work: CountLimit,
+        max_uncertain_replacements_per_work: u32,
     }
     impl Default for JudgePreparation {
         fn default() -> Self {
             Self {
                 while_blocked: false,
                 retry_uncertain: false,
-                max_attempts_per_work: 2,
+                max_attempts_per_work: CountLimit::Bounded(2),
+                max_uncertain_replacements_per_work: 1,
             }
         }
     }
@@ -277,6 +368,7 @@ fn deserialize_judge_preparation<'de, D: serde::Deserializer<'de>>(
         while_blocked: value.while_blocked,
         retry_uncertain: value.retry_uncertain,
         max_attempts_per_work: value.max_attempts_per_work,
+        max_uncertain_replacements_per_work: value.max_uncertain_replacements_per_work,
     })
 }
 
@@ -425,16 +517,23 @@ pub struct QueuedJobPolling {
 pub struct Preparation {
     pub while_blocked: bool,
     pub retry_uncertain: bool,
-    pub max_attempts_per_work: u32,
+    pub max_attempts_per_work: CountLimit,
+    #[serde(skip_serializing_if = "is_one")]
+    pub max_uncertain_replacements_per_work: u32,
 }
 impl Default for Preparation {
     fn default() -> Self {
         Self {
             while_blocked: true,
             retry_uncertain: false,
-            max_attempts_per_work: 2,
+            max_attempts_per_work: CountLimit::Bounded(2),
+            max_uncertain_replacements_per_work: 1,
         }
     }
+}
+
+fn is_one(value: &u32) -> bool {
+    *value == 1
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -459,14 +558,14 @@ pub enum HistoricalAnswerCapacity {
 pub struct Participation {
     pub mode: ParticipationMode,
     pub uncertainty_grace_seconds: u64,
-    pub max_unresolved_operations: u32,
+    pub max_unresolved_operations: CountLimit,
 }
 impl Default for Participation {
     fn default() -> Self {
         Self {
             mode: ParticipationMode::Strict,
             uncertainty_grace_seconds: 300,
-            max_unresolved_operations: 4,
+            max_unresolved_operations: CountLimit::Bounded(4),
         }
     }
 }
@@ -476,7 +575,7 @@ impl Default for Participation {
 pub struct AnswerParticipation {
     pub mode: ParticipationMode,
     pub uncertainty_grace_seconds: u64,
-    pub max_unresolved_operations: u32,
+    pub max_unresolved_operations: CountLimit,
     pub retry_uncertain_answers: bool,
     pub uncertain_answer_retry_seconds: u64,
     pub max_answer_attempts_per_epoch: u32,
@@ -488,7 +587,7 @@ impl Default for AnswerParticipation {
         Self {
             mode: ParticipationMode::Strict,
             uncertainty_grace_seconds: 300,
-            max_unresolved_operations: 4,
+            max_unresolved_operations: CountLimit::Bounded(4),
             retry_uncertain_answers: false,
             uncertain_answer_retry_seconds: 600,
             max_answer_attempts_per_epoch: 2,
@@ -672,7 +771,7 @@ impl Config {
         );
         for kind in LaneId::ALL {
             ensure!(
-                self.participation(kind).max_unresolved_operations > 0,
+                self.participation(kind).max_unresolved_operations.finite() != Some(0),
                 ConfigDiagnostic::model(
                     kind,
                     "participation.max_unresolved_operations",
@@ -681,11 +780,22 @@ impl Config {
             );
             if let Some(preparation) = self.preparation(kind) {
                 ensure!(
-                    (1..=8).contains(&preparation.max_attempts_per_work),
+                    preparation
+                        .max_attempts_per_work
+                        .finite()
+                        .is_none_or(|limit| (1..=8).contains(&limit)),
                     ConfigDiagnostic::model(
                         kind,
                         "preparation.max_attempts_per_work",
-                        "Preparation attempts must be between 1 and 8."
+                        "Preparation attempts must be between 1 and 8 or unbounded."
+                    )
+                );
+                ensure!(
+                    preparation.max_uncertain_replacements_per_work <= 8,
+                    ConfigDiagnostic::model(
+                        kind,
+                        "preparation.max_uncertain_replacements_per_work",
+                        "Uncertain replacements must be between 0 and 8."
                     )
                 );
             }
@@ -1119,6 +1229,26 @@ impl Config {
             LaneId::Mine => self.capabilities.mine.participation,
         }
     }
+    pub fn producer_revision(&self, kind: LaneId) -> Result<String> {
+        let mut digest = Sha256::new();
+        digest.update(self.schema_version.to_le_bytes());
+        digest.update(kind.as_str().as_bytes());
+        if let Some(model) = self.model(kind) {
+            ensure!(self.guidance_loaded, "model guidance has not been loaded");
+            digest.update(serde_json::to_vec(&(
+                model.harness,
+                &model.executable,
+                &model.model,
+                &model.reasoning,
+                &model.hermes_api_url,
+            ))?);
+            for guidance in [&model.guidance, &model.core_guidance] {
+                digest.update((guidance.len() as u64).to_le_bytes());
+                digest.update(guidance.as_bytes());
+            }
+        }
+        Ok(format!("{:x}", digest.finalize()))
+    }
     pub fn lane_revision(&self, kind: LaneId) -> Result<String> {
         let mut digest = Sha256::new();
         digest.update(self.schema_version.to_le_bytes());
@@ -1370,6 +1500,112 @@ mod tests {
     use super::*;
 
     #[test]
+    fn count_limits_are_explicit_and_preserve_numeric_serialization() {
+        for (text, limit) in [
+            ("4", CountLimit::Bounded(4)),
+            ("\"unbounded\"", CountLimit::Unbounded),
+        ] {
+            assert_eq!(serde_json::from_str::<CountLimit>(text).unwrap(), limit);
+            assert_eq!(serde_json::to_string(&limit).unwrap(), text);
+        }
+        for text in [
+            "0",
+            "-1",
+            "4294967296",
+            "1.5",
+            "\"4\"",
+            "\"Unlimited\"",
+            "null",
+        ] {
+            assert!(serde_json::from_str::<CountLimit>(text).is_err(), "{text}");
+        }
+        let finite = CountLimit::Bounded(4);
+        assert!(finite.allows(3));
+        assert!(!finite.allows(4));
+        assert!(CountLimit::Unbounded.allows(u64::MAX));
+        assert_eq!(finite.intersect(CountLimit::Unbounded), finite);
+        assert_eq!(CountLimit::Unbounded.intersect(finite), finite);
+        assert_eq!(finite.intersect(2.into()), CountLimit::Bounded(2));
+        assert_eq!(CountLimit::Unbounded.finite(), None);
+    }
+
+    #[test]
+    fn unbounded_and_uncertain_replacement_defaults_are_independent() {
+        let config: Config = toml::from_str("schema_version=2\n[capabilities.judge.preparation]\nmax_attempts_per_work='unbounded'\n[capabilities.answer.participation]\nmax_unresolved_operations='unbounded'").unwrap();
+        config.validate().unwrap();
+        assert!(!config.capabilities.judge.preparation.while_blocked);
+        assert!(!config.capabilities.judge.preparation.retry_uncertain);
+        assert_eq!(
+            config
+                .capabilities
+                .judge
+                .preparation
+                .max_uncertain_replacements_per_work,
+            1
+        );
+        assert_eq!(
+            config.capabilities.answer.participation.mode,
+            ParticipationMode::Strict
+        );
+        let mut preparation = config.capabilities.judge.preparation;
+        assert!(
+            serde_json::to_value(preparation)
+                .unwrap()
+                .get("max_uncertain_replacements_per_work")
+                .is_none()
+        );
+        preparation.max_uncertain_replacements_per_work = 0;
+        assert_eq!(
+            serde_json::to_value(preparation).unwrap()["max_uncertain_replacements_per_work"],
+            0
+        );
+        let mut invalid = config;
+        invalid
+            .capabilities
+            .judge
+            .preparation
+            .max_uncertain_replacements_per_work = 9;
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn producer_revision_ignores_policy_but_binds_route_and_guidance() {
+        let original = Config::default();
+        let revision = original.producer_revision(LaneId::Answer).unwrap();
+        let mut changed = original.clone();
+        changed.capabilities.answer.mode = Mode::Off;
+        changed.capabilities.answer.schedule.retry_seconds += 1;
+        changed.capabilities.answer.timeouts.model_seconds += 1;
+        changed
+            .capabilities
+            .answer
+            .preparation
+            .max_attempts_per_work = CountLimit::Unbounded;
+        changed
+            .capabilities
+            .answer
+            .participation
+            .max_unresolved_operations = CountLimit::Unbounded;
+        assert_eq!(changed.producer_revision(LaneId::Answer).unwrap(), revision);
+        assert_ne!(
+            changed.lane_revision(LaneId::Answer).unwrap(),
+            original.lane_revision(LaneId::Answer).unwrap()
+        );
+        changed.capabilities.answer.model.guidance = Arc::from("new guidance");
+        assert_ne!(changed.producer_revision(LaneId::Answer).unwrap(), revision);
+        changed = original.clone();
+        changed
+            .capabilities
+            .answer
+            .model
+            .model
+            .push_str("-different");
+        assert_ne!(changed.producer_revision(LaneId::Answer).unwrap(), revision);
+        changed.guidance_loaded = false;
+        assert!(changed.producer_revision(LaneId::Answer).is_err());
+    }
+
+    #[test]
     fn schema_version_is_required_and_legacy_and_inappropriate_fields_reject() {
         for text in [
             "",
@@ -1412,14 +1648,17 @@ mod tests {
         for kind in LaneId::ALL {
             assert_eq!(config.mode(kind), Mode::ReadOnly);
             assert_eq!(config.participation(kind).mode, ParticipationMode::Strict);
-            assert_eq!(config.participation(kind).max_unresolved_operations, 4);
+            assert_eq!(
+                config.participation(kind).max_unresolved_operations,
+                CountLimit::Bounded(4)
+            );
             assert_eq!(config.timeouts(kind).read_http_seconds, 90);
         }
         assert!(config.capabilities.answer.preparation.while_blocked);
         assert!(!config.capabilities.judge.preparation.while_blocked);
         assert_eq!(
             config.capabilities.judge.preparation.max_attempts_per_work,
-            3
+            CountLimit::Bounded(3)
         );
         assert!(
             !config
@@ -1446,13 +1685,13 @@ mod tests {
             .capabilities
             .answer
             .preparation
-            .max_attempts_per_work = 8;
+            .max_attempts_per_work = 8.into();
         changed.capabilities.answer.participation.mode = ParticipationMode::ParticipationFirst;
         changed
             .capabilities
             .answer
             .participation
-            .max_unresolved_operations = 9;
+            .max_unresolved_operations = 9.into();
         changed.validate().unwrap();
         assert_ne!(
             changed.lane_revision(LaneId::Answer).unwrap(),
@@ -1498,21 +1737,21 @@ mod tests {
         assert_eq!(config.schedule(LaneId::Answer).queued_job_polling, None);
         assert!(toml::from_str::<Config>("schema_version=2\n[capabilities.mine.schedule.queued_job_polling]\ninitial_seconds=2").is_err());
         for cap in [0, 9] {
-            config.capabilities.judge.preparation.max_attempts_per_work = cap;
+            config.capabilities.judge.preparation.max_attempts_per_work = cap.into();
             assert!(config.validate().is_err());
         }
-        config.capabilities.judge.preparation.max_attempts_per_work = 2;
+        config.capabilities.judge.preparation.max_attempts_per_work = 2.into();
         config
             .capabilities
             .mine
             .participation
-            .max_unresolved_operations = 0;
+            .max_unresolved_operations = 0.into();
         assert!(config.validate().is_err());
         config
             .capabilities
             .mine
             .participation
-            .max_unresolved_operations = 1;
+            .max_unresolved_operations = 1.into();
         config
             .capabilities
             .answer

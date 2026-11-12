@@ -110,12 +110,27 @@ impl Default for Options {
     }
 }
 
-/// Add local progress and intervention evidence without changing admission or risk.
-/// Status uses default thresholds; health and doctor use their selected options.
+/// Project the same local readiness/risk evaluation as health and doctor.
+/// Status does not probe filesystem capacity; health qualifies that separately.
 pub fn enrich_status(status: &mut Value, options: Options, at: i64) {
-    let (work, intervention) = intervention::project(status, options, at);
-    status["work"] = work;
-    status["intervention"] = intervention;
+    let mut report = evaluate_evidence(options, status, at);
+    for field in [
+        "work",
+        "intervention",
+        "components",
+        "healthy",
+        "operational",
+        "risk",
+        "issues",
+        "warnings",
+        "attention_required",
+        "checked_at",
+        "thresholds",
+        "expect_participation",
+        "assessment_scope",
+    ] {
+        status[field] = report[field].take();
+    }
 }
 
 /// Stable diagnostic shapes when configuration or journal evidence is unavailable.
@@ -125,6 +140,13 @@ pub fn unknown_intervention(reason: &str) -> Value {
 
 pub fn unknown_work(reason: &str) -> Value {
     intervention::unknown_work(reason)
+}
+
+pub fn unknown_risk() -> Value {
+    json!({"status":"unknown","attention_required":null,"unresolved_effects":null,
+        "historical_eligible_answers":null,"capacity_exempt_answers":null,
+        "unresolved_model_attempts":null,"background_remote_work":null,
+        "retained_uncertainty_nonblocking_lanes":null})
 }
 
 /// Doctor supplies lifecycle facts; health owns their effect on existing evidence.
@@ -167,6 +189,7 @@ pub(crate) fn qualify_doctor(report: &mut Value, repairs: &Value) {
                 .retain(|issue| issue != "controller_stopped");
             push_issue(report, reason);
             finalize_readiness(report);
+            sync_work_components(report);
         }
         intervention::qualify_restoration(report);
     }
@@ -188,7 +211,8 @@ pub fn check(config: &Config, options: Options) -> Result<Value> {
                 "healthy":false,"attention_required":true,
                 "issues":["local_evidence_unavailable"],"warnings":[],
                 "operational":{"status":"unknown","issues":["local_evidence_unavailable"]},
-                "risk":{"status":"unknown","attention_required":null,"unresolved_effects":null,"unresolved_model_attempts":null},
+                "risk":unknown_risk(),
+                "assessment_scope":{"evidence":"local_only","state_filesystem":"not_assessed"},
                 "evidence":"local_only","mutations":false
             }));
         }
@@ -211,6 +235,7 @@ pub fn check(config: &Config, options: Options) -> Result<Value> {
         if let Some(code) = issue {
             apply_disk_issue(&mut result, code);
         }
+        result["assessment_scope"]["state_filesystem"] = json!("assessed");
     }
     result["thresholds"]["min_free_mib"] = json!(options.min_free_mib);
     result["thresholds"]["warn_free_mib"] = json!(if options.min_free_mib == 0 {
@@ -309,7 +334,7 @@ impl WorkTiming {
             {
                 Some("dispatch_outcome_uncertain")
             }
-            Some(_)
+            Some("generated" | "prepared" | "retry")
                 if age(&work["created_at"], at).is_some_and(|seconds| seconds > self.pending) =>
             {
                 Some("pending_work_overdue")
@@ -375,6 +400,19 @@ fn work_timing(status: &Value, lane: &str, options: Options) -> Option<WorkTimin
 }
 
 fn evaluate(config: &Config, options: Options, status: &Value, at: i64) -> Value {
+    let mut result = evaluate_evidence(options, status, at);
+    result["captured_work"] = status["captured_work"].clone();
+    result["pending_work"] = status["pending_work"].clone();
+    result["desired_capabilities"] = json!(
+        LaneId::ALL
+            .into_iter()
+            .map(|lane| (lane.as_str(), config.mode(lane)))
+            .collect::<std::collections::BTreeMap<_, _>>()
+    );
+    result
+}
+
+fn evaluate_evidence(options: Options, status: &Value, at: i64) -> Value {
     // Desired configuration never substitutes for missing applied evidence.
     let effective = &status["effective_runtime"];
     let floor = controller_floor(status);
@@ -460,6 +498,14 @@ fn evaluate(config: &Config, options: Options, status: &Value, at: i64) -> Value
     {
         if work["state"] == "unknown" && !warnings.contains(&"pending_outcome_uncertain") {
             warnings.push("pending_outcome_uncertain");
+        }
+        // Remote follow-up retains risk without becoming a dependency of
+        // canonical distinct or already completed participation.
+        if work["nonblocking_for_fresh_work"] == true {
+            if !warnings.contains(&"background_remote_work_retained") {
+                warnings.push("background_remote_work_retained");
+            }
+            continue;
         }
         if work["state"] != "unknown"
             && ["created_at", "updated_at"]
@@ -549,13 +595,18 @@ fn evaluate(config: &Config, options: Options, status: &Value, at: i64) -> Value
     } else if admission.is_none() {
         issues.push("admission_unobserved");
     }
-    let risk_attention = issues.contains(&"dispatch_outcome_uncertain")
+    let risk_attention = status["participation"]["unresolved_count"]
+        .as_u64()
+        .unwrap_or(0)
+        > 0
+        || issues.contains(&"dispatch_outcome_uncertain")
         || warnings.iter().any(|code| {
             matches!(
                 *code,
                 "pending_outcome_uncertain"
                     | "model_execution_unresolved"
                     | "participation_risk_admitted"
+                    | "background_remote_work_retained"
             )
         });
     let (work, intervention) = intervention::project(status, options, at);
@@ -569,7 +620,8 @@ fn evaluate(config: &Config, options: Options, status: &Value, at: i64) -> Value
             "model_seconds":timing.as_ref().and_then(|timing| timing.model),
             "read_http_seconds":policy["timeouts"]["read_http_seconds"].as_u64(),
             "write_http_seconds":policy["timeouts"]["http_seconds"].as_u64(),
-            "model_attempt_limit":policy["preparation"]["max_attempts_per_work"].as_u64(),
+            "model_attempt_limit":policy["preparation"]["max_attempts_per_work"],
+            "max_uncertain_replacements_per_work":policy["preparation"]["max_uncertain_replacements_per_work"].as_u64().unwrap_or(1),
             "timing_source":if timing.is_some() {"effective"} else {"unavailable"}
         });
     }
@@ -584,8 +636,7 @@ fn evaluate(config: &Config, options: Options, status: &Value, at: i64) -> Value
         "heartbeat_recent":fresh(effective["observed_at"].as_i64(),at,stale),
         "observing":fresh(answer["observed_at"].as_i64(),at,answer_stale),"preparing":preparing,
         "last_safety_observation_at":status["last_safety_observation_at"],
-        "work":work,"intervention":intervention,"captured_work":status["captured_work"],
-        "pending_work":status["pending_work"],"epoch_observed_age_seconds":epoch_age,
+        "work":work,"intervention":intervention,"epoch_observed_age_seconds":epoch_age,
         "pending_age_seconds":age(&status["pending"]["created_at"],at),"admission_blocked":admission,
     });
     result["oldest_unresolved_operation"] = status["oldest_unresolved_operation"].clone();
@@ -593,12 +644,6 @@ fn evaluate(config: &Config, options: Options, status: &Value, at: i64) -> Value
     result["oldest_unresolved_age_seconds"] = json!(age(&status["oldest_unresolved_since"], at));
     result["affected_capabilities"] = status["affected_capabilities"].clone();
     result["progress_age_seconds"] = json!(age(&status["last_progress_at"], at));
-    result["desired_capabilities"] = json!(
-        LaneId::ALL
-            .into_iter()
-            .map(|lane| (lane.as_str(), config.mode(lane)))
-            .collect::<std::collections::BTreeMap<_, _>>()
-    );
     result["effective_capabilities"] = effective["policy"]["capabilities"].clone();
     // Store owns control freshness, closure and uncertainty; never infer them
     // from desired files or a successful resume.
@@ -613,6 +658,7 @@ fn evaluate(config: &Config, options: Options, status: &Value, at: i64) -> Value
     result["process_identity"] = json!("unverified");
     result["evidence"] = json!("local_only");
     result["notifications"] = json!("local_exit_status_and_journal");
+    result["assessment_scope"] = json!({"evidence":"local_only","state_filesystem":"not_assessed"});
     result["current_epoch"] = json!({
         "epoch":answer["epoch"].as_u64(),"answered":answer["answered"].as_bool(),
         "source":"answer","evidence_fresh":answer_floor.map(|_| fresh(answer["observed_at"].as_i64(),at,answer_stale)),
@@ -631,12 +677,65 @@ fn evaluate(config: &Config, options: Options, status: &Value, at: i64) -> Value
         "unresolved_effects":status["participation"]["unresolved_count"].as_u64(),
         "historical_eligible_answers":status["participation"]["lanes"]["answer"]["historical_eligible_count"].as_u64(),
         "capacity_exempt_answers":status["participation"]["lanes"]["answer"]["capacity_exempt_count"].as_u64(),
-        "unresolved_model_attempts":unresolved_models
+        "unresolved_model_attempts":unresolved_models,
+        "retained_uncertainty_nonblocking_lanes":LANES.into_iter().filter(|lane|status["participation"]["lanes"][*lane]["retained_uncertainty_nonblocking"]==true).collect::<Vec<_>>(),
     });
+    result["risk"]["background_remote_work"] = json!(
+        status["pending_work"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|work| work["nonblocking_for_fresh_work"] == true)
+            .count()
+    );
     result["components"] = components(status, &result, at, stale, options);
     qualify_components(&mut result, status, options);
     finalize_readiness(&mut result);
+    intervention::qualify_operational(&mut result, status);
+    sync_work_components(&mut result);
     result
+}
+
+fn sync_work_components(report: &mut Value) {
+    for lane in LANES {
+        report["work"][lane]["operational"] = json!({
+            "state":report["components"][lane]["state"],
+            "reasons":report["components"][lane]["reasons"],
+        });
+    }
+}
+
+fn work_complete(status: &Value, lane: &str, at: i64, stale: u64) -> bool {
+    let work = &status["work"][lane];
+    if lane == "judge" {
+        assessment_fresh(&work["assessment"], at, stale)
+            && work["assessment"]["completeness"] == "complete"
+            && work["assessment"]["locally_judgeable"] == false
+            && !current_remote_work(status, lane)
+            && !status["pending_work"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|row| {
+                    row["kind"] == lane
+                        && row.get("nonblocking_for_fresh_work") == Some(&Value::Null)
+                })
+            && judge_inventory_blocker(&work["assessment"]).is_none()
+    } else {
+        let observed = observation(status, lane);
+        fresh(observed["observed_at"].as_i64(), at, stale)
+            && if lane == "answer" {
+                observed["answered"] == true
+            } else {
+                work["phase"] == "completed"
+                    && observed["epoch"].as_u64().is_some()
+                    && work["operation_epoch"] == observed["epoch"]
+                    && (lane_policy(status, lane)["schedule"]["each_epoch"] == true
+                        || work["completion_valid_until"]
+                            .as_i64()
+                            .is_some_and(|deadline| at < deadline))
+            }
+    }
 }
 
 fn push_issue(result: &mut Value, code: &str) {
@@ -648,16 +747,63 @@ fn push_issue(result: &mut Value, code: &str) {
     }
 }
 
+fn judge_inventory_blocker(assessment: &Value) -> Option<&'static str> {
+    if assessment["completeness"] != "complete" || assessment["locally_judgeable"] != false {
+        return None;
+    }
+    [
+        ("assignment_read_backoff", "api_dependency_unavailable"),
+        (
+            "assignment_resource_restricted",
+            "api_dependency_unavailable",
+        ),
+        ("model_budget_exhausted", "model_attempt_budget_exhausted"),
+        (
+            "model_uncertain_retry_disabled",
+            "model_uncertain_retry_disabled",
+        ),
+        (
+            "model_uncertain_replacement_exhausted",
+            "model_uncertain_replacement_exhausted",
+        ),
+        ("model_preparation_reserved", "model_preparation_reserved"),
+        ("model_retry_cooldown", "model_retry_backoff"),
+    ]
+    .into_iter()
+    .find_map(|(key, reason)| {
+        (assessment["exclusions"][key].as_u64().unwrap_or(0) > 0).then_some(reason)
+    })
+}
+
+fn current_remote_work(status: &Value, lane: &str) -> bool {
+    std::iter::once(&status["pending"])
+        .chain(status["pending_work"].as_array().into_iter().flatten())
+        .any(|work| {
+            work["kind"] == lane
+                && work
+                    .get("nonblocking_for_fresh_work")
+                    .is_none_or(|flag| flag == false)
+                && matches!(
+                    work["state"].as_str(),
+                    Some("unknown" | "queued" | "included_pending" | "confirmed")
+                )
+        })
+}
+
 fn current_work(status: &Value, lane: &str) -> bool {
     std::iter::once(&status["pending"])
         .chain(status["pending_work"].as_array().into_iter().flatten())
         .chain(status["captured_work"].as_array().into_iter().flatten())
         .any(|work| {
             work["kind"] == lane
+                && work
+                    .get("nonblocking_for_fresh_work")
+                    .is_none_or(|flag| flag == false)
                 && matches!(
                     work["state"].as_str(),
                     Some(
-                        "generating"
+                        "unknown"
+                            | "generating"
                             | "generated"
                             | "prepared"
                             | "dispatching"
@@ -667,10 +813,10 @@ fn current_work(status: &Value, lane: &str) -> bool {
                     )
                 )
         })
-        || matches!(
+        || (matches!(
             status["work"][lane]["read_key"]["purpose"].as_str(),
             Some("job" | "receipt")
-        )
+        ) && status["work"][lane]["operation_id"].as_i64().is_some())
 }
 
 fn expectation_only(code: &str) -> bool {
@@ -914,6 +1060,7 @@ fn fresh(timestamp: Option<i64>, at: i64, stale: u64) -> bool {
 }
 
 fn assessment_fresh(assessment: &Value, at: i64, stale: u64) -> bool {
+    // Aggregate inventory validity expires at its earliest page, not its last.
     fresh(assessment["observed_at"].as_i64(), at, stale)
         && assessment["valid_until"]
             .as_i64()
@@ -1073,25 +1220,7 @@ fn components(status: &Value, health: &Value, at: i64, stale: u64, options: Opti
             } else if !read_only && admission.is_none() {
                 finding = ("unknown", "admission_evidence_unavailable", evidence_at);
             } else {
-                let complete = fresh(observation, at, stale)
-                    && match name {
-                        "answer" => status["observations"][name]["answered"] == true,
-                        "judge" => {
-                            assessment_fresh(&work["assessment"], at, stale)
-                                && work["assessment"]["completeness"] == "complete"
-                                && work["assessment"]["locally_judgeable"] == false
-                        }
-                        _ => {
-                            work["phase"] == "completed"
-                                && status["observations"][name]["epoch"].as_u64().is_some()
-                                && work["operation_epoch"] == status["observations"][name]["epoch"]
-                                && (effective["policy"]["capabilities"]["mine"]["schedule"]["each_epoch"]
-                                    == true
-                                    || work["completion_valid_until"]
-                                        .as_i64()
-                                        .is_some_and(|deadline| at < deadline))
-                        }
-                    };
+                let complete = work_complete(status, name, at, stale);
                 if read_only {
                     if primary["state"] == "ok" {
                         finding = (
@@ -1110,13 +1239,56 @@ fn components(status: &Value, health: &Value, at: i64, stale: u64, options: Opti
                         },
                         observation,
                     );
+                } else if !read_only
+                    && admission == Some(false)
+                    && primary["state"] == "ok"
+                    && fresh(observation, at, stale)
+                    && work["phase"] == "observing"
+                    && match name {
+                        "judge" => {
+                            assessment_fresh(&work["assessment"], at, stale)
+                                && work["assessment"]["locally_judgeable"] == true
+                        }
+                        "answer" => status["observations"][name]["answered"] == false,
+                        _ => status["observations"][name]["epoch"].as_u64().is_some(),
+                    }
+                {
+                    finding = ("ok", "fresh_work_available", observation);
+                }
+                if !read_only
+                    && !complete
+                    && fresh(observation, at, stale)
+                    && current_remote_work(status, name)
+                    && matches!(
+                        work["phase"].as_str(),
+                        Some("unknown" | "queued" | "included_pending" | "included")
+                    )
+                {
+                    finding = ("blocked", "current_work_outcome_unresolved", observation);
+                }
+                if !read_only
+                    && name == "judge"
+                    && assessment_fresh(&work["assessment"], at, stale)
+                    && let Some(reason) = judge_inventory_blocker(&work["assessment"])
+                {
+                    finding = (
+                        if reason == "api_dependency_unavailable" {
+                            "degraded"
+                        } else {
+                            "blocked"
+                        },
+                        reason,
+                        observation,
+                    );
                 }
                 // Completed current work or idle inventory cannot hide another
                 // overdue operation. Share the overall health deadline authority.
                 for pending in std::iter::once(&status["pending"])
                     .chain(status["pending_work"].as_array().into_iter().flatten())
                     .chain(status["captured_work"].as_array().into_iter().flatten())
-                    .filter(|pending| pending["kind"] == name)
+                    .filter(|pending| {
+                        pending["kind"] == name && pending["nonblocking_for_fresh_work"] != true
+                    })
                 {
                     let timestamp = pending["updated_at"]
                         .as_i64()
@@ -1143,9 +1315,9 @@ fn components(status: &Value, health: &Value, at: i64, stale: u64, options: Opti
                             pending["http_deadline"].as_i64().is_some()
                                 || pending["updated_at"].as_i64().is_some()
                         }
-                        Some(
-                            "generated" | "prepared" | "retry" | "queued" | "included_pending",
-                        ) => pending["created_at"].as_i64().is_some(),
+                        Some("generated" | "prepared" | "retry") => {
+                            pending["created_at"].as_i64().is_some()
+                        }
                         _ => false,
                     };
                     if !complete
@@ -1219,6 +1391,31 @@ fn components(status: &Value, health: &Value, at: i64, stale: u64, options: Opti
                 }
             }
         }
+        // Intent does not cancel native execution or an unsettled dispatch.
+        // Keep its deadline visible even when admission/mode overlays win above.
+        for pending in std::iter::once(&status["pending"])
+            .chain(status["pending_work"].as_array().into_iter().flatten())
+            .chain(status["captured_work"].as_array().into_iter().flatten())
+            .filter(|pending| pending["kind"] == name)
+        {
+            if pending["state"] == "generating"
+                && timing
+                    .as_ref()
+                    .and_then(|timing| model_overdue(pending, at, timing.poll, timing.model))
+                    .is_none()
+            {
+                finding = (
+                    "unknown",
+                    "model_deadline_unavailable",
+                    pending["updated_at"].as_i64(),
+                );
+                continue;
+            }
+            if let Some(issue) = timing.as_ref().and_then(|timing| timing.issue(pending, at)) {
+                finding = ("degraded", issue, pending["updated_at"].as_i64());
+                break;
+            }
+        }
         let intervention_reason = health["work"][name]["intervention"]["reason"].as_str();
         if mode == Some("active")
             && matches!(
@@ -1228,6 +1425,8 @@ fn components(status: &Value, health: &Value, at: i64, stale: u64, options: Opti
                         | "model_configuration_failed"
                         | "model_attempt_budget_exhausted"
                         | "model_uncertain"
+                        | "model_uncertain_retry_disabled"
+                        | "model_uncertain_replacement_exhausted"
                         | "model_retry_unavailable"
                 )
             )
@@ -1305,6 +1504,76 @@ mod tests {
         status["work"]["mine"]["phase"] = json!("completed");
         status["work"]["mine"]["operation_epoch"] = json!(7);
         (config, Options::default(), status)
+    }
+
+    #[test]
+    fn old_bound_missing_jobs_do_not_mask_fresh_work_or_current_faults() {
+        let (config, options, mut status) = fixture();
+        let mut pending = Vec::new();
+        for id in 1..=1000 {
+            pending.push(
+                json!({"operation_id":id,"binding_revision":1,"kind":"judge",
+                "state":"queued","work_class":"pending_remote","nonblocking_for_fresh_work":true,
+                "created_at":1,"updated_at":1}),
+            );
+            status["reads"].as_array_mut().unwrap().push(json!({
+                "owner":"judge","purpose":"job","resource":format!("{id}:1"),
+                "operation_id":id,"binding_revision":1,"state":"idle","status":404,
+                "last_failure_at":9999,"failures":10,"failure_category":"job_not_found","next_at":12000
+            }));
+        }
+        status["pending_work"] = json!(pending);
+        status["participation"]["unresolved_count"] = json!(1000);
+        let health = evaluate(&config, options, &status, 10000);
+        assert_eq!(health["healthy"], true);
+        assert_eq!(health["intervention"]["unattended"], true);
+        assert_eq!(health["risk"]["background_remote_work"], 1000);
+        assert_eq!(
+            health["components"]["api"]["resources"][0]["health"]["state"],
+            "degraded"
+        );
+        assert_eq!(
+            health["components"]["api"]["resources"][0]["dependency"],
+            "background_remote_work"
+        );
+        status["pending_work"].as_array_mut().unwrap().push(json!({
+            "kind":"judge","state":"dispatching","created_at":1,"updated_at":1,"http_deadline":1
+        }));
+        assert!(has(
+            &evaluate(&config, options, &status, 10000),
+            "dispatch_outcome_uncertain"
+        ));
+        status["pending_work"].as_array_mut().unwrap().pop();
+        status["work"]["judge"]["assessment"]["locally_judgeable"] = json!(true);
+        status["reads"][1]["last_failure_at"] = json!(10000);
+        status["reads"][1]["failures"] = json!(1);
+        status["reads"][1]["failure_category"] = json!("transport");
+        assert_ne!(
+            evaluate(&config, options, &status, 10000)["components"]["judge"]["state"],
+            "ok"
+        );
+    }
+
+    #[test]
+    fn retained_unbounded_uncertainty_remains_risk_not_fresh_work_blocker() {
+        let (config, options, mut status) = fixture();
+        status["participation"]["unresolved_count"] = json!(3000);
+        status["participation"]["risk_admissions"] = json!(1);
+        status["pending_work"] =
+            json!([{"kind":"answer","state":"unknown","created_at":1,"updated_at":1}]);
+        status["participation"]["lanes"]["answer"]["retained_uncertainty_nonblocking"] =
+            json!(true);
+        status["participation"]["lanes"]["answer"]["own_limit"] = json!("unbounded");
+        status["participation"]["lanes"]["answer"]["own_count"] = json!(3000);
+        let health = evaluate(&config, options, &status, 10000);
+        assert_eq!(health["healthy"], true);
+        assert_eq!(health["risk"]["unresolved_effects"], 3000);
+        assert_eq!(
+            health["risk"]["retained_uncertainty_nonblocking_lanes"],
+            json!(["answer"])
+        );
+        assert_eq!(health["intervention"]["unattended"], true);
+        assert_eq!(health["risk"]["attention_required"], true);
     }
 
     fn has(value: &Value, code: &str) -> bool {
@@ -1616,8 +1885,8 @@ mod tests {
         assert_eq!(clear["risk"]["attention_required"], true);
         assert_eq!(clear["risk"]["unresolved_effects"], 4);
         for (state, issue) in [
-            ("queued", "pending_work_overdue"),
-            ("included_pending", "pending_work_overdue"),
+            ("prepared", "pending_work_overdue"),
+            ("retry", "pending_work_overdue"),
             ("dispatching", "dispatch_outcome_uncertain"),
             ("generating", "model_work_overdue"),
         ] {
@@ -1958,8 +2227,16 @@ mod tests {
         assert!(has(&dependent, "api_dependency_unavailable"));
         assert_eq!(dependent["components"]["answer"]["state"], "degraded");
         assert_eq!(dependent["components"]["judge"]["state"], "ok");
+        // Isolate exact-binding behavior from the independently failed discovery
+        // dependency, which became required again after local generation ended.
+        status["reads"][0]["last_success_at"] = json!(10000);
+        status["reads"][0]["last_failure_at"] = Value::Null;
+        status["reads"][0]["failure_category"] = Value::Null;
+        status["reads"][0]["status"] = json!(200);
         status["reads"][4]["binding_revision"] = json!(1);
-        assert_eq!(evaluate(&config, options, &status, 10000)["healthy"], true);
+        let missing_binding = evaluate(&config, options, &status, 10000);
+        assert!(!has(&missing_binding, "api_dependency_unavailable"));
+        assert_eq!(missing_binding["healthy"], false);
     }
 
     #[test]
@@ -1972,7 +2249,7 @@ mod tests {
         let missing = evaluate(&config, options, &status, 10000);
         assert!(has(&missing, "model_deadline_unavailable"));
         assert_eq!(missing["healthy"], false);
-        assert_eq!(missing["components"]["judge"]["state"], "disabled");
+        assert_eq!(missing["components"]["judge"]["state"], "unknown");
         status["captured_work"][0]["pending_execution_deadline"] = json!(9999);
         assert!(has(
             &evaluate(&config, options, &status, 10000),
