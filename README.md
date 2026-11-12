@@ -9,7 +9,7 @@
 
 Rust infrastructure for MinePOA: answer challenges, judge assigned answers and attest through the mining API. Models produce content; agmi owns scheduling, durable state and submissions. Each instance keeps its own identity, credentials and history.
 
-**Unreleased source change:** this branch uses configuration schema 2 and journal format 4. Released v0.1.1 uses the earlier layout; existing installations require [explicit stopped migration](docs/OPERATIONS.md#atomic-capability-migration), not a normal update.
+**Unreleased source change:** this branch uses one current capability-owned configuration shape and journal format 4. Released v0.1.1 layouts and earlier per-lane configurations carrying `schema_version` require [explicit stopped migration](docs/OPERATIONS.md#atomic-capability-migration), not a normal update.
 
 ```mermaid
 flowchart LR

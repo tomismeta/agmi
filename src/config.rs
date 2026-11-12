@@ -601,15 +601,6 @@ impl Default for AnswerParticipation {
     }
 }
 
-fn deserialize_schema_version<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> std::result::Result<u32, D::Error> {
-    let version = u32::deserialize(deserializer)?;
-    if version != 2 {
-        return Err(serde::de::Error::custom("schema_version must be 2"));
-    }
-    Ok(version)
-}
 fn default_state_dir() -> PathBuf {
     dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -619,8 +610,6 @@ fn default_state_dir() -> PathBuf {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    #[serde(deserialize_with = "deserialize_schema_version")]
-    pub schema_version: u32,
     #[serde(default)]
     pub network: NetworkConfig,
     #[serde(default = "default_state_dir")]
@@ -637,7 +626,6 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            schema_version: 2,
             network: NetworkConfig::default(),
             state_dir: default_state_dir(),
             runtime: RuntimePolicy::default(),
@@ -769,10 +757,6 @@ impl Config {
     }
 
     fn validate_fields(&self, check_guidance_paths: bool) -> Result<()> {
-        ensure!(
-            self.schema_version == 2,
-            ConfigDiagnostic::field("schema_version", "Configuration schema_version must be 2.")
-        );
         for kind in LaneId::ALL {
             ensure!(
                 self.participation(kind).max_unresolved_operations.finite() != Some(0),
@@ -1247,8 +1231,9 @@ impl Config {
         }
     }
     pub fn producer_revision(&self, kind: LaneId) -> Result<String> {
+        // Retiring the config marker deliberately changes producer identity. Existing
+        // attempt charges and captured producers remain evidence, not replay permission.
         let mut digest = Sha256::new();
-        digest.update(self.schema_version.to_le_bytes());
         digest.update(kind.as_str().as_bytes());
         if let Some(model) = self.model(kind) {
             ensure!(self.guidance_loaded, "model guidance has not been loaded");
@@ -1268,7 +1253,6 @@ impl Config {
     }
     pub fn lane_revision(&self, kind: LaneId) -> Result<String> {
         let mut digest = Sha256::new();
-        digest.update(self.schema_version.to_le_bytes());
         digest.update(kind.as_str().as_bytes());
         digest.update(match kind {
             LaneId::Answer => serde_json::to_vec(&self.capabilities.answer)?,
@@ -1548,7 +1532,7 @@ mod tests {
 
     #[test]
     fn unbounded_and_uncertain_replacement_defaults_are_independent() {
-        let config: Config = toml::from_str("schema_version=2\n[capabilities.judge.preparation]\nmax_attempts_per_work='unbounded'\n[capabilities.answer.participation]\nmax_unresolved_operations='unbounded'").unwrap();
+        let config: Config = toml::from_str("[capabilities.judge.preparation]\nmax_attempts_per_work='unbounded'\n[capabilities.answer.participation]\nmax_unresolved_operations='unbounded'").unwrap();
         config.validate().unwrap();
         assert!(!config.capabilities.judge.preparation.while_blocked);
         assert!(!config.capabilities.judge.preparation.retry_uncertain);
@@ -1623,16 +1607,16 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_is_required_and_legacy_and_inappropriate_fields_reject() {
+    fn retired_marker_and_legacy_and_inappropriate_fields_reject() {
         for text in [
-            "",
+            "schema_version=2",
             "schema_version=1",
             "schema_version=3",
             "schema_version='2'",
         ] {
             assert!(toml::from_str::<Config>(text).is_err());
         }
-        let defaults: Config = toml::from_str("schema_version=2").unwrap();
+        let defaults: Config = toml::from_str("").unwrap();
         defaults.validate().unwrap();
         for table in [
             "[solver]",
@@ -1652,16 +1636,13 @@ mod tests {
             "[capabilities]\nanswer='active'",
             "excluded_judging_assignments=[]",
         ] {
-            assert!(
-                toml::from_str::<Config>(&format!("schema_version=2\n{table}")).is_err(),
-                "{table}"
-            );
+            assert!(toml::from_str::<Config>(table).is_err(), "{table}");
         }
     }
 
     #[test]
     fn defaults_and_partial_tables_preserve_lane_permissions() {
-        let config: Config = toml::from_str("schema_version=2\n[capabilities.judge.preparation]\nmax_attempts_per_work=3\n[capabilities.answer.timeouts]\nhttp_seconds=17").unwrap();
+        let config: Config = toml::from_str("[capabilities.judge.preparation]\nmax_attempts_per_work=3\n[capabilities.answer.timeouts]\nhttp_seconds=17").unwrap();
         for kind in LaneId::ALL {
             assert_eq!(config.mode(kind), Mode::ReadOnly);
             assert_eq!(config.participation(kind).mode, ParticipationMode::Strict);
@@ -1753,7 +1734,12 @@ mod tests {
         });
         config.validate().unwrap();
         assert_eq!(config.schedule(LaneId::Answer).queued_job_polling, None);
-        assert!(toml::from_str::<Config>("schema_version=2\n[capabilities.mine.schedule.queued_job_polling]\ninitial_seconds=2").is_err());
+        assert!(
+            toml::from_str::<Config>(
+                "[capabilities.mine.schedule.queued_job_polling]\ninitial_seconds=2"
+            )
+            .is_err()
+        );
         for cap in [0, 9] {
             config.capabilities.judge.preparation.max_attempts_per_work = cap.into();
             assert!(config.validate().is_err());
@@ -1843,15 +1829,13 @@ mod tests {
     fn judging_exclusions_default_empty_validate_and_change_revision() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        std::fs::write(&path, "schema_version=2\n").unwrap();
+        std::fs::write(&path, "").unwrap();
         let original = Config::load(&path).unwrap();
         assert!(original.capabilities.judge.excluded_assignments.is_empty());
         let id = "aB".repeat(32);
         std::fs::write(
             &path,
-            format!(
-                "schema_version=2\n[capabilities.judge]\nexcluded_assignments = ['{id}', '{id}']\n"
-            ),
+            format!("[capabilities.judge]\nexcluded_assignments = ['{id}', '{id}']\n"),
         )
         .unwrap();
         let changed = Config::load(&path).unwrap();
@@ -1877,9 +1861,7 @@ mod tests {
         ] {
             std::fs::write(
                 &path,
-                format!(
-                    "schema_version=2\n[capabilities.judge]\nexcluded_assignments = ['{invalid}']\n"
-                ),
+                format!("[capabilities.judge]\nexcluded_assignments = ['{invalid}']\n"),
             )
             .unwrap();
             let error = Config::load(&path).unwrap_err().to_string();

@@ -655,6 +655,15 @@ fn doctor_outcome(report: &mut Value, data: &Value, repair: bool, exited: bool) 
     let identity = crate::health::hosted_identity(data);
     readiness["hosted_identity"] = identity.value();
     readiness["hosted_identity_verified"] = json!(identity.verified());
+    // Older executables emitted only a boolean. Neither value proves a current
+    // permit or rejection; translate it only at this subprocess boundary.
+    if !data["hosted_identity"].is_object()
+        && data["initialized"] != false
+        && let Some(verified) = data["hosted_identity_verified"].as_bool()
+    {
+        readiness["hosted_identity"] = json!({"status":"legacy_unknown","rejection":null,
+            "observed_at":null,"last_verified_at":null,"legacy_failure":!verified});
+    }
     let legacy_identity =
         !data["hosted_identity"].is_object() && data["hosted_identity_verified"] == false;
     let legacy_root =
@@ -1422,6 +1431,20 @@ mod tests {
         );
         assert!(!result.to_string().contains("secret-response-body"));
         assert!(!result.to_string().contains("credential"));
+    }
+
+    #[test]
+    fn legacy_child_boolean_neither_verifies_nor_rejects_identity() {
+        for verified in [false, true] {
+            let data = json!({"initialized":true,"hosted_identity_verified":verified});
+            let mut report = json!({"success":true});
+            doctor_outcome(&mut report, &data, false, false);
+            let identity = &report["readiness"]["hosted_identity"];
+            assert_eq!(identity["status"], "legacy_unknown");
+            assert_eq!(identity["rejection"], Value::Null);
+            assert_eq!(identity["legacy_failure"], !verified);
+            assert_eq!(report["readiness"]["hosted_identity_verified"], Value::Null);
+        }
     }
 
     #[test]

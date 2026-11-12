@@ -875,7 +875,11 @@ fn malformed_pending_and_unproven_expiry_keep_the_bound_job_uncertain() {
 fn invalid_reload_keeps_effective_snapshot_and_cap_lowering_keeps_unknowns() {
     let (_temp, mut runtime, _stop) = fixture();
     let original = runtime.config.revision().unwrap();
-    std::fs::write(&runtime.config_path, "schema_version = 1\n").unwrap();
+    std::fs::write(
+        &runtime.config_path,
+        "[capabilities.answer]\nmode = 'invalid'\n",
+    )
+    .unwrap();
     runtime.reload().unwrap();
     assert!(runtime.reload_blocked);
     assert_eq!(runtime.config.revision().unwrap(), original);

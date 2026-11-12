@@ -44,7 +44,7 @@ impl MigrationError {
                 "A sealed migration is pending. Inspect migration status and finish that migration before ordinary mutations; participation remains paused."
             }
             Self::LimitsRequired => {
-                "Supply explicit positive answer, judge and mine caps, or a complete v2 candidate, in the migration proposal. No conversion was approved."
+                "Supply explicit positive answer, judge and mine caps, or a complete per-lane candidate, in the migration proposal. No conversion was approved."
             }
             Self::ApprovalConflict => {
                 "The migration approval does not match the current snapshot. Obtain a fresh preview and use its request and token; do not reuse stale approval."
@@ -275,6 +275,83 @@ fn validated(path: &Path, source: &str) -> Result<Config> {
     crate::admin::validate_complete(path, &mut config)?;
     Ok(config)
 }
+// Retired markers are accepted only at this explicit boundary, never by Config.
+fn unversioned(source: &str) -> Result<String> {
+    let mut value: toml::Value = toml::from_str(source)?;
+    if let Some(marker) = value
+        .as_table_mut()
+        .context("configuration must be a table")?
+        .remove("schema_version")
+    {
+        ensure!(
+            marker.as_integer() == Some(2),
+            "unsupported retired config marker"
+        );
+        return Ok(toml::to_string_pretty(&value)?);
+    }
+    Ok(source.to_owned())
+}
+
+fn sealed_config(path: &Path, source: &str) -> Result<Config> {
+    validated(path, &unversioned(source)?)
+}
+
+fn sealed_revision(config: &Config, source: &str) -> Result<String> {
+    let value: toml::Value = toml::from_str(source)?;
+    if value.get("schema_version").is_none() {
+        return config.revision();
+    }
+    ensure!(
+        value["schema_version"].as_integer() == Some(2),
+        "unsupported retired config marker"
+    );
+    // Reproduce the old struct serialization exactly, only to verify old approval.
+    // Never rewrite its seal, candidate bytes, or captured producer evidence.
+    let serialized = serde_json::to_vec(config)?;
+    let mut hash = Sha256::new();
+    hash.update(b"{\"schema_version\":2,");
+    hash.update(&serialized[1..]);
+    for model in [
+        &config.capabilities.answer.model,
+        &config.capabilities.judge.model,
+    ] {
+        for guidance in [&model.guidance, &model.core_guidance] {
+            hash.update((guidance.len() as u64).to_le_bytes());
+            hash.update(guidance.as_bytes());
+        }
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+fn global_shape(parsed: &toml::Value) -> Result<bool> {
+    let root = parsed.as_table().context("configuration must be a table")?;
+    let global = [
+        "solver",
+        "timeouts",
+        "schedule",
+        "preparation",
+        "participation",
+        "excluded_judging_assignments",
+    ]
+    .iter()
+    .any(|key| root.contains_key(*key))
+        || root
+            .get("capabilities")
+            .and_then(toml::Value::as_table)
+            .is_some_and(|lanes| lanes.values().any(toml::Value::is_str));
+    let lane = root.contains_key("schema_version")
+        || root.contains_key("runtime")
+        || root.contains_key("identity")
+        || root
+            .get("capabilities")
+            .and_then(toml::Value::as_table)
+            .is_some_and(|lanes| lanes.values().any(toml::Value::is_table));
+    ensure!(
+        global != lane,
+        "empty, mixed or ambiguous configuration shape"
+    );
+    Ok(global)
+}
 fn guidance(config: &Config) -> Result<Value> {
     let mut result = serde_json::Map::new();
     for kind in [LaneId::Answer, LaneId::Judge] {
@@ -321,21 +398,21 @@ fn prepare(path: &Path, input: &Value) -> Result<Prepared> {
     validate_request(input)?;
     let source = bytes(path)?;
     let parsed: toml::Value = toml::from_str(std::str::from_utf8(&source)?)?;
-    let legacy = if parsed.get("schema_version").is_some() {
-        None
-    } else {
+    let legacy = if global_shape(&parsed)? {
         Some(legacy::Legacy::parse(&source)?)
+    } else {
+        None
     };
-    // Current-shape source3 conversion preserves the exact configuration; policy
-    // changes have their own approval path and are not part of a format cutover.
+    // A per-lane cutover removes only the retired marker; it cannot edit policy.
     let (old, candidate) = if let Some(legacy) = &legacy {
         let baseline = legacy.candidate(Some(&json!({"answer":1,"judge":1,"mine":1})))?;
         let old = validated(path, &baseline)?;
         let candidate = if let Some(candidate) = input.get("candidate_toml") {
-            candidate
-                .as_str()
-                .context("candidate_toml must be a string")?
-                .to_owned()
+            unversioned(
+                candidate
+                    .as_str()
+                    .context("candidate_toml must be a string")?,
+            )?
         } else {
             legacy.candidate(input.get("caps"))?
         };
@@ -345,16 +422,17 @@ fn prepare(path: &Path, input: &Value) -> Result<Prepared> {
             input.get("caps").is_none()
                 && input.get("initial_database_id").is_none()
                 && input.get("adopt_legacy").is_none(),
-            "format3 conversion does not adopt authority or change caps"
+            "per-lane conversion does not adopt authority or change caps"
         );
         let text = std::str::from_utf8(&source)?;
+        let candidate = unversioned(text)?;
         ensure!(
             input
                 .get("candidate_toml")
-                .is_none_or(|v| v.as_str() == Some(text)),
-            "format3 conversion must preserve exact configuration bytes"
+                .is_none_or(|v| v.as_str() == Some(candidate.as_str())),
+            "per-lane conversion must preserve configuration except its retired marker"
         );
-        (validated(path, text)?, text.to_owned())
+        (validated(path, &candidate)?, candidate)
     };
     let config = validated(path, &candidate)?;
     ensure!(
@@ -467,8 +545,9 @@ fn snapshot(
         let (phase, token, raw) = seals::raw_record(db, None)?;
         let sealed: Value = serde_json::from_str(&raw)?;
         ensure!(
-            phase == "complete" && seals::target(&token, &sealed)? == 3,
-            "only a completed historical target3 predecessor may be superseded"
+            phase == "complete"
+                && matches!(seals::target(&token, &sealed)?, 3 | CURRENT_JOURNAL_FORMAT),
+            "only a completed supported predecessor may be superseded"
         );
         result["predecessor"] = json!({"phase":phase,"token":token,"sealed_raw":raw});
     } else {
@@ -483,16 +562,20 @@ fn snapshot(
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
     )?;
     ensure!(
-        matches!(version, 1..=3),
-        "explicit migration requires source journal format 1, 2 or 3"
+        matches!(version, 1..=CURRENT_JOURNAL_FORMAT),
+        "unsupported source journal format"
     );
-    if version == 3 {
+    if version >= 3 {
         ensure!(
             paused,
-            "format3 conversion requires an explicit durable global pause before preview"
+            "per-lane conversion requires an explicit durable global pause before preview"
         );
     }
-    conversion::validate_source(db, version)?;
+    if version == CURRENT_JOURNAL_FORMAT {
+        validate_required_lane_state(db)?;
+    } else {
+        conversion::validate_source(db, version)?;
+    }
     ensure!(stored == identity(config)?, "journal identity mismatch");
     let location = fs::canonicalize(&config.state_dir)?
         .to_string_lossy()
@@ -578,7 +661,7 @@ fn snapshot(
         |r| r.get::<_, i64>(0)
     )?);
     result["bound_unknowns"] = json!(db.query_row("SELECT count(*) FROM operations WHERE state='unknown' AND (job_id IS NOT NULL OR txid IS NOT NULL)",[],|r| r.get::<_,i64>(0))?);
-    result["pending_grants_to_revoke"] = if version == 3 {
+    result["pending_grants_to_revoke"] = if version >= 3 {
         json!(0)
     } else if table_exists(db, "manual_grants")? {
         let query = if table_exists(db, "manual_grant_revocations")? {
@@ -616,7 +699,11 @@ fn preview_value(
             state.get("source_schema").is_none()
                 || matches!(state["source_schema"].as_i64(), Some(1 | 2))
         } else {
-            state["source_schema"] == 3
+            state.get("source_schema").is_none()
+                || matches!(
+                    state["source_schema"].as_i64(),
+                    Some(3 | CURRENT_JOURNAL_FORMAT)
+                )
         },
         "configuration shape does not match the supported source journal format"
     );
@@ -704,14 +791,20 @@ pub fn apply(
     if let Some(db) = db.as_mut() {
         let initial = preview_value(&path, &p, input, Some(db), &locks)?;
         approved(&initial, expected_token, accept_risk_change)?;
-        locks.lanes = Some(provision_lane_gates(
-            &p.config,
-            initial["snapshot"]["database_id"]
-                .as_str()
-                .context("approved database ID missing")?,
-            &locks.admission,
-            &locks.writer,
-        )?);
+        locks.lanes = Some(
+            if initial["snapshot"]["source_schema"] == CURRENT_JOURNAL_FORMAT {
+                open_required_lane_gates(&p.config, db, &locks.admission, &locks.writer)?
+            } else {
+                provision_lane_gates(
+                    &p.config,
+                    initial["snapshot"]["database_id"]
+                        .as_str()
+                        .context("approved database ID missing")?,
+                    &locks.admission,
+                    &locks.writer,
+                )?
+            },
+        );
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let preview = preview_value(&path, &p, input, Some(&tx), &locks)?;
         approved(&preview, expected_token, accept_risk_change)?;
@@ -754,14 +847,19 @@ fn seal_conversion(
     gates: &LaneGateSet,
 ) -> Result<()> {
     seals::prepare_storage(db)?;
-    if preview["snapshot"]["source_schema"] != 3 {
+    let source = preview["snapshot"]["source_schema"]
+        .as_i64()
+        .context("source journal format missing")?;
+    if source < 3 {
         conversion::convert(db, &p.config, &preview["snapshot"])?;
     }
-    conversion::add_current_state(db, gates)?;
-    db.execute(
-        "UPDATE control SET version=?1 WHERE singleton=1",
-        [CURRENT_JOURNAL_FORMAT],
-    )?;
+    if source < CURRENT_JOURNAL_FORMAT {
+        conversion::add_current_state(db, gates)?;
+        db.execute(
+            "UPDATE control SET version=?1 WHERE singleton=1",
+            [CURRENT_JOURNAL_FORMAT],
+        )?;
+    }
     let mut sealed = preview["seal"].clone();
     sealed["source_toml"] = json!(std::str::from_utf8(&p.source)?);
     sealed["candidate_toml"] = json!(p.candidate);
@@ -844,7 +942,12 @@ fn check_sealed(
     );
     ensure!(
         guidance(config)? == sealed["guidance"]
-            && json!(config.revision()?) == sealed["effective_revision"],
+            && json!(sealed_revision(
+                config,
+                sealed["candidate_toml"]
+                    .as_str()
+                    .context("sealed candidate missing")?
+            )?) == sealed["effective_revision"],
         "approved guidance changed; restore sealed inputs"
     );
     Ok(())
@@ -1061,7 +1164,7 @@ fn finish(
         return Ok(
             json!({"phase":"complete","token":token,"target_journal_format":target,
             "recovery_prerequisite":authority_prerequisite(target, &sealed),
-            "further_migration_required":target != CURRENT_JOURNAL_FORMAT,"participation_resumed":false}),
+            "further_migration_required":target != CURRENT_JOURNAL_FORMAT || toml::from_str::<toml::Value>(new)?.get("schema_version").is_some(),"participation_resumed":false}),
         );
     }
     check_sealed(db, config, &sealed, locks, target).context(MigrationError::Conflict)?;
@@ -1121,7 +1224,7 @@ fn finish(
     );
     // Also redo persistence when already new: a prior rename may precede directory fsync.
     crate::admin::persist(path, new.as_bytes())?;
-    let installed_config = validated(path, new).context(MigrationError::Conflict)?;
+    let installed_config = sealed_config(path, new).context(MigrationError::Conflict)?;
     ensure!(
         bytes(path)? == new.as_bytes(),
         "configuration installation changed"
@@ -1172,9 +1275,9 @@ fn finish(
     tx.commit()?;
     Ok(
         json!({"phase":"complete","token":token,"target_journal_format":target,
-        "further_migration_required":target != CURRENT_JOURNAL_FORMAT,
+        "further_migration_required":target != CURRENT_JOURNAL_FORMAT || toml::from_str::<toml::Value>(new)?.get("schema_version").is_some(),
         "recovery_prerequisite":authority_prerequisite(target, &sealed),
-        "paused":true,"generation":sealed["sealed_generation"],"participation_resumed":false}),
+        "paused":if s["source_schema"] == CURRENT_JOURNAL_FORMAT { s["paused"].clone() } else { json!(true) },"generation":sealed["sealed_generation"],"participation_resumed":false}),
     )
 }
 /// Explicit state location keeps recovery available when the installed config conflicts.
@@ -1184,7 +1287,7 @@ pub fn resume(path: &Path, state_dir: &Path, expected_token: &str) -> Result<Val
     let initial = open_existing(state_dir, false)?.context("migration journal missing")?;
     let (_, _, sealed) = record(&initial, Some(expected_token))?;
     seals::target(expected_token, &sealed).context(MigrationError::UnsupportedRecovery)?;
-    let config = validated(
+    let config = sealed_config(
         &path,
         sealed["candidate_toml"]
             .as_str()
@@ -1219,6 +1322,14 @@ pub fn status(state_dir: &Path) -> Result<Value> {
     }
     let (phase, token, sealed) = record(&db, None)?;
     let target = seals::target(&token, &sealed).ok();
+    let marked_candidate = target.is_some()
+        && toml::from_str::<toml::Value>(
+            sealed["candidate_toml"]
+                .as_str()
+                .context("sealed candidate missing")?,
+        )?
+        .get("schema_version")
+        .is_some();
     Ok(
         json!({"phase":phase,"pending":phase != "complete","token":token,"target_journal_format":target,
         "recovery_supported":target.is_some(),
@@ -1226,7 +1337,7 @@ pub fn status(state_dir: &Path) -> Result<Value> {
             None => Some(MigrationError::UnsupportedRecovery.message()),
             Some(target) => authority_prerequisite(target, &sealed),
         },
-        "further_migration_required":target.is_some_and(|target| target != CURRENT_JOURNAL_FORMAT),
+        "further_migration_required":target.is_some_and(|target| target != CURRENT_JOURNAL_FORMAT) || marked_candidate,
         "history":seals::history(&db)?,
         "branch":sealed["snapshot"]["branch"],"paused_generation":sealed["sealed_generation"],
         "source_sha256":sealed["source_sha256"],"candidate_sha256":sealed["candidate_sha256"],"risk_acknowledged":sealed["risk_acknowledged"],

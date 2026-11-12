@@ -140,7 +140,6 @@ def init(f):
         text = config.read_text()
         assert not any(secret in text for secret in SECRETS)
         initialized = f.cli(config, ['config', 'show'])['config']
-        assert initialized['schema_version'] == 2
         assert all(initialized['capabilities'][lane]['mode'] == 'read_only'
                    for lane in ('answer', 'judge', 'mine'))
         private_tree(target)

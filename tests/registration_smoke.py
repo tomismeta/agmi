@@ -569,7 +569,6 @@ def separate_init(f):
     assert initialized['identity_verified'] and initialized['paused']
     assert not initialized['journal_initialized'] and len(f.posts) == 1
     configured = f.run(['config', 'show'])['config']
-    assert configured['schema_version'] == 2
     assert configured['network']['address'] == ADDRESS
     assert configured['network']['base_url'] == f.origin
     assert configured['network']['chain'] == CHAIN

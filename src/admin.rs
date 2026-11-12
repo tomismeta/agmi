@@ -530,17 +530,13 @@ fn describe(path: &str, value: &Value, settings: &mut Vec<Value>) {
         setting["required"] = json!(["initial_seconds", "max_seconds"]);
         setting["constraint"] = json!("initial_seconds <= max_seconds; null disables the policy");
     }
-    if path == "schema_version" {
-        setting["required"] = json!(true);
-        setting["enum"] = json!([2]);
-    }
     settings.push(setting);
 }
 pub fn schema() -> Value {
     let defaults = defaults();
     let mut settings = Vec::new();
     describe("", &defaults, &mut settings);
-    json!({"schema":"agmi.config.v2","settings":settings,"defaults":defaults,
+    json!({"schema":"agmi.config","settings":settings,"defaults":defaults,
         "capabilities":crate::capability::DESCRIPTORS,
         "control":{"configuration":"desired_saved_only","fence_acknowledged":false,
             "inspection":"lane show <lane>","pause":"lane pause <lane> --expected-control <control-token>",
@@ -786,9 +782,9 @@ mod tests {
     #[test]
     fn schema_exposes_only_typed_lane_fields() {
         let schema = schema();
-        assert_eq!(schema["schema"], "agmi.config.v2");
+        assert_eq!(schema["schema"], "agmi.config");
         let defaults = &schema["defaults"];
-        assert_eq!(defaults["schema_version"], 2);
+        assert!(defaults.get("schema_version").is_none());
         for old in [
             "solver",
             "timeouts",
@@ -807,8 +803,11 @@ mod tests {
         );
         let settings = schema["settings"].as_array().unwrap();
         let setting = |path: &str| settings.iter().find(|s| s["path"] == path).unwrap();
-        assert_eq!(setting("schema_version")["required"], true);
-        assert_eq!(setting("schema_version")["enum"], json!([2]));
+        assert!(
+            !settings
+                .iter()
+                .any(|setting| setting["path"] == "schema_version")
+        );
         assert_eq!(
             setting("capabilities.judge.mode")["enum"],
             json!(["active", "read_only", "off"])

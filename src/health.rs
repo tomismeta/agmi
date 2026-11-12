@@ -1,4 +1,4 @@
-//! Read-only, local health evidence with a versioned, bounded component contract.
+//! Read-only, local health evidence with a bounded component contract.
 //! Component readiness is separate from retained effect risk and never authorizes
 //! replay. Effective modes and fresh local evidence are not live remote probes.
 use crate::{capability::LaneId, config::Config, runtime, store::now};
@@ -9,7 +9,7 @@ mod api;
 mod intervention;
 
 /// A bounded view of canonical evidence, not an upstream-response classifier.
-/// Legacy booleans cannot establish either a current permit or a rejection.
+/// Only structured evidence establishes identity state.
 pub(crate) struct HostedIdentity<'a> {
     evidence: &'a Value,
     status: &'a str,
@@ -32,9 +32,6 @@ pub(crate) fn hosted_identity(status: &Value) -> HostedIdentity<'_> {
                 | "legacy_unknown"
                 | "unobserved"),
             ) => state,
-            _ if !evidence.is_object() && status["hosted_identity_verified"].is_boolean() => {
-                "legacy_unknown"
-            }
             _ => "unobserved",
         }
     };
@@ -52,9 +49,7 @@ pub(crate) fn hosted_identity(status: &Value) -> HostedIdentity<'_> {
         evidence,
         status: state,
         rejection,
-        legacy_failure: status["initialized"] != false
-            && (evidence["legacy_failure"] == true
-                || (!evidence.is_object() && status["hosted_identity_verified"] == false)),
+        legacy_failure: status["initialized"] != false && evidence["legacy_failure"] == true,
     }
 }
 
@@ -205,7 +200,7 @@ pub fn check(config: &Config, options: Options) -> Result<Value> {
         Ok(status) => status,
         Err(_) => {
             return Ok(json!({
-                "contract_version":2,"components":unknown_components(),
+                "components":unknown_components(),
                 "work":unknown_work("local_evidence_unavailable"),
                 "intervention":unknown_intervention("local_evidence_unavailable"),
                 "healthy":false,"attention_required":true,
@@ -636,7 +631,7 @@ fn evaluate_evidence(options: Options, status: &Value, at: i64) -> Value {
         });
     }
     let mut result = json!({
-        "contract_version":2,"healthy":issues.is_empty(),"checked_at":at,
+        "healthy":issues.is_empty(),"checked_at":at,
         "issues":issues,"warnings":warnings,"attention_required":!issues.is_empty() || !warnings.is_empty(),
         "unresolved_model_attempts":unresolved_models,"initialized":initialized,"paused":paused,
         "expect_participation":options.expect_participation,
@@ -716,6 +711,9 @@ fn sync_work_components(report: &mut Value) {
 }
 
 fn work_complete(status: &Value, lane: &str, at: i64, stale: u64) -> bool {
+    if status["lane_participation"][lane]["freshness"] == "stale" {
+        return false;
+    }
     let work = &status["work"][lane];
     if lane == "judge" {
         assessment_fresh(&work["assessment"], at, stale)
@@ -1087,6 +1085,7 @@ fn observation_fresh(
     Some(
         fresh(timestamp, at, stale)
             && timestamp.is_some_and(|time| (at.saturating_sub(time) as u64) < maximum_age)
+            && status["lane_participation"][lane]["freshness"] != "stale"
             && recorded_bound,
     )
 }
@@ -1254,7 +1253,8 @@ fn components(status: &Value, health: &Value, at: i64, stale: u64, options: Opti
             } else {
                 let complete = work_complete(status, name, at, stale);
                 let usable_observation = if name == "judge" {
-                    assessment_fresh(&work["assessment"], at, stale)
+                    status["lane_participation"][name]["freshness"] != "stale"
+                        && assessment_fresh(&work["assessment"], at, stale)
                 } else {
                     observation_fresh(status, name, observation, at, stale) == Some(true)
                 };
@@ -1574,6 +1574,27 @@ mod tests {
                 evaluate(&config, options, &status, 10000)["components"][lane]["state"],
                 "unknown"
             );
+        }
+    }
+
+    #[test]
+    fn stale_projected_stamp_cannot_complete_recent_work() {
+        for lane in LANES {
+            for mode in ["active", "read_only"] {
+                let (config, options, mut status) = fixture();
+                status["effective_runtime"]["policy"]["capabilities"][lane]["mode"] = json!(mode);
+                status["lane_participation"][lane] = json!({
+                    "freshness":"stale",
+                    "assessment":{"observed_at":10000,"valid_until":10060}
+                });
+                let health = evaluate(&config, options, &status, 10000);
+                assert_eq!(health["healthy"], false, "{lane}/{mode}: {health}");
+                assert_eq!(
+                    health["components"][lane]["state"], "unknown",
+                    "{lane}/{mode}: {health}"
+                );
+                assert!(!work_complete(&status, lane, 10000, options.stale_seconds));
+            }
         }
     }
 
@@ -2020,8 +2041,8 @@ mod tests {
         for legacy in [false, true] {
             status["hosted_identity_verified"] = json!(legacy);
             let health = evaluate(&config, options, &status, 10000);
-            assert_eq!(health["hosted_identity"]["status"], "legacy_unknown");
-            assert_eq!(health["hosted_identity"]["legacy_failure"], !legacy);
+            assert_eq!(health["hosted_identity"]["status"], "unobserved");
+            assert_eq!(health["hosted_identity"]["legacy_failure"], false);
             assert!(health["hosted_identity_verified"].is_null());
         }
     }

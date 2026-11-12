@@ -831,7 +831,9 @@ fn configuration_check_reports_safe_file_and_field_repairs() {
             None,
         ),
         (
-            Some(format!("schema_version = 2\n[capabilities.answer.timeouts]\nhttp_seconds = '{marker}'\n").into_bytes()),
+            Some(
+                format!("[capabilities.answer.timeouts]\nhttp_seconds = '{marker}'\n").into_bytes(),
+            ),
             "parse_invalid",
             None,
         ),

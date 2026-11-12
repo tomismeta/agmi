@@ -256,8 +256,7 @@ print(json.dumps({'provider': 'openai-codex', 'model': payload['model'],
         def table(name, fields):
             return '[' + name + ']\n' + '\n'.join(
                 f'{key} = {value(val)}' for key, val in fields.items() if val is not None) + '\n'
-        text = f'''schema_version = 2
-state_dir = {json.dumps(str(self.root / 'state'))}
+        text = f'''state_dir = {json.dumps(str(self.root / 'state'))}
 [network]
 base_url = "http://127.0.0.1:{self.server.server_port}"
 chain = "{self.chain}"

@@ -15,7 +15,7 @@ fn recovery_code(error: &anyhow::Error) -> &'static str {
 }
 
 fn unknown_report(reason: &str) -> Value {
-    json!({"contract_version":2,"components":health::unknown_components(),
+    json!({"components":health::unknown_components(),
         "healthy":false,"attention_required":true,"issues":[reason],
         "warnings":[],"initialized":null,"paused":null,"evidence":"local_only",
         "assessment_scope":{"evidence":"local_only","state_filesystem":"not_assessed"},

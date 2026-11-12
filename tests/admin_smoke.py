@@ -164,8 +164,8 @@ def main():
             schema = invoke('config', 'schema')
             assert not config.exists() and not state.exists()
             settings = {entry['path']: entry for entry in schema['settings']}
-            assert schema['schema'] == 'agmi.config.v2'
-            assert schema['defaults']['schema_version'] == 2
+            assert schema['schema'] == 'agmi.config'
+            assert 'schema_version' not in schema['defaults']
             for name in ('network.address', 'state_dir', 'capabilities.answer.model.guidance_file',
                          'capabilities.answer.model.core_guidance_file',
                          'capabilities.judge.model.core_guidance_file',

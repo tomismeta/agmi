@@ -921,14 +921,29 @@ impl Store {
         let mut effective_config = None;
         let effective=runtime.as_ref().map(|(revision,reload,capabilities,at)| -> Result<Value>{
             if let Some(policy)=&policy
-                && policy["schema_version"]==2 {
+                && let (Ok(capabilities), Ok(identity), Ok(runtime)) = (
+                    <crate::config::Capabilities as serde::Deserialize>::deserialize(&policy["capabilities"]),
+                    <crate::config::IdentityPolicy as serde::Deserialize>::deserialize(&policy["identity"]),
+                    <crate::config::RuntimePolicy as serde::Deserialize>::deserialize(&policy["runtime"]),
+                )
+                // Captures are complete serialized output, not partial config input.
+                // Round trips reject missing defaulted fields at every nesting level.
+                && serde_json::to_value(&capabilities)? == policy["capabilities"]
+                && serde_json::to_value(identity)? == policy["identity"]
+                && serde_json::to_value(runtime)? == policy["runtime"]
+                && LaneId::ALL.into_iter().all(|lane| {
+                    policy["lane_revisions"][lane.as_str()]
+                        .as_str()
+                        .is_some_and(|revision| !revision.is_empty())
+                })
+            {
                 let mut captured=config.clone();
                 captured.network.chain=stored["chain"].as_str().context("journal chain missing")?.to_owned();
                 captured.network.address=stored["address"].as_str().context("journal address missing")?.to_owned();
                 captured.network.base_url=stored["base_url"].as_str().context("journal origin missing")?.to_owned();
-                captured.capabilities=serde_json::from_value(policy["capabilities"].clone())?;
-                captured.identity=serde_json::from_value(policy["identity"].clone())?;
-                captured.runtime=serde_json::from_value(policy["runtime"].clone())?;
+                captured.capabilities=capabilities;
+                captured.identity=identity;
+                captured.runtime=runtime;
                 effective_config=Some(captured);
             }
             Ok(json!({"revision":revision,"reload_blocked":reload,"capabilities":serde_json::from_str::<Value>(capabilities)?,"observed_at":at,"policy":policy}))

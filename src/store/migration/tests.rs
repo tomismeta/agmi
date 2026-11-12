@@ -228,6 +228,15 @@ fn strict_mode_does_not_hide_unbounded_exposure_or_recurring_inference_risk() {
         legacy.risk(&baseline, [0; 3])["risk_change_required"],
         false
     );
+    let mut increased_attempts = baseline.clone();
+    increased_attempts
+        .capabilities
+        .answer
+        .participation
+        .max_answer_attempts_per_epoch += 1;
+    let risk = legacy.risk(&increased_attempts, [0; 3]);
+    assert_eq!(risk["answer_retry_policy_increased"], true);
+    assert_eq!(risk["risk_change_required"], true);
     let mut candidate = baseline.clone();
     candidate
         .capabilities
@@ -261,6 +270,43 @@ fn strict_mode_does_not_hide_unbounded_exposure_or_recurring_inference_risk() {
         crate::config::CountLimit::Unbounded
     );
 }
+#[test]
+fn strict_migration_attempt_increase_requires_exact_acknowledgment() {
+    let fixture = Fixture::new(None);
+    let mut candidate = fixture.config.clone();
+    candidate
+        .capabilities
+        .answer
+        .participation
+        .max_answer_attempts_per_epoch += 1;
+    let proposal = preview(
+        &fixture.path,
+        &json!({
+            "candidate_toml":toml::to_string(&candidate).unwrap()
+        }),
+    )
+    .unwrap();
+    let token = proposal["token"].as_str().unwrap();
+    assert_eq!(proposal["risk_change_required"], true);
+    assert!(apply(&fixture.path, &proposal["request"], token, None).is_err());
+    assert_eq!(bytes(&fixture.path).unwrap(), fixture.source);
+    apply(&fixture.path, &proposal["request"], token, Some(token)).unwrap();
+    assert_eq!(
+        Config::load(&fixture.path)
+            .unwrap()
+            .capabilities
+            .answer
+            .participation
+            .max_answer_attempts_per_epoch,
+        candidate
+            .capabilities
+            .answer
+            .participation
+            .max_answer_attempts_per_epoch
+    );
+    assert!(!fixture.config.state_dir.exists());
+}
+
 #[test]
 fn config_only_conversion_never_bootstraps_and_absence_race_rejects() {
     let fixture = Fixture::new(None);
@@ -568,7 +614,7 @@ impl Fixture {
     // executable or evidence that compatibility has been exercised on Linux.
     fn historical_pending(schema: i64) -> (Self, String, String) {
         let fixture = Self::new(Some(schema));
-        let proposal = pre_gate_proposal(fixture.preview());
+        let proposal = retired_marker_proposal(&fixture, pre_gate_proposal(fixture.preview()));
         let mut sealed = proposal["seal"].clone();
         sealed
             .as_object_mut()
@@ -579,6 +625,7 @@ impl Fixture {
             "unbounded_exposure",
             "model_cost_increased",
             "recurring_inference_possible",
+            "answer_retry_policy_increased",
         ] {
             sealed["risk"].as_object_mut().unwrap().remove(field);
         }
@@ -1597,4 +1644,192 @@ fn new4_gate_member_removal_cannot_reuse_the_authenticated_token() {
         ("journal_ready".into(), token.into(), raw)
     );
     assert_eq!(bytes(&fixture.path).unwrap(), fixture.source);
+}
+
+// Construct approval bytes using the deployed marker and old effective digest
+// before sealing, rather than mutating an authenticated stored record.
+fn retired_marker_proposal(fixture: &Fixture, mut proposal: Value) -> Value {
+    let candidate = format!(
+        "schema_version = 2\n{}",
+        proposal["candidate_toml"].as_str().unwrap()
+    );
+    proposal["candidate_toml"] = json!(candidate);
+    proposal["request"]["candidate_toml"] = json!(candidate);
+    proposal["seal"]["request"] = proposal["request"].clone();
+    proposal["seal"]["candidate_sha256"] = json!(digest(candidate.as_bytes()));
+    #[derive(serde::Serialize)]
+    struct RetiredConfig<'a> {
+        schema_version: u32,
+        #[serde(flatten)]
+        config: &'a Config,
+    }
+    let config = sealed_config(&fixture.path, &candidate).unwrap();
+    let mut hash = Sha256::new();
+    hash.update(
+        serde_json::to_vec(&RetiredConfig {
+            schema_version: 2,
+            config: &config,
+        })
+        .unwrap(),
+    );
+    for model in [
+        &config.capabilities.answer.model,
+        &config.capabilities.judge.model,
+    ] {
+        hash.update((model.guidance.len() as u64).to_le_bytes());
+        hash.update(model.guidance.as_bytes());
+        hash.update((model.core_guidance.len() as u64).to_le_bytes());
+        hash.update(model.core_guidance.as_bytes());
+    }
+    proposal["seal"]["effective_revision"] = json!(format!("{:x}", hash.finalize()));
+    proposal["token"] = json!(format!(
+        "{FORMAT}:{}",
+        digest(serde_json::to_vec(&proposal["seal"]).unwrap())
+    ));
+    proposal
+}
+
+#[test]
+fn authentic_pre_gate_marker_candidate_resumes_exact_bytes_and_old_revision() {
+    let fixture = Fixture::new(Some(2));
+    let proposal = retired_marker_proposal(&fixture, pre_gate_proposal(fixture.preview()));
+    let token = proposal["token"].as_str().unwrap();
+    let mut p = prepare(&fixture.path, &fixture.preview()["request"]).unwrap();
+    p.candidate = proposal["candidate_toml"].as_str().unwrap().to_owned();
+    let locks = Locks::acquire(&p.config).unwrap();
+    let mut db = open_existing(&p.config.state_dir, true).unwrap().unwrap();
+    let gates = provision_lane_gates(
+        &p.config,
+        proposal["snapshot"]["database_id"].as_str().unwrap(),
+        &locks.admission,
+        &locks.writer,
+    )
+    .unwrap();
+    let tx = db
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+    approved(&proposal, token, Some(token)).unwrap();
+    seal_conversion(&tx, &p, &proposal, token, Some(token), &gates).unwrap();
+    tx.commit().unwrap();
+    let raw = seals::raw_record(&db, None).unwrap().2;
+    drop(db);
+    drop(gates);
+    drop(locks);
+    resume(&fixture.path, &fixture.config.state_dir, token).unwrap();
+    assert_eq!(bytes(&fixture.path).unwrap(), p.candidate.as_bytes());
+    assert!(Config::load(&fixture.path).is_err());
+    assert_eq!(
+        status(&fixture.config.state_dir).unwrap()["further_migration_required"],
+        true
+    );
+    assert_eq!(
+        export(&fixture.config.state_dir, token).unwrap()["sealed_raw"],
+        raw
+    );
+}
+
+#[test]
+fn journal4_marker_cutover_preserves_all_existing_journal_rows_and_archives_seal() {
+    let fixture = Fixture::format3();
+    let initial = preview(&fixture.path, &json!({})).unwrap();
+    let old_token = initial["token"].as_str().unwrap();
+    apply(&fixture.path, &initial["request"], old_token, None).unwrap();
+    let old_raw = export(&fixture.config.state_dir, old_token).unwrap()["sealed_raw"].clone();
+    let db = open_existing(&fixture.config.state_dir, true)
+        .unwrap()
+        .unwrap();
+    db.execute("UPDATE control SET paused=0", []).unwrap();
+    assert!(preview(&fixture.path, &json!({})).is_err());
+    db.execute("UPDATE control SET paused=1", []).unwrap();
+    db.execute(
+        "UPDATE lane_control SET paused=1,control_revision=7 WHERE lane='judge'",
+        [],
+    )
+    .unwrap();
+    // Distinct lane controls and runtime evidence must survive a config-only cutover.
+    let mut tables = db.prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'capability_migration%' ORDER BY name").unwrap();
+    let names: Vec<String> = tables
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(|row| row.unwrap())
+        .collect();
+    drop(tables);
+    let mut before = Vec::new();
+    for name in &names {
+        rows(&db, name, |row| {
+            before.push((name.clone(), row));
+            Ok(())
+        })
+        .unwrap();
+    }
+    let source = format!(
+        "schema_version = 2\n{}",
+        std::str::from_utf8(&bytes(&fixture.path).unwrap()).unwrap()
+    );
+    crate::admin::persist(&fixture.path, source.as_bytes()).unwrap();
+    assert!(Config::load(&fixture.path).is_err());
+    let proposal = preview(&fixture.path, &json!({})).unwrap();
+    assert_eq!(proposal["risk_change_required"], false);
+    assert!(
+        !proposal["candidate_toml"]
+            .as_str()
+            .unwrap()
+            .contains("schema_version")
+    );
+    apply(
+        &fixture.path,
+        &proposal["request"],
+        proposal["token"].as_str().unwrap(),
+        None,
+    )
+    .unwrap();
+    Config::load(&fixture.path).unwrap();
+    let mut after = Vec::new();
+    for name in &names {
+        rows(&db, name, |row| {
+            after.push((name.clone(), row));
+            Ok(())
+        })
+        .unwrap();
+    }
+    assert_eq!(before, after);
+    assert_eq!(
+        export(&fixture.config.state_dir, old_token).unwrap()["sealed_raw"],
+        old_raw
+    );
+}
+
+#[test]
+fn no_journal_per_lane_cutovers_and_ambiguous_shapes_fail_closed() {
+    for marked in [false, true] {
+        let fixture = Fixture::new(None);
+        let text = toml::to_string(&fixture.config).unwrap();
+        let source = if marked {
+            format!("schema_version=2\n{text}")
+        } else {
+            text
+        };
+        crate::admin::persist(&fixture.path, source.as_bytes()).unwrap();
+        let proposal = preview(&fixture.path, &json!({})).unwrap();
+        apply(
+            &fixture.path,
+            &proposal["request"],
+            proposal["token"].as_str().unwrap(),
+            None,
+        )
+        .unwrap();
+        Config::load(&fixture.path).unwrap();
+    }
+    for text in [
+        "",
+        "[network]\n",
+        "[capabilities]\n",
+        "[runtime]\n[participation]\n",
+        "[capabilities]\nanswer='off'\n[capabilities.judge]\nmode='off'\n",
+    ] {
+        assert!(
+            global_shape(&toml::from_str(text).unwrap()).is_err(),
+            "{text}"
+        );
+    }
 }

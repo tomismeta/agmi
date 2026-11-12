@@ -1,6 +1,5 @@
 # Copy outside the repository. Keep account credentials in a separate private file.
 # Paths are relative to this configuration file, except bare executables use PATH.
-schema_version = 2
 state_dir = "./agmi-state"
 
 [network]

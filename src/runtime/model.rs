@@ -170,7 +170,7 @@ impl ModelSlot {
                     .max_uncertain_replacements_per_work
                     .min(entry.max_uncertain_replacements_per_work)
             });
-        let captured = json!({"schema_version":2,"model":model,"lane_revision":stamp.lane_config_revision,
+        let captured = json!({"model":model,"lane_revision":stamp.lane_config_revision,
             "producer_revision":host.config.producer_revision(kind)?,
             "model_seconds":timeout,"attempt":count+1,"retry_uncertain":retry_uncertain,
             "max_uncertain_replacements_per_work":uncertain_replacements,

@@ -477,12 +477,16 @@ enum MigrationCommand {
     /// Preview a JSON proposal from stdin; retain its request and token for apply.
     #[command(after_help = r#"INPUT
   {"caps":{"answer":2,"judge":1,"mine":1}}
-  {"candidate_toml":"schema_version = 2\n..."}
+  {"candidate_toml":"[capabilities.answer]\nmode = \"active\"\n..."}
   {}
 
 These are operator-selected examples, not recommended risk limits.
 Legacy initial authority adoption additionally requires "adopt_legacy":true.
 An unchanged current-shape configuration with a format-3 journal accepts {}.
+A per-lane configuration carrying the retired schema_version = 2 marker with a
+format-4 journal also accepts {} for explicit marker removal; policy, lane
+controls, generation and journal history remain unchanged. Ordinary config
+loading rejects the retired marker. Capability candidate TOML is unversioned.
 Conversion requires a stopped controller and durable global pause. The preview
 token binds target_journal_format; a sealed migration is never silently retargeted.
 Keep the returned request and token together. Apply reads that request from stdin;
@@ -568,7 +572,7 @@ fn config_path(cli: &Cli) -> Result<PathBuf> {
 
 fn health_prerequisite(code: &'static str) -> Value {
     json!({
-        "contract_version":2,"components":health::unknown_components(),
+        "components":health::unknown_components(),
         "healthy":false,"attention_required":true,"issues":[code],"warnings":[],
         "readiness":"prerequisites_missing","evidence":"local_only",
         "assessment_scope":{"evidence":"local_only","state_filesystem":"not_assessed"},

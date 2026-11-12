@@ -63,9 +63,6 @@ pub fn recovery_refusal(config_path: &Path, operation: i64, apply: Option<&str>)
     let _configuration = crate::admin::lock_config_directory(config_path)?;
     let config = Config::load_metadata(config_path)?;
     let store = Store::read_only(&config)?.context("journal not initialized")?;
-    if store.schema_version()? != CURRENT_JOURNAL_FORMAT {
-        return Err(RefusalRecoveryError("refusal_recovery_schema").into());
-    }
     store.routing_change_allowed(&config)?;
     // Bind approval to file bytes, including metadata-only configuration changes.
     let revision = digest(fs::read(config_path)?);
@@ -98,9 +95,6 @@ pub(crate) fn doctor_repairs(config_path: &Path, apply: Option<&Value>) -> Resul
     let Some(store) = Store::read_only(&config)? else {
         return Ok(report);
     };
-    if store.schema_version()? != CURRENT_JOURNAL_FORMAT {
-        return Err(RefusalRecoveryError("refusal_recovery_schema").into());
-    }
     store.routing_change_allowed(&config)?;
     if apply.is_none() {
         let snapshot = store.db.unchecked_transaction()?;
@@ -2201,7 +2195,7 @@ impl Store {
                     tx.execute(
                         "INSERT INTO risk_admissions
                         VALUES ((SELECT dispatch_sequence FROM authority WHERE singleton=1),?1,?2,?3,?4,?5,?6,?7)",
-                        params![op.id,serde_json::to_string(&json!({"schema_version":2,"lane":op.kind,
+                        params![op.id,serde_json::to_string(&json!({"lane":op.kind,
                             "participation":participation,"history_evaluated":evaluated,
                             "own_count":own_count,
                             "own_limit":config.participation(op.kind).max_unresolved_operations,
@@ -2266,7 +2260,7 @@ impl Store {
                     .map(|p| serde_json::from_str(&p))
                     .transpose()?
                     .unwrap_or_else(|| json!({}));
-                captured["dispatch_policy"] = json!({"schema_version":2,"lane":op.kind,
+                captured["dispatch_policy"] = json!({"lane":op.kind,
                     "participation":participation,"revision":lane_revision,
                     "http_seconds":config.timeouts(op.kind).http_seconds,
                     "mine_each_epoch":config.capabilities.mine.schedule.each_epoch});
@@ -3190,7 +3184,7 @@ impl Store {
     pub(crate) fn runtime_state(&self, config: &Config, reload_blocked: bool) -> Result<()> {
         self.continuity()?;
         let tx = self.db.unchecked_transaction()?;
-        let mut policy = json!({"schema_version":2,"capabilities":config.capabilities,
+        let mut policy = json!({"capabilities":config.capabilities,
             "identity":config.identity,"runtime":config.runtime,"build":crate::runtime::build_info()});
         let mut revisions = serde_json::Map::new();
         for lane in LaneId::ALL {
@@ -3870,28 +3864,21 @@ impl Store {
 
     pub(crate) fn inspect(&self, id: i64) -> Result<Value> {
         let op = self.operation(id)?.context("operation not found")?;
-        let policy = if self.schema_version()? == CURRENT_JOURNAL_FORMAT {
-            self.db.query_row("SELECT policy,evidence,dispatch_sequence,blocked_since,resolution FROM operation_evidence WHERE operation_id=?1",
-                [id], |r| Ok(json!({"captured_policy":r.get::<_,Option<String>>(0)?,
-                    "evidence":r.get::<_,Option<String>>(1)?,"dispatch_sequence":r.get::<_,Option<i64>>(2)?,
-                    "blocked_since":r.get::<_,Option<i64>>(3)?,"resolution":r.get::<_,Option<String>>(4)?}))).optional()?
-        } else {
-            None
-        };
-        let candidates = if self.schema_version()? == CURRENT_JOURNAL_FORMAT {
-            self.db
-                .query_row(
-                    "SELECT candidates,truncated FROM operation_candidates WHERE operation_id=?1",
-                    [id],
-                    |r| {
-                        Ok(json!({"untrusted":true,"candidates":r.get::<_,String>(0)?,
-                    "truncated":r.get::<_,bool>(1)?}))
-                    },
-                )
-                .optional()?
-        } else {
-            None
-        };
+        let policy = self.db.query_row("SELECT policy,evidence,dispatch_sequence,blocked_since,resolution FROM operation_evidence WHERE operation_id=?1",
+            [id], |r| Ok(json!({"captured_policy":r.get::<_,Option<String>>(0)?,
+                "evidence":r.get::<_,Option<String>>(1)?,"dispatch_sequence":r.get::<_,Option<i64>>(2)?,
+                "blocked_since":r.get::<_,Option<i64>>(3)?,"resolution":r.get::<_,Option<String>>(4)?}))).optional()?;
+        let candidates = self
+            .db
+            .query_row(
+                "SELECT candidates,truncated FROM operation_candidates WHERE operation_id=?1",
+                [id],
+                |r| {
+                    Ok(json!({"untrusted":true,"candidates":r.get::<_,String>(0)?,
+                "truncated":r.get::<_,bool>(1)?}))
+                },
+            )
+            .optional()?;
         let window: (i64, i64) = self.db.query_row(
             "SELECT created_at,updated_at FROM operations WHERE id=?1",
             [id],
@@ -6866,12 +6853,56 @@ mod tests {
             store.status(&config).unwrap()["participation"]["lanes"]["answer"]["allowed"],
             true
         );
+        // Retained applied policy remains usable without interpreting its old label.
+        store
+            .db
+            .execute(
+                "UPDATE runtime_policy SET policy=json_set(policy,'$.schema_version',2)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            store.status(&config).unwrap()["participation"]["lanes"]["answer"]["allowed"],
+            true
+        );
         store.db.execute("DELETE FROM runtime_policy", []).unwrap();
         let changes = store.db.total_changes();
         let status = store.status(&config).unwrap();
         assert_eq!(status["participation"]["policy_source"], "unavailable");
         assert!(status["participation"]["lanes"]["answer"].is_null());
         assert_eq!(store.db.total_changes(), changes);
+        for (pointer, replacement) in [
+            ("/identity", Value::Null),
+            ("/runtime", Value::Null),
+            ("/capabilities/answer", Value::Null),
+            ("/capabilities/judge/mode", Value::Null),
+            ("/capabilities/mine/participation", Value::Null),
+            ("/capabilities/answer/participation", json!({})),
+            ("/capabilities/judge/timeouts", json!({})),
+            ("/capabilities/mine/schedule", json!({})),
+            ("/identity", json!({})),
+            ("/runtime", json!({})),
+            ("/lane_revisions", Value::Null),
+            ("/lane_revisions/answer", Value::Null),
+            ("/lane_revisions/judge", json!("")),
+        ] {
+            store.runtime_state(&config, false).unwrap();
+            let raw: String = store
+                .db
+                .query_row("SELECT policy FROM runtime_policy", [], |row| row.get(0))
+                .unwrap();
+            let mut policy: Value = serde_json::from_str(&raw).unwrap();
+            *policy.pointer_mut(pointer).unwrap() = replacement;
+            store
+                .db
+                .execute("UPDATE runtime_policy SET policy=?1", [policy.to_string()])
+                .unwrap();
+            let changes = store.db.total_changes();
+            let status = store.status(&config).unwrap();
+            assert_eq!(status["participation"]["policy_source"], "unavailable");
+            assert!(status["participation"]["lanes"]["answer"].is_null());
+            assert_eq!(store.db.total_changes(), changes);
+        }
     }
 
     #[test]

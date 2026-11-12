@@ -294,6 +294,11 @@ impl Legacy {
         let no_recharge = answer.historical_unknown_answer_capacity
             == HistoricalAnswerCapacity::Bounded
             && answer.max_historical_unknown_answers == 0;
+        let answer_retry_preserved = answer.max_answer_attempts_per_epoch
+            <= p.max_answer_attempts_per_epoch
+            && (!answer.retry_uncertain_answers
+                || (p.retry_uncertain_answers
+                    && answer.uncertain_answer_retry_seconds >= p.uncertain_answer_retry_seconds));
         let same_or_stricter = kinds.iter().enumerate().all(|(i, kind)| {
             let lane = candidate.participation(*kind);
             let allowed = [p.allow_answer, p.allow_judge, p.allow_mine][i];
@@ -301,11 +306,7 @@ impl Legacy {
                 || (allowed
                     && lane.mode == p.mode
                     && lane.uncertainty_grace_seconds >= p.uncertainty_grace_seconds)
-        }) && answer.max_answer_attempts_per_epoch
-            <= p.max_answer_attempts_per_epoch
-            && (!answer.retry_uncertain_answers
-                || (p.retry_uncertain_answers
-                    && answer.uncertain_answer_retry_seconds >= p.uncertain_answer_retry_seconds));
+        });
         let non_answer_risky = [LaneId::Judge, LaneId::Mine]
             .iter()
             .any(|kind| candidate.participation(*kind).mode != ParticipationMode::Strict);
@@ -328,6 +329,7 @@ impl Legacy {
             });
         let preserved = !unbounded_exposure
             && !model_cost_increased
+            && answer_retry_preserved
             && (all_strict
                 || (no_recharge
                     && same_or_stricter
@@ -337,6 +339,7 @@ impl Legacy {
             "exposure_including_backlog":exposure,"conservative_old_bound":bound,
             "over_cap":caps.iter().zip(unresolved).map(|(c,u)| c.finite().map(|limit| u.saturating_sub(u64::from(limit)))).collect::<Vec<_>>(),
             "unbounded_exposure":unbounded_exposure,"model_cost_increased":model_cost_increased,
+            "answer_retry_policy_increased":!answer_retry_preserved,
             "recurring_inference_possible":([LaneId::Answer,LaneId::Judge].iter().any(|&kind| candidate.preparation(kind).is_some_and(|p|p.max_attempts_per_work.finite().is_none()))),
             "historical_recharge_possible":!no_recharge,"preservation_proven":preserved,
             "risk_change_required":!preserved,"old_policy":p,

@@ -58,7 +58,7 @@ pub(super) fn target(token: &str, sealed: &Value) -> Result<i64> {
         if historical {
             matches!(source, Some(1 | 2))
         } else {
-            matches!(source, Some(1..=3))
+            matches!(source, Some(1..=CURRENT_JOURNAL_FORMAT))
         },
         "unrecognized sealed source journal format; exact historical recovery implementation required"
     );
@@ -145,7 +145,7 @@ pub(super) fn target(token: &str, sealed: &Value) -> Result<i64> {
             (source, branch),
             (Some(1), "initial_adoption")
                 | (Some(2), "legacy_adoption" | "established_authority")
-                | (Some(3), "established_authority")
+                | (Some(3 | CURRENT_JOURNAL_FORMAT), "established_authority")
         ),
         "sealed source authority branch mismatch"
     );
@@ -177,7 +177,7 @@ pub(super) fn target(token: &str, sealed: &Value) -> Result<i64> {
     let generation = s["generation"]
         .as_i64()
         .context("sealed source generation missing")?;
-    let expected_generation = if source == Some(3) {
+    let expected_generation = if source.is_some_and(|source| source >= 3) {
         Some(generation)
     } else {
         generation.checked_add(1)
@@ -293,7 +293,7 @@ pub(super) fn prepare_storage(db: &Connection) -> Result<()> {
     ensure!(phase == "complete", MigrationError::Pending);
     let sealed: Value = serde_json::from_str(&raw)?;
     ensure!(
-        target(&token, &sealed)? == 3,
+        matches!(target(&token, &sealed)?, 3 | CURRENT_JOURNAL_FORMAT),
         "unsupported predecessor target"
     );
     db.execute(

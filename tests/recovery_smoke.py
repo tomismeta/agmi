@@ -265,7 +265,7 @@ poll_seconds = 1
 retry_seconds = 1
 jitter_seconds = 0
 '''
-                config.write_text('schema_version = 2\n' + network + '''[runtime]
+                config.write_text(network + '''[runtime]
 shutdown_seconds = 2
 [identity]
 read_http_seconds = 2
@@ -436,7 +436,7 @@ mode = "off"
                 if preview['risk_change_required']:
                     apply_words += ['--accept-risk-change', preview['token']]
                 invoke(*apply_words, stdin=json.dumps(preview['request']))
-                assert invoke('config', 'show')['data']['config']['schema_version'] == 2
+                assert 'schema_version' not in invoke('config', 'show')['data']['config']
                 assert len(shared['writes']) == writes_before, 'local migration submitted a wallet effect'
                 invoke('resume')
                 rollback = subprocess.run([initial_binary, '--config', str(legacy_config), '--json', 'resume'],

@@ -90,7 +90,7 @@ pub(super) fn convert(db: &Connection, config: &Config, snapshot: &Value) -> Res
     }
     // No source operation generation, artifact, model policy, link or witness is rewritten.
     db.execute(
-        "UPDATE control SET paused=1,generation=generation+1,version=3 WHERE singleton=1",
+        "UPDATE control SET paused=1,generation=generation+1 WHERE singleton=1",
         [],
     )?;
     db.execute(

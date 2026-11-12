@@ -308,7 +308,6 @@ fn initialized_health_fixture() -> (tempfile::TempDir, Config, rusqlite::Connect
         .unwrap()
         .as_secs() as i64;
     let mut policy = serde_json::to_value(&config).unwrap();
-    policy["schema_version"] = json!(2);
     policy["lane_revisions"] = json!({"answer":"fixture","judge":"fixture","mine":"fixture"});
     db.execute("UPDATE control SET paused=0", []).unwrap();
     db.execute("INSERT OR REPLACE INTO runtime_authority VALUES(1,1)", [])
@@ -827,7 +826,6 @@ fn paused_current_bindings_keep_read_failures_without_folding_unrelated_reads() 
 fn persist_diagnostic_policy(config: &Config, db: &rusqlite::Connection) {
     use serde_json::json;
     let mut policy = serde_json::to_value(config).unwrap();
-    policy["schema_version"] = json!(2);
     policy["lane_revisions"] = json!({"answer":"fixture","judge":"fixture","mine":"fixture"});
     db.execute("UPDATE runtime_policy SET policy=?1", [policy.to_string()])
         .unwrap();
