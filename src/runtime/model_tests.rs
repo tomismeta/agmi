@@ -529,7 +529,7 @@ async fn shutdown_native_cleanup_keeps_original_deadline_and_effect_gates() {
                 marker.display()
             );
             let hanging = format!("{announced}exec sleep 60\n");
-            let terminal = json!({"provider":"openai-codex","model":"different-model","reasoning_effort":"high","run_id":"completed-run","output":"{}"});
+            let terminal = json!({"provider":"openai-codex","model":"different-model","reasoning_effort":"high","run_id":"completed-run","native_turn_id":"completed-run:completed-run:0123abcd","output":"{}"});
             std::fs::write(
                 &interpreter,
                 if native_finished {

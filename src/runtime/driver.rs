@@ -180,9 +180,7 @@ impl HostAccess {
         self.store.defer(
             kind,
             self.config
-                .schedule(kind)
-                .poll_seconds
-                .saturating_add(self.jitter(kind, "poll")),
+                .discovery_poll_seconds(kind, self.jitter(kind, "poll")),
         )
     }
 
@@ -547,5 +545,313 @@ impl OncePlan {
     }
     pub(in crate::runtime) fn lane_mut(&mut self, kind: LaneId) -> &mut OnceLane {
         &mut self.lanes[crate::runtime::registry::lane_index(kind)]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::host::tests::{accept, fixture_with, identity_fixture, reply};
+
+    fn challenge_response(epoch: u64, answered: bool) -> Response {
+        Response {
+            status: 200,
+            body: json!({"epoch":epoch,"words":["burn"],"min_chars":4,"max_chars":100,
+                "answered":answered}),
+            retry_after_seconds: None,
+            read_failure: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn challenge_drafts_revalidate_while_blocked_without_discarding_reusable_work() {
+        for lane in [LaneId::Answer, LaneId::Mine] {
+            for scenario in [
+                "capacity_unchanged",
+                "capacity_changed",
+                "accepted",
+                "operation_floor",
+            ] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let mut config = Config::default();
+                config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
+                config.capabilities.answer.timeouts.read_http_seconds = 7;
+                config
+                    .capabilities
+                    .answer
+                    .schedule
+                    .observation_max_age_seconds = 40;
+                config.capabilities.answer.mode = Mode::Off;
+                config.capabilities.judge.mode = Mode::Off;
+                config.capabilities.mine.mode = Mode::Off;
+                match lane {
+                    LaneId::Answer => {
+                        config.capabilities.answer.mode = Mode::Active;
+                        config
+                            .capabilities
+                            .answer
+                            .participation
+                            .max_unresolved_operations = 1.into();
+                    }
+                    LaneId::Mine => {
+                        config.capabilities.mine.mode = Mode::Active;
+                        config
+                            .capabilities
+                            .mine
+                            .participation
+                            .max_unresolved_operations = 1.into();
+                        config.capabilities.mine.schedule.each_epoch = true;
+                    }
+                    LaneId::Judge => unreachable!(),
+                }
+                let (_temp, mut runtime, _stop) = fixture_with(config);
+                identity_fixture(&mut runtime, &listener).await;
+                runtime.store.defer(lane, 3600).unwrap();
+                let original = parse_challenge(&challenge_response(8, false)).unwrap();
+                let input = serde_json::to_value(runtime.challenge_input(lane, &original).unwrap())
+                    .unwrap();
+                let revision = runtime.config.lane_revision(lane).unwrap();
+                let mut prior = runtime
+                    .store
+                    .seed_operation_for_test(
+                        lane,
+                        if scenario == "accepted" {
+                            "8:prior"
+                        } else {
+                            "7:prior"
+                        },
+                        "prepared",
+                        &input,
+                        runtime.store.control().unwrap(),
+                        &revision,
+                    )
+                    .unwrap();
+                prior.state = "dispatching".into();
+                runtime
+                    .store
+                    .seed_transition_for_test(&prior, "fixture_prior_dispatch")
+                    .unwrap();
+                prior.state = if scenario == "accepted" {
+                    "confirmed"
+                } else {
+                    "unknown"
+                }
+                .into();
+                prior.next_at = now() + 3600;
+                if scenario == "accepted" {
+                    prior.txid = Some("a".repeat(64));
+                }
+                runtime
+                    .store
+                    .seed_transition_for_test(&prior, "fixture_prior_effect")
+                    .unwrap();
+                let mut draft = runtime
+                    .store
+                    .seed_operation_for_test(
+                        lane,
+                        "8:draft",
+                        "prepared",
+                        &input,
+                        runtime.store.control().unwrap(),
+                        &revision,
+                    )
+                    .unwrap();
+                draft.payload =
+                    (lane == LaneId::Answer).then(|| json!({"answer":"burning answer"}));
+                if scenario == "operation_floor" {
+                    draft.next_at = now() + 3600;
+                }
+                runtime
+                    .store
+                    .seed_transition_for_test(&draft, "fixture_unsent_draft")
+                    .unwrap();
+                assert!(
+                    !runtime.admission_allowed(&draft).unwrap(),
+                    "{lane:?}: {scenario}"
+                );
+                runtime.plan().unwrap();
+                if scenario == "operation_floor" {
+                    assert!(
+                        !runtime.lanes.busy(),
+                        "operation floors still prevent early refresh"
+                    );
+                } else {
+                    assert!(
+                        runtime.lanes.busy(),
+                        "blocked admission cannot prevent revalidation"
+                    );
+                    let (stream, request) = accept(&listener).await;
+                    assert!(request.contains("/challenge"), "{request}");
+                    let changed = scenario != "capacity_unchanged";
+                    let response = challenge_response(
+                        if changed && lane == LaneId::Mine {
+                            9
+                        } else {
+                            8
+                        },
+                        changed && lane == LaneId::Answer,
+                    );
+                    reply(stream, 200, None, response.body).await;
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        while runtime.lanes.busy() {
+                            runtime.collect().await.unwrap();
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                }
+                if scenario != "operation_floor" {
+                    let status = runtime.store.status(&runtime.config).unwrap();
+                    let assessment = &status["lane_participation"][lane.as_str()]["assessment"];
+                    assert_eq!(
+                        assessment["valid_until"].as_i64().unwrap(),
+                        assessment["observed_at"].as_i64().unwrap()
+                            + runtime.config.schedule(lane).observation_max_age_seconds as i64,
+                    );
+                }
+                let retained = runtime.store.operation(draft.id).unwrap().unwrap();
+                let retired = matches!(scenario, "capacity_changed" | "accepted");
+                assert_eq!(
+                    retained.state,
+                    if retired { "discarded" } else { "prepared" }
+                );
+                assert_eq!(
+                    runtime.store.operation(prior.id).unwrap().unwrap().state,
+                    prior.state
+                );
+                if !retired {
+                    assert_eq!(
+                        runtime.current_preparation(lane).unwrap().unwrap().id,
+                        draft.id
+                    );
+                } else {
+                    assert!(runtime.current_preparation(lane).unwrap().is_none());
+                }
+                assert!(
+                    runtime.effect.is_none(),
+                    "revalidation is not dispatch authority"
+                );
+                runtime.shutdown().await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn once_inventory_continuation_survives_runtime_and_journal_reopen() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = Config::default();
+        config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
+        config.capabilities.answer.mode = Mode::Off;
+        config.capabilities.judge.mode = Mode::ReadOnly;
+        config.capabilities.mine.mode = Mode::Off;
+        let (_temp, mut runtime, _stop) = fixture_with(config);
+        // Cross the former protocol offset ceiling using real page progress,
+        // then require the reopened runtime to fetch the persisted tail.
+        runtime.store.set_judge_inventory_offset(9_700).unwrap();
+        let config = runtime.config.clone();
+        let path = runtime.config_path.clone();
+        let server = tokio::spawn(async move {
+            for offset in [9_700, 9_800, 9_900, 10_000, 10_100] {
+                let (stream, request) = accept(&listener).await;
+                assert!(request.contains(&format!("offset={offset}")), "{request}");
+                let rows = if offset == 10_100 {
+                    vec![json!({"answer_txid":"f".repeat(64),"answer_epoch":8,
+                        "answer":"tail candidate","words":["tail"]})]
+                } else {
+                    (1..=100)
+                        .map(|id| {
+                            json!({
+                                "answer_txid":format!("{id:064x}"),"answer_epoch":8,
+                                "answer":"burning candidate","words":["burn"]
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                };
+                reply(
+                    stream,
+                    200,
+                    None,
+                    json!({
+                        "assignments":rows,"has_more":offset != 10_100,
+                    }),
+                )
+                .await;
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(10), runtime.run_loop(true))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(runtime.store.judge_inventory_offset().unwrap(), 10_100);
+        drop(runtime);
+        let (_writer, store) = AccountLock::acquire(&config).unwrap();
+        assert_eq!(store.judge_inventory_offset().unwrap(), 10_100);
+        store.defer_until(LaneId::Judge, now() - 1).unwrap();
+        let (_sender, stop) = watch::channel(false);
+        let mut restarted = HostAccess::new(
+            path,
+            config.clone(),
+            Arc::new(Protocol::new(&config).unwrap()),
+            store,
+            stop,
+            true,
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), restarted.run_loop(true))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(restarted.store.judge_inventory_offset().unwrap(), 0);
+        let status = restarted.store.status(&config).unwrap();
+        assert_eq!(
+            status["work"]["judge"]["assessment"]["observed_opportunities"],
+            1
+        );
+        assert_eq!(
+            status["work"]["judge"]["assessment"]["completeness"],
+            "bounded_partial"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn observation_age_uses_original_completion_and_not_transport_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = Config::default();
+        config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
+        config.capabilities.answer.timeouts.read_http_seconds = 7;
+        config
+            .capabilities
+            .answer
+            .schedule
+            .observation_max_age_seconds = 40;
+        let (_temp, mut runtime, _stop) = fixture_with(config);
+        let mut flight = runtime.begin_challenge(LaneId::Answer).unwrap().unwrap();
+        let (stream, _) = accept(&listener).await;
+        reply(stream, 200, None, challenge_response(8, false).body).await;
+        tokio::time::timeout(Duration::from_secs(5), &mut flight.task)
+            .await
+            .unwrap()
+            .unwrap();
+        let result = flight.take().unwrap();
+        runtime
+            .finish_scoped_read(LaneId::Answer, &flight, result)
+            .unwrap();
+        let observation = runtime.read_observation(LaneId::Answer, &flight).unwrap();
+        assert_eq!(
+            observation.admit_before,
+            flight.completed().unwrap() + Duration::from_secs(40)
+        );
+        assert_eq!(observation.admit_before_unix, flight.completed_at + 40);
+        runtime.discovered(LaneId::Answer).unwrap();
+        assert!(runtime.store.next_at(LaneId::Answer).unwrap() <= now() + 21);
+        let mut expired = observation;
+        expired.admit_before = Instant::now() - Duration::from_secs(1);
+        assert!(
+            !runtime
+                .scoped_observation_current(LaneId::Answer, &expired)
+                .unwrap()
+        );
     }
 }

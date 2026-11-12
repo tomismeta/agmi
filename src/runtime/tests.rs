@@ -475,7 +475,7 @@ mod regressions;
 pub(in crate::runtime) fn observation(runtime: &HostAccess, lane: LaneId) -> Observation {
     let completed = Instant::now();
     let completed_at = now();
-    let seconds = runtime.config.timeouts(lane).read_http_seconds;
+    let seconds = runtime.config.schedule(lane).observation_max_age_seconds;
     Observation {
         stamp: runtime.admission_stamp(lane).unwrap(),
         admit_before: completed + Duration::from_secs(seconds),

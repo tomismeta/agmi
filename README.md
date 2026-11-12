@@ -98,6 +98,7 @@ Answering, judging and mining own their modes, timing, scheduling and participat
 | Participation | `capabilities.<lane>.mode` | `off`, `read_only` or `active`, independently. |
 | Pause one lane | `lane show`, `lane pause`, `lane resume` | A token-checked admission override; sibling lanes keep their own controls. |
 | Timing and cost | Each lane's `schedule`, `timeouts`; answer/judge `preparation` | Independent cadence, original execution deadlines and finite or explicitly recurring model attempts. |
+| Observation validity | Each lane's `schedule.observation_max_age_seconds` | Freshness independent of HTTP timeout; successful discovery refreshes before this age when no retry floor intervenes. |
 | Uncertain outcomes | Each lane's `participation` | Finite exposure or explicit unbounded participation-first admission; strict is the default. |
 
 See the [annotated configuration](examples/config.toml) for exact fields. Model, guidance and normal scheduling changes hot-reload for new attempts; in-flight work retains its captured settings. Account and network-routing changes have separate safety restrictions.

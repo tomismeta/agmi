@@ -1,5 +1,6 @@
 use super::*;
 use crate::endpoints::Endpoint;
+use crate::solver::contract::{NativeAttemptCompletion, NativeOutcome};
 
 /// Participation relevance, not permission to retry or settle a remote effect.
 /// Admission owns capacity/uncertainty gates; current work owns deduplication.
@@ -27,6 +28,11 @@ impl RemoteWorkScope {
             )
         {
             return Some(false);
+        }
+        // Inclusion is accepted participation, not finality. Keep its receipt
+        // recovery visible without making it a dependency of fresh work.
+        if state == "confirmed" {
+            return Some(true);
         }
         if let Some(assessment) = judge {
             return judging_work_current(assessment, key).map(|current| !current);
@@ -774,35 +780,31 @@ impl Store {
                 );
             if config.preparation(kind).is_some() {
                 let latest:Option<(i64,String,String,Option<String>,String)>=self.db.query_row(
-                    "SELECT o.id,o.work_key,o.state,e.evidence,o.revision FROM operations o LEFT JOIN operation_evidence e ON e.operation_id=o.id
+                    "SELECT o.id,o.work_key,o.state,json_extract(e.model_attempt,'$.completion'),o.revision FROM operations o LEFT JOIN operation_evidence e ON e.operation_id=o.id
                      WHERE o.kind=?1 AND (?2 IS NULL OR o.request ->> '$.solver.epoch' = ?2)
                      AND (?3 IS NULL OR o.work_key=?3)
                      AND (e.model_attempt IS NOT NULL OR o.state IN ('model_unknown','superseded_model_unknown','retry_model','prelaunch_failed','rejected'))
                      ORDER BY o.id DESC LIMIT 1",
                     params![kind.as_str(),if kind==LaneId::Answer { epoch } else { None },if kind==LaneId::Judge { op.as_ref().map(|op|op.key.as_str()) } else { None }],
                     |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
-                if let Some((id, key, state, evidence, revision)) = latest {
+                if let Some((id, key, state, completion, revision)) = latest {
                     let assessment = self.model_retry_assessment(kind, &key, config, now())?;
-                    let evidence = evidence.and_then(|e| serde_json::from_str::<Value>(&e).ok());
+                    let completion = completion.and_then(|value| {
+                        serde_json::from_str::<NativeAttemptCompletion>(&value).ok()
+                    });
                     lane["model"] = serde_json::to_value(&assessment)?;
                     let model = &mut lane["model"];
                     model["operation_id"] = json!(id);
                     model["state"] = json!(state);
                     model["budget_used"] = json!(assessment.total_attempts);
                     model["budget_limit"] = json!(assessment.attempt_limit);
+                    // Receipt/admission diagnostics can replace generic evidence
+                    // after a successful model run; only immutable model
+                    // completion can identify a model failure.
                     model["failure_category"] = json!(
-                        evidence
-                            .as_ref()
-                            .and_then(|e| e["reason"].as_str())
-                            .map(|reason| match reason {
-                                "model_unknown"
-                                | "model_spawn_failed"
-                                | "model_rejected"
-                                | "model_timeout"
-                                | "invalid_model_output"
-                                | "cancelled" => reason,
-                                _ => "model_failure",
-                            })
+                        completion
+                            .filter(|completion| completion.outcome != NativeOutcome::Captured)
+                            .map(|completion| completion.reason_code.as_str())
                     );
                     model["current_route"] = json!(
                         lane_revisions[kind.as_str()]

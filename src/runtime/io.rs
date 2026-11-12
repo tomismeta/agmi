@@ -81,7 +81,7 @@ impl Recovery {
         runtime: &mut HostAccess,
         kind: LaneId,
     ) -> Result<()> {
-        if runtime.stopping() {
+        if runtime.stopping() || self.reads.len() >= 2 {
             return Ok(());
         }
         // Run-once owns its entry selection. Later fresh bindings must not
@@ -90,13 +90,24 @@ impl Recovery {
             plan.lane(kind)
                 .recovery
                 .iter()
-                .filter_map(|id| runtime.store.operation(*id).transpose())
+                .filter_map(|id| {
+                    runtime
+                        .store
+                        .operation(*id)
+                        .map(|op| op.map(|op| (op, None)))
+                        .transpose()
+                })
                 .collect::<Result<Vec<_>>>()?
         } else {
-            runtime.store.reconciliation_batch(kind)?
+            runtime
+                .store
+                .reconciliation_plan(kind)?
+                .into_iter()
+                .map(|(op, service)| (op, Some(service)))
+                .collect()
         };
-        for op in operations {
-            if self.reads.len() >= 2 {
+        for (op, service) in operations {
+            if runtime.stopping() || self.reads.len() >= 2 {
                 break;
             }
             if op.next_at > runtime.deadline_now() {
@@ -121,9 +132,26 @@ impl Recovery {
             } else {
                 continue;
             };
-            if let Some(flight) =
+            let flight = if let Some(service) = service {
+                if !runtime.store.reconciliation_read_claimed(
+                    &runtime.config,
+                    kind,
+                    &key,
+                    service,
+                )? {
+                    continue;
+                }
+                Some(runtime.launch_reserved_read(
+                    kind,
+                    key.clone(),
+                    endpoint,
+                    Some(resource),
+                    None,
+                )?)
+            } else {
                 runtime.launch_read(kind, key.clone(), endpoint, Some(resource), None)?
-            {
+            };
+            if let Some(flight) = flight {
                 if let Some(plan) = runtime.once.as_mut() {
                     plan.lane_mut(kind).reads.push(key);
                 }
@@ -220,6 +248,18 @@ impl HostAccess {
         {
             return Ok(None);
         }
+        self.launch_reserved_read(kind, key, endpoint, resource, offset)
+            .map(Some)
+    }
+
+    fn launch_reserved_read(
+        &mut self,
+        kind: LaneId,
+        key: ReadKey,
+        endpoint: Endpoint,
+        resource: Option<&str>,
+        offset: Option<u64>,
+    ) -> Result<ReadFlight> {
         let meta = self.meta(Some(kind), Some(&key), None, None)?;
         let sequence = self.sequence;
         let deadline = ReadDeadline::seconds(if key == ReadKey::Identity {
@@ -249,7 +289,7 @@ impl HostAccess {
             let _ = sender.send((Instant::now(), result));
             wake.notify_one();
         });
-        Ok(Some(ReadFlight {
+        Ok(ReadFlight {
             key,
             control,
             authority_epoch: self.authority_epoch,
@@ -261,7 +301,7 @@ impl HostAccess {
             cancelled: false,
             task,
             completion,
-        }))
+        })
     }
 
     pub(in crate::runtime) fn finish_read(
@@ -522,5 +562,170 @@ impl HostAccess {
             }
         }
         Ok(())
+    }
+}
+#[cfg(test)]
+mod recovery_tests {
+    use super::super::tests::{accept, fixture_with, reply};
+    use super::*;
+
+    fn seed(runtime: &mut HostAccess, db: &rusqlite::Connection, job: &str) -> Operation {
+        let op = runtime
+            .store
+            .seed_operation_for_test(
+                LaneId::Judge,
+                job,
+                "prepared",
+                &json!({}),
+                runtime.store.control().unwrap(),
+                &runtime.config.lane_revision(LaneId::Judge).unwrap(),
+            )
+            .unwrap();
+        db.execute(
+            "UPDATE operations SET state='unknown',job_id=?1,binding_revision=1,next_at=0 WHERE id=?2",
+            rusqlite::params![job, op.id],
+        ).unwrap();
+        runtime.store.operation(op.id).unwrap().unwrap()
+    }
+
+    fn schedule(db: &rusqlite::Connection, name: &str) -> (i64, i64, bool) {
+        db.query_row(
+            "SELECT next_at,COALESCE(CAST(cursor AS INTEGER),0),served_in_round FROM schedule WHERE kind=?1",
+            [name],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap()
+    }
+
+    #[tokio::test]
+    async fn recovery_retains_history_behind_occupied_flights_and_claims_the_overdue_service() {
+        for missing in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut config = Config::default();
+            config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
+            config.capabilities.judge.schedule.retry_seconds = 10;
+            config.capabilities.judge.schedule.backoff_max_seconds = 50;
+            let (_temp, mut runtime, _stop) = fixture_with(config);
+            let db =
+                rusqlite::Connection::open(runtime.config.state_dir.join("state.sqlite3")).unwrap();
+            let occupied = seed(&mut runtime, &db, "occupied");
+            let flight = runtime
+                .launch_read(
+                    LaneId::Judge,
+                    Store::operation_read_key(&occupied).unwrap(),
+                    Endpoint::Job,
+                    occupied.job_id.as_deref(),
+                    None,
+                )
+                .unwrap()
+                .unwrap();
+            let mut recovery = Recovery {
+                reads: vec![RecoveryRead {
+                    op: occupied,
+                    flight,
+                }],
+            };
+            let (occupied_stream, path) =
+                tokio::time::timeout(Duration::from_secs(5), accept(&listener))
+                    .await
+                    .unwrap();
+            assert!(path.contains("/api/job/occupied"));
+
+            let historical = seed(&mut runtime, &db, "historical");
+            let historical_key = Store::operation_read_key(&historical).unwrap();
+            assert!(runtime.store.read_started(&historical_key).unwrap());
+            runtime.store.cancel_read(&historical_key).unwrap();
+            if missing {
+                db.execute(
+                    "UPDATE read_state SET status=404,failures=2 WHERE operation_id=?1",
+                    [historical.id],
+                )
+                .unwrap();
+            }
+            seed(&mut runtime, &db, "recent");
+            // Advance the durable cadence, not wall time, while the first
+            // actual HTTP request remains outstanding.
+            db.execute(
+                "UPDATE schedule SET next_at=1 WHERE kind='reconciliation:judge'",
+                [],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO schedule(kind,next_at) VALUES('reconciliation:fair:judge',2)",
+                [],
+            )
+            .unwrap();
+            recovery.plan(&mut runtime, LaneId::Judge).unwrap();
+            assert_eq!(recovery.reads.len(), 2);
+            let (recent_stream, path) =
+                tokio::time::timeout(Duration::from_secs(5), accept(&listener))
+                    .await
+                    .unwrap();
+            assert!(path.contains("/api/job/recent"));
+            let fair = schedule(&db, "reconciliation:fair:judge");
+            let missing_cursor = schedule(&db, "reconciliation:missing:judge");
+            for job in ["arrival-1", "arrival-2", "arrival-3"] {
+                seed(&mut runtime, &db, job);
+                recovery.plan(&mut runtime, LaneId::Judge).unwrap();
+                assert_eq!(recovery.reads.len(), 2);
+                assert_eq!(schedule(&db, "reconciliation:fair:judge"), fair);
+                assert_eq!(
+                    schedule(&db, "reconciliation:missing:judge"),
+                    missing_cursor
+                );
+            }
+
+            reply(recent_stream, 202, None, json!({"state":"queued"})).await;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while recovery.reads.len() == 2 {
+                    recovery.collect(&mut runtime).unwrap();
+                    if recovery.reads.len() == 2 {
+                        runtime.wake.notified().await;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(recovery.reads[0].op.job_id.as_deref(), Some("occupied"));
+            db.execute(
+                "UPDATE schedule SET next_at=3 WHERE kind='reconciliation:judge'",
+                [],
+            )
+            .unwrap();
+            recovery.plan(&mut runtime, LaneId::Judge).unwrap();
+            assert_eq!(recovery.reads.len(), 2);
+            let (historical_stream, path) =
+                tokio::time::timeout(Duration::from_secs(5), accept(&listener))
+                    .await
+                    .unwrap();
+            assert!(path.contains("/api/job/historical"), "{path}");
+            assert_eq!(schedule(&db, "reconciliation:judge").0, 3);
+            let claimed = schedule(&db, "reconciliation:fair:judge");
+            assert!(claimed.0 > now());
+            assert_eq!(claimed.2, missing);
+            if missing {
+                let claimed_missing = schedule(&db, "reconciliation:missing:judge");
+                assert_eq!(claimed_missing.1, historical.id);
+                assert!(claimed_missing.0 >= claimed.0 + 40);
+            } else {
+                assert_eq!(claimed.1, historical.id);
+            }
+            assert_eq!(
+                runtime
+                    .store
+                    .operation(historical.id)
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                "unknown"
+            );
+            recovery
+                .cancel(
+                    &mut runtime,
+                    tokio::time::Instant::now() + Duration::from_secs(1),
+                )
+                .await
+                .unwrap();
+            drop((occupied_stream, historical_stream));
+        }
     }
 }

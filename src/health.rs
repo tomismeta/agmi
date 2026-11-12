@@ -435,6 +435,15 @@ fn evaluate_evidence(options: Options, status: &Value, at: i64) -> Value {
     let answer = observation(status, "answer");
     let observation_age = age(&answer["observed_at"], at);
     let epoch_age = age(&answer["first_observed_at"], at);
+    let answer_fresh = answer_floor.and_then(|_| {
+        observation_fresh(
+            status,
+            "answer",
+            answer["observed_at"].as_i64(),
+            at,
+            answer_stale,
+        )
+    });
     let mut issues = Vec::<&str>::new();
     let mut warnings = Vec::<&str>::new();
     if !initialized {
@@ -538,17 +547,18 @@ fn evaluate_evidence(options: Options, status: &Value, at: i64) -> Value {
         }
     }
     if options.expect_participation && lane_mode(status, "answer") == Some("active") {
-        match observation_age {
-            None => issues.push("challenge_unobserved"),
-            Some(seconds) if answer_floor.is_some() && seconds > answer_stale => {
-                issues.push("challenge_observation_stale");
+        match (observation_age, answer_fresh) {
+            (None, _) => issues.push("challenge_unobserved"),
+            (_, Some(false)) => issues.push("challenge_observation_stale"),
+            (_, None) if !issues.contains(&"effective_policy_unavailable") => {
+                issues.push("effective_policy_unavailable");
             }
             _ => {}
         }
         if answer_floor.is_some()
             && answer["answered"] == false
             && epoch_age.is_some_and(|seconds| seconds > grace)
-            && observation_age.is_some_and(|seconds| seconds <= answer_stale)
+            && answer_fresh == Some(true)
         {
             issues.push("current_epoch_unanswered");
         }
@@ -661,7 +671,7 @@ fn evaluate_evidence(options: Options, status: &Value, at: i64) -> Value {
     result["assessment_scope"] = json!({"evidence":"local_only","state_filesystem":"not_assessed"});
     result["current_epoch"] = json!({
         "epoch":answer["epoch"].as_u64(),"answered":answer["answered"].as_bool(),
-        "source":"answer","evidence_fresh":answer_floor.map(|_| fresh(answer["observed_at"].as_i64(),at,answer_stale)),
+        "source":"answer","evidence_fresh":answer_fresh,
         "evidence":"last_local_observation_not_a_live_remote_check"
     });
     result["thresholds"] = json!({
@@ -723,7 +733,7 @@ fn work_complete(status: &Value, lane: &str, at: i64, stale: u64) -> bool {
             && judge_inventory_blocker(&work["assessment"]).is_none()
     } else {
         let observed = observation(status, lane);
-        fresh(observed["observed_at"].as_i64(), at, stale)
+        observation_fresh(status, lane, observed["observed_at"].as_i64(), at, stale) == Some(true)
             && if lane == "answer" {
                 observed["answered"] == true
             } else {
@@ -785,7 +795,7 @@ fn current_remote_work(status: &Value, lane: &str) -> bool {
                     .is_none_or(|flag| flag == false)
                 && matches!(
                     work["state"].as_str(),
-                    Some("unknown" | "queued" | "included_pending" | "confirmed")
+                    Some("unknown" | "queued" | "included_pending")
                 )
         })
 }
@@ -1059,6 +1069,28 @@ fn fresh(timestamp: Option<i64>, at: i64, stale: u64) -> bool {
     timestamp.is_some_and(|time| time <= at && at.saturating_sub(time) as u64 <= stale)
 }
 
+fn observation_fresh(
+    status: &Value,
+    lane: &str,
+    timestamp: Option<i64>,
+    at: i64,
+    stale: u64,
+) -> Option<bool> {
+    let maximum_age = lane_policy(status, lane)["schedule"]["observation_max_age_seconds"]
+        .as_u64()
+        .filter(|seconds| *seconds > 0)?;
+    let assessment = &status["lane_participation"][lane]["assessment"];
+    // A later policy must not extend an already recorded observation deadline.
+    let recorded_bound = assessment.is_null()
+        || assessment["observed_at"].as_i64() != timestamp
+        || assessment_fresh(assessment, at, stale);
+    Some(
+        fresh(timestamp, at, stale)
+            && timestamp.is_some_and(|time| (at.saturating_sub(time) as u64) < maximum_age)
+            && recorded_bound,
+    )
+}
+
 fn assessment_fresh(assessment: &Value, at: i64, stale: u64) -> bool {
     // Aggregate inventory validity expires at its earliest page, not its last.
     fresh(assessment["observed_at"].as_i64(), at, stale)
@@ -1221,8 +1253,21 @@ fn components(status: &Value, health: &Value, at: i64, stale: u64, options: Opti
                 finding = ("unknown", "admission_evidence_unavailable", evidence_at);
             } else {
                 let complete = work_complete(status, name, at, stale);
+                let usable_observation = if name == "judge" {
+                    assessment_fresh(&work["assessment"], at, stale)
+                } else {
+                    observation_fresh(status, name, observation, at, stale) == Some(true)
+                };
                 if read_only {
-                    if primary["state"] == "ok" {
+                    if primary["state"] == "ok"
+                        && observation_fresh(
+                            status,
+                            name,
+                            primary["observed_at"].as_i64(),
+                            at,
+                            stale,
+                        ) == Some(true)
+                    {
                         finding = (
                             "ok",
                             "read_only_observation_recent",
@@ -1242,7 +1287,7 @@ fn components(status: &Value, health: &Value, at: i64, stale: u64, options: Opti
                 } else if !read_only
                     && admission == Some(false)
                     && primary["state"] == "ok"
-                    && fresh(observation, at, stale)
+                    && usable_observation
                     && work["phase"] == "observing"
                     && match name {
                         "judge" => {
@@ -1257,11 +1302,11 @@ fn components(status: &Value, health: &Value, at: i64, stale: u64, options: Opti
                 }
                 if !read_only
                     && !complete
-                    && fresh(observation, at, stale)
+                    && usable_observation
                     && current_remote_work(status, name)
                     && matches!(
                         work["phase"].as_str(),
-                        Some("unknown" | "queued" | "included_pending" | "included")
+                        Some("unknown" | "queued" | "included_pending")
                     )
                 {
                     finding = ("blocked", "current_work_outcome_unresolved", observation);
@@ -1504,6 +1549,61 @@ mod tests {
         status["work"]["mine"]["phase"] = json!("completed");
         status["work"]["mine"]["operation_epoch"] = json!(7);
         (config, Options::default(), status)
+    }
+
+    #[test]
+    fn observation_expiry_is_strict_and_a_policy_change_cannot_extend_recorded_evidence() {
+        for lane in ["answer", "mine"] {
+            let (config, options, mut status) = fixture();
+            status["observations"][lane]["observed_at"] = json!(9881);
+            status["lane_participation"][lane]["assessment"] =
+                json!({"observed_at":9881,"valid_until":10001});
+            assert_eq!(
+                evaluate(&config, options, &status, 10000)["components"][lane]["state"],
+                "ok"
+            );
+            status["observations"][lane]["observed_at"] = json!(9880);
+            status["lane_participation"][lane]["assessment"] =
+                json!({"observed_at":9880,"valid_until":10000});
+            let expired = evaluate(&config, options, &status, 10000);
+            assert_eq!(expired["healthy"], false);
+            assert_eq!(expired["components"][lane]["state"], "unknown");
+            status["effective_runtime"]["policy"]["capabilities"][lane]["schedule"]["observation_max_age_seconds"] =
+                json!(3600);
+            assert_eq!(
+                evaluate(&config, options, &status, 10000)["components"][lane]["state"],
+                "unknown"
+            );
+        }
+    }
+
+    #[test]
+    fn confirmed_judging_is_accepted_but_never_supplies_fresh_inventory() {
+        let (config, options, mut status) = fixture();
+        status["work"]["judge"]["phase"] = json!("included");
+        status["pending_work"] = json!([{
+            "kind":"judge","state":"confirmed","created_at":1,"updated_at":1
+        }]);
+        let accepted = evaluate(&config, options, &status, 10000);
+        assert_eq!(accepted["healthy"], true, "{accepted}");
+        assert_eq!(accepted["components"]["judge"]["state"], "ok");
+        assert_eq!(accepted["work"]["judge"]["progress"], "idle");
+        assert!(!has(&accepted, "current_work_outcome_unresolved"));
+        for state in ["unknown", "queued", "included_pending"] {
+            status["pending_work"][0]["state"] = json!(state);
+            status["work"]["judge"]["phase"] = json!(state);
+            let unresolved = evaluate(&config, options, &status, 10000);
+            assert_eq!(unresolved["healthy"], false, "{state}: {unresolved}");
+            assert_eq!(unresolved["components"]["judge"]["state"], "blocked");
+            assert!(has(&unresolved, "current_work_outcome_unresolved"));
+        }
+        status["pending_work"][0]["state"] = json!("confirmed");
+        status["work"]["judge"]["phase"] = json!("included");
+        status["work"]["judge"]["assessment"]["valid_until"] = json!(9999);
+        let stale = evaluate(&config, options, &status, 10000);
+        assert_eq!(stale["healthy"], false, "{stale}");
+        assert_eq!(stale["components"]["judge"]["state"], "unknown");
+        assert_ne!(stale["work"]["judge"]["progress"], "idle");
     }
 
     #[test]

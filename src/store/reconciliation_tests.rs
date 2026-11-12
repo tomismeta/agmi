@@ -35,8 +35,13 @@ fn seed(store: &Store, lane: LaneId, id: i64, missing: bool) -> ReadKey {
 }
 
 fn start_candidates(store: &Store, config: &Config, at: i64) -> Vec<(i64, bool)> {
-    let candidates = store.reconciliation_candidates(LaneId::Judge, at).unwrap();
-    start_selected(store, config, at, candidates)
+    let candidates = store
+        .reconciliation_selection(LaneId::Judge, at)
+        .unwrap()
+        .into_iter()
+        .map(|(id, service)| (id, Some(service)))
+        .collect();
+    start_claims(store, config, at, candidates)
 }
 
 fn start_selected(
@@ -45,16 +50,30 @@ fn start_selected(
     at: i64,
     candidates: Vec<i64>,
 ) -> Vec<(i64, bool)> {
+    start_claims(
+        store,
+        config,
+        at,
+        candidates.into_iter().map(|id| (id, None)).collect(),
+    )
+}
+
+fn start_claims(
+    store: &Store,
+    config: &Config,
+    at: i64,
+    candidates: Vec<(i64, Option<ReconciliationService>)>,
+) -> Vec<(i64, bool)> {
     assert!(candidates.len() <= 2);
     let mut started = Vec::new();
     // Keep both reads in flight until the captured batch has been launched,
     // exactly as Recovery::plan does before collecting any completion.
-    for candidate in candidates {
+    for (candidate, service) in candidates {
         let op = store.operation(candidate).unwrap().unwrap();
         let key = Store::operation_read_key(&op).unwrap();
         assert!(
             store
-                .reconciliation_read_started_at(config, LaneId::Judge, &key, at)
+                .reconciliation_claim_at(config, LaneId::Judge, &key, at, service)
                 .unwrap()
         );
         let missing = store
@@ -162,7 +181,7 @@ fn reconciliation_fair_cursors_cannot_be_overtaken_by_new_work() {
         let candidates = store.reconciliation_candidates(LaneId::Judge, at).unwrap();
         assert_eq!(candidates[0], newest);
         visited.extend(
-            start_selected(&store, &config, at, candidates)
+            start_candidates(&store, &config, at)
                 .into_iter()
                 .map(|(id, _)| id),
         );
@@ -513,7 +532,7 @@ fn reconciliation_empty_walks_survive_restart_and_find_sparse_due_work() {
         seed(&store, LaneId::Judge, newest, false);
         let time = at + round * 11;
         let started = start_candidates(&store, &config, time);
-        assert_eq!(started[0], (newest, false));
+        assert!(started.contains(&(newest, false)));
         for (id, missing) in started {
             assert!(id <= 2 || id > count, "a future server floor was bypassed");
             ordinary_seen |= id == 1;
@@ -614,4 +633,252 @@ fn reconciliation_recent_pending_work_keeps_service_while_ordinary_walk_advances
         let started = start_candidates(&store, &config, at + round * 11);
         assert_eq!(started, vec![(count, false), (count - round - 1, false)]);
     }
+}
+
+#[test]
+fn reconciliation_selection_retains_unclaimed_candidates_across_restart() {
+    let (_dir, config, mut store) = fixture();
+    for id in 1..=5 {
+        seed(&store, LaneId::Judge, id, id <= 2);
+    }
+    let at = now();
+    let selected = store.reconciliation_selection(LaneId::Judge, at).unwrap();
+    assert_eq!(
+        selected,
+        vec![
+            (5, ReconciliationService::Recent),
+            (2, ReconciliationService::Missing),
+        ]
+    );
+    let cursors = ["reconciliation:fair:judge", "reconciliation:missing:judge"]
+        .map(|name| store.reconciliation_schedule(name).unwrap());
+    for _ in 0..4 {
+        assert_eq!(
+            store.reconciliation_selection(LaneId::Judge, at).unwrap(),
+            selected
+        );
+        assert_eq!(
+            ["reconciliation:fair:judge", "reconciliation:missing:judge"]
+                .map(|name| store.reconciliation_schedule(name).unwrap()),
+            cursors
+        );
+    }
+    drop(store);
+    store = Store::open(&config).unwrap();
+    store.recover().unwrap();
+    assert_eq!(
+        store.reconciliation_selection(LaneId::Judge, at).unwrap(),
+        selected
+    );
+    assert_eq!(
+        start_candidates(&store, &config, at),
+        vec![(5, false), (2, true)]
+    );
+    assert_eq!(
+        store
+            .reconciliation_schedule("reconciliation:fair:judge")
+            .unwrap(),
+        (at + 11, 5, true)
+    );
+    assert_eq!(
+        store
+            .reconciliation_schedule("reconciliation:missing:judge")
+            .unwrap(),
+        (at + 51, 2, false)
+    );
+}
+
+#[test]
+fn reconciliation_failed_claim_preserves_cursor_and_service_until_actual_claim() {
+    let (_dir, config, mut store) = fixture();
+    seed(&store, LaneId::Judge, 1, true);
+    let ordinary = seed(&store, LaneId::Judge, 2, false);
+    let recent = seed(&store, LaneId::Judge, 3, false);
+    let at = now();
+    // Missing is not due yet, so the second selected candidate is ordinary.
+    store
+        .db
+        .execute(
+            "INSERT INTO schedule(kind,next_at) VALUES('reconciliation:missing:judge',?1)",
+            [at + 50],
+        )
+        .unwrap();
+    assert_eq!(
+        store.reconciliation_selection(LaneId::Judge, at).unwrap(),
+        vec![
+            (3, ReconciliationService::Recent),
+            (2, ReconciliationService::Fair)
+        ]
+    );
+    assert!(
+        store
+            .reconciliation_claim_at(
+                &config,
+                LaneId::Judge,
+                &recent,
+                at,
+                Some(ReconciliationService::Recent)
+            )
+            .unwrap()
+    );
+    // A concurrent reservation wins after selection, before Recovery can claim.
+    assert!(store.read_started(&ordinary).unwrap());
+    let fair = store
+        .reconciliation_schedule("reconciliation:fair:judge")
+        .unwrap();
+    assert!(
+        !store
+            .reconciliation_claim_at(
+                &config,
+                LaneId::Judge,
+                &ordinary,
+                at,
+                Some(ReconciliationService::Fair)
+            )
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .reconciliation_schedule("reconciliation:fair:judge")
+            .unwrap(),
+        fair
+    );
+    store.cancel_read(&ordinary).unwrap();
+    store.cancel_read(&recent).unwrap();
+    drop(store);
+    store = Store::open(&config).unwrap();
+    store.recover().unwrap();
+    seed(&store, LaneId::Judge, 4, false);
+    assert_eq!(
+        store
+            .reconciliation_selection(LaneId::Judge, at + 11)
+            .unwrap(),
+        vec![
+            (2, ReconciliationService::Fair),
+            (4, ReconciliationService::Recent)
+        ]
+    );
+    assert!(
+        store
+            .reconciliation_claim_at(
+                &config,
+                LaneId::Judge,
+                &ordinary,
+                at + 11,
+                Some(ReconciliationService::Fair)
+            )
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .reconciliation_schedule("reconciliation:fair:judge")
+            .unwrap(),
+        (at + 22, 2, false)
+    );
+    assert_eq!(
+        store
+            .reconciliation_schedule("reconciliation:judge")
+            .unwrap()
+            .0,
+        at + 11,
+        "a fair claim must not spend the recent service floor"
+    );
+    assert_eq!(
+        store
+            .reconciliation_schedule("reconciliation:missing:judge")
+            .unwrap()
+            .0,
+        at + 50
+    );
+    store.cancel_read(&ordinary).unwrap();
+    drop(store);
+    store = Store::open(&config).unwrap();
+    store.recover().unwrap();
+    assert!(
+        !store
+            .reconciliation_claim_at(
+                &config,
+                LaneId::Judge,
+                &ordinary,
+                at + 21,
+                Some(ReconciliationService::Fair)
+            )
+            .unwrap()
+    );
+    let missing = Store::operation_read_key(&store.operation(1).unwrap().unwrap()).unwrap();
+    assert!(
+        !store
+            .reconciliation_claim_at(
+                &config,
+                LaneId::Judge,
+                &missing,
+                at + 49,
+                Some(ReconciliationService::Missing)
+            )
+            .unwrap()
+    );
+}
+
+#[test]
+fn discovery_refresh_clamps_only_successful_cadence_and_preserves_durable_floors() {
+    let (_dir, mut config, mut store) = fixture();
+    config.capabilities.judge.schedule.poll_seconds = 120;
+    config.capabilities.judge.schedule.jitter_seconds = 30;
+    config
+        .capabilities
+        .judge
+        .schedule
+        .observation_max_age_seconds = 120;
+    let key = ReadKey::Discovery {
+        lane: LaneId::Judge,
+        source: DiscoverySource::Assignments,
+    };
+    store.reset_read(&key).unwrap();
+    let at = 1_000_000;
+    store.defer_until(LaneId::Judge, at + 150).unwrap();
+    store
+        .db
+        .execute(
+            "UPDATE read_state SET last_success_at=?1 WHERE owner='judge' AND purpose='discovery'",
+            [at],
+        )
+        .unwrap();
+    let next = |store: &Store| {
+        store
+            .discovery_next_at(&config, LaneId::Judge, &store.read_backoff(&key).unwrap())
+            .unwrap()
+    };
+    assert_eq!(next(&store), at + 61);
+    store.db.execute(
+        "UPDATE read_state SET local_next_at=?1,server_not_before=?2,retained_conservative_floor=?3
+        WHERE owner='judge' AND purpose='discovery'",
+        params![at + 70, at + 80, at + 90],
+    ).unwrap();
+    assert_eq!(next(&store), at + 90);
+    drop(store);
+    store = Store::open(&config).unwrap();
+    store.recover().unwrap();
+    store.reschedule_all_reads(&config).unwrap();
+    assert_eq!(next(&store), at + 90);
+    store
+        .db
+        .execute(
+            "UPDATE read_state SET failures=1,local_next_at=?1
+        WHERE owner='judge' AND purpose='discovery'",
+            [at + 200],
+        )
+        .unwrap();
+    assert_eq!(next(&store), at + 200);
+    let success: i64 = store
+        .db
+        .query_row(
+            "SELECT last_success_at FROM read_state WHERE owner='judge' AND purpose='discovery'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        success, at,
+        "a timing calculation must not renew observation evidence"
+    );
 }

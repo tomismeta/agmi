@@ -349,6 +349,73 @@ fn initialized_health_fixture() -> (tempfile::TempDir, Config, rusqlite::Connect
 }
 
 #[test]
+fn expired_discovery_is_not_healthy_under_the_longer_controller_threshold() {
+    use agmi::config::CountLimit;
+    for lane in ["answer", "judge", "mine"] {
+        let (_dir, mut config, db, at) = initialized_health_fixture();
+        diagnostic_lane(&mut config, &db, lane, CountLimit::Unbounded, at);
+        assert_eq!(diagnostic_health(&config)["healthy"], true);
+        if lane == "judge" {
+            db.execute(
+                "UPDATE runtime_state SET lane_participation=json_set(lane_participation,
+                '$.judge.assessment.observed_at',?1,'$.judge.assessment.valid_until',?2)",
+                rusqlite::params![at - 121, at - 1],
+            )
+            .unwrap();
+        } else {
+            db.execute(
+                "UPDATE lane_observations SET observed_at=?1 WHERE lane=?2",
+                rusqlite::params![at - 121, lane],
+            )
+            .unwrap();
+        }
+        let path = config
+            .state_dir
+            .parent()
+            .unwrap()
+            .join("expiry-config.toml");
+        fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+        let version: i64 = db
+            .query_row("PRAGMA data_version", [], |row| row.get(0))
+            .unwrap();
+        for command in ["status", "health", "doctor"] {
+            let mut process = Command::new(env!("CARGO_BIN_EXE_agmi"));
+            process
+                .arg("--config")
+                .arg(&path)
+                .args(["--json", command, "--verbose"]);
+            if command == "health" {
+                process.args(["--min-free-mib", "0"]);
+            }
+            let output = process.output().unwrap();
+            let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+            let report = &envelope["data"];
+            assert_ne!(
+                report["components"][lane]["state"], "ok",
+                "{lane}/{command}: {report}"
+            );
+            assert_ne!(
+                report["operational"]["status"], "clear",
+                "{lane}/{command}: {report}"
+            );
+            if lane == "answer" && command == "health" {
+                assert_eq!(
+                    report["current_epoch"]["evidence_fresh"], false,
+                    "{command}: {report}"
+                );
+            }
+            if command == "health" {
+                assert!(!output.status.success());
+            }
+        }
+        let after: i64 = db
+            .query_row("PRAGMA data_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(after, version, "diagnostics mutated the journal");
+    }
+}
+
+#[test]
 fn future_judge_assessment_alone_makes_health_cli_fail() {
     let (_dir, config, db, at) = initialized_health_fixture();
     let (_config_dir, before) = run_health(&config, &["--min-free-mib", "0"]);
@@ -1324,6 +1391,292 @@ fn confirmed_current_mine_is_completed_participation_with_retained_finality_foll
     assert_eq!(stale["healthy"], false);
     assert_eq!(stale["components"]["mine"]["state"], "unknown");
     assert_ne!(stale["work"]["mine"]["progress"], "complete");
+}
+
+#[test]
+fn confirmed_current_judgment_is_accepted_with_nonblocking_finality_followup() {
+    use agmi::config::CountLimit;
+    use serde_json::json;
+    let (_dir, mut config, db, at) = initialized_health_fixture();
+    diagnostic_lane(&mut config, &db, "judge", CountLimit::Bounded(4), at);
+    retained_remote(&db, "judge", "confirmed", 2, at);
+    db.execute(
+        "UPDATE runtime_state SET lane_participation=json_set(lane_participation,
+        '$.judge.assessment.locally_judgeable',json('false'),
+        '$.judge.assessment.eligible_candidates',0,
+        '$.judge.assessment.exclusions',json('{\"already_attempted\":1}'),
+        '$.judge.assessment.excluded_work',json('[{\"work_key\":\"2:retained\",\"reason\":\"already_attempted\"}]'),
+        '$.judge.assessment.excluded_work_truncated',json('false'))",
+        [],
+    )
+    .unwrap();
+    let path = config
+        .state_dir
+        .parent()
+        .unwrap()
+        .join("diagnostic-config.toml");
+    fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+    let version: i64 = db
+        .query_row("PRAGMA data_version", [], |row| row.get(0))
+        .unwrap();
+    for command in ["status", "health", "doctor"] {
+        let mut process = Command::new(env!("CARGO_BIN_EXE_agmi"));
+        process
+            .arg("--config")
+            .arg(&path)
+            .args(["--json", command, "--verbose"]);
+        if command == "health" {
+            process.args(["--min-free-mib", "0"]);
+        }
+        let output = process.output().unwrap();
+        let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let report = &envelope["data"];
+        assert!(output.status.success(), "{command}: {envelope}");
+        assert_eq!(report["healthy"], true, "{command}: {report}");
+        assert_eq!(report["operational"]["status"], "clear");
+        assert_eq!(report["components"]["judge"]["state"], "ok");
+        assert_eq!(report["work"]["judge"]["progress"], "idle");
+        assert_eq!(
+            report["work"]["judge"]["next_action"],
+            "observe_assignments"
+        );
+        assert_eq!(
+            report["work"]["judge"]["intervention"]["status"],
+            "none_required"
+        );
+        assert_eq!(report["pending_work"][0]["state"], "confirmed");
+        assert_eq!(
+            report["pending_work"][0]["nonblocking_for_fresh_work"],
+            true
+        );
+        assert_eq!(report["risk"]["background_remote_work"], 1);
+        assert_eq!(report["risk"]["attention_required"], true);
+        assert_eq!(
+            report["work"]["judge"]["background_recovery"]["bound_count"],
+            1
+        );
+        assert_eq!(
+            report["components"]["api"]["resources"][0]["dependency"],
+            "background_remote_work"
+        );
+        assert_eq!(
+            report["components"]["api"]["resources"][0]["health"]["state"],
+            "degraded"
+        );
+        assert_eq!(
+            report["lane_participation"]["judge"]["finality"],
+            "not_verified"
+        );
+        assert_eq!(report["issues"], json!([]));
+    }
+    let after: i64 = db
+        .query_row("PRAGMA data_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        after, version,
+        "diagnostics mutated confirmed participation"
+    );
+
+    // Acceptance of this receipt cannot establish fresh assignment inventory.
+    db.execute(
+        "UPDATE runtime_state SET lane_participation=json_set(lane_participation,
+        '$.judge.assessment.valid_until',0)",
+        [],
+    )
+    .unwrap();
+    for report in [
+        diagnostic_health(&config),
+        agmi::runtime::status(&config).unwrap(),
+    ] {
+        assert_eq!(report["healthy"], false, "{report}");
+        assert_eq!(report["operational"]["status"], "unknown");
+        assert_eq!(report["components"]["judge"]["state"], "unknown");
+        assert_ne!(report["work"]["judge"]["progress"], "idle");
+        assert_eq!(report["pending_work"][0]["state"], "confirmed");
+        assert_eq!(
+            report["pending_work"][0]["nonblocking_for_fresh_work"],
+            true
+        );
+        assert_eq!(report["risk"]["background_remote_work"], 1);
+    }
+
+    // Another current unknown is still unresolved even beside accepted work.
+    db.execute(
+        "INSERT INTO operations
+        (id,kind,work_key,state,request,generation,revision,created_at,updated_at)
+        SELECT 2,'judge','other-current','unknown','{}',generation,'fixture',?1,?1 FROM control",
+        [at],
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE runtime_state SET lane_participation=json_set(lane_participation,
+        '$.judge.assessment.valid_until',?1,
+        '$.judge.assessment.exclusions',json('{\"already_attempted\":2}'),
+        '$.judge.assessment.excluded_work',json('[{\"work_key\":\"2:retained\",\"reason\":\"already_attempted\"},{\"work_key\":\"other-current\",\"reason\":\"already_attempted\"}]'))",
+        [at + 3600],
+    )
+    .unwrap();
+    let blocked = diagnostic_health(&config);
+    assert_eq!(blocked["healthy"], false, "{blocked}");
+    assert_eq!(blocked["components"]["judge"]["state"], "blocked");
+    assert_eq!(
+        blocked["pending_work"][0]["nonblocking_for_fresh_work"],
+        true
+    );
+    assert_eq!(
+        blocked["pending_work"][1]["nonblocking_for_fresh_work"],
+        false
+    );
+    assert_eq!(blocked["risk"]["background_remote_work"], 1);
+    assert!(
+        blocked["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| issue == "current_work_outcome_unresolved")
+    );
+}
+
+#[test]
+fn model_failure_categories_require_model_attempt_failure_evidence() {
+    use agmi::config::CountLimit;
+    use serde_json::json;
+    for lane in ["answer", "judge"] {
+        for (state, execution, outcome, code, diagnostic, category) in [
+            (
+                "confirmed",
+                "completed",
+                "captured",
+                "captured",
+                "included",
+                None,
+            ),
+            ("final", "completed", "captured", "captured", "final", None),
+            (
+                "queued",
+                "completed",
+                "captured",
+                "captured",
+                "native_auth_unavailable",
+                None,
+            ),
+            ("rejected", "", "", "", "invalid_model_output", None),
+            (
+                "model_unknown",
+                "unknown",
+                "unknown",
+                "artifact_request_digest_mismatch",
+                "included",
+                Some("artifact_request_digest_mismatch"),
+            ),
+            (
+                "prelaunch_failed",
+                "not_started",
+                "not_started",
+                "native_auth_unavailable",
+                "included",
+                Some("native_auth_unavailable"),
+            ),
+            (
+                "prelaunch_failed",
+                "not_started",
+                "not_started",
+                "executable_unavailable",
+                "included",
+                Some("executable_unavailable"),
+            ),
+            (
+                "rejected",
+                "completed",
+                "invalid",
+                "native_artifact_invalid",
+                "included",
+                Some("native_artifact_invalid"),
+            ),
+        ] {
+            let (_dir, mut config, db, at) = initialized_health_fixture();
+            diagnostic_lane(&mut config, &db, lane, CountLimit::Bounded(4), at);
+            let completion = (!outcome.is_empty()).then(|| json!({
+                "phase":if execution == "not_started" {"preflight"} else {"artifact_validation"},
+                "execution":execution,"outcome":outcome,"reason_code":code,
+                "collected_at":at,"preflight_started_at":at,
+                "inference_spawned_at":if execution == "not_started" {None} else {Some(at)},
+                "reported":{},
+                "cancellation":{"requested_at":null,"local_process_stop":"not_requested",
+                    "remote_run_stop":"not_requested"}
+            }));
+            let attempt = completion.map(|completion| json!({
+                "producer":{"requested":{"model":"fixture-model"}},
+                "launch":if execution == "not_started" {Value::Null} else {json!({"admitted_at":at})},
+                "completion":completion
+            }));
+            db.execute(
+                "INSERT INTO operations
+                (id,kind,work_key,state,request,payload,generation,revision,created_at,updated_at,txid,job_id,binding_revision)
+                SELECT 1,?1,'2:attempt',?2,?3,?4,generation,'fixture',?5,?5,?6,?7,1 FROM control",
+                rusqlite::params![
+                    lane, state, json!({"solver":{"epoch":2}}).to_string(),
+                    (outcome == "captured").then_some("{}"), at,
+                    matches!(state, "confirmed" | "final").then(|| "a".repeat(64)),
+                    (state == "queued").then_some("fixture-job")
+                ],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO operation_evidence(operation_id,evidence,model_attempt)
+                VALUES(1,?1,?2)",
+                rusqlite::params![
+                    json!({"reason":diagnostic}).to_string(),
+                    attempt.as_ref().map(Value::to_string)
+                ],
+            )
+            .unwrap();
+            for report in [
+                diagnostic_health(&config),
+                agmi::runtime::status(&config).unwrap(),
+            ] {
+                let model = &report["work"][lane]["model"];
+                assert_eq!(model["operation_id"], 1, "{lane}/{state}: {report}");
+                assert_eq!(
+                    model["failure_category"],
+                    json!(category),
+                    "{lane}/{state}: {report}"
+                );
+                assert_eq!(model["current_route"], true);
+                assert_eq!(
+                    model["budget_used"],
+                    if execution == "not_started" { 0 } else { 1 }
+                );
+                assert_eq!(
+                    model["unresolved_attempts"],
+                    if execution == "unknown" || execution.is_empty() {
+                        1
+                    } else {
+                        0
+                    }
+                );
+                if code == "native_auth_unavailable" {
+                    assert_eq!(
+                        report["work"][lane]["intervention"]["reason"],
+                        "model_authentication_failed"
+                    );
+                } else if code == "executable_unavailable" {
+                    assert_eq!(
+                        report["work"][lane]["intervention"]["reason"],
+                        "model_configuration_failed"
+                    );
+                }
+            }
+            let retained: Option<String> = db
+                .query_row(
+                    "SELECT model_attempt FROM operation_evidence WHERE operation_id=1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(retained, attempt.as_ref().map(Value::to_string));
+        }
+    }
 }
 
 #[test]

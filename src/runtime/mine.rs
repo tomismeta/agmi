@@ -35,6 +35,14 @@ impl MineLane {
             return Ok(());
         };
         let observation = services.observation(&read.flight)?;
+        services.participation(
+            &observation,
+            &json!({
+                "source":"validated_challenge","observed_at":read.flight.completed_at,
+                "valid_until":observation.admit_before_unix,"completeness":"single_challenge",
+                "assessment_creates_model_work":false,"outcome":"unobserved"
+            }),
+        )?;
         if let Some(op) = read.target {
             let binding = services.binding(&op)?;
             if !services.draft_current(&binding)? {
@@ -71,7 +79,6 @@ impl MineLane {
             && self.read.is_none()
             && self.ready.is_none()
             && services.active()?
-            && services.admission_allowed(&op)?
             && op.next_at <= services.deadline_now()
             && services.fresh_allowed(op.id)
             && let Some(flight) = services.begin_discovery()?

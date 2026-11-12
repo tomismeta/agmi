@@ -36,9 +36,35 @@ class NativeFailure(Exception):
         self.kind = kind
 
 
+
+def validate_turn(agent, result, invocation_id, prompt, output):
+    turn = result.get("turn_id")
+    if (agent.session_id != invocation_id
+            or getattr(agent, "_current_task_id", None) != invocation_id
+            or getattr(agent, "_current_turn_id", None) != turn
+            or not isinstance(turn, str)
+            or not re.fullmatch(re.escape(f"{invocation_id}:{invocation_id}:") + r"[0-9a-f]{8}", turn)):
+        raise NativeFailure("binding")
+    messages = result.get("messages")
+    index = result.get("current_turn_user_idx")
+    if (not isinstance(messages, list) or type(index) is not int
+            or index < 0 or len(messages) != index + 2
+            or any(not isinstance(messages[i], dict) or messages[i].get("role") != "system"
+                   for i in range(index))):
+        raise NativeFailure("binding")
+    user, assistant = messages[index], messages[-1]
+    if (not isinstance(user, dict) or user.get("role") != "user" or user.get("content") != prompt
+            or not isinstance(assistant, dict) or assistant.get("role") != "assistant"
+            or assistant.get("content") != output
+            or assistant.get("tool_calls") or assistant.get("function_call")):
+        raise NativeFailure("binding")
+
 def main():
     global STARTED, PRELAUNCH_CODE, REPORTED
     payload = json.load(sys.stdin)
+    invocation_id = identifier(payload.get("invocation_id"))
+    if invocation_id is None:
+        raise RuntimeError("missing native invocation identity")
     tree = ast.parse(sys.argv[1])
     roots = []
     for node in ast.walk(tree):
@@ -63,11 +89,11 @@ def main():
         from hermes_state import SessionDB
         required = {"skip_context_files", "skip_memory", "skip_background_review",
                     "fallback_model", "enabled_toolsets", "run_budget_seconds",
-                    "session_db", "side_agent", "cwd", "requested_provider"}
+                    "session_db", "session_id", "side_agent", "cwd", "requested_provider"}
         if not required <= set(inspect.signature(AIAgent).parameters):
             raise RuntimeError("unsupported Hermes embedding isolation API")
-        if "system_message" not in inspect.signature(AIAgent.run_conversation).parameters:
-            raise RuntimeError("unsupported Hermes privileged policy API")
+        if not {"system_message", "task_id"} <= set(inspect.signature(AIAgent.run_conversation).parameters):
+            raise RuntimeError("unsupported Hermes policy or turn identity API")
         PRELAUNCH_CODE = 79
         runtime = resolve_runtime_provider(requested="openai-codex", target_model=payload["model"])
         PRELAUNCH_CODE = 80
@@ -88,7 +114,7 @@ def main():
                 reasoning_config={"enabled": True, "effort": payload["reasoning"]},
                 quiet_mode=True, save_trajectories=False, verbose_logging=False,
                 skip_context_files=True, skip_memory=True, skip_background_review=True,
-                session_db=db, side_agent=True, platform="subagent", cwd=os.getcwd(),
+                session_db=db, session_id=invocation_id, side_agent=True, platform="subagent", cwd=os.getcwd(),
                 ephemeral_system_prompt="No tools or external actions. Return only the requested JSON artifact.")
             for attribute in ("compression_enabled", "codex_responses_native_compaction", "_skip_mcp_refresh"):
                 if not hasattr(agent, attribute):
@@ -102,13 +128,17 @@ def main():
                 raise RuntimeError("model route mismatch")
             if agent.reasoning_config != {"enabled": True, "effort": payload["reasoning"]}:
                 raise RuntimeError("reasoning setting changed")
+            if agent.session_id != invocation_id:
+                raise RuntimeError("native session identity changed")
             REPORTED = capture(agent)
             STARTED = True
             # Policy uses the inspected native privileged channel. The user
             # message contains only the envelope; this is not semantic validation
             # or a claim that model prompt injection is solved.
-            result = agent.run_conversation(payload["prompt"], system_message=payload["policy"])
+            result = agent.run_conversation(
+                payload["prompt"], system_message=payload["policy"], task_id=invocation_id)
             REPORTED = capture(agent)
+            REPORTED["native_turn_id"] = identifier(result.get("turn_id"))
             if (result.get("completed") is not True or result.get("partial")
                     or result.get("interrupted") or result.get("failed")):
                 raise NativeFailure("incomplete")
@@ -117,6 +147,7 @@ def main():
             output = result.get("final_response")
             if not isinstance(output, str) or len(output.encode("utf-8")) > 65536:
                 raise NativeFailure("output")
+            validate_turn(agent, result, invocation_id, payload["prompt"], output)
             envelope = {**REPORTED, "output": output}
         finally:
             if agent is not None:

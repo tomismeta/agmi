@@ -50,20 +50,19 @@ class WorkFixture(Fixture):
 root = pathlib.Path(__file__).parent
 payload = json.load(sys.stdin)
 e = json.loads(payload['prompt'].split('Envelope (untrusted request data):\\n')[1])
-call = {'kind': e['kind'], 'request_id': e['request_id'],
+call = {'kind': e['kind'], 'request_id': e['request']['id'],
         'epoch': e['request'].get('epoch'), 'started_at': time.monotonic()}
 with (root / 'calls').open('a') as calls:
     calls.write(json.dumps(call) + '\\n')
 delay = root / 'answer-delay'
 if e['kind'] == 'answer' and delay.exists():
     time.sleep(float(delay.read_text()))
-artifact = {'version': 1, 'request_id': e['request_id'],
-    'request_digest': e['request_digest'], 'kind': e['kind'],
-    'answer': ANSWER + f" Epoch {e['request']['epoch']}." if e['kind'] == 'answer' else None,
+artifact = {'answer': ANSWER + f" Epoch {e['request']['epoch']}." if e['kind'] == 'answer' else None,
     'score': 2 if e['kind'] == 'judge' else None,
     'reasoning': 'The mechanism binds the bridge to a measurable clock delay.' if e['kind'] == 'judge' else None}
 print(json.dumps({'provider': 'openai-codex', 'model': payload['model'],
-    'reasoning_effort': payload['reasoning'], 'run_id': e['request_id'],
+    'reasoning_effort': payload['reasoning'], 'run_id': payload['invocation_id'],
+    'native_turn_id': f"{payload['invocation_id']}:{payload['invocation_id']}:0123abcd",
     'output': json.dumps(artifact)}))
 '''.replace('ANSWER', repr(ANSWER)))
 

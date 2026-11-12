@@ -503,6 +503,12 @@ fn describe(path: &str, value: &Value, settings: &mut Vec<Value>) {
         setting["minimum"] = json!(0);
         setting["maximum"] = json!(8);
     }
+    if path.ends_with(".schedule.observation_max_age_seconds") {
+        setting["minimum"] = json!(1);
+        setting["description"] = json!(
+            "Maximum discovery evidence age from original read completion, independent of HTTP deadlines. Successful polling is clamped to half this age; retry floors still apply."
+        );
+    }
     if path.starts_with("network.api.") {
         setting["change_conditions"] = json!({
             "when_initialized": ["controller_stopped", "journal_drained"],

@@ -18,6 +18,7 @@ import tempfile
 import threading
 import time
 import uuid
+import urllib.parse
 
 
 def main():
@@ -76,7 +77,8 @@ def main():
                         'pending_meta': {'expires_at_epoch': 25}}], 'has_more': False,
                         'offset': 0, 'limit': 50, 'total': 1}
                 if args.slow_inventory:
-                    if 'offset=' not in self.path:
+                    offset = int(urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get('offset', ['0'])[0])
+                    if offset == 0:
                         # Simulate elapsed time within this still-running cycle.
                         with sqlite3.connect(shared['database']) as connection:
                             connection.execute('UPDATE runtime_state SET observed_at=?',
@@ -138,26 +140,24 @@ def main():
             native.chmod(0o700)
             (root / 'package.json').write_text(json.dumps({'name': 'openclaw', 'type': 'module',
                 'exports': {'./plugin-sdk/gateway-runtime': './gateway.mjs'}}))
-            (root / 'gateway.mjs').write_text('''
+            gateway_source = '''
 import {appendFileSync} from 'node:fs';
 export async function callGatewayFromCli(_method, _options, params) {
  const e=JSON.parse(params.message.split('Envelope (untrusted request data):\\n')[1]);
  appendFileSync(new URL('./calls',import.meta.url),e.kind+'\\n');
  /*stall*/
  const answer='A clock delays each bridge crossing until a bonded claim matures. Every new identity must lock ten units for a full day; ten fake claims therefore lock one hundred units.';
- const artifact={version:1,request_id:e.request_id,request_digest:e.request_digest,kind:e.kind,
- answer:e.kind==='answer'?answer:null,score:e.kind==='judge'?2:null,
+ const artifact={answer:e.kind==='answer'?answer:null,score:e.kind==='judge'?2:null,
  reasoning:e.kind==='judge'?'The mechanism binds the bridge to a measurable clock delay.':null};
- return {status:'ok',runId:params.idempotencyKey,result:{payloads:[{text:JSON.stringify(artifact)}],
+ return {status:'ok',runId:params.idempotencyKey,result:{payloads:[{text:JSON.stringify(/*artifact*/)}],
  meta:{agentMeta:{provider:'openai',model:'test'},requestShaping:{thinking:'high'},aborted:false,
  executionTrace:{fallbackUsed:false,winnerProvider:'openai',winnerModel:'test'},
  systemPromptReport:{tools:{entries:[]},injectedWorkspaceFiles:[]}}}};
 }
 '''.replace('/*stall*/', "if(e.kind==='judge') await new Promise(resolve=>setTimeout(resolve,8000));"
-                if args.stalled_judge else ''))
-            if args.harness == 'hermes':
-                interpreter = root / 'fixture-python'
-                interpreter.write_text(f'#!{sys.executable}\n' + '''
+                if args.stalled_judge else '')
+            interpreter = root / 'fixture-python'
+            hermes_source = f'#!{sys.executable}\n' + '''
 import json, pathlib, sys, time
 payload = json.load(sys.stdin)
 envelope = json.loads(payload['prompt'].split('Envelope (untrusted request data):\\n')[1])
@@ -165,18 +165,42 @@ kind = envelope['kind']
 with pathlib.Path(__file__).with_name('calls').open('a') as calls:
     calls.write(kind + '\\n')
 /*stall*/
-artifact = {'version': 1, 'request_id': envelope['request_id'],
-    'request_digest': envelope['request_digest'], 'kind': kind,
-    'answer': 'A clock delays each bridge crossing until a bonded claim matures. Every new identity must lock ten units for a full day; ten fake claims therefore lock one hundred units.' if kind == 'answer' else None,
+artifact = {'answer': 'A clock delays each bridge crossing until a bonded claim matures. Every new identity must lock ten units for a full day; ten fake claims therefore lock one hundred units.' if kind == 'answer' else None,
     'score': 2 if kind == 'judge' else None,
     'reasoning': 'The mechanism binds the bridge to a measurable clock delay.' if kind == 'judge' else None}
-print(json.dumps({'provider': 'openai-codex', 'model': payload['model'],
-    'reasoning_effort': payload['reasoning'], 'run_id': envelope['request_id'],
-    'output': json.dumps(artifact)}))
-'''.replace('/*stall*/', "if kind == 'judge': time.sleep(8)" if args.stalled_judge else ''))
-                interpreter.chmod(0o700)
-                runtime = json.dumps([str(interpreter), '-I', '-c', 'fixture-bootstrap'])
-                native.write_text("#!/bin/sh\nprintf '%s' '" + runtime + "'\n")
+native = {'provider': 'openai-codex', 'model': payload['model'],
+          'reasoning_effort': payload['reasoning']}
+/*binding*/
+native['output'] = json.dumps(artifact)
+print(json.dumps(native))
+'''.replace('/*stall*/', "if kind == 'judge': time.sleep(8)" if args.stalled_judge else '')
+
+            def install_native_fixture(*, legacy):
+                # Historical wire format is an explicit test phase, never an
+                # input-detected fallback in the current model fixture.
+                assert not legacy or args.baseline or args.old_binary
+                gateway_artifact = (
+                    '{version:1,request_id:e.request_id,request_digest:e.request_digest,'
+                    'kind:e.kind,...artifact}'
+                ) if legacy else 'artifact'
+                hermes_binding = (
+                    "artifact.update(version=1, request_id=envelope['request_id'], "
+                    "request_digest=envelope['request_digest'], kind=kind)\n"
+                    "native['run_id'] = envelope['request_id']"
+                ) if legacy else (
+                    "native['run_id'] = payload['invocation_id']\n"
+                    "native['native_turn_id'] = "
+                    "f\"{payload['invocation_id']}:{payload['invocation_id']}:0123abcd\""
+                )
+                (root / 'gateway.mjs').write_text(
+                    gateway_source.replace('/*artifact*/', gateway_artifact))
+                if args.harness == 'hermes':
+                    interpreter.write_text(hermes_source.replace('/*binding*/', hermes_binding))
+                    interpreter.chmod(0o700)
+                    runtime = json.dumps([str(interpreter), '-I', '-c', 'fixture-bootstrap'])
+                    native.write_text("#!/bin/sh\nprintf '%s' '" + runtime + "'\n")
+
+            install_native_fixture(legacy=args.baseline or bool(args.old_binary))
             config = root / 'config.toml'
             core_original = {
                 'answer': 'Produce an original mechanism with meaningful required words.',
@@ -400,6 +424,7 @@ mode = "off"
                 legacy_config.write_bytes(config.read_bytes())
                 legacy_schema = int(invoke('build-info')['data']['journal_schema'])
                 command[0] = binary
+                install_native_fixture(legacy=False)
                 denied = subprocess.run(command + ['run', '--once'], capture_output=True, text=True, timeout=10)
                 assert denied.returncode != 0, 'legacy config/journal silently adopted'
                 request = {'caps': {'answer': 1, 'judge': 1, 'mine': 1}}
@@ -520,6 +545,8 @@ mode = "off"
             print(json.dumps({'mode': mode,
                 'cold_restart': True, 'epoch_observed': 11, 'wallet_mutations': 1,
                 'unknown_preserved': True, 'answer_preparations': prepared,
+                'initial_native_fixture': 'legacy' if args.baseline or args.old_binary else 'current',
+                'restart_native_fixture': 'legacy' if args.baseline else 'current',
                 'core_edit_preserved_captured_work': captured is not None,
                 'health_blocked': True}))
     finally:

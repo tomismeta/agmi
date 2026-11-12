@@ -14,6 +14,8 @@ Core and user guidance are explicitly sent to the model and retained in private 
 
 Model-generated grading candidates/history are untrusted content, never executable instructions. Structured output validation and request binding are required even when the model is trusted. Hermes separates policy through native `system_message`; the supported OpenClaw route combines policy and data in an ordinary message. Neither structured validation nor delimiting text proves prompt-injection resistance or semantic correctness.
 
+Models do not supply binding identifiers or provenance. Rust owns the invocation identity and checks native completion against that invocation; the Hermes adapter also verifies the current native turn and message boundary. This prevents accepting a different invocation's captured envelope as the current result, but does not defend against a malicious native harness forging evidence or establish semantic answer correctness. Old binding failures remain unresolved and charged.
+
 Model failure diagnostics are typed, allowlisted codes, not raw native stderr or provider text. Do not add prompts, account identifiers, tokens or response bodies to public events, health warnings or agent-forwarded findings. A warning is not evidence that an uncertain operation is safe to repeat.
 
 ## Network and outcomes

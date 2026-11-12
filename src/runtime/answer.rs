@@ -65,7 +65,7 @@ impl AnswerLane {
         };
         let observation = services.observation(&read.flight)?;
         services.participation(&observation, &json!({"source":"validated_challenge","observed_at":read.flight.completed_at,
-            "valid_until":read.flight.completed_at.saturating_add(services.config().timeouts.read_http_seconds as i64),
+            "valid_until":observation.admit_before_unix,
             "completeness":"single_challenge","observed_opportunities":1,
             "locally_eligible":!challenge.answered,"exclusion_reason":if challenge.answered {Some("already_answered")} else {None},
             "assessment_creates_model_work":false,"outcome":"unobserved"}))?;
@@ -185,12 +185,13 @@ impl AnswerLane {
                 }
             }
         }
+        // Revalidation may retire a superseded draft even when effect admission
+        // is closed. Capacity and dispatch floors do not invalidate reusable work.
         let preparation = services.preparation()?;
         if let Some(op) = preparation
             && self.read.is_none()
             && self.ready.is_none()
             && services.active()?
-            && services.admission_allowed(&op)?
             && op.next_at <= services.deadline_now()
             && services.fresh_allowed(op.id)
             && let Some(flight) = services.begin_discovery()?

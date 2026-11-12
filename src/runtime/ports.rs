@@ -87,14 +87,6 @@ impl HostAccess {
     pub(in crate::runtime) fn effect_busy(&self) -> bool {
         self.effect.is_some()
     }
-    pub(in crate::runtime) fn scoped_admission_allowed(
-        &self,
-        lane: LaneId,
-        op: &Operation,
-    ) -> Result<bool> {
-        self.scoped_binding(lane, op)?;
-        self.admission_allowed(op)
-    }
     pub(in crate::runtime) fn scoped_ready_current(
         &self,
         lane: LaneId,
@@ -119,7 +111,7 @@ impl HostAccess {
     ) -> Result<Observation> {
         self.validate_read(lane, flight)?;
         let completed = flight.completed()?;
-        let budget = Duration::from_secs(self.config.timeouts(lane).read_http_seconds);
+        let budget = Duration::from_secs(self.config.schedule(lane).observation_max_age_seconds);
         Ok(Observation {
             stamp: flight
                 .lane_stamp
@@ -184,6 +176,12 @@ impl HostAccess {
             None,
             offset,
         )
+    }
+    pub(in crate::runtime) fn judge_inventory_offset(&self) -> Result<u64> {
+        self.store.judge_inventory_offset()
+    }
+    pub(in crate::runtime) fn set_judge_inventory_offset(&self, offset: u64) -> Result<()> {
+        self.store.set_judge_inventory_offset(offset)
     }
     pub(in crate::runtime) fn begin_hydration(
         &mut self,

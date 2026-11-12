@@ -66,6 +66,13 @@ fn resource_target(endpoint: Endpoint, resource: &str) -> Result<String> {
     Ok(format!("{}:{resource}", endpoint_name(endpoint)?))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReconciliationService {
+    Recent,
+    Fair,
+    Missing,
+}
+
 const RECONCILIATION_PAGE_SIZE: usize = 64;
 const RECONCILIATION_SELECT: &str = "WITH page AS MATERIALIZED (
     SELECT id,binding_revision,txid,job_id,next_at
@@ -252,7 +259,38 @@ impl Store {
         let local = if backoff.failures > 0 {
             backoff.next_at
         } else {
-            self.next_at(lane)?.max(backoff.next_at)
+            let success: Option<i64> = self
+                .db
+                .query_row(
+                    "SELECT last_success_at FROM read_state
+                WHERE owner=?1 AND purpose='discovery' AND resource=?2 AND retired=0",
+                    params![
+                        lane.as_str(),
+                        if lane == LaneId::Judge {
+                            "assignments"
+                        } else {
+                            "challenge"
+                        }
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten();
+            let cadence = self.next_at(lane)?;
+            // Old persisted poll deadlines may exceed the observation's new
+            // refresh budget. Clamp only successful cadence, never a read
+            // backoff or server floor, and never rebase from the current time.
+            let cadence = success.map_or(cadence, |at| {
+                cadence.min(
+                    at.saturating_add(
+                        config
+                            .discovery_poll_seconds(lane, config.schedule(lane).jitter_seconds)
+                            .min(i64::MAX as u64) as i64,
+                    )
+                    .saturating_add(1),
+                )
+            });
+            cadence.max(backoff.next_at)
         };
         let endpoint = if lane == LaneId::Judge {
             Endpoint::Assignments
@@ -644,13 +682,38 @@ impl Store {
     }
 
     pub(crate) fn reconciliation_batch(&self, lane: LaneId) -> Result<Vec<Operation>> {
-        self.reconciliation_candidates(lane, now())?
+        self.reconciliation_selection(lane, now())?
             .into_iter()
-            .map(|id| {
+            .map(|(id, _)| {
                 self.operation(id)?
                     .context("recovery operation disappeared")
             })
             .collect()
+    }
+
+    pub(crate) fn reconciliation_plan(
+        &self,
+        lane: LaneId,
+    ) -> Result<Vec<(Operation, ReconciliationService)>> {
+        self.reconciliation_selection(lane, now())?
+            .into_iter()
+            .map(|(id, service)| {
+                Ok((
+                    self.operation(id)?
+                        .context("recovery operation disappeared")?,
+                    service,
+                ))
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn reconciliation_candidates(&self, lane: LaneId, at: i64) -> Result<Vec<i64>> {
+        Ok(self
+            .reconciliation_selection(lane, at)?
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect())
     }
 
     fn reconciliation_schedule(&self, name: &str) -> Result<(i64, i64, bool)> {
@@ -676,7 +739,14 @@ impl Store {
         Ok(())
     }
 
-    fn reconciliation_candidates(&self, lane: LaneId, at: i64) -> Result<Vec<i64>> {
+    fn reconciliation_selection(
+        &self,
+        lane: LaneId,
+        at: i64,
+    ) -> Result<Vec<(i64, ReconciliationService)>> {
+        // Selection may advance past ineligible rows, but only a successful
+        // claim may consume an eligible fair or missing candidate.
+        let tx = rusqlite::Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
         let recent_name = format!("reconciliation:{}", lane.as_str());
         let fair_name = format!("reconciliation:fair:{}", lane.as_str());
         let missing_name = format!("reconciliation:missing:{}", lane.as_str());
@@ -686,9 +756,6 @@ impl Store {
             return Ok(Vec::new());
         }
         let missing = self.reconciliation_schedule(&missing_name)?;
-        // Cursor selection now writes durable progress. Acquire the writer before
-        // reading a snapshot; a deferred upgrade can fail during live config/control writes.
-        let tx = rusqlite::Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
         let identity: String =
             self.db
                 .query_row("SELECT identity FROM control WHERE singleton=1", [], |r| {
@@ -735,8 +802,9 @@ impl Store {
                 for row in rows {
                     let (id, missing, eligible) = row?;
                     last = id;
-                    if candidate.is_none() && id != exclude && missing == missing_only && eligible {
+                    if id != exclude && missing == missing_only && eligible {
                         candidate = Some(id);
+                        break;
                     }
                 }
                 Ok((candidate, last))
@@ -779,34 +847,44 @@ impl Store {
                 self.set_reconciliation_cursor(&head_name, newest)?;
             }
             if let Some(candidate) = candidate {
-                candidates.push(candidate);
+                candidates.push((candidate, ReconciliationService::Recent));
             }
         }
         if fair.0 <= at {
-            let exclude = candidates.first().copied().unwrap_or(0);
+            let exclude = candidates.first().map_or(0, |(id, _)| *id);
             let (ordinary, ordinary_last) = select(fair.1, exclude, false)?;
             // Missing work owns a separate descending walk. Alternation and
             // its sparse service floor are independent of traversal progress.
             let historical = if missing.0 <= at && (!fair.2 || ordinary.is_none()) {
                 let (candidate, last) = select(missing.1, exclude, true)?;
-                self.set_reconciliation_cursor(&missing_name, candidate.unwrap_or(last))?;
+                self.set_reconciliation_cursor(
+                    &missing_name,
+                    candidate.map_or(last, |id| id.saturating_add(1)),
+                )?;
                 candidate
             } else {
                 None
             };
             self.set_reconciliation_cursor(
                 &fair_name,
-                match ordinary {
-                    // Preserve an eligible ordinary candidate when missing
-                    // work takes this slot; only skipped rows are consumed.
-                    Some(id) if historical.is_some() => id.saturating_add(1),
-                    Some(id) => id,
-                    None => ordinary_last,
-                },
+                ordinary.map_or(ordinary_last, |id| id.saturating_add(1)),
             )?;
             if let Some(candidate) = historical.or(ordinary) {
-                candidates.push(candidate);
+                candidates.push((
+                    candidate,
+                    if historical.is_some() {
+                        ReconciliationService::Missing
+                    } else {
+                        ReconciliationService::Fair
+                    },
+                ));
             }
+        }
+        // With one free flight, the older unserved cadence wins. Claiming it
+        // moves its durable deadline behind the other cadence, including after
+        // restart; fresh arrivals cannot permanently monopolize the free slot.
+        if candidates.len() == 2 && fair.0 < recent.0 {
+            candidates.swap(0, 1);
         }
         drop(stmt);
         tx.commit()?;
@@ -824,12 +902,33 @@ impl Store {
         self.reconciliation_read_started_at(config, lane, key, now())
     }
 
+    pub(crate) fn reconciliation_read_claimed(
+        &self,
+        config: &Config,
+        lane: LaneId,
+        key: &ReadKey,
+        service: ReconciliationService,
+    ) -> Result<bool> {
+        self.reconciliation_claim_at(config, lane, key, now(), Some(service))
+    }
+
     fn reconciliation_read_started_at(
         &self,
         config: &Config,
         lane: LaneId,
         key: &ReadKey,
         at: i64,
+    ) -> Result<bool> {
+        self.reconciliation_claim_at(config, lane, key, at, None)
+    }
+
+    fn reconciliation_claim_at(
+        &self,
+        config: &Config,
+        lane: LaneId,
+        key: &ReadKey,
+        at: i64,
+        service: Option<ReconciliationService>,
     ) -> Result<bool> {
         self.continuity()?;
         let ReadKey::Operation { operation_id, .. } = key else {
@@ -848,19 +947,23 @@ impl Store {
             params![operation_id, lane.as_str()],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        let recent = self.reconciliation_schedule(&format!("reconciliation:{}", lane.as_str()))?;
-        let fair = missing || recent.0 > at;
-        if next_at > at
-            || (fair
-                && self
-                    .reconciliation_schedule(&format!("reconciliation:fair:{}", lane.as_str()))?
-                    .0
-                    > at)
-            || (missing
-                && self
-                    .reconciliation_schedule(&format!("reconciliation:missing:{}", lane.as_str()))?
-                    .0
-                    > at)
+        let recent_name = format!("reconciliation:{}", lane.as_str());
+        let fair_name = format!("reconciliation:fair:{}", lane.as_str());
+        let missing_name = format!("reconciliation:missing:{}", lane.as_str());
+        let recent = self.reconciliation_schedule(&recent_name)?;
+        let service = service.unwrap_or(if missing {
+            ReconciliationService::Missing
+        } else if recent.0 > at {
+            ReconciliationService::Fair
+        } else {
+            ReconciliationService::Recent
+        });
+        let fair = service != ReconciliationService::Recent;
+        if missing != (service == ReconciliationService::Missing)
+            || next_at > at
+            || (!fair && recent.0 > at)
+            || (fair && self.reconciliation_schedule(&fair_name)?.0 > at)
+            || (missing && self.reconciliation_schedule(&missing_name)?.0 > at)
         {
             return Ok(false);
         }
@@ -885,23 +988,36 @@ impl Store {
             at.saturating_add(seconds.min(i64::MAX as u64) as i64)
                 .saturating_add(1)
         };
-        let name = if fair {
-            format!("reconciliation:fair:{}", lane.as_str())
-        } else {
-            format!("reconciliation:{}", lane.as_str())
-        };
+        let name = if fair { &fair_name } else { &recent_name };
         tx.execute(
             "INSERT INTO schedule(kind,next_at,served_in_round) VALUES (?1,?2,?3)
             ON CONFLICT(kind) DO UPDATE SET next_at=excluded.next_at,
                 served_in_round=excluded.served_in_round",
             params![name, deadline(interval), missing],
         )?;
+        let cursor_name = match service {
+            ReconciliationService::Recent => None,
+            ReconciliationService::Fair => Some(&fair_name),
+            ReconciliationService::Missing => Some(&missing_name),
+        };
+        if let Some(cursor_name) = cursor_name {
+            // A captured run-once batch may outlive a later selection. Do not
+            // rewind a different walk when claiming that older snapshot.
+            tx.execute(
+                "UPDATE schedule SET cursor=?2 WHERE kind=?1 AND CAST(cursor AS INTEGER)=?3",
+                params![
+                    cursor_name,
+                    operation_id.to_string(),
+                    operation_id.saturating_add(1)
+                ],
+            )?;
+        }
         if missing {
             tx.execute(
                 "INSERT INTO schedule(kind,next_at) VALUES (?1,?2)
                 ON CONFLICT(kind) DO UPDATE SET next_at=excluded.next_at",
                 params![
-                    format!("reconciliation:missing:{}", lane.as_str()),
+                    missing_name,
                     deadline(schedule.backoff_max_seconds.max(interval))
                 ],
             )?;

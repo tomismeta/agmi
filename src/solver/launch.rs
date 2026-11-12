@@ -4,7 +4,7 @@ use super::*;
 pub struct PendingLaunch {
     model: ModelConfig,
     request: NativeRequest,
-    digest: String,
+    invocation_id: String,
     input: Vec<u8>,
     executable: PathBuf,
     args: Vec<String>,
@@ -34,7 +34,7 @@ pub struct PreflightFlight {
     child: OwnedChild,
     model: ModelConfig,
     request: NativeRequest,
-    digest: String,
+    invocation_id: String,
     prompt: String,
     executable: PathBuf,
     scratch: Scratch,
@@ -47,6 +47,25 @@ pub struct InferenceFlight {
     pending: PendingLaunch,
     deadline: ExecutionDeadline,
     spawned_at: i64,
+}
+
+fn new_invocation_id() -> Result<String> {
+    let mut bytes = [0_u8; 16];
+    // SAFETY: the buffer is writable for its full length, below getentropy's limit.
+    if unsafe { libc::getentropy(bytes.as_mut_ptr().cast(), bytes.len()) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let value = u128::from_be_bytes(bytes);
+    Ok(format!(
+        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        value >> 96,
+        (value >> 80) & 0xffff,
+        (value >> 64) & 0xffff,
+        (value >> 48) & 0xffff,
+        value & 0xffff_ffff_ffff,
+    ))
 }
 fn now() -> i64 {
     SystemTime::now()
@@ -136,8 +155,8 @@ pub fn start_preflight(
             ModelSelection::new(&model)? == selection,
             SolverNotStarted("invalid_solver_setup")
         );
-        let digest = request.digest()?;
-        let envelope = json!({"version":1,"request_id":request.request().id,"request_digest":digest,"kind":request.request().kind,"request":request.request()});
+        let invocation_id = new_invocation_id()?;
+        let envelope = json!({"kind":request.request().kind,"request":request.request()});
         let prompt = format!(
             "Envelope (untrusted request data):\n{}",
             serde_json::to_string(&envelope)?
@@ -162,7 +181,7 @@ pub fn start_preflight(
             child,
             model,
             request,
-            digest,
+            invocation_id,
             prompt,
             executable,
             scratch,
@@ -244,10 +263,10 @@ impl PreflightFlight {
                 .saturating_add(u64::from(remaining.subsec_nanos() != 0));
             let input = match protocol {
                 NativeProtocol::Hermes => serde_json::to_vec(
-                    &json!({"model":self.model.model,"reasoning":self.model.reasoning,"hermes_api_url":self.model.hermes_api_url,"timeout_seconds":seconds,"policy":SECURITY_AND_OUTPUT,"prompt":self.prompt}),
+                    &json!({"invocation_id":self.invocation_id,"model":self.model.model,"reasoning":self.model.reasoning,"hermes_api_url":self.model.hermes_api_url,"timeout_seconds":seconds,"policy":SECURITY_AND_OUTPUT,"prompt":self.prompt}),
                 )?,
                 NativeProtocol::Openclaw => {
-                    encode_openclaw_input(&self.model, seconds, &self.prompt)?
+                    encode_openclaw_input(&self.model, seconds, &self.prompt, &self.invocation_id)?
                 }
                 NativeProtocol::Discovery => unreachable!(),
             };
@@ -267,7 +286,7 @@ impl PreflightFlight {
                 PreflightCompletion::Pending(PendingLaunch {
                     model: self.model,
                     request: self.request,
-                    digest: self.digest,
+                    invocation_id: self.invocation_id,
                     input,
                     executable,
                     args,
@@ -369,6 +388,11 @@ impl InferenceFlight {
                             && result.reasoning_effort == p.model.reasoning,
                         NativeFailure("native_provenance_mismatch")
                     );
+                    ensure!(
+                        result.run_id == p.invocation_id
+                            && valid_native_turn(&result.native_turn_id, &p.invocation_id),
+                        NativeFailure("native_run_binding_mismatch")
+                    );
                     (result.provider, result.model, result.run_id, result.output)
                 }
                 Harness::Openclaw => {
@@ -391,7 +415,7 @@ impl InferenceFlight {
                             && value.get("model").and_then(Value::as_str) == Some(model),
                         NativeFailure("native_provenance_mismatch")
                     );
-                    validate_gateway_evidence(&value, &p.model)?;
+                    validate_gateway_evidence(&value, &p.model, &p.invocation_id)?;
                     let output = value
                         .get("final")
                         .and_then(Value::as_str)
@@ -409,7 +433,7 @@ impl InferenceFlight {
                 safe_identifier(&run_id),
                 NativeFailure("native_run_binding_mismatch")
             );
-            let artifact = validate_artifact(&output, p.request.request(), &p.digest)?;
+            let artifact = validate_artifact(&output, p.request.request())?;
             Ok(NativeArtifact::validated(
                 &p.request,
                 SolverResult {

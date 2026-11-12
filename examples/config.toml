@@ -75,6 +75,7 @@ model_seconds = 300
 
 [capabilities.answer.schedule]
 poll_seconds = 120
+observation_max_age_seconds = 120 # Independent of HTTP deadlines; polling is clamped to half this age.
 retry_seconds = 180
 backoff_max_seconds = 900
 jitter_seconds = 30 # Deterministic staggering; zero disables it.
@@ -135,6 +136,7 @@ model_seconds = 300
 
 [capabilities.judge.schedule]
 poll_seconds = 120
+observation_max_age_seconds = 120
 retry_seconds = 180
 backoff_max_seconds = 900
 jitter_seconds = 30
@@ -165,6 +167,7 @@ read_http_seconds = 90
 
 [capabilities.mine.schedule]
 poll_seconds = 120
+observation_max_age_seconds = 120
 retry_seconds = 180
 backoff_max_seconds = 900
 jitter_seconds = 30

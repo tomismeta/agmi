@@ -423,10 +423,7 @@ impl Protocol {
         deadline: ReadDeadline,
         meta: RequestMeta,
     ) -> Result<HostedResponse> {
-        ensure!(
-            offset <= 10_000 && (1..=100).contains(&limit),
-            "invalid inventory page bounds"
-        );
+        ensure!((1..=100).contains(&limit), "invalid inventory page bounds");
         self.request_query(
             Endpoint::Assignments,
             None,
@@ -2501,12 +2498,6 @@ mod tests {
         config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
         let mut protocol = Protocol::new(&config).unwrap();
         protocol.key = Some(HeaderValue::from_static("pk_fixture"));
-        assert!(
-            protocol
-                .assignment_page(10_001, 1, read_deadline(), meta())
-                .await
-                .is_err()
-        );
         assert!(
             protocol
                 .assignment_page(0, 101, read_deadline(), meta())

@@ -46,8 +46,10 @@ struct Inventory {
     // Each candidate retains the page's original authority and freshness deadline.
     sources: [Option<InventorySource>; 4],
     pages: usize,
+    start_offset: u64,
     offset: u64,
     complete: bool,
+    overlapping_pages: bool,
     more: bool,
     usable: bool,
     eligible_candidates: usize,
@@ -76,7 +78,7 @@ impl Inventory {
     }
 }
 enum JudgeReadKind {
-    Page,
+    Page { offset: u64 },
     Hydration { id: String },
 }
 struct JudgeRead {
@@ -117,7 +119,7 @@ impl JudgeLane {
             return Ok(());
         }
         match read.kind {
-            JudgeReadKind::Page => {
+            JudgeReadKind::Page { offset } => {
                 let Some(mut response) = response else {
                     if let Some(inventory) = self.inventory.as_mut() {
                         inventory.more = false;
@@ -137,8 +139,16 @@ impl JudgeLane {
                 let rows = response.body["assignments"]
                     .as_array_mut()
                     .context("assignment rows missing")?;
-                let complete = has_more == Some(false);
+                let page_complete = has_more == Some(false);
                 let more = has_more == Some(true) && !rows.is_empty();
+                let next_offset = offset.checked_add(rows.len() as u64).unwrap_or(0);
+                // Moving pages can repeat IDs. Advance by the page's raw length,
+                // not novel candidates, and wrap only at an explicit end/empty page.
+                services.set_inventory_offset(if page_complete || rows.is_empty() {
+                    0
+                } else {
+                    next_offset
+                })?;
                 if let Some(inventory) = self.inventory.as_mut() {
                     let known: std::collections::HashSet<_> =
                         inventory.ids.iter().map(String::as_str).collect();
@@ -152,6 +162,7 @@ impl JudgeLane {
                             added += 1;
                         }
                     }
+                    inventory.overlapping_pages |= added != ids.len();
                     ids.retain(|id| !known.contains(id.as_str()));
                     drop(known);
                     inventory.ids.append(&mut ids);
@@ -165,12 +176,14 @@ impl JudgeLane {
                         rows: end - added..end,
                     });
                     inventory.pages += 1;
-                    inventory.offset = inventory.offset.saturating_add(rows.len() as u64);
-                    inventory.complete = complete;
-                    inventory.more = more && added != 0 && inventory.pages < 4;
-                    inventory.response.body["has_more"] = json!(!complete);
+                    inventory.offset = next_offset;
+                    inventory.complete = page_complete
+                        && inventory.start_offset == 0
+                        && !inventory.overlapping_pages;
+                    inventory.more = more && inventory.pages < 4;
+                    inventory.response.body["has_more"] = json!(!page_complete);
                 } else {
-                    let offset = rows.len() as u64;
+                    let count = rows.len();
                     self.inventory = Some(Inventory {
                         response,
                         ids,
@@ -178,15 +191,17 @@ impl JudgeLane {
                             Some(InventorySource {
                                 observation,
                                 completed_at: read.flight.completed_at,
-                                rows: 0..offset as usize,
+                                rows: 0..count,
                             }),
                             None,
                             None,
                             None,
                         ],
                         pages: 1,
-                        offset,
-                        complete,
+                        start_offset: offset,
+                        offset: next_offset,
+                        complete: page_complete && offset == 0,
+                        overlapping_pages: false,
                         more,
                         usable: true,
                         eligible_candidates: 0,
@@ -251,12 +266,14 @@ impl JudgeLane {
         services: &mut GradeServices<'_>,
         target: Option<Target>,
     ) -> Result<bool> {
-        if let Some(flight) = services.begin_discovery(None)? {
+        let offset = services.inventory_offset()?;
+        if let Some(flight) = services.begin_discovery(Some(offset))? {
+            services.discovered()?;
             self.inventory = None;
             self.selected = None;
             self.read = Some(JudgeRead {
                 flight,
-                kind: JudgeReadKind::Page,
+                kind: JudgeReadKind::Page { offset },
                 target,
             });
             Ok(true)
@@ -297,6 +314,13 @@ impl JudgeLane {
                 PendingInputDecision::Wait(_reason) => {}
             }
         }
+        let retain_targeted_inventory = self.inventory.as_ref().is_some_and(|inventory| {
+            inventory.more
+                || inventory
+                    .target
+                    .as_ref()
+                    .is_some_and(|target| inventory.ids.iter().any(|id| id == target.id()))
+        }) || !services.discovery_allowed()?;
         if let Some(pending) = self.model.pending_work() {
             let key = pending.key;
             let id = pending
@@ -315,9 +339,10 @@ impl JudgeLane {
                     .inventory
                     .as_ref()
                     .and_then(|i| i.target.as_ref())
-                    .is_some_and(
-                        |target| matches!(target,Target::Pending(existing,_) if existing == &key),
-                    )
+                    .is_some_and(|target| {
+                        retain_targeted_inventory
+                            && matches!(target,Target::Pending(existing,_) if existing == &key)
+                    })
                 && services.fresh_allowed(key.operation.operation_id)
             {
                 self.start_inventory(services, Some(Target::Pending(key, id)))?;
@@ -332,13 +357,13 @@ impl JudgeLane {
                 .inventory
                 .as_ref()
                 .and_then(|i| i.target.as_ref())
-                .is_some_and(
-                    |target| matches!(target,Target::Prepared(current) if current.id == op.id),
-                );
+                .is_some_and(|target| {
+                    retain_targeted_inventory
+                        && matches!(target,Target::Prepared(current) if current.id == op.id)
+                });
             if !targeted
                 && services.active()?
                 && op.next_at <= services.deadline_now()
-                && services.admission_allowed(&op)?
                 && services.fresh_allowed(op.id)
                 && self.start_inventory(services, Some(Target::Prepared(op)))?
             {
@@ -372,7 +397,7 @@ impl JudgeLane {
             if let Some(flight) = services.begin_discovery(Some(offset))? {
                 self.read = Some(JudgeRead {
                     flight,
-                    kind: JudgeReadKind::Page,
+                    kind: JudgeReadKind::Page { offset },
                     target: None,
                 });
             }
@@ -381,9 +406,8 @@ impl JudgeLane {
             && services.discovery_allowed()?
             && self.inventory.as_ref().is_none_or(|i| i.target.is_none())
             && (!services.active()? || (self.selected.is_none() && !self.model.occupied()))
-            && self.start_inventory(services, None)?
         {
-            services.discovered()?;
+            self.start_inventory(services, None)?;
         }
         Ok(())
     }
@@ -494,8 +518,6 @@ impl JudgeLane {
                             "request_no_longer_current",
                         )?,
                     }
-                    self.inventory = None;
-                } else if !inventory.more {
                     self.inventory = None;
                 }
             } else if !inventory.more {
@@ -750,8 +772,10 @@ mod tests {
             },
             sources,
             pages: count,
+            start_offset: 0,
             offset: count as u64,
             complete: false,
+            overlapping_pages: false,
             more: count < 4,
             usable: true,
             eligible_candidates: 0,
@@ -844,7 +868,7 @@ mod tests {
         assert!(
             matches!(
                 lane.read.as_ref().map(|read| &read.kind),
-                Some(JudgeReadKind::Page)
+                Some(JudgeReadKind::Page { .. })
             ),
             "assessment must precede the next page, not await the whole traversal"
         );
@@ -907,6 +931,11 @@ mod tests {
         let mut config = Config::default();
         config.capabilities.judge.mode = Mode::ReadOnly;
         config.capabilities.judge.timeouts.read_http_seconds = 15;
+        config
+            .capabilities
+            .judge
+            .schedule
+            .observation_max_age_seconds = 15;
         let (_temp, mut runtime, _stop) = tests::fixture_with(config);
         let mut inventory = paged_inventory(&runtime, 4);
         // Four six-second reads: at page four, page one is eighteen seconds old.
@@ -956,8 +985,8 @@ mod tests {
         lane.inventory.as_mut().unwrap().target = Some(Target::Prepared(op.clone()));
         lane.select(&mut GradeServices::new(&mut runtime)).unwrap();
         assert!(
-            lane.inventory.is_none(),
-            "stale absence requires rediscovery"
+            lane.inventory.is_some(),
+            "stale absence retains its target until the next bounded rediscovery"
         );
         assert_eq!(
             tests::store(&mut runtime)
@@ -1041,6 +1070,7 @@ mod tests {
             page(3, true),
             page(4, true),
             page(1, true),
+            page(1, false),
             page(1, false),
         ];
         let server = tokio::spawn(async move {
@@ -1172,6 +1202,24 @@ mod tests {
                 .unwrap()
         );
         collect_page(&mut lane, &mut runtime).await;
+        assert!(!lane.inventory.as_ref().unwrap().complete);
+        assert_eq!(
+            tests::store(&mut runtime).judge_inventory_offset().unwrap(),
+            0
+        );
+        assert_eq!(
+            tests::store(&mut runtime)
+                .read_backoff(&key)
+                .unwrap()
+                .failures,
+            failure.failures,
+            "a tail-only end page is not whole-inventory recovery"
+        );
+        assert!(
+            lane.start_inventory(&mut GradeServices::new(&mut runtime), None)
+                .unwrap()
+        );
+        collect_page(&mut lane, &mut runtime).await;
         assert!(lane.inventory.as_ref().unwrap().complete);
         assert_eq!(
             tests::store(&mut runtime)
@@ -1237,6 +1285,353 @@ mod tests {
         );
         let status = tests::store(&mut runtime).status(&config).unwrap();
         assert_eq!(status["lane_participation"]["judge"]["freshness"], "stale");
+    }
+
+    #[tokio::test]
+    async fn bounded_target_search_continues_past_duplicate_pages_and_tail_absence_is_partial() {
+        for pending in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut config = Config::default();
+            config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
+            config.capabilities.judge.mode = Mode::ReadOnly;
+            let (_temp, mut runtime, _stop) = tests::fixture_with(config);
+            let row = |id: String| {
+                json!({
+                    "answer_txid":id,"answer_epoch":8,"answer":"burning candidate","words":["burn"]
+                })
+            };
+            let first = (1..=100)
+                .map(|id| row(format!("{id:064x}")))
+                .collect::<Vec<_>>();
+            let target_id = "f".repeat(64);
+            let tail = row(target_id.clone());
+            let server = tokio::spawn(async move {
+                for offset in [0, 100, 200, 300, 400, 0] {
+                    let (stream, request) = tests::accept(&listener).await;
+                    assert!(request.contains(&format!("offset={offset}")), "{request}");
+                    assert!(request.contains("limit=100"), "{request}");
+                    let body = if offset == 400 {
+                        json!({"assignments":[tail.clone()],"has_more":false})
+                    } else {
+                        // A moving view may repeat every ID without repeating
+                        // its offset. Such pages must not reset the traversal.
+                        json!({"assignments":first.clone(),"has_more":true})
+                    };
+                    tests::reply(stream, 200, None, body).await;
+                }
+            });
+            let revision = GradeServices::new(&mut runtime).lane_revision().unwrap();
+            let store = tests::store(&mut runtime);
+            let op = store
+                .seed_operation_for_test(
+                    LaneId::Judge,
+                    &target_id,
+                    "prepared",
+                    &json!({}),
+                    store.control().unwrap(),
+                    &revision,
+                )
+                .unwrap();
+            let target = if pending {
+                Target::Pending(
+                    PendingWorkKey {
+                        operation: GradeServices::new(&mut runtime).binding(&op).unwrap(),
+                        request_digest: "pending-digest".into(),
+                    },
+                    target_id.clone(),
+                )
+            } else {
+                Target::Prepared(op.clone())
+            };
+            let mut lane = JudgeLane::default();
+            assert!(
+                lane.start_inventory(&mut GradeServices::new(&mut runtime), Some(target.clone()),)
+                    .unwrap()
+            );
+            for page in 0..4 {
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    &mut lane.read.as_mut().unwrap().flight.task,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                lane.collect(&mut GradeServices::new(&mut runtime)).unwrap();
+                if page < 3 {
+                    lane.plan(&mut GradeServices::new(&mut runtime)).unwrap();
+                }
+            }
+            assert_eq!(lane.inventory.as_ref().unwrap().pages, 4);
+            assert_eq!(lane.inventory.as_ref().unwrap().ids.len(), 100);
+            assert!(!lane.inventory.as_ref().unwrap().more);
+            lane.plan(&mut GradeServices::new(&mut runtime)).unwrap();
+            assert!(
+                lane.read.is_none(),
+                "a bounded slice waits for its next scheduled cycle"
+            );
+            assert_eq!(
+                tests::store(&mut runtime).judge_inventory_offset().unwrap(),
+                400
+            );
+            assert_eq!(
+                tests::store(&mut runtime)
+                    .operation(op.id)
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                "prepared"
+            );
+
+            // Reconstructing the controller must use the journal's continuation,
+            // not a transient field from the old in-memory inventory.
+            lane = JudgeLane::default();
+            assert!(
+                lane.start_inventory(&mut GradeServices::new(&mut runtime), Some(target.clone()),)
+                    .unwrap()
+            );
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                &mut lane.read.as_mut().unwrap().flight.task,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            lane.collect(&mut GradeServices::new(&mut runtime)).unwrap();
+            assert_eq!(
+                lane.candidates(&GradeServices::new(&mut runtime))
+                    .unwrap()
+                    .candidates,
+                vec![target_id],
+            );
+            assert!(!lane.inventory.as_ref().unwrap().complete);
+            assert_eq!(
+                tests::store(&mut runtime).judge_inventory_offset().unwrap(),
+                0
+            );
+            // Even an explicit end flag only completes this tail window. It
+            // cannot retire a target omitted from the beginning of the list.
+            lane.inventory.as_mut().unwrap().target = Some(Target::Prepared(op.clone()));
+            lane.inventory.as_mut().unwrap().ids[0] = "e".repeat(64);
+            lane.inventory.as_mut().unwrap().response.body["assignments"][0]["answer_txid"] =
+                json!("e".repeat(64));
+            lane.select(&mut GradeServices::new(&mut runtime)).unwrap();
+            assert_eq!(
+                tests::store(&mut runtime)
+                    .operation(op.id)
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                "prepared"
+            );
+            assert!(
+                lane.start_inventory(&mut GradeServices::new(&mut runtime), Some(target),)
+                    .unwrap()
+            );
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                &mut lane.read.as_mut().unwrap().flight.task,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            lane.collect(&mut GradeServices::new(&mut runtime)).unwrap();
+            assert_eq!(lane.inventory.as_ref().unwrap().start_offset, 0);
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn overlapping_zero_offset_pages_cannot_retire_an_unseen_preparation() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = Config::default();
+        config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
+        config.capabilities.judge.mode = Mode::ReadOnly;
+        let (_temp, mut runtime, _stop) = tests::fixture_with(config);
+        let server = tokio::spawn(async move {
+            for (offset, ids, more) in [
+                (0, vec![1, 2], true),
+                (2, vec![2, 3], true),
+                (4, vec![4], false),
+            ] {
+                let (stream, request) = tests::accept(&listener).await;
+                assert!(request.contains(&format!("offset={offset}")), "{request}");
+                let rows = ids
+                    .into_iter()
+                    .map(|id| {
+                        json!({
+                            "answer_txid":format!("{id:064x}"),"answer_epoch":8,
+                            "answer":"burning candidate","words":["burn"]
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                tests::reply(
+                    stream,
+                    200,
+                    None,
+                    json!({"assignments":rows,"has_more":more}),
+                )
+                .await;
+            }
+        });
+        let revision = GradeServices::new(&mut runtime).lane_revision().unwrap();
+        let store = tests::store(&mut runtime);
+        let op = store
+            .seed_operation_for_test(
+                LaneId::Judge,
+                &"f".repeat(64),
+                "prepared",
+                &json!({}),
+                store.control().unwrap(),
+                &revision,
+            )
+            .unwrap();
+        let mut lane = JudgeLane::default();
+        assert!(
+            lane.start_inventory(
+                &mut GradeServices::new(&mut runtime),
+                Some(Target::Prepared(op.clone())),
+            )
+            .unwrap()
+        );
+        for _ in 0..3 {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                &mut lane.read.as_mut().unwrap().flight.task,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            lane.collect(&mut GradeServices::new(&mut runtime)).unwrap();
+            lane.plan(&mut GradeServices::new(&mut runtime)).unwrap();
+        }
+        server.await.unwrap();
+        assert!(!lane.inventory.as_ref().unwrap().complete);
+        assert_eq!(
+            tests::store(&mut runtime)
+                .operation(op.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "prepared"
+        );
+        assert!(lane.ready.is_none());
+        assert!(!lane.model.busy());
+    }
+
+    #[tokio::test]
+    async fn blocked_judge_draft_revalidates_and_only_changed_input_retires() {
+        for changed in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut config = Config::default();
+            config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
+            config.capabilities.judge.mode = Mode::Active;
+            config
+                .capabilities
+                .judge
+                .participation
+                .max_unresolved_operations = 1.into();
+            let (_temp, mut runtime, _stop) = tests::fixture_with(config);
+            tests::store(&mut runtime)
+                .defer(LaneId::Judge, 3600)
+                .unwrap();
+            let inventory = paged_inventory(&runtime, 1);
+            let id = inventory.ids[0].clone();
+            let assignment = parse_selected_assignment(&inventory.response, &id, None).unwrap();
+            let task = GradeServices::new(&mut runtime).task(&assignment).unwrap();
+            let input = json!({"solver":task.request(),"challenge_fingerprint":null});
+            let revision = GradeServices::new(&mut runtime).lane_revision().unwrap();
+            let store = tests::store(&mut runtime);
+            let mut prior = store
+                .seed_operation_for_test(
+                    LaneId::Judge,
+                    &"a".repeat(64),
+                    "prepared",
+                    &input,
+                    store.control().unwrap(),
+                    &revision,
+                )
+                .unwrap();
+            prior.state = "dispatching".into();
+            store
+                .seed_transition_for_test(&prior, "fixture_grade_dispatch")
+                .unwrap();
+            prior.state = "unknown".into();
+            prior.next_at = now() + 3600;
+            store
+                .seed_transition_for_test(&prior, "fixture_unknown_grade")
+                .unwrap();
+            let mut op = store
+                .seed_operation_for_test(
+                    LaneId::Judge,
+                    &id,
+                    "prepared",
+                    &input,
+                    store.control().unwrap(),
+                    &revision,
+                )
+                .unwrap();
+            op.payload =
+                Some(json!({"assignment":id,"score":2,"reasoning":"Grounded grade reasoning."}));
+            store
+                .seed_transition_for_test(&op, "fixture_prepared_grade")
+                .unwrap();
+            assert!(!runtime.admission_allowed(&op).unwrap());
+            let mut lane = JudgeLane::default();
+            lane.plan(&mut GradeServices::new(&mut runtime)).unwrap();
+            assert!(
+                matches!(lane.read.as_ref().and_then(|read| read.target.as_ref()),
+                Some(Target::Prepared(current)) if current.id == op.id)
+            );
+            // Complete only the assignment flight; the unrelated identity
+            // request remains fenced and is cancelled at shutdown.
+            let mut response = inventory.response;
+            response.body["has_more"] = json!(false);
+            if changed {
+                response.body["assignments"][0]["answer"] = json!("changed candidate");
+            }
+            let (stream, request) = tests::accept(&listener).await;
+            if request.contains("/assignments") {
+                tests::reply(stream, 200, None, response.body).await;
+            } else {
+                tests::reply(stream, 503, None, json!({"error":"unavailable"})).await;
+                let (stream, request) = tests::accept(&listener).await;
+                assert!(request.contains("/assignments"), "{request}");
+                tests::reply(stream, 200, None, response.body).await;
+            }
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                &mut lane.read.as_mut().unwrap().flight.task,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            lane.collect(&mut GradeServices::new(&mut runtime)).unwrap();
+            lane.select(&mut GradeServices::new(&mut runtime)).unwrap();
+            assert_eq!(
+                tests::store(&mut runtime)
+                    .operation(op.id)
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                if changed { "discarded" } else { "prepared" }
+            );
+            assert_eq!(lane.ready.is_some(), !changed);
+            assert_eq!(
+                tests::store(&mut runtime)
+                    .operation(prior.id)
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                "unknown"
+            );
+            lane.cancel(
+                &mut GradeServices::new(&mut runtime),
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+            runtime.shutdown().await.unwrap();
+        }
     }
 
     #[test]

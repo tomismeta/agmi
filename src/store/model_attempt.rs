@@ -915,6 +915,83 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn replayed_native_completion_retains_execution_charge_across_restart() {
+        let (_dir, config, mut store, op, mut record) = fixture(true);
+        let (native, selected, completion) =
+            crate::solver::tests::replayed_native_completion().await;
+        assert_eq!(
+            completion.result.as_ref().unwrap_err(),
+            &NativeReasonCode::NativeRunBindingMismatch
+        );
+        assert_eq!(completion.evidence.execution, NativeExecution::Unknown);
+        assert_eq!(completion.evidence.outcome, NativeOutcome::Unknown);
+        // Seed the journal with B's immutable producer facts, then commit the
+        // actual child collector's rejected A-envelope evidence without
+        // synthesizing its certainty, reported run, or reason code.
+        record.producer.request_id = native.request().id.clone();
+        record.producer.request_digest = native.digest().unwrap();
+        record.producer.requested = selected;
+        store
+            .db
+            .execute(
+                "UPDATE operations SET request=?2 WHERE id=?1",
+                params![op.id, json!({"solver":native.request()}).to_string()],
+            )
+            .unwrap();
+        store
+            .db
+            .execute(
+                "UPDATE operation_evidence SET model_attempt=?2 WHERE operation_id=?1",
+                params![op.id, encode_attempt(&record).unwrap()],
+            )
+            .unwrap();
+        let mut op = store.operation(op.id).unwrap().unwrap();
+        assert_eq!(store.model_budget_used(LaneId::Answer, &op.key).unwrap(), 1);
+        op.state = "model_unknown".into();
+        store
+            .finish_model_attempt(
+                &record.producer.operation,
+                &op,
+                &completion.evidence,
+                "native_run_binding_mismatch",
+            )
+            .unwrap();
+        let retained = store.model_attempt(op.id).unwrap().unwrap();
+        assert_eq!(retained.producer, record.producer);
+        assert_eq!(retained.launch, record.launch);
+        assert_eq!(retained.completion.as_ref(), Some(&completion.evidence));
+        assert_eq!(store.model_budget_used(LaneId::Answer, &op.key).unwrap(), 1);
+        assert!(store.operation(op.id).unwrap().unwrap().result.is_none());
+        assert!(store.operation(op.id).unwrap().unwrap().payload.is_none());
+        assert!(store.effect().unwrap().is_none());
+
+        drop(store);
+        let mut reopened = Store::open(&config).unwrap();
+        reopened.recover().unwrap();
+        reopened.retry_models(&config).unwrap();
+        let persisted = reopened.operation(op.id).unwrap().unwrap();
+        assert_eq!(persisted.state, "model_unknown");
+        assert!(persisted.result.is_none());
+        assert!(persisted.payload.is_none());
+        assert!(persisted.job_id.is_none());
+        assert!(persisted.txid.is_none());
+        assert_eq!(
+            reopened.model_budget_used(LaneId::Answer, &op.key).unwrap(),
+            1
+        );
+        assert_eq!(reopened.model_attempt(op.id).unwrap().unwrap(), retained);
+        assert_eq!(
+            reopened
+                .model_retry_assessment(LaneId::Answer, &op.key, &config, now())
+                .unwrap()
+                .blocker,
+            Some("model_uncertain_retry_disabled")
+        );
+        assert!(reopened.effect().unwrap().is_none());
+    }
+
     #[test]
     fn completion_is_idempotent_but_never_replaces_truth_or_accepts_wrong_binding() {
         let (_dir, _config, mut store, mut op, before) = fixture(true);

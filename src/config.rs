@@ -449,6 +449,7 @@ impl Default for ModelTimeouts {
 #[serde(default, deny_unknown_fields)]
 pub struct Schedule {
     pub poll_seconds: u64,
+    pub observation_max_age_seconds: u64,
     pub retry_seconds: u64,
     pub backoff_max_seconds: u64,
     pub jitter_seconds: u64,
@@ -463,6 +464,7 @@ impl Default for Schedule {
     fn default() -> Self {
         Self {
             poll_seconds: 120,
+            observation_max_age_seconds: 120,
             retry_seconds: 180,
             backoff_max_seconds: 900,
             jitter_seconds: 30,
@@ -477,6 +479,7 @@ impl Default for Schedule {
 #[serde(default, deny_unknown_fields)]
 pub struct MineSchedule {
     pub poll_seconds: u64,
+    pub observation_max_age_seconds: u64,
     pub retry_seconds: u64,
     pub backoff_max_seconds: u64,
     pub jitter_seconds: u64,
@@ -493,6 +496,7 @@ impl Default for MineSchedule {
     fn default() -> Self {
         Self {
             poll_seconds: 120,
+            observation_max_age_seconds: 120,
             retry_seconds: 180,
             backoff_max_seconds: 900,
             jitter_seconds: 30,
@@ -965,6 +969,11 @@ impl Config {
                     true,
                 ),
                 ("schedule.poll_seconds", schedule.poll_seconds, false),
+                (
+                    "schedule.observation_max_age_seconds",
+                    schedule.observation_max_age_seconds,
+                    false,
+                ),
                 ("schedule.retry_seconds", schedule.retry_seconds, false),
                 (
                     "schedule.backoff_max_seconds",
@@ -1198,6 +1207,7 @@ impl Config {
                 let mine = self.capabilities.mine.schedule;
                 Schedule {
                     poll_seconds: mine.poll_seconds,
+                    observation_max_age_seconds: mine.observation_max_age_seconds,
                     retry_seconds: mine.retry_seconds,
                     backoff_max_seconds: mine.backoff_max_seconds,
                     jitter_seconds: mine.jitter_seconds,
@@ -1207,6 +1217,13 @@ impl Config {
                 }
             }
         }
+    }
+    pub(crate) fn discovery_poll_seconds(&self, kind: LaneId, jitter: u64) -> u64 {
+        let schedule = self.schedule(kind);
+        schedule
+            .poll_seconds
+            .saturating_add(jitter)
+            .min((schedule.observation_max_age_seconds / 2).max(1))
     }
     pub fn preparation(&self, kind: LaneId) -> Option<Preparation> {
         match kind {
@@ -1653,6 +1670,7 @@ mod tests {
                 CountLimit::Bounded(4)
             );
             assert_eq!(config.timeouts(kind).read_http_seconds, 90);
+            assert_eq!(config.schedule(kind).observation_max_age_seconds, 120);
         }
         assert!(config.capabilities.answer.preparation.while_blocked);
         assert!(!config.capabilities.judge.preparation.while_blocked);
@@ -1768,6 +1786,58 @@ mod tests {
         config.capabilities.answer.schedule.discovery_retry_seconds = None;
         config.identity.read_http_seconds = 0;
         assert!(config.validate().is_err());
+    }
+    #[test]
+    fn observation_freshness_is_independent_and_refresh_caps_include_jitter() {
+        let mut config = Config::default();
+        for kind in LaneId::ALL {
+            assert_eq!(config.discovery_poll_seconds(kind, 30), 60);
+        }
+        config.capabilities.answer.timeouts.read_http_seconds = 1;
+        config.capabilities.answer.schedule.poll_seconds = 30;
+        assert_eq!(config.discovery_poll_seconds(LaneId::Answer, 0), 30);
+        assert_eq!(config.discovery_poll_seconds(LaneId::Answer, 90), 60);
+        config
+            .capabilities
+            .answer
+            .schedule
+            .observation_max_age_seconds = 10;
+        assert_eq!(config.discovery_poll_seconds(LaneId::Answer, 90), 5);
+        config
+            .capabilities
+            .answer
+            .schedule
+            .observation_max_age_seconds = 1;
+        assert_eq!(config.discovery_poll_seconds(LaneId::Answer, 90), 1);
+        for invalid in [0, u64::MAX] {
+            for kind in LaneId::ALL {
+                let mut config = Config::default();
+                match kind {
+                    LaneId::Answer => {
+                        config
+                            .capabilities
+                            .answer
+                            .schedule
+                            .observation_max_age_seconds = invalid;
+                    }
+                    LaneId::Judge => {
+                        config
+                            .capabilities
+                            .judge
+                            .schedule
+                            .observation_max_age_seconds = invalid;
+                    }
+                    LaneId::Mine => {
+                        config
+                            .capabilities
+                            .mine
+                            .schedule
+                            .observation_max_age_seconds = invalid;
+                    }
+                }
+                assert!(config.validate().is_err(), "{kind:?}: {invalid}");
+            }
+        }
     }
     #[test]
     fn judging_exclusions_default_empty_validate_and_change_revision() {

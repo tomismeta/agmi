@@ -195,7 +195,7 @@ enum Command {
     },
     /// Check sanitized local liveness and participation evidence without side effects.
     #[command(
-        after_help = "Local checks for controller, answer, judge and mine; no network or model calls.\nExit zero means operationally clear under the selected checks, not remote finality.\nRetained unknowns can require risk attention while healthy remains true, under\nfinite or unbounded policy. Actual capacity/strict-policy blockers, overdue local\nexecution and unavailable current evidence still fail the check. Fresh complete\nempty judging inventory is healthy idle; stale or partial inventory is not proof\nof no work. Unknown outcomes never authorize replay. --verbose shows full evidence."
+        after_help = "Local checks for controller, answer, judge and mine; no network or model calls.\nExit zero means operationally clear under the selected checks, not remote finality.\nRetained unknowns and accepted work awaiting finality can require risk attention\nwhile healthy remains true, under finite or unbounded policy. Actual capacity or\nsame-work blockers, overdue local execution and unavailable current evidence still\nfail the check. Fresh complete empty judging inventory is healthy idle; stale or\npartial inventory is not proof of no work. Unknown outcomes never authorize replay.\n--verbose shows full evidence; model failures describe native completion, not receipt errors."
     )]
     Health {
         /// Include complete retained diagnostic evidence.

@@ -3,7 +3,6 @@
 // are passed in argv; native diagnostics never enter the result envelope.
 import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
-import { randomUUID } from 'node:crypto';
 
 const emit = process.stdout.write.bind(process.stdout);
 process.stdout.write = process.stderr.write.bind(process.stderr);
@@ -28,7 +27,8 @@ try {
   const { callGatewayFromCli } = await import(pathToFileURL(
     require.resolve('openclaw/plugin-sdk/gateway-runtime')).href);
   if (typeof callGatewayFromCli !== 'function') throw new Error('unsupported native API');
-  const runId = randomUUID();
+  const runId = identifier(request.invocation_id);
+  if (!runId) throw new Error('missing native invocation identity');
   started = true;
   // The inspected agent API exposes a single message, not a privileged policy
   // field. Rust combines policy and envelope here without claiming isolation.
@@ -62,7 +62,7 @@ try {
   const trace = meta?.executionTrace;
   reported = {
     provider: identifier(native?.provider), model: identifier(native?.model),
-    runId: identifier(response?.runId), requestedRunId: runId,
+    runId: identifier(response?.runId),
     reasoning: identifier(meta?.requestShaping?.thinking),
     aborted: typeof meta?.aborted === 'boolean' ? meta.aborted : null,
     fallbackUsed: typeof trace?.fallbackUsed === 'boolean' ? trace.fallbackUsed : null,

@@ -28,6 +28,14 @@ macro_rules! common_services {
                 self.host
                     .scoped_observation_current(LaneId::$lane, observation)
             }
+            pub(super) fn participation(
+                &self,
+                observation: &Observation,
+                value: &Value,
+            ) -> Result<()> {
+                self.host
+                    .record_participation(LaneId::$lane, observation, value)
+            }
             pub(super) fn active(&self) -> Result<bool> {
                 self.host.active(LaneId::$lane)
             }
@@ -83,9 +91,6 @@ macro_rules! common_services {
             pub(super) fn ready_current(&self, ready: &ReadyEffect) -> Result<bool> {
                 self.host.scoped_ready_current(LaneId::$lane, ready)
             }
-            pub(super) fn admission_allowed(&self, op: &Operation) -> Result<bool> {
-                self.host.scoped_admission_allowed(LaneId::$lane, op)
-            }
             pub(super) fn fresh_allowed(&mut self, id: i64) -> bool {
                 self.host.fresh_allowed(LaneId::$lane, id)
             }
@@ -111,10 +116,6 @@ impl AnswerServices<'_> {
     }
     pub(super) fn effect_busy(&self) -> bool {
         self.host.effect_busy()
-    }
-    pub(super) fn participation(&self, observation: &Observation, value: &Value) -> Result<()> {
-        self.host
-            .record_participation(LaneId::Answer, observation, value)
     }
     pub(super) fn begin_discovery(&mut self) -> Result<Option<ReadFlight>> {
         self.host.begin_challenge(LaneId::Answer)
@@ -206,12 +207,14 @@ impl GradeServices<'_> {
     pub(super) fn effect_allowed(&self) -> bool {
         self.host.effect_allowed(LaneId::Judge)
     }
-    pub(super) fn participation(&self, observation: &Observation, value: &Value) -> Result<()> {
-        self.host
-            .record_participation(LaneId::Judge, observation, value)
-    }
     pub(super) fn begin_discovery(&mut self, offset: Option<u64>) -> Result<Option<ReadFlight>> {
         self.host.begin_inventory(offset)
+    }
+    pub(super) fn inventory_offset(&self) -> Result<u64> {
+        self.host.judge_inventory_offset()
+    }
+    pub(super) fn set_inventory_offset(&self, offset: u64) -> Result<()> {
+        self.host.set_judge_inventory_offset(offset)
     }
     pub(super) fn begin_hydration(
         &mut self,

@@ -3074,6 +3074,31 @@ impl Store {
         Ok(())
     }
 
+    pub(crate) fn judge_inventory_offset(&self) -> Result<u64> {
+        self.db
+            .query_row(
+                "SELECT cursor FROM schedule WHERE kind='judge:inventory'",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+            .map(|cursor| cursor.parse().context("invalid judge inventory cursor"))
+            .transpose()
+            .map(|cursor| cursor.unwrap_or(0))
+    }
+
+    pub(crate) fn set_judge_inventory_offset(&self, offset: u64) -> Result<()> {
+        self.continuity()?;
+        self.db.execute(
+            "INSERT INTO schedule(kind,next_at,cursor) VALUES ('judge:inventory',0,?1)
+             ON CONFLICT(kind) DO UPDATE SET cursor=excluded.cursor
+             WHERE schedule.cursor IS NOT excluded.cursor",
+            [offset.to_string()],
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn participation_next_at(&self, kind: LaneId) -> Result<i64> {
         Ok(self
             .db

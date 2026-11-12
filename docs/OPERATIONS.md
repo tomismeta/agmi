@@ -66,6 +66,8 @@ This source tree requires `schema_version = 2`. Released v0.1.1 configuration is
 
 Each lane's schedule defaults to 120-second polling, 180-second retry, a 900-second exponential-backoff cap and 30-second deterministic staggering. Mining additionally has `interval_seconds = 86400` and `each_epoch = false`. These are independent values, not references to a global schedule. Optional `discovery_retry_seconds` and `discovery_backoff_max_seconds` inherit that lane's retry/base-cap settings.
 
+`schedule.observation_max_age_seconds` independently limits usable discovery evidence (default 120 seconds). It is not the HTTP request timeout. Successful discovery schedules its next refresh after the smaller of configured polling plus stagger and half this age (minimum one second). Server restrictions and failure backoff still take precedence; an outage can therefore leave evidence stale without silently extending its validity. Each page retains its original completion time and expiry.
+
 The mining interval starts with a new operation's first durable dispatch intent, not preparation. A draft discarded during fresh challenge validation does not consume the interval; a possibly-sent request does, including an unknown outcome. This local cadence survives restart, while safe retries of that same operation do not restart it. `each_epoch = true` instead limits new mining attempts to one per observed epoch; neither mode bypasses server-imposed request minima.
 
 The latest completed mining operation remains visible in `status.work.mine` during the current epoch's scheduled wait. Health requires fresh matching epoch evidence; completion does not hide newer failed work or pending/uncertain work, or satisfy a new epoch or an already-due interval. For interval mining, `completion_valid_until` carries the deadline and health rechecks it at report time.
@@ -177,6 +179,7 @@ printf '%s\n' '{"capabilities":{"judge":{"participation":{"mode":"participation_
 Remove `--dry-run` only after approving the exposure change. Recurring model spending is a separate decision: set the model lane's `preparation.max_attempts_per_work` to `"unbounded"` explicitly if desired. Neither patch activates an inactive lane or resumes participation.
 
 These opt-ins require a binary that understands them. Older numeric-only parsers reject `"unbounded"` and do not understand the new uncertain-replacement field; matching journal formats alone does not make such a configuration backward-compatible. Never restore an older journal to undo a policy choice.
+The same rule applies to `schedule.observation_max_age_seconds`: earlier binaries reject this field. A same-journal-format binary rollback requires restoring a configuration accepted by that binary, including its prior finite policy where necessary. Preserve the pre-update configuration separately; never restore an older database or clear uncertain outcomes to make rollback succeed.
 
 Only answer owns historical capacity settings. `historical_unknown_answer_capacity = "bounded"` and `max_historical_unknown_answers = 0` are defaults. An explicit finite historical allowance excludes qualifying originals from answer's own active capacity. Participation-first may instead select `accepted_linked`, excluding all qualifying originals without a lifetime historical-count bound.
 
@@ -443,7 +446,11 @@ evidence still excludes recovery.
 
 Preflight and inference start synchronously under account and selected-lane gates. Pending work retains its original deadline; waiting across pause, revalidation or SQLite contention consumes that budget rather than renewing it. Owning-lane revalidation must match unchanged task/config inputs and fresh observations. Store rechecks freshness after acquiring its transaction, and the host checks final bounds and continuity before native spawn. A pause ACK therefore fences subsequent starts, without claiming that already-started remote inference stopped.
 
+Models return only task payloads: an answer, or a score and reasoning. agmi generates the native invocation identity outside the prompt and validates the returned native run against it. Hermes additionally binds the session, task, turn and exact current user/terminal assistant boundary; OpenClaw must return the invocation's native run ID. Unsupported native APIs fail preflight; mismatched completion evidence remains unknown and charged, not a valid artifact or permission to submit. Historical binding failures are not repaired by this cutover. Existing harness installations and authentication are untouched.
+
 Assignments use the returned `answer_epoch`, never the inventory's current epoch. Bounded offset pagination deduplicates canonical transaction IDs, preserves partial coverage and prioritizes supplied expiry with deterministic ties. Moving/partial inventories never prove a sent operation failed. Missing target metadata triggers selected-transaction hydration; missing authoritative original words prevents judging. Supplied author history is candidate-bound and labelled missing, supplied or truncated; supplied does not mean exhaustive. Answer novelty context may include locally submitted text with unresolved acceptance.
+
+Discovery persists its offset after validated pages, continuing bounded four-page windows across restart rather than repeatedly visiting only the first 400 assignments. Offsets above 10,000 remain traversable. Partial, duplicate-heavy or nonzero-start windows never establish complete absence; prepared targets retain their own bounded freshness lookup. Permanently obsolete unsent preparations retire without waiting for admission, while temporary backoff or capacity blockage preserves reusable work.
 
 ## Doctor and unattended status
 
@@ -466,6 +473,7 @@ operational essentials rather than duplicating full evidence trees; use
 Nonblocking historical uncertainty is still reported as risk, not as a current
 new-work blocker, under finite as well as unbounded policy. Current actions take
 precedence over background reconciliation. Shell-rendered actions preserve the selected configuration path.
+Accepted/included work awaiting finality is also background follow-up when the canonical policy permits fresh participation. Its age alone does not make an open lane unhealthy. Same-work uncertainty, unavailable fresh evidence and actual admission fences still do. Model-failure diagnostics come from immutable model completion, not a later receipt or protocol error.
 Exit codes retain distinct purposes: `status` succeeds when its snapshot is read;
 `health` succeeds when its selected operational checks pass; `doctor` succeeds
 when an unattended path exists and repair did not fail. A scheduled automatic

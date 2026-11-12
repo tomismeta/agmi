@@ -255,6 +255,7 @@ def risk_health(f):
     f.lanes['answer']['mode'] = 'read_only'
     f.lanes['judge']['mode'] = 'active'
     f.lanes['mine']['mode'] = 'off'
+    f.lanes['judge']['timeouts']['model_seconds'] = 30
     f.assignments = True
     f.answered = True
     f.configure()
@@ -274,43 +275,61 @@ def risk_health(f):
                 and assessment.get('locally_judgeable') is False)
     f.wait(judge_inventory_assessed,
            'judge did not assess retained inventory under the reloaded policy')
-    health = f.invoke('health')
-    assert health['operational']['status'] == 'clear', health
-    assert health['risk']['attention_required'] and health['attention_required']
-    assert health['healthy'] and not health['issues']
-    assert 'pending_outcome_uncertain' in health['warnings']
-    disk = json.loads(f.invoke('health', '--min-free-mib', '999999999', succeeds=False).stdout)['data']
-    assert disk['operational']['status'] == 'degraded', disk
-    assert 'state_disk_space_low' in disk['operational']['issues']
-    assert len(f.writes) == 1 and f.operations('judge')[0]['state'] == 'unknown'
-    # Create later work through the real dispatch boundary, retaining its binding
-    # and intent witness. Only its clock is aged while the controller is stopped.
-    f.queued_grades = True
-    f.wait(lambda: any(o['state'] == 'queued' for o in f.operations('judge')),
-           'later genuine queued judgment was not captured')
-    f.assignments = False
-    f.stop()
-    later = next(o['id'] for o in f.operations('judge') if o['state'] == 'queued')
-    for state in ('queued', 'included_pending'):
-        if state == 'included_pending':
-            for job in f.jobs:
-                f.jobs[job] = 'final'
-            f.receipt_state = 'included_pending'
-            f.start()
-            f.wait(lambda: any(o['id'] == later and o['state'] == state for o in f.operations('judge')),
-                   'later queued judgment never reached genuine receipt evidence')
-            f.stop()
+    same_work = json.loads(f.invoke('health', succeeds=False).stdout)['data']
+    assert same_work['operational']['status'] == 'blocked', same_work
+    assert 'current_work_outcome_unresolved' in same_work['issues']
+    assert same_work['risk']['attention_required'] and not same_work['healthy']
+    original = f.operations('judge')[0]
+    assert len(f.writes) == 1 and original['state'] == 'unknown'
+
+    # Publish a genuinely different assignment, holding its actual native
+    # execution so diagnostics observe a stable, viable path before dispatch.
+    interpreter = f.root / 'fixture-python'
+    source = interpreter.read_text()
+    marker = 'artifact = {'
+    assert source.count(marker) == 1
+    interpreter.write_text(source.replace(marker,
+        "import time\n"
+        "while pathlib.Path(__file__).with_name('hold-judge-model').exists():\n"
+        "    time.sleep(0.05)\n" + marker, 1))
+    hold = f.root / 'hold-judge-model'
+    hold.touch()
+    try:
+        f.queued_grades = True
+        f.wait(lambda: f.model_calls('judge') == 2
+               and len(f.rows("SELECT o.id FROM operations o JOIN operation_evidence e "
+                              "ON e.operation_id=o.id WHERE o.kind='judge' "
+                              "AND o.state='generating' AND e.model_deadline IS NOT NULL")) == 1,
+               'distinct judgment did not begin genuine native execution')
+        later = f.operations('judge')[-1]
+        assert later['work_key'] != original['work_key']
+        health = f.invoke('health')
+        assert health['operational']['status'] == 'clear', health
+        assert health['risk']['attention_required'] and health['attention_required']
+        assert health['healthy'] and not health['issues']
+        assert 'pending_outcome_uncertain' in health['warnings']
+        assert health['work']['judge']['progress'] == 'working'
+        disk = json.loads(f.invoke('health', '--min-free-mib', '999999999', succeeds=False).stdout)['data']
+        assert disk['operational']['status'] == 'degraded', disk
+        assert 'state_disk_space_low' in disk['operational']['issues']
+        assert len(f.writes) == 1 and f.operations('judge')[0]['state'] == 'unknown'
+
+        # Crash with the genuine attempt in flight, then age only its deadline.
+        # Queued/accepted remote history is risk, not an overdue local execution.
+        f.stop(crash=True)
         with sqlite3.connect(f.database) as db:
-            db.execute('UPDATE operations SET created_at=1,updated_at=1 WHERE id=?', (later,))
-            db.execute('UPDATE operation_evidence SET blocked_since=1 WHERE operation_id=?', (later,))
-            db.execute('UPDATE events SET at=1 WHERE operation_id=?', (later,))
+            db.execute('UPDATE operation_evidence SET model_deadline=1 WHERE operation_id=?',
+                       (later['id'],))
         overdue = json.loads(f.invoke('health', succeeds=False).stdout)['data']
-        assert 'pending_work_overdue' in overdue['issues'], overdue
+        assert 'model_work_overdue' in overdue['issues'], overdue
         assert 'pending_outcome_uncertain' in overdue['warnings']
-    assert len(f.writes) == 2 and f.operations('judge')[0]['state'] == 'unknown'
-    return {'strict_block_visible': True, 'risk_retained_after_admission_opens': True,
-            'healthy_with_warnings_exits_zero': True, 'later_overdue_work_detected': True,
-            'disk_failure_still_operational': True, 'writes': 2}
+        assert overdue['work']['judge']['intervention']['status'] == 'undetermined'
+        assert len(f.writes) == 1 and f.operations('judge')[0]['state'] == 'unknown'
+    finally:
+        hold.unlink(missing_ok=True)
+    return {'strict_block_visible': True, 'same_work_stays_blocked': True,
+            'risk_retained_with_distinct_work': True, 'healthy_with_warnings_exits_zero': True,
+            'later_overdue_model_detected': True, 'disk_failure_still_operational': True, 'writes': 1}
 
 
 def policy_administration(f):
