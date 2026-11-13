@@ -24,6 +24,7 @@ pub(crate) use cleanup::drain_native_cleanup_until;
 #[cfg(test)]
 pub(crate) use cleanup::pause_native_cleanup_for_test;
 mod launch;
+mod omp;
 pub use launch::{
     ExecutionDeadline, InferenceFlight, InferenceStart, PendingLaunch, PreflightCompletion,
     PreflightFlight, PreflightStart, start_preflight,
@@ -131,6 +132,7 @@ enum NativeProtocol {
     Discovery,
     Hermes,
     Openclaw,
+    Omp,
 }
 
 // CLI disconnects and Gateway failures do not prove inference stopped.
@@ -446,15 +448,81 @@ struct OwnedChild {
     group: i32,
 }
 
-impl Drop for OwnedChild {
-    fn drop(&mut self) {
+impl OwnedChild {
+    fn request_stop(&mut self) {
         #[cfg(unix)]
-        // SAFETY: group is the positive PID returned for our freshly spawned
-        // private process group; no shared shell or caller group is targeted.
-        unsafe {
-            libc::kill(-self.group, libc::SIGKILL);
+        if self.group > 0 {
+            // SAFETY: this is the private group created for our owned child.
+            unsafe {
+                libc::kill(-self.group, libc::SIGKILL);
+            }
+            self.group = 0;
         }
         let _ = self.child.start_kill();
+    }
+
+    async fn stop_and_reap(&mut self) -> Result<()> {
+        self.request_stop();
+        self.child
+            .wait()
+            .await
+            .map(|_| ())
+            .map_err(|_| NativeFailure("native_process_failed").into())
+    }
+
+    async fn wait(&mut self) -> Result<std::process::ExitStatus> {
+        #[cfg(unix)]
+        {
+            let pid = self
+                .child
+                .id()
+                .context(NativeFailure("native_process_failed"))?;
+            let mut signals = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())
+                .map_err(|_| NativeFailure("native_process_failed"))?;
+            loop {
+                // Keep the exited leader unreaped so its PID/group cannot be reused
+                // before we terminate descendants. Tokio remains the sole reaper.
+                let ready = {
+                    // SAFETY: siginfo_t is a plain C output record; zero means not ready.
+                    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                    // SAFETY: pid belongs to our unreaped child and info is writable.
+                    let result = unsafe {
+                        libc::waitid(
+                            libc::P_PID,
+                            pid as libc::id_t,
+                            &mut info,
+                            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                        )
+                    };
+                    if result != 0 {
+                        if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                        {
+                            continue;
+                        }
+                        return Err(NativeFailure("native_process_failed").into());
+                    }
+                    info.si_signo != 0
+                };
+                if ready {
+                    break;
+                }
+                signals
+                    .recv()
+                    .await
+                    .context(NativeFailure("native_process_failed"))?;
+            }
+            self.request_stop();
+        }
+        self.child
+            .wait()
+            .await
+            .map_err(|_| NativeFailure("native_process_failed").into())
+    }
+}
+
+impl Drop for OwnedChild {
+    fn drop(&mut self) {
+        self.request_stop();
     }
 }
 
@@ -502,7 +570,12 @@ fn spawn_native(executable: &Path, args: &[String], cwd: &Path) -> Result<OwnedC
         .env("PYTHONDONTWRITEBYTECODE", "1")
         .env("HERMES_SAFE_MODE", "1")
         .env("HERMES_IGNORE_USER_CONFIG", "1")
-        .env("HERMES_IGNORE_RULES", "1")
+        .env("HERMES_IGNORE_RULES", "1");
+    spawn_owned(command)
+}
+
+fn spawn_owned(mut command: Command) -> Result<OwnedChild> {
+    command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -566,13 +639,7 @@ async fn collect_native_evidence(
         drop(stdin);
         Ok::<_, anyhow::Error>(())
     };
-    let wait = async {
-        owner
-            .child
-            .wait()
-            .await
-            .map_err(|_| anyhow::Error::new(NativeFailure("native_process_failed")))
-    };
+    let wait = owner.wait();
     let (written, output, diagnostics, status) =
         tokio::join!(write, read_bounded(stdout), read_bounded(stderr), wait);
     let output = output?;
@@ -1360,6 +1427,7 @@ invocation=${invocation%%\"*}
             model: "gpt-6.1-sol".into(),
             reasoning: "high".into(),
             hermes_api_url: crate::config::default_hermes_api_url(),
+            omp: None,
             guidance_file: None,
             core_guidance_file: None,
             core_guidance: "".into(),

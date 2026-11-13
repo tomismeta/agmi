@@ -433,6 +433,7 @@ fn defaults() -> Value {
         let model = &mut value["capabilities"][lane]["model"];
         model["guidance_file"] = Value::Null;
         model["core_guidance_file"] = Value::Null;
+        model["omp"] = Value::Null;
         value["capabilities"][lane]["preparation"]["max_uncertain_replacements_per_work"] =
             json!(1);
     }
@@ -445,6 +446,14 @@ fn patch_shape() -> Value {
     for lane in LaneId::ALL.map(LaneId::as_str) {
         shape["capabilities"][lane]["schedule"]["queued_job_polling"] =
             json!({"initial_seconds":1,"max_seconds":1});
+    }
+    for lane in crate::capability::DESCRIPTORS
+        .iter()
+        .filter(|descriptor| descriptor.model_task.is_some())
+        .map(|descriptor| descriptor.id.as_str())
+    {
+        shape["capabilities"][lane]["model"]["omp"] =
+            json!({"profile":null,"agent_dir":null,"provider_discovery_cwd":null,"env":[]});
     }
     shape
 }
@@ -464,7 +473,11 @@ fn describe(path: &str, value: &Value, settings: &mut Vec<Value>) {
         Value::Bool(_) => "boolean",
         Value::Number(_) => "integer",
         Value::Array(_) => "array<string>",
-        Value::Null if path.ends_with(".schedule.queued_job_polling") => "object|null",
+        Value::Null
+            if path.ends_with(".schedule.queued_job_polling") || path.ends_with(".model.omp") =>
+        {
+            "object|null"
+        }
         Value::Null
             if path.ends_with(".schedule.discovery_retry_seconds")
                 || path.ends_with(".schedule.discovery_backoff_max_seconds") =>
@@ -480,7 +493,7 @@ fn describe(path: &str, value: &Value, settings: &mut Vec<Value>) {
     ) {
         json!(["active", "read_only", "off"])
     } else if path.ends_with(".harness") {
-        json!(["hermes", "openclaw"])
+        json!(["hermes", "openclaw", "omp"])
     } else if path.ends_with(".participation.mode") {
         json!(["strict", "participation_first", "manual"])
     } else if path == "capabilities.answer.participation.historical_unknown_answer_capacity" {
@@ -529,6 +542,26 @@ fn describe(path: &str, value: &Value, settings: &mut Vec<Value>) {
         });
         setting["required"] = json!(["initial_seconds", "max_seconds"]);
         setting["constraint"] = json!("initial_seconds <= max_seconds; null disables the policy");
+    }
+    if path.ends_with(".model.omp") {
+        setting["properties"] = json!({
+            "profile":{"type":["string","null"],"maxLength":64,
+                "pattern":"^(?!(?:con|prn|aux|nul|com[0-9]|lpt[0-9])(?:\\.|$))[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9_-])?$"},
+            "agent_dir":{"type":["string","null"]},
+            "provider_discovery_cwd":{"type":["string","null"]},
+            "env":{"type":"array","maxItems":64,"items":{"type":"string","maxLength":128,
+                "pattern":"^[A-Za-z_][A-Za-z0-9_]*$","not":{"enum":[
+                    "HOME","PATH","LANG","TMPDIR","TMP","TEMP","OMP_PROFILE","PI_PROFILE",
+                    "PI_CONFIG_DIR","PI_CODING_AGENT_DIR","PI_CONFIG_FILES"]}}}
+        });
+        setting["not"] = json!({"type":"object","required":["profile","agent_dir"],
+            "properties":{"profile":{"type":"string"},"agent_dir":{"type":"string"}}});
+        setting["constraint"] = json!(
+            "profile and agent_dir are mutually exclusive; use canonical native profile names or an explicit native directory."
+        );
+        setting["description"] = json!(
+            "Omp-only native profile, config-relative agent/discovery paths, and explicitly inherited environment variable names; never credential values. Omitted settings use the native default profile and HOME for provider discovery."
+        );
     }
     settings.push(setting);
 }
@@ -849,6 +882,36 @@ mod tests {
                 "object|null"
             );
         }
+    }
+
+    #[test]
+    fn omp_patch_selects_an_independent_native_route() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let config = Config {
+            state_dir: directory.path().join("state"),
+            ..Config::default()
+        };
+        fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+        let revision = file_revision(&path).unwrap();
+        apply(&path, &revision, br#"{"capabilities":{"answer":{"model":{"harness":"omp","executable":"omp","model":"fixture/model","omp":{"profile":"work","provider_discovery_cwd":"project","env":["OPENAI_API_KEY"]}}}}}"#, false).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(
+            loaded.capabilities.answer.model.harness,
+            crate::config::Harness::Omp
+        );
+        let route = loaded.capabilities.answer.model.omp.as_ref().unwrap();
+        assert_eq!(route.profile.as_deref(), Some("work"));
+        assert_eq!(
+            route.provider_discovery_cwd.as_deref(),
+            Some(directory.path().join("project").as_path())
+        );
+        assert_eq!(route.env, ["OPENAI_API_KEY"]);
+        assert_eq!(
+            loaded.capabilities.judge.model.harness,
+            crate::config::Harness::Hermes
+        );
+        assert!(loaded.capabilities.judge.model.omp.is_none());
     }
 
     #[test]

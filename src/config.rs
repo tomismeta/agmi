@@ -194,6 +194,87 @@ pub enum Mode {
 pub enum Harness {
     Hermes,
     Openclaw,
+    Omp,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OmpConfig {
+    pub profile: Option<String>,
+    pub agent_dir: Option<PathBuf>,
+    pub provider_discovery_cwd: Option<PathBuf>,
+    /// Native environment variable names, never credential values.
+    pub env: Vec<String>,
+}
+
+impl OmpConfig {
+    pub(crate) fn validate(&self) -> Result<()> {
+        ensure!(
+            self.profile.is_none() || self.agent_dir.is_none(),
+            "omp profile and agent_dir are mutually exclusive"
+        );
+        ensure!(
+            self.profile.as_ref().is_none_or(|profile| {
+                let base = profile.split('.').next().unwrap_or("");
+                let reserved = matches!(base, "con" | "prn" | "aux" | "nul")
+                    || (base.len() == 4
+                        && (base.starts_with("com") || base.starts_with("lpt"))
+                        && base.as_bytes()[3].is_ascii_digit());
+                !profile.is_empty()
+                    && profile.len() <= 64
+                    && !profile.ends_with('.')
+                    && (profile.as_bytes()[0].is_ascii_lowercase()
+                        || profile.as_bytes()[0].is_ascii_digit())
+                    && profile.bytes().all(|b| {
+                        b.is_ascii_lowercase() || b.is_ascii_digit() || b"-_.".contains(&b)
+                    })
+                    && !reserved
+            }),
+            "invalid omp profile"
+        );
+        for path in [&self.agent_dir, &self.provider_discovery_cwd]
+            .into_iter()
+            .flatten()
+        {
+            ensure!(
+                !path.as_os_str().is_empty()
+                    && !path.starts_with("~")
+                    && path.as_os_str().len() <= 4096
+                    && path
+                        .to_str()
+                        .is_some_and(|path| !path.chars().any(char::is_control)),
+                "invalid omp native path"
+            );
+        }
+        ensure!(
+            self.env.len() <= 64
+                && self.env.iter().all(|name| {
+                    !name.is_empty()
+                        && name.len() <= 128
+                        && name.bytes().enumerate().all(|(index, b)| {
+                            b.is_ascii_alphabetic()
+                                || b == b'_'
+                                || (index > 0 && b.is_ascii_digit())
+                        })
+                        && !matches!(
+                            name.as_str(),
+                            "HOME"
+                                | "PATH"
+                                | "LANG"
+                                | "TMPDIR"
+                                | "TMP"
+                                | "TEMP"
+                                | "OMP_PROFILE"
+                                | "PI_PROFILE"
+                                | "PI_CONFIG_DIR"
+                                | "PI_CODING_AGENT_DIR"
+                                | "PI_CONFIG_FILES"
+                        )
+                }),
+            "invalid omp environment inheritance"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -205,6 +286,8 @@ pub struct ModelConfig {
     pub reasoning: String,
     #[serde(default = "default_hermes_api_url")]
     pub hermes_api_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub omp: Option<OmpConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guidance_file: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -221,6 +304,7 @@ impl std::fmt::Debug for ModelConfig {
             .field("executable", &self.executable)
             .field("model", &self.model)
             .field("reasoning", &self.reasoning)
+            .field("omp", &self.omp)
             .field("guidance_file", &self.guidance_file)
             .field("core_guidance_file", &self.core_guidance_file)
             .finish_non_exhaustive()
@@ -294,6 +378,7 @@ impl Default for ModelConfig {
             reasoning: "high".into(),
             hermes_api_url: default_hermes_api_url(),
             guidance_file: None,
+            omp: None,
             core_guidance_file: None,
             core_guidance: Arc::from(""),
             guidance: Arc::from(""),
@@ -713,6 +798,14 @@ impl Config {
             if model.executable.components().count() > 1 {
                 model.executable = resolve_path(root, &model.executable);
             }
+            if let Some(omp) = &mut model.omp {
+                for path in [&mut omp.agent_dir, &mut omp.provider_discovery_cwd]
+                    .into_iter()
+                    .flatten()
+                {
+                    *path = resolve_path(root, path);
+                }
+            }
             for path in [&mut model.guidance_file, &mut model.core_guidance_file]
                 .into_iter()
                 .flatten()
@@ -861,27 +954,39 @@ impl Config {
             (LaneId::Answer, &self.capabilities.answer.model),
             (LaneId::Judge, &self.capabilities.judge.model),
         ] {
-            let api_url = reqwest::Url::parse(&model.hermes_api_url).map_err(|_| {
-                ConfigDiagnostic::model(kind, "hermes_api_url", "Invalid Hermes API URL.")
-            })?;
-            ensure!(
-                model.hermes_api_url.len() <= 2048
-                    && !model
-                        .hermes_api_url
-                        .chars()
-                        .any(|c| c.is_whitespace() || c.is_control())
-                    && !model.hermes_api_url.contains('\\')
-                    && api_url.scheme() == "https"
-                    && api_url.username().is_empty()
-                    && api_url.password().is_none()
-                    && api_url.query().is_none()
-                    && api_url.fragment().is_none(),
-                ConfigDiagnostic::model(
-                    kind,
-                    "hermes_api_url",
-                    "Hermes API URL requires HTTPS without credentials, query or fragment."
-                )
-            );
+            if model.harness == Harness::Omp {
+                if let Some(omp) = &model.omp {
+                    omp.validate().map_err(|_| {
+                        ConfigDiagnostic::model(kind, "omp", "Invalid omp native route.")
+                    })?;
+                }
+            } else {
+                ensure!(
+                    model.omp.is_none(),
+                    ConfigDiagnostic::model(kind, "omp", "Omp settings require the omp harness.")
+                );
+                let api_url = reqwest::Url::parse(&model.hermes_api_url).map_err(|_| {
+                    ConfigDiagnostic::model(kind, "hermes_api_url", "Invalid Hermes API URL.")
+                })?;
+                ensure!(
+                    model.hermes_api_url.len() <= 2048
+                        && !model
+                            .hermes_api_url
+                            .chars()
+                            .any(|c| c.is_whitespace() || c.is_control())
+                        && !model.hermes_api_url.contains('\\')
+                        && api_url.scheme() == "https"
+                        && api_url.username().is_empty()
+                        && api_url.password().is_none()
+                        && api_url.query().is_none()
+                        && api_url.fragment().is_none(),
+                    ConfigDiagnostic::model(
+                        kind,
+                        "hermes_api_url",
+                        "Hermes API URL requires HTTPS without credentials, query or fragment."
+                    )
+                );
+            }
             if check_guidance_paths {
                 for (layer, path) in [
                     ("user", &model.guidance_file),
@@ -1237,13 +1342,23 @@ impl Config {
         digest.update(kind.as_str().as_bytes());
         if let Some(model) = self.model(kind) {
             ensure!(self.guidance_loaded, "model guidance has not been loaded");
-            digest.update(serde_json::to_vec(&(
-                model.harness,
-                &model.executable,
-                &model.model,
-                &model.reasoning,
-                &model.hermes_api_url,
-            ))?);
+            if model.harness == Harness::Omp {
+                digest.update(serde_json::to_vec(&(
+                    model.harness,
+                    &model.executable,
+                    &model.model,
+                    &model.reasoning,
+                    &model.omp,
+                ))?);
+            } else {
+                digest.update(serde_json::to_vec(&(
+                    model.harness,
+                    &model.executable,
+                    &model.model,
+                    &model.reasoning,
+                    &model.hermes_api_url,
+                ))?);
+            }
             for guidance in [&model.guidance, &model.core_guidance] {
                 digest.update((guidance.len() as u64).to_le_bytes());
                 digest.update(guidance.as_bytes());
@@ -2151,5 +2266,135 @@ mod tests {
         std::fs::write(&path, vec![b'a'; MAX_GUIDANCE_BYTES + 1]).unwrap();
         assert!(read_guidance(&path, LaneId::Answer, "user").is_err());
         assert!(read_guidance(dir.path(), LaneId::Answer, "user").is_err());
+    }
+
+    #[test]
+    fn omp_native_route_changes_retire_only_its_producer() {
+        let mut original = Config::default();
+        original.capabilities.answer.model.harness = Harness::Omp;
+        original.capabilities.answer.model.executable = "omp".into();
+        original.capabilities.answer.model.model = "fixture/model/name".into();
+        original.capabilities.answer.model.omp = Some(OmpConfig::default());
+        let answer = original.producer_revision(LaneId::Answer).unwrap();
+        let judge = original.producer_revision(LaneId::Judge).unwrap();
+        let routes = [
+            OmpConfig {
+                profile: Some("work".into()),
+                ..Default::default()
+            },
+            OmpConfig {
+                agent_dir: Some("/native/agent".into()),
+                ..Default::default()
+            },
+            OmpConfig {
+                provider_discovery_cwd: Some("/native/project".into()),
+                ..Default::default()
+            },
+            OmpConfig {
+                env: vec!["OPENAI_API_KEY".into()],
+                ..Default::default()
+            },
+        ];
+        for route in routes {
+            let mut changed = original.clone();
+            changed.capabilities.answer.model.omp = Some(route);
+            assert_ne!(changed.producer_revision(LaneId::Answer).unwrap(), answer);
+            assert_eq!(changed.producer_revision(LaneId::Judge).unwrap(), judge);
+        }
+        original.capabilities.answer.model.hermes_api_url = "unused by omp".into();
+        assert_eq!(original.producer_revision(LaneId::Answer).unwrap(), answer);
+    }
+
+    #[test]
+    fn omp_paths_are_config_relative_and_host_environment_controls_are_reserved() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let mut config = Config::default();
+        config.capabilities.answer.model.harness = Harness::Omp;
+        config.capabilities.answer.model.executable = "omp".into();
+        config.capabilities.answer.model.model = "fixture/model".into();
+        config.capabilities.answer.model.omp = Some(OmpConfig {
+            agent_dir: Some("native".into()),
+            provider_discovery_cwd: Some("project".into()),
+            ..Default::default()
+        });
+        std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        let route = loaded.capabilities.answer.model.omp.as_ref().unwrap();
+        assert_eq!(
+            route.agent_dir.as_deref(),
+            Some(directory.path().join("native").as_path())
+        );
+        assert_eq!(
+            route.provider_discovery_cwd.as_deref(),
+            Some(directory.path().join("project").as_path())
+        );
+        for name in [
+            "HOME",
+            "TMPDIR",
+            "OMP_PROFILE",
+            "PI_PROFILE",
+            "PI_CONFIG_DIR",
+            "PI_CODING_AGENT_DIR",
+            "PI_CONFIG_FILES",
+            "KEY=VALUE",
+        ] {
+            assert!(
+                OmpConfig {
+                    env: vec![name.into()],
+                    ..Default::default()
+                }
+                .validate()
+                .is_err()
+            );
+        }
+    }
+    #[test]
+    fn invalid_native_profile_selection_is_rejected_before_launch() {
+        for profile in [
+            "Work",
+            "-work",
+            "work.",
+            "con",
+            "con.txt",
+            "lpt0",
+            "com9.log",
+            "work/name",
+            "",
+        ] {
+            assert!(
+                OmpConfig {
+                    profile: Some(profile.into()),
+                    ..Default::default()
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        assert!(
+            OmpConfig {
+                profile: Some("a".repeat(65)),
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            OmpConfig {
+                profile: Some("work".into()),
+                agent_dir: Some("/native".into()),
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+        for profile in ["default".to_owned(), "work.1".to_owned(), "a".repeat(64)] {
+            OmpConfig {
+                profile: Some(profile),
+                ..Default::default()
+            }
+            .validate()
+            .unwrap();
+        }
     }
 }

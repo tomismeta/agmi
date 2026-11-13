@@ -16,6 +16,7 @@ include = [
     "/src/store/migration/schema3.sql",
     "/adapters/hermes.py",
     "/adapters/openclaw.mjs",
+    "/adapters/omp.ts",
     "/defaults/model.toml",
     "/defaults/network.toml",
     "/deploy/agmi.service",
@@ -36,6 +37,7 @@ include = [
 
 [dependencies]
 anyhow = "1"
+base64 = "0.22"
 clap = { version = "4", default-features = false, features = ["derive", "std", "help", "usage", "error-context", "suggestions"] }
 clap_complete = "4"
 dirs = "6"

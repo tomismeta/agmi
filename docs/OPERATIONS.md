@@ -396,18 +396,50 @@ For identities created through agmi, `identity status` retains the original succ
 
 ### Native model routes
 
-Use a native CLI executable, not a shell command or an arbitrary JSON adapter. This implementation targets Unix (Linux/macOS). The embedded Python and Node adapters remain thin native API bridges: provision the harness, its compatible Python/Node runtime and authentication yourself. Neither Cargo builds nor `agmi install`/`update` installs harnesses, authenticates providers or provisions accounts.
+Use a native CLI executable, not a shell command or an arbitrary JSON adapter. This implementation targets Unix (Linux/macOS). Provision each harness and its native authentication yourself. Hermes/OpenClaw additionally require their compatible Python/Node runtime; omp's standalone binary supplies its own runtime and bundled SDK. Neither Cargo builds nor `agmi install`/`update` installs harnesses, authenticates providers or provisions accounts. The omp executable/SDK are not vendored in agmi; only agmi's small native bridge is embedded.
 
 | Harness | Inspected execution contract | Model syntax |
 |---|---|---|
 | Hermes | Launcher supports `--print-runtime-command`; native embedding API supports tool/context isolation and the authenticated OpenAI Codex route | Exact model identifier, for example `gpt-6.1-sol` |
 | OpenClaw | `2026.10.9` public Gateway CLI transport, compatible Node.js on PATH, and an authenticated running Gateway permitting `operator.admin` | Provider/model, for example `openai/gpt-6.1-sol` |
+| omp | Official standalone `18.19.0` binary; invocation-loaded public SDK bridge, independent direct inference and native authentication | Exact provider/model, including model IDs containing slashes |
 
 The user service sets `PATH` to `$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin`; it does not load shell startup files. Configure the native harness executable by absolute path and make OpenClaw's compatible `node` available on that service PATH. A working interactive `nvm`/`fnm` shell is not sufficient. Provision and authenticate the harness as the runtime OS account, then verify model execution under supervision before leaving it unattended.
 
 Unsupported native contracts fail explicitly; a matching product name alone does not establish compatibility. Hermes uses its existing authenticated Codex subscription route; the inspected OpenClaw route uses its native `openai` provider authentication. Other providers are not silently substituted. Reasoning values must be supported by the selected native model.
 
 `capabilities.answer.model.hermes_api_url` and `capabilities.judge.model.hermes_api_url` independently declare the expected authenticated Hermes URL, defaulted from [`defaults/model.toml`](../defaults/model.toml). It must match the native authentication route; changing it never silently redirects a native key. OpenClaw resolves its endpoint through its existing Gateway configuration.
+
+For omp, install the official binary separately with `curl -fsSL https://omp.sh/install | sh`, then run `~/.local/bin/omp` and authenticate through omp as the service OS account. No source checkout, npm SDK, external Bun/Node runtime or permanent plugin installation is required. Other omp versions fail qualification rather than silently changing the adapter contract.
+
+Either model lane can independently use:
+
+```toml
+[capabilities.answer.model]
+harness = "omp"
+executable = "omp"
+model = "openai-codex/gpt-6.1-sol" # Choose an exact ID from your native catalog.
+reasoning = "high" # Must be supported; never silently clamped.
+core_guidance_file = "answer/core-guidance.md"
+guidance_file = "answer/user-guidance.md"
+
+# Optional; omitted means native default profile, HOME-based provider discovery.
+[capabilities.answer.model.omp]
+# profile = "work"
+# agent_dir = "./native-agent" # Explicit native agent directory instead of a named profile.
+# provider_discovery_cwd = "./project" # Explicitly authorize project provider discovery.
+env = [] # Native environment variable NAMES to inherit, never credential values.
+```
+
+Native paths are config-relative; native profile/auth/cache ownership stays with omp. Choose either `profile` or `agent_dir`, never both. Profiles use canonical native names: at most 64 lowercase ASCII letters/digits/dots/underscores/hyphens, beginning with a letter/digit; trailing dots and reserved device names are rejected before launch. Service-only environment inheritance is explicit: shell startup files are not read. HOME/PATH/LANG, private temporary/config controls and all native profile/root selectors (`OMP_PROFILE`, `PI_PROFILE`, `PI_CONFIG_DIR`, `PI_CODING_AGENT_DIR`) cannot be replaced through `env`. Native broker, proxy or provider environment variables must be named deliberately. Omp does not use `hermes_api_url`.
+
+The omp adapter performs version-only preflight, waits for final admission, then owns one fresh native process and temporary extension per attempt. The extension also checks its actual bundled SDK version before projecting providers, so replacement during admission waiting cannot silently select an unqualified SDK. A fixed local command calls the public SDK directly with agmi's privileged policy and both captured guidance layers; native conversation, project instructions and tool hooks are not inherited into inference. Normal factory-time native providers are projected without attaching their tools/handlers. Providers registered only during live session lifecycle are not projected.
+
+Native profile/provider factories remain trusted executable code, and the outer shell can initialize native facilities: this is tool-free direct inference, not a sandbox against startup side effects or opaque remote agent/tool behavior. Native endpoint-routing settings are passed explicitly; tools and configured fallback chains are not requested, returned tool calls fail, and unsupported exact reasoning-off fails closed. Host invocation/effort evidence is labeled adapter-owned, not provider-issued attestation. Native auth refresh/retries/cache writes remain native behavior; one logical attempt is not a hard HTTP-call or monetary cap. Killing the owned process does not prove remote cancellation, and possible execution remains charged.
+
+Known agent/workflow transports `cursor-agent` and `gitlab-duo-agent` are refused before streaming: an empty supplied tool list does not disable their built-in workflow/tool capabilities. This is an API-capability fence, not a provider-name blacklist; ordinary direct-inference APIs and the supported Factory Droid controls remain independent.
+
+Run `python3 tests/omp_native_smoke.py --omp /absolute/path/to/omp` for isolated default-binary/loopback acceptance. It uses temporary profiles and fixture credentials, not the operator's native login. Real authenticated provider acceptance remains separate.
 
 OpenClaw uses its existing Gateway and native authentication through a small embedded Node bridge to `callGatewayFromCli`. Prompts travel over stdin, never argv. Each request is a fresh one-shot raw model run with tools, bootstrap context and delivery disabled. The Gateway chooses its configured default agent; no shared configuration is changed. Model overrides require the native `operator.admin` scope; insufficient authority fails rather than silently using another model.
 

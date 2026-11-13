@@ -60,12 +60,14 @@ pub struct ModelSelection {
     reasoning_effort: String,
     native_route: PathBuf,
     hermes_api_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    omp: Option<crate::config::OmpConfig>,
 }
 impl ModelSelection {
     pub fn new(model: &ModelConfig) -> Result<Self> {
         let (provider, name) = match model.harness {
             Harness::Hermes => ("openai-codex", model.model.as_str()),
-            Harness::Openclaw => model
+            Harness::Openclaw | Harness::Omp => model
                 .model
                 .split_once('/')
                 .context("model route missing provider")?,
@@ -73,8 +75,9 @@ impl ModelSelection {
         ensure!(
             model.executable.as_os_str().len() <= 4096
                 && !model.executable.as_os_str().is_empty()
-                && model.hermes_api_url.len() <= 2048
-                && !model.hermes_api_url.chars().any(char::is_control),
+                && (model.harness == Harness::Omp
+                    || (model.hermes_api_url.len() <= 2048
+                        && !model.hermes_api_url.chars().any(char::is_control))),
             "invalid native route"
         );
         ensure!(
@@ -85,13 +88,32 @@ impl ModelSelection {
             model.harness != Harness::Openclaw || (provider == "openai" && !name.contains('/')),
             "unsupported provider"
         );
+        ensure!(
+            model.harness == Harness::Omp || model.omp.is_none(),
+            "omp settings require the omp harness"
+        );
+        if let Some(omp) = &model.omp {
+            omp.validate()?;
+            ensure!(
+                omp.agent_dir
+                    .iter()
+                    .chain(omp.provider_discovery_cwd.iter())
+                    .all(|path| path.is_absolute()),
+                "omp native paths must be resolved"
+            );
+        }
         Ok(Self {
             harness: model.harness,
             provider: provider.into(),
             model: name.into(),
             reasoning_effort: model.reasoning.clone(),
             native_route: model.executable.clone(),
-            hermes_api_url: model.hermes_api_url.clone(),
+            hermes_api_url: if model.harness == Harness::Omp {
+                String::new()
+            } else {
+                model.hermes_api_url.clone()
+            },
+            omp: model.omp.clone(),
         })
     }
     pub fn harness(&self) -> Harness {
@@ -113,13 +135,14 @@ impl ModelSelection {
         ModelConfig {
             harness: self.harness,
             executable: self.native_route.clone(),
-            model: if self.harness == Harness::Openclaw {
+            model: if matches!(self.harness, Harness::Openclaw | Harness::Omp) {
                 format!("{}/{}", self.provider, self.model)
             } else {
                 self.model.clone()
             },
             reasoning: self.reasoning_effort.clone(),
             hermes_api_url: self.hermes_api_url.clone(),
+            omp: self.omp.clone(),
             guidance_file: None,
             core_guidance_file: None,
             guidance: Default::default(),
@@ -425,5 +448,18 @@ pub(super) fn reported(value: &Value) -> NativeReportedEvidence {
         tool_count: count("tool_count").or_else(|| count("toolCount")),
         bootstrap_file_count: count("bootstrap_file_count").or_else(|| count("bootstrapFileCount")),
         prompt_channel: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn historical_selection_identity_survives_launch_recipe_round_trip() {
+        let recorded = r#"{"harness":"openclaw","provider":"openai","model":"fixture","reasoning_effort":"high","native_route":"/native/fixture","hermes_api_url":"https://example.invalid"}"#;
+        let selection: ModelSelection = serde_json::from_str(recorded).unwrap();
+        let reconstructed = ModelSelection::new(&selection.config()).unwrap();
+        assert_eq!(serde_json::to_string(&reconstructed).unwrap(), recorded);
     }
 }

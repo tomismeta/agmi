@@ -163,11 +163,15 @@ pub fn start_preflight(
             SolverNotStarted("invalid_solver_setup")
         );
         let invocation_id = new_invocation_id()?;
-        let envelope = json!({"kind":request.request().kind,"request":request.request()});
-        let prompt = format!(
-            "Envelope (untrusted request data):\n{}",
-            serde_json::to_string(&envelope)?
-        );
+        let prompt = if model.harness == Harness::Omp {
+            String::new()
+        } else {
+            let envelope = json!({"kind":request.request().kind,"request":request.request()});
+            format!(
+                "Envelope (untrusted request data):\n{}",
+                serde_json::to_string(&envelope)?
+            )
+        };
         let scratch = Scratch::new()?;
         let executable = resolve_executable(&model.executable)
             .map_err(|e| e.context(SolverNotStarted("executable_unavailable")))?;
@@ -178,7 +182,7 @@ pub fn start_preflight(
         let args = vec![
             match model.harness {
                 Harness::Hermes => "--print-runtime-command",
-                Harness::Openclaw => "--version",
+                Harness::Openclaw | Harness::Omp => "--version",
             }
             .to_owned(),
         ];
@@ -219,7 +223,7 @@ impl PreflightFlight {
                 &mut Default::default(),
             )
             .await?;
-            let (executable, args, protocol) = match self.model.harness {
+            let (executable, mut args, protocol) = match self.model.harness {
                 Harness::Hermes => {
                     let runtime: Vec<String> = serde_json::from_slice(&bytes)
                         .map_err(|_| NativeFailure("native_envelope_invalid"))?;
@@ -263,6 +267,10 @@ impl PreflightFlight {
                         NativeProtocol::Openclaw,
                     )
                 }
+                Harness::Omp => {
+                    omp::check_version(&bytes)?;
+                    (self.executable.clone(), Vec::new(), NativeProtocol::Omp)
+                }
             };
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             let seconds = remaining
@@ -274,6 +282,17 @@ impl PreflightFlight {
                 )?,
                 NativeProtocol::Openclaw => {
                     encode_openclaw_input(&self.model, seconds, &self.prompt, &self.invocation_id)?
+                }
+                NativeProtocol::Omp => {
+                    let prepared = omp::prepare(
+                        &self.model,
+                        &self.request,
+                        &self.invocation_id,
+                        &self.scratch.0,
+                        self.execution_deadline,
+                    )?;
+                    args = prepared.args;
+                    prepared.input
                 }
                 NativeProtocol::Discovery => unreachable!(),
             };
@@ -336,7 +355,17 @@ impl PendingLaunch {
                 facts,
             ));
         }
-        match spawn_native(&self.executable, &self.args, &self.scratch.0) {
+        let spawned = if self.model.harness == Harness::Omp {
+            omp::spawn(
+                &self.executable,
+                &self.args,
+                &self.scratch.0,
+                self.model.omp.as_ref().unwrap_or(&Default::default()),
+            )
+        } else {
+            spawn_native(&self.executable, &self.args, &self.scratch.0)
+        };
+        match spawned {
             Ok(child) => InferenceStart::Started(InferenceFlight {
                 child,
                 pending: self,
@@ -368,23 +397,29 @@ impl InferenceFlight {
         }
         facts.reported.prompt_channel = Some(Reported {
             value: match self.pending.model.harness {
-                Harness::Hermes => "privileged_policy",
+                Harness::Hermes | Harness::Omp => "privileged_policy",
                 Harness::Openclaw => "shared_gateway_message",
             }
             .into(),
             source: EvidenceSource::AdapterContract,
         });
+        let deadline = self.deadline;
         let p = &mut self.pending;
         let operation = async {
-            let bytes = collect_native_evidence(
-                &mut self.child,
-                std::mem::take(&mut p.input),
-                p.protocol,
-                &mut facts.reported,
-            )
-            .await?;
-            let value: Value = serde_json::from_slice(&bytes)
-                .map_err(|_| NativeFailure("native_envelope_invalid"))?;
+            let input = std::mem::take(&mut p.input);
+            let value: Value = if matches!(p.protocol, NativeProtocol::Omp) {
+                omp::collect(&mut self.child, input, deadline, &mut facts.reported).await?
+            } else {
+                let bytes = collect_native_evidence(
+                    &mut self.child,
+                    input,
+                    p.protocol,
+                    &mut facts.reported,
+                )
+                .await?;
+                serde_json::from_slice(&bytes)
+                    .map_err(|_| NativeFailure("native_envelope_invalid"))?
+            };
             let (provider, model, run_id, output) = match p.model.harness {
                 Harness::Hermes => {
                     let result: HermesOutput = serde_json::from_value(value)
@@ -435,6 +470,7 @@ impl InferenceFlight {
                         .to_owned();
                     (provider.to_owned(), p.model.model.clone(), run, output)
                 }
+                Harness::Omp => omp::result(&value, &p.model, &p.invocation_id)?,
             };
             ensure!(
                 safe_identifier(&run_id),
