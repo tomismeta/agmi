@@ -45,7 +45,6 @@ pub struct PreflightFlight {
 pub struct InferenceFlight {
     child: OwnedChild,
     pending: PendingLaunch,
-    deadline: ExecutionDeadline,
     spawned_at: i64,
 }
 
@@ -369,7 +368,6 @@ impl PendingLaunch {
             Ok(child) => InferenceStart::Started(InferenceFlight {
                 child,
                 pending: self,
-                deadline,
                 spawned_at: now(),
             }),
             Err(error) => InferenceStart::Finished(failed(error, facts)),
@@ -392,7 +390,8 @@ impl InferenceFlight {
             Some(self.pending.preflight_started_at),
             Some(self.spawned_at),
         );
-        if self.deadline.at <= tokio::time::Instant::now() {
+        let deadline = self.pending.deadline;
+        if deadline.at <= tokio::time::Instant::now() {
             return failed(NativeFailure("model_deadline_exceeded").into(), facts);
         }
         facts.reported.prompt_channel = Some(Reported {
@@ -403,7 +402,6 @@ impl InferenceFlight {
             .into(),
             source: EvidenceSource::AdapterContract,
         });
-        let deadline = self.deadline;
         let p = &mut self.pending;
         let operation = async {
             let input = std::mem::take(&mut p.input);
@@ -489,7 +487,7 @@ impl InferenceFlight {
                 },
             ))
         };
-        let result = tokio::time::timeout_at(self.deadline.at, operation).await;
+        let result = tokio::time::timeout_at(deadline.at, operation).await;
         drop(self.child);
         drop(self.pending.scratch);
         match result {
