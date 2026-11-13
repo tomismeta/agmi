@@ -91,6 +91,185 @@ fn update_repair_dry_run_preserves_user_files_and_never_executes_candidate() {
     assert!(value["data"]["readiness"].is_null());
     assert!(!String::from_utf8_lossy(&output.stdout).contains("private synthetic credential"));
 }
+
+#[test]
+fn update_migration_flags_require_explicit_mode_and_release_pinned_approval() {
+    let private = "private-approval-or-path-value";
+    for json in [false, true] {
+        for arguments in [
+            vec!["update", "--migrate", "--repair"],
+            vec!["update", "--migrate", "--migration-only", "--stopped"],
+            vec!["update", "--proposal", private],
+            vec!["update", "--migrate", "--expected-token", private],
+            vec!["update", "--release", private, "--expected-token", private],
+            vec!["update", "--migrate", "--accept-risk-change", private],
+            vec![
+                "update",
+                "--migrate",
+                "--binary",
+                private,
+                "--sha256",
+                private,
+                "--expected-token",
+                private,
+            ],
+            vec![
+                "update",
+                "--migrate",
+                "--check",
+                "--release",
+                private,
+                "--expected-token",
+                private,
+            ],
+        ] {
+            let mut command = binary();
+            if json {
+                command.arg("--json");
+            }
+            let output = command.args(arguments).output().unwrap();
+            assert_eq!(output.status.code(), Some(2));
+            assert!(output.stdout.is_empty());
+            assert!(!String::from_utf8_lossy(&output.stderr).contains(private));
+        }
+    }
+    let output = binary()
+        .args([
+            "--json",
+            "update",
+            "--migrate",
+            "--release",
+            private,
+            "--expected-token",
+            private,
+            "--accept-risk-change",
+            "different-private-token",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let text = String::from_utf8_lossy(&output.stderr);
+    assert!(!text.contains(private));
+    assert!(!text.contains("different-private-token"));
+    let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "update_invalid_arguments");
+}
+
+#[test]
+fn update_private_proposals_are_bounded_objects_and_errors_never_echo_inputs() {
+    let root = tempfile::tempdir().unwrap();
+    let marker = "private-migration-config-or-guidance";
+    let proposal = root.path().join(format!("{marker}.json"));
+    for contents in [
+        format!("{{\"candidate_toml\":\"{marker}\""),
+        format!("\"{marker}\""),
+        format!(
+            "{{\"candidate_toml\":\"{marker}{}\"}}",
+            "x".repeat(64 * 1024)
+        ),
+    ] {
+        fs::write(&proposal, &contents).unwrap();
+        for json in [false, true] {
+            let mut command = binary();
+            if json {
+                command.arg("--json");
+            }
+            let output = command
+                .args(["update", "--migrate", "--dry-run", "--proposal"])
+                .arg(&proposal)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(1));
+            assert!(output.stdout.is_empty());
+            assert!(!String::from_utf8_lossy(&output.stderr).contains(marker));
+            assert_eq!(fs::read_to_string(&proposal).unwrap(), contents);
+            if json {
+                let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+                assert_eq!(error["error"]["code"], "update_invalid_proposal");
+            }
+        }
+    }
+    fs::remove_file(&proposal).unwrap();
+    let output = binary()
+        .args(["--json", "update", "--migrate", "--proposal"])
+        .arg(&proposal)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(marker));
+}
+
+#[cfg(unix)]
+#[test]
+fn update_migration_dry_run_never_executes_or_transports_private_proposal() {
+    use sha2::Digest;
+    use std::{io::Write, os::unix::fs::PermissionsExt, process::Stdio};
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let temporary = root.path().join("temporary");
+    fs::create_dir(&home).unwrap();
+    fs::create_dir(&temporary).unwrap();
+    let candidate = root.path().join("candidate");
+    let marker = root.path().join("executed");
+    let script = b"#!/bin/sh\n: > \"$AGMI_PREVIEW_MARKER\"\nexit 1\n";
+    fs::write(&candidate, script).unwrap();
+    fs::set_permissions(&candidate, fs::Permissions::from_mode(0o700)).unwrap();
+    let digest = format!("{:x}", sha2::Sha256::digest(script));
+    let secret = "private-proposal-body";
+    let input = serde_json::json!({"candidate_toml":secret}).to_string();
+    let proposal = root.path().join("proposal.json");
+    fs::write(&proposal, &input).unwrap();
+    for source in [
+        None,
+        Some(proposal.as_path()),
+        Some(std::path::Path::new("-")),
+    ] {
+        let mut command = binary();
+        command
+            .env("HOME", &home)
+            .env("TMPDIR", &temporary)
+            .env("PATH", root.path())
+            .env("AGMI_PREVIEW_MARKER", &marker)
+            .args(["--json", "update", "--migrate", "--dry-run", "--binary"])
+            .arg(&candidate)
+            .args(["--sha256", &digest]);
+        if let Some(source) = source {
+            command.arg("--proposal").arg(source);
+        }
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Supplying stdin alone is not permission to read it; explicit '-' is.
+        let stdin = if source == Some(std::path::Path::new("-")) {
+            input.as_bytes()
+        } else {
+            b"not-json-private-proposal-body".as_slice()
+        };
+        child.stdin.take().unwrap().write_all(stdin).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert!(!marker.exists());
+        assert_eq!(fs::read_dir(&home).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(&temporary).unwrap().count(), 0);
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["data"]["update"]["status"], "planned");
+        assert_eq!(
+            value["data"]["compatibility"]["classification"],
+            "not_assessed"
+        );
+        assert_eq!(value["data"]["migration"]["phase"], "unknown");
+        assert!(value["data"]["readiness"].is_null());
+        assert!(value["data"].get("preview").is_none());
+        assert!(value["data"]["update"].get("doctor_status").is_none());
+        assert!(!String::from_utf8_lossy(&output.stdout).contains(secret));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(secret));
+    }
+}
+
 #[test]
 fn configuration_initialization_never_overwrites_existing_operator_file() {
     let dir = tempfile::tempdir().unwrap();

@@ -41,7 +41,7 @@ import subprocess
 import sys
 import time
 
-from participation_smoke import Fixture
+from participation_smoke import ANSWER, Fixture
 
 UNITS = ('agmi.service', 'agmi-health.service', 'agmi-health.timer')
 
@@ -156,16 +156,48 @@ def compatibility(binary, old, expected_old_hash, home):
     assert current > 3 and old_manifest != current_manifest
     config_root = home / '.config/agmi'
     config_root.mkdir(parents=True, mode=0o700)
-    fixture = Fixture(str(old), config_root)
+    class HistoricalFixture(Fixture):
+        def __init__(self, executable, root):
+            super().__init__(executable, root)
+            # The old producer owns the original request-bound artifact envelope.
+            interpreter = root / 'fixture-python'
+            interpreter.write_text(f'#!{sys.executable}\n' + '''import json, pathlib, sys
+payload = json.load(sys.stdin)
+e = json.loads(payload['prompt'].split('Envelope (untrusted request data):\\n')[1])
+with pathlib.Path(__file__).with_name('calls').open('a') as calls:
+    calls.write(json.dumps({'kind': e['kind'], 'request_id': e['request_id']}) + '\\n')
+artifact = {'version': 1, 'request_id': e['request_id'],
+    'request_digest': e['request_digest'], 'kind': e['kind'],
+    'answer': ANSWER + f" Epoch {e['request']['epoch']}." if e['kind'] == 'answer' else None,
+    'score': 2 if e['kind'] == 'judge' else None,
+    'reasoning': 'The mechanism binds the bridge to a measurable clock delay.' if e['kind'] == 'judge' else None}
+print(json.dumps({'provider': 'openai-codex', 'model': payload['model'],
+    'reasoning_effort': payload['reasoning'], 'run_id': e['request_id'],
+    'output': json.dumps(artifact)}))
+'''.replace('ANSWER', repr(ANSWER)))
+            interpreter.chmod(0o700)
+
+        def status(self):
+            return self.invoke('status')
+
+        def configure(self, lane=None, **participation):
+            super().configure(lane, **participation)
+            # This authentic format3 reader requires its retired config marker.
+            pending = self.config.with_suffix('.historical')
+            pending.write_text('schema_version = 2\n' + self.config.read_text())
+            pending.chmod(0o600)
+            pending.replace(self.config)
+
+    fixture = HistoricalFixture(str(old), config_root)
     releases = home / '.local/share/agmi/releases'
     current_id, old_id = 'r-' + digest(binary), 'r-' + digest(old)
     lock_root = home / '.agmi-account-locks'
     receipt_written = False
 
-    def cli(executable, *words, success=True, data=None):
+    def cli(executable, *words, success=True, data=None, config_path=None):
         command = [str(executable), '--json']
         if words[0] not in ('install', 'update', 'service'):
-            command += ['--config', str(fixture.config)]
+            command += ['--config', str(config_path or fixture.config)]
         completed = subprocess.run(command + list(words),
                                    input=None if data is None else json.dumps(data),
                                    capture_output=True, text=True, timeout=60)
@@ -194,7 +226,12 @@ def compatibility(binary, old, expected_old_hash, home):
         assert fixture.rows('SELECT id FROM operations')
         assert fixture.rows('SELECT version FROM control')[0]['version'] == 3
         baseline, columns = journal_rows(fixture.database)
-        private = {str(path): digest(path) for path in (fixture.config, fixture.key, fixture.core)}
+        old_reader = config_root / 'old-reader.toml'
+        old_reader.write_bytes(fixture.config.read_bytes())
+        old_reader.chmod(0o600)
+        assert cli(old, 'config', 'check', config_path=old_reader)['valid'] is True
+        cli(old, 'status', config_path=old_reader)
+        private = {str(path): digest(path) for path in (fixture.config, fixture.key, fixture.core, old_reader)}
         writes = len(fixture.writes)
 
         # No release pointer is not evidence of a fresh account.
@@ -205,14 +242,22 @@ def compatibility(binary, old, expected_old_hash, home):
         assert os.readlink(releases / 'current') == old_id
         cli(binary, 'update', '--binary', str(binary), '--sha256', digest(binary), '--stopped', success=False)
         assert os.readlink(releases / 'current') == old_id
-        cli(binary, 'update', '--binary', str(binary), '--sha256', digest(binary), '--stopped', '--migration-only')
+        prepared = cli(binary, 'update', '--binary', str(binary), '--sha256', digest(binary), '--migrate')
+        assert prepared['update']['status'] == 'migration_prepared'
+        assert prepared['migration']['phase'] == 'prepared'
+        assert prepared['private'] is True
         assert os.readlink(releases / 'current') == current_id
         assert all(not active(unit) for unit in UNITS)
         assert all(property_value(unit, 'UnitFileState') in ('disabled', 'linked')
                    for unit in ('agmi.service', 'agmi-health.timer'))
         assert journal_rows(fixture.database, columns)[0] == baseline
+        assert all(digest(pathlib.Path(path)) == value for path, value in private.items())
 
-        proposal = cli(binary, 'config', 'migrate', 'preview', data={})
+        proposal = prepared['preview']
+        import tomllib
+        original_policy = tomllib.loads(fixture.config.read_text())
+        assert original_policy.pop('schema_version') == 2
+        assert tomllib.loads(proposal['candidate_toml']) == original_policy
         assert proposal['target_journal_format'] == current
         token = proposal['token']
         command = ['strace', '-f', '-o', str(home / 'conversion.strace'),
@@ -247,7 +292,13 @@ def compatibility(binary, old, expected_old_hash, home):
         pending = cli(binary, 'config', 'migrate', 'status', '--state-dir', str(fixture.database.parent))
         assert pending['phase'] == 'journal_ready' and pending['token'] == token
         cli(binary, 'run', success=False)
-        cli(binary, 'config', 'migrate', 'resume', '--state-dir', str(fixture.database.parent), '--expected-token', token)
+        recovered = cli(binary, 'update', '--release', current_id, '--migrate', '--expected-token', token)
+        assert recovered['migration']['phase'] == 'complete'
+        assert recovered['migration']['token'] == token
+        assert recovered['migration']['participation_resumed'] is False
+        expected_config = hashlib.sha256(proposal['candidate_toml'].encode()).hexdigest()
+        assert digest(fixture.config) == expected_config, 'configuration differs from approved candidate'
+        private[str(fixture.config)] = expected_config
         assert_conversion_preserved(fixture.database, baseline, columns)
         assert all(digest(pathlib.Path(path)) == value for path, value in private.items())
         assert fixture.rows('SELECT version FROM control')[0]['version'] == current
@@ -256,9 +307,27 @@ def compatibility(binary, old, expected_old_hash, home):
         before = file_inventory(fixture.database.parent, lock_root)
         observations = (len(fixture.reads), len(fixture.writes))
         for command in ('status', 'pause', 'run'):
-            cli(old, command, success=False)
+            if command == 'status':
+                trace = home / 'old-status.strace'
+                trace.touch(mode=0o600)
+                refused = run(['strace', '-f', '-qq', '-s', '4096', '-e', 'trace=openat',
+                               '-o', str(trace), str(old), '--config', str(old_reader),
+                               '--json', command], success=False)
+                opened = [line for line in trace.read_text().splitlines()
+                          if f'"{fixture.database}"' in line]
+                assert opened, 'old reader never opened the converted journal'
+                assert any(line.rsplit(' = ', 1)[-1].strip().isdigit() for line in opened), (
+                    'old reader never successfully opened the converted journal')
+                assert all('O_RDONLY' in line and 'O_RDWR' not in line and 'O_WRONLY' not in line
+                           for line in opened), 'old reader opened the journal for writing'
+            else:
+                refused = cli(old, command, success=False, config_path=old_reader)
+            # The authentic CLI redacts the underlying unsupported-schema cause.
+            # Valid old config and a read-only DB open rule out a parse-only pass.
+            assert json.loads(refused.stderr)['error']['code'] == 'operation_failed'
             assert file_inventory(fixture.database.parent, lock_root) == before
             assert (len(fixture.reads), len(fixture.writes)) == observations
+            assert all(digest(pathlib.Path(path)) == value for path, value in private.items())
         for extra in ([], ['--migration-only']):
             cli(binary, 'update', '--release', old_id, '--stopped', *extra, success=False)
             assert os.readlink(releases / 'current') == current_id
@@ -293,6 +362,7 @@ def compatibility(binary, old, expected_old_hash, home):
             name: before_restart[name] for name in protected}
         assert len(fixture.writes) == writes
         assert fixture.status()['paused'] is True
+        assert all(digest(pathlib.Path(path)) == value for path, value in private.items())
         # Starting/restarting must preserve the migration-only disabled boot intent.
         # Another disable would remove the installed out-of-tree definition links.
         assert all(property_value(unit, 'UnitFileState') in ('disabled', 'linked')

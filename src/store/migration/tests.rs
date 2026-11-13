@@ -1833,3 +1833,395 @@ fn no_journal_per_lane_cutovers_and_ambiguous_shapes_fail_closed() {
         );
     }
 }
+
+type UpgradeInspectionEvidence = (Vec<PathBuf>, Vec<(PathBuf, Vec<u8>)>, Option<String>);
+
+// Capture consumer-visible durable evidence, including the absence of lock files.
+// SQLite's shared-memory coordination bytes are not migration journal evidence.
+fn upgrade_inspection_evidence(fixture: &Fixture) -> UpgradeInspectionEvidence {
+    fn paths(root: &Path, result: &mut Vec<PathBuf>) {
+        if root.is_dir() {
+            for entry in fs::read_dir(root).unwrap() {
+                let path = entry.unwrap().path();
+                result.push(path.clone());
+                paths(&path, result);
+            }
+        }
+    }
+    let journal = open_existing(&fixture.config.state_dir, false)
+        .unwrap()
+        .map(|db| evidence_digest(&db).unwrap());
+    // List paths after observing SQLite: this collector's read-only WAL reader
+    // can itself establish coordination sidecars before returning the snapshot.
+    let mut files = Vec::new();
+    paths(fixture._temp.path(), &mut files);
+    files.sort();
+    let writer = lock_path(&fixture.config, "writer").unwrap();
+    let prefix = format!("{}.", writer.file_stem().unwrap().to_string_lossy());
+    let mut authority = Vec::new();
+    if let Ok(entries) = fs::read_dir(writer.parent().unwrap()) {
+        for entry in entries {
+            let entry = entry.unwrap();
+            if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                authority.push((entry.path(), fs::read(entry.path()).unwrap()));
+            }
+        }
+    }
+    authority.push((fixture.path.clone(), bytes(&fixture.path).unwrap()));
+    authority.sort();
+    (files, authority, journal)
+}
+
+fn current_upgrade_fixture() -> Fixture {
+    let fixture = Fixture::format3();
+    let proposal = preview(&fixture.path, &json!({})).unwrap();
+    apply(
+        &fixture.path,
+        &proposal["request"],
+        proposal["token"].as_str().unwrap(),
+        None,
+    )
+    .unwrap();
+    fixture
+}
+
+#[test]
+fn upgrade_inspection_and_proposal_preflight_never_initialize_config_only_sources() {
+    for kind in [
+        UpgradeKind::Conversion,
+        UpgradeKind::MarkerOnly,
+        UpgradeKind::Compatible,
+    ] {
+        let fixture = Fixture::new(None);
+        if kind != UpgradeKind::Conversion {
+            let text = toml::to_string(&fixture.config).unwrap();
+            let source = if kind == UpgradeKind::MarkerOnly {
+                format!("schema_version=2\n{text}")
+            } else {
+                text
+            };
+            crate::admin::persist(&fixture.path, source.as_bytes()).unwrap();
+        }
+        let before = upgrade_inspection_evidence(&fixture);
+        let inspected = inspect_upgrade(&fixture.path).unwrap();
+        assert_eq!(inspected.kind, kind);
+        assert_eq!(inspected.state_dir, fixture.config.state_dir);
+        assert_eq!(
+            inspected.source_sha256,
+            digest(bytes(&fixture.path).unwrap())
+        );
+        assert_eq!(inspected.journal_format, None);
+        assert_eq!(inspected.paused, None);
+        assert!(inspected.pending.is_none());
+        validate_upgrade_proposal(&fixture.path, &json!({})).unwrap();
+        assert_eq!(upgrade_inspection_evidence(&fixture), before);
+        assert!(!fixture.config.state_dir.exists());
+        assert!(!lock_path(&fixture.config, "writer").unwrap().exists());
+        assert!(!lock_path(&fixture.config, "admission").unwrap().exists());
+        assert!(!lock_path(&fixture.config, "binding").unwrap().exists());
+    }
+}
+
+#[test]
+fn upgrade_legacy_inspection_discovers_without_caps_but_never_invents_policy_or_adoption() {
+    for schema in [1, 2] {
+        let mut fixture = Fixture::new(Some(schema));
+        let mut legacy = legacy::Legacy::parse(&fixture.source).unwrap();
+        legacy.participation.mode = ParticipationMode::ParticipationFirst;
+        legacy.participation.allow_judge = true;
+        fixture.source = toml::to_string(&legacy).unwrap().into_bytes();
+        crate::admin::persist(&fixture.path, &fixture.source).unwrap();
+        let before = upgrade_inspection_evidence(&fixture);
+        let inspected = inspect_upgrade(&fixture.path).unwrap();
+        assert_eq!(inspected.kind, UpgradeKind::Conversion);
+        assert_eq!(inspected.journal_format, Some(schema));
+        assert_eq!(inspected.paused, Some(false));
+        let missing = validate_upgrade_proposal(&fixture.path, &json!({})).unwrap_err();
+        assert!(matches!(
+            missing.downcast_ref::<MigrationError>(),
+            Some(MigrationError::LimitsRequired)
+        ));
+        let caps = json!({"caps":{"answer":2,"judge":1,"mine":1}});
+        if schema == 1 {
+            assert!(validate_upgrade_proposal(&fixture.path, &caps).is_err());
+            let approved = json!({"caps":{"answer":2,"judge":1,"mine":1},"adopt_legacy":true});
+            validate_upgrade_proposal(&fixture.path, &approved).unwrap();
+            assert!(validate_upgrade_proposal(
+                &fixture.path,
+                &json!({"caps":{"answer":2,"judge":1,"mine":1},"adopt_legacy":true,"initial_database_id":"invalid"}),
+            ).is_err());
+        } else {
+            validate_upgrade_proposal(&fixture.path, &caps).unwrap();
+        }
+        assert_eq!(upgrade_inspection_evidence(&fixture), before);
+        // Validation is not risk approval and does not seal even an increased exposure.
+        let db = open_existing(&fixture.config.state_dir, false)
+            .unwrap()
+            .unwrap();
+        assert!(!table_exists(&db, "capability_migration").unwrap());
+    }
+    let fixture = Fixture::new(Some(2));
+    fs::remove_file(lock_path(&fixture.config, "binding").unwrap()).unwrap();
+    fs::write(
+        lock_path(&fixture.config, "writer").unwrap(),
+        digest(fixture.config.state_dir.as_os_str().as_encoded_bytes()),
+    )
+    .unwrap();
+    assert_eq!(
+        inspect_upgrade(&fixture.path).unwrap().kind,
+        UpgradeKind::Conversion
+    );
+    assert!(validate_upgrade_proposal(&fixture.path, &json!({})).is_err());
+    validate_upgrade_proposal(&fixture.path, &json!({"adopt_legacy":true})).unwrap();
+}
+
+#[test]
+fn upgrade_marker4_and_source3_preflight_do_not_require_or_change_the_future_pause() {
+    for current in [false, true] {
+        let fixture = if current {
+            current_upgrade_fixture()
+        } else {
+            Fixture::format3()
+        };
+        let source = format!(
+            "schema_version=2\n{}",
+            String::from_utf8(bytes(&fixture.path).unwrap()).unwrap()
+        );
+        crate::admin::persist(&fixture.path, source.as_bytes()).unwrap();
+        let db = open_existing(&fixture.config.state_dir, true)
+            .unwrap()
+            .unwrap();
+        db.execute("UPDATE control SET paused=0", []).unwrap();
+        drop(db);
+        let before = upgrade_inspection_evidence(&fixture);
+        let inspected = inspect_upgrade(&fixture.path).unwrap();
+        assert_eq!(
+            inspected.kind,
+            if current {
+                UpgradeKind::MarkerOnly
+            } else {
+                UpgradeKind::Conversion
+            }
+        );
+        assert_eq!(inspected.journal_format, Some(if current { 4 } else { 3 }));
+        assert_eq!(inspected.paused, Some(false));
+        validate_upgrade_proposal(&fixture.path, &json!({})).unwrap();
+        assert!(
+            validate_upgrade_proposal(
+                &fixture.path,
+                &json!({"caps":{"answer":2,"judge":1,"mine":1}})
+            )
+            .is_err()
+        );
+        let mut changed = fixture.config.clone();
+        changed.runtime.shutdown_seconds += 1;
+        assert!(
+            validate_upgrade_proposal(
+                &fixture.path,
+                &json!({"candidate_toml":toml::to_string(&changed).unwrap()}),
+            )
+            .is_err()
+        );
+        assert_eq!(upgrade_inspection_evidence(&fixture), before);
+        assert!(preview(&fixture.path, &json!({})).is_err());
+    }
+}
+
+#[test]
+fn upgrade_current_compatibility_uses_metadata_and_not_a_completed_seals_stale_inputs() {
+    let fixture = current_upgrade_fixture();
+    let mut current = Config::load_metadata(&fixture.path).unwrap();
+    current.runtime.shutdown_seconds += 1;
+    current.capabilities.answer.model.guidance_file =
+        Some(fixture._temp.path().join("missing-guidance"));
+    crate::admin::persist(&fixture.path, toml::to_string(&current).unwrap().as_bytes()).unwrap();
+    let db = open_existing(&fixture.config.state_dir, true)
+        .unwrap()
+        .unwrap();
+    db.execute("UPDATE control SET paused=0,generation=generation+7", [])
+        .unwrap();
+    drop(db);
+    let before = upgrade_inspection_evidence(&fixture);
+    let inspected = inspect_upgrade(&fixture.path).unwrap();
+    assert_eq!(inspected.kind, UpgradeKind::Compatible);
+    assert_eq!(inspected.journal_format, Some(CURRENT_JOURNAL_FORMAT));
+    assert_eq!(inspected.paused, Some(false));
+    assert!(inspected.pending.is_none());
+    assert_eq!(upgrade_inspection_evidence(&fixture), before);
+}
+
+#[test]
+fn upgrade_pending_discovery_preserves_canonical_target_token_and_prerequisites_without_caps() {
+    for pre_gate in [false, true] {
+        let mut fixture = Fixture::new(Some(2));
+        let mut legacy = legacy::Legacy::parse(&fixture.source).unwrap();
+        legacy.participation.mode = ParticipationMode::ParticipationFirst;
+        legacy.participation.allow_judge = true;
+        fixture.source = toml::to_string(&legacy).unwrap().into_bytes();
+        crate::admin::persist(&fixture.path, &fixture.source).unwrap();
+        let proposal = fixture.preview();
+        let proposal = if pre_gate {
+            pre_gate_proposal(proposal)
+        } else {
+            proposal
+        };
+        fixture.stage(&proposal);
+        let before = upgrade_inspection_evidence(&fixture);
+        let inspected = inspect_upgrade(&fixture.path).unwrap();
+        assert_eq!(inspected.kind, UpgradeKind::Pending);
+        assert_eq!(inspected.journal_format, Some(4));
+        let pending = inspected.pending.unwrap();
+        assert_eq!(pending, status(&fixture.config.state_dir).unwrap());
+        assert_eq!(pending["token"], proposal["token"]);
+        assert_eq!(pending["target_journal_format"], 4);
+        assert_eq!(pending["recovery_supported"], true);
+        assert_eq!(pending["recovery_prerequisite"].is_string(), pre_gate);
+        assert!(pending.get("candidate_toml").is_none());
+        assert!(pending.get("seal").is_none());
+        assert!(validate_upgrade_proposal(&fixture.path, &json!({})).is_err());
+        assert_eq!(upgrade_inspection_evidence(&fixture), before);
+    }
+    let (fixture, token, _) = Fixture::historical_pending(1);
+    let before = upgrade_inspection_evidence(&fixture);
+    let inspected = inspect_upgrade(&fixture.path).unwrap();
+    assert_eq!(inspected.kind, UpgradeKind::Pending);
+    let pending = inspected.pending.unwrap();
+    assert_eq!(pending["token"], token);
+    assert_eq!(pending["target_journal_format"], 3);
+    assert_eq!(pending["further_migration_required"], true);
+    assert_eq!(upgrade_inspection_evidence(&fixture), before);
+}
+
+#[test]
+fn upgrade_pre_gate4_discovery_accepts_historical_intermediates_but_never_adopts_them() {
+    let fixture = Fixture::new(Some(1));
+    let proposal = pre_gate_proposal(fixture.preview());
+    fixture.stage(&proposal);
+    let mut intermediate: Binding = serde_json::from_slice(
+        &current_destination(&fixture.config, &proposal["snapshot"]).unwrap(),
+    )
+    .unwrap();
+    intermediate.writer_inode = None;
+    intermediate.admission_inode = None;
+    write_binding(
+        &lock_path(&fixture.config, "binding").unwrap(),
+        &intermediate,
+    )
+    .unwrap();
+    for stable in [false, true] {
+        if stable {
+            fs::write(lock_path(&fixture.config, "writer").unwrap(), WRITER_MARKER).unwrap();
+        }
+        let before = upgrade_inspection_evidence(&fixture);
+        let inspected = inspect_upgrade(&fixture.path).unwrap();
+        assert_eq!(inspected.kind, UpgradeKind::Pending);
+        assert!(inspected.pending.unwrap()["recovery_prerequisite"].is_string());
+        assert_eq!(upgrade_inspection_evidence(&fixture), before);
+    }
+    resume(
+        &fixture.path,
+        &fixture.config.state_dir,
+        proposal["token"].as_str().unwrap(),
+    )
+    .unwrap();
+    let before = upgrade_inspection_evidence(&fixture);
+    assert!(inspect_upgrade(&fixture.path).is_err());
+    assert_eq!(upgrade_inspection_evidence(&fixture), before);
+    assert!(
+        read_binding(&fixture.config)
+            .unwrap()
+            .unwrap()
+            .admission_inode
+            .is_none()
+    );
+}
+
+#[test]
+fn upgrade_inspection_rejects_conflicting_unsupported_and_corrupt_states_without_repair() {
+    for mutation in ["seal", "phase", "config", "control", "authority"] {
+        let fixture = Fixture::new(Some(2));
+        let proposal = fixture.preview();
+        fixture.stage(&proposal);
+        let db = open_existing(&fixture.config.state_dir, true)
+            .unwrap()
+            .unwrap();
+        match mutation {
+            "seal" => {
+                let mut sealed = export(
+                    &fixture.config.state_dir,
+                    proposal["token"].as_str().unwrap(),
+                )
+                .unwrap()["sealed"]
+                    .clone();
+                sealed["target_journal_format"] = json!(99);
+                db.execute(
+                    "UPDATE capability_migration SET sealed=?1",
+                    [serde_json::to_string(&sealed).unwrap()],
+                )
+                .unwrap();
+            }
+            "phase" => {
+                db.execute("UPDATE capability_migration SET phase='unknown'", [])
+                    .unwrap();
+            }
+            "config" => {
+                let mut legacy = legacy::Legacy::parse(&fixture.source).unwrap();
+                legacy.participation.max_unresolved_operations += 1;
+                crate::admin::persist(&fixture.path, toml::to_string(&legacy).unwrap().as_bytes())
+                    .unwrap();
+            }
+            "control" => {
+                db.execute("UPDATE control SET generation=generation+1", [])
+                    .unwrap();
+            }
+            _ => {
+                db.execute("DELETE FROM authority", []).unwrap();
+            }
+        }
+        drop(db);
+        let before = upgrade_inspection_evidence(&fixture);
+        assert!(inspect_upgrade(&fixture.path).is_err(), "{mutation}");
+        assert_eq!(upgrade_inspection_evidence(&fixture), before);
+    }
+    for mutation in ["version", "authority", "binding", "journal", "lane"] {
+        let fixture = current_upgrade_fixture();
+        if mutation == "journal" {
+            fs::remove_file(fixture.config.state_dir.join("state.sqlite3")).unwrap();
+        } else if mutation == "binding" {
+            fs::remove_file(lock_path(&fixture.config, "binding").unwrap()).unwrap();
+        } else {
+            let db = open_existing(&fixture.config.state_dir, true)
+                .unwrap()
+                .unwrap();
+            db.execute_batch(match mutation {
+                "version" => "UPDATE control SET version=99;",
+                "authority" => "DELETE FROM authority;",
+                _ => "DELETE FROM lane_control WHERE lane='answer';",
+            })
+            .unwrap();
+        }
+        let before = upgrade_inspection_evidence(&fixture);
+        assert!(inspect_upgrade(&fixture.path).is_err(), "{mutation}");
+        assert_eq!(upgrade_inspection_evidence(&fixture), before);
+    }
+    let fixture = Fixture::new(None);
+    for source in [
+        format!(
+            "schema_version=99\n{}",
+            toml::to_string(&fixture.config).unwrap()
+        ),
+        format!(
+            "schema_version=2\n{}",
+            String::from_utf8(fixture.source.clone()).unwrap()
+        ),
+        format!(
+            "[participation]\n{}",
+            toml::to_string(&fixture.config).unwrap()
+        ),
+    ] {
+        crate::admin::persist(&fixture.path, source.as_bytes()).unwrap();
+        let before = upgrade_inspection_evidence(&fixture);
+        assert!(inspect_upgrade(&fixture.path).is_err());
+        assert_eq!(upgrade_inspection_evidence(&fixture), before);
+    }
+}

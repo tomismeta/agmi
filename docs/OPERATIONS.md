@@ -264,37 +264,40 @@ Configuration failures include a bounded `details.reason` and, where known, a so
 
 ### Atomic capability migration
 
-Capability-owned configuration and journal format 4 are an explicit breaking cutover from v0.1.1, not an automatic upgrade or legacy-bot importer. Preserve private backups for investigation; never restore older state to regain availability. For a live cutover, durably pause with the old binary and stop the writer before preview/apply. The isolated unsealed source-2 rehearsal below does not require pausing production. Existing IDs, dispatch witnesses, operations, binding history, uncertainty and budgets remain intact. Source-3 conversion preserves existing controls and rows while provisioning required lane state; older-layout conversion retains its explicit pause/grant-revocation semantics.
+The proposed current contract uses unversioned per-lane configuration and journal format 4. Published **v0.1.0 and v0.1.1 use global-shaped configuration and journal format 2**; the unreleased implementation below is not a package publication or proof of a deployed format. Inspect actual configuration, journal, authority and migration seal rather than inferring compatibility from a version label. This is a permanent explicit cutover, not a legacy-bot importer. Preserve private backups for investigation; never restore older state to regain availability.
 
-For an existing managed **journal-2 or journal-3 installation**, invoke the independently verified new binary—not the installed old updater:
+Ordinary `update` does not convert or pause an incompatible installation. `update --migrate` explicitly authorizes stopped maintenance: verify/stage the incoming release, disable service/timer boot activation, stop and verify the writer, durably pause when necessary, then select the incoming release stopped. A pause can change generation and invalidate grants/captures. Preparation is disruptive and mutating, **not a dry run**. Nothing automatically re-enables, starts or resumes participation.
 
-```sh
-# NEW_AGMI is the approved new executable; EXPECTED_SHA256 is operator-trusted.
-"$NEW_AGMI" update --binary "$NEW_AGMI" --sha256 "$EXPECTED_SHA256" \
-  --stopped --migration-only
-```
-
-This permits only the supported stopped 2/3-to-4 release bootstrap. It disables boot activation for `agmi.service` and `agmi-health.timer` and verifies that the units remain stopped. It never repairs, converts configuration/state or resumes participation. Ordinary updates reject the crossing; downgrade to an older journal contract is refused. A direct local foreground installation can use the new binary without this systemd bootstrap.
-
-Bootstrap completes legacy backup and link publication before disabling boot activation. If disabling partially fails, it attempts to restore all missing unit-definition links against the still-selected release and reload the manager before reporting failure. It does not re-enable services; filesystem or manager errors can still require operator repair. Inspect service state before explicitly retrying or re-enabling the old release.
-
-Installer evidence includes `bootstrap_recovery` for the pre-selection recovery sequence: `disable_command_succeeded`, `definitions_restored` (including directory sync), and `manager_reload_succeeded`. A false value includes an unconfirmed action; command success alone does not prove disabled boot intent. `null` means no recovery evidence was captured. `bootstrap_recovery_failed` identifies incomplete restoration or reload even when disabling also failed. Later activation/reload failures have their own stage and failure code. Inspect the retained release, definition links and manager state before any retry; this evidence never authorizes an automatic enable/start.
-
-Prepare a private JSON proposal containing explicit positive `caps` for `answer`, `judge` and `mine`, or a complete `candidate_toml`. Caps are policy decisions, not automatically copied global capacity. Strict legacy configuration can use `{}` where preservation is provable. Inspect `config migrate preview --help` for the input shape. With `jq` available:
+**One-time published-client bootstrap:** v0.1.0 has no latest-stable updater; v0.1.1 online discovery requires journal format 2 before downloading and cannot fetch a journal-4 candidate. Old CLIs do not learn the new migration flags. Acquire the correct candidate through the publisher/operator trust path; verify origin, archive checksum, extracted executable checksum, and published manifest/build identity **before executing it**. Checksums under publisher trust are not independent signatures. Invoke that verified new executable directly; do not overwrite the managed binary by hand or install an intermediate bridge release:
 
 ```sh
+# NEW_AGMI is the verified new executable; EXPECTED_SHA256 is operator-trusted.
 umask 077
-"$NEW_AGMI" --config "$CONFIG" --json config migrate preview \
-  < proposal.json > migration-preview.json
-TOKEN="$(jq -r '.data.token' migration-preview.json)"
-# Review candidate, risk, backlog and authority evidence before applying.
-jq '.data.request' migration-preview.json |
-  "$NEW_AGMI" --config "$CONFIG" --json config migrate apply --expected-token "$TOKEN"
+"$NEW_AGMI" --json update --binary "$NEW_AGMI" --sha256 "$EXPECTED_SHA256" \
+  --migrate --proposal proposal.json > migration-preview.json
 ```
 
-Use the preview's exact returned `request`, not a reconstructed proposal. Approval binds source/candidate bytes, guidance, authority and journal evidence. Changed inputs require a fresh preview. If `risk_change_required` is true, application also requires explicit `--accept-risk-change "$TOKEN"` after reviewing that same preview. Historical exemptions and over-cap backlog can make preservation unprovable; current charged counts alone are not proof. Migration evaluates effect exposure, per-epoch answer attempts, uncertain-retry allowances and model spending independently: increases cannot hide behind an otherwise strict participation mode.
+Prepare `proposal.json` privately with explicit positive `caps` for `answer`, `judge` and `mine`, or a complete `candidate_toml`. Caps are policy decisions, never automatically copied or divided global capacity. Canonical strict/no-allow legacy configuration may use `{}` only when preservation is proven. Missing necessary choices refuse before maintenance. No default modes, models, quotas or authority adoption are invented. Inspect `config migrate preview --help` for the canonical input shape.
 
-Earlier per-lane configurations containing `schema_version = 2` also require explicit cutover, including installations already on journal format 4. With the old build, durably pause and stop the writer; use `{}` as the proposal. Preview removes the obsolete configuration marker without changing the selected lane policy. Current-format cutover preserves existing lane controls, generation, account authority and retained operations; it does not reprovision them as a fresh migration. Configuration, lane and producer revisions change deliberately. Historical captures keep their original producer facts and charges; changed revisions never grant replay or reset an uncertain-inference budget.
+`--proposal FILE` accepts one JSON object of at most 64 KiB; only explicit `--proposal -` reads stdin. Proposal JSON never travels in child argv: handoff uses an owned mode-0600 temporary file until the installer finishes. Preview/request/config/guidance/routing details are private; do not publish or log them. Preparation reports `migration_prepared`, not `updated`, and returns a private canonical `data.preview`, exact request, token and selected release ID. With `jq` available:
+
+```sh
+TOKEN="$(jq -r '.data.migration.token' migration-preview.json)"
+RELEASE_ID="$(jq -r '.data.migration.release_id' migration-preview.json)"
+jq '.data.preview.request' migration-preview.json > request.json
+# Review candidate, backlog, exposure, model routes/budgets and authority first.
+"$NEW_AGMI" --json update --release "$RELEASE_ID" --migrate \
+  --proposal request.json --expected-token "$TOKEN"
+# Add --accept-risk-change "$TOKEN" only when required and explicitly approved.
+```
+
+Use the preview's exact returned `request`, never a reconstructed proposal. The approval tuple is **selected release ID + exact request + migration token**. Continuation requires an explicit `--release` equal to the currently selected verified candidate and never re-resolves latest or selects a different candidate incidentally. Source/config/guidance/journal/authority or selection changes require refusal and a fresh explicit review, not automatic reapproval. Risk acknowledgment must equal the expected token. Changed/unproven effect exposure, answer-attempt or uncertain-retry allowances, model spending and historical backlog are assessed independently; strict mode alone is not proof. `--migrate` conflicts with `--repair` and `--migration-only`.
+
+For per-lane `schema_version = 2` configuration already on journal format 4, plain update reports migration required. Explicit `update --migrate` uses the canonical exact `{}` marker-only preview/token/apply internally; it needs no external approval token and cannot change lane policy. Existing controls, account authority, operations, charges and retry floors remain. The necessary pause may change generation; configuration/lane/producer revisions change, and formatting/comments may be reserialized. Historical captures retain their original facts and charges, never automatic replay or budget reset. The result is `migration_complete_stopped`, not readiness.
+
+Per-lane journal-3 conversion also uses unchanged-policy `{}`, but requires the returned token and explicit pinned continuation. Global-layout conversion requires explicit policy choices as above. Ordinary already-compatible updates retain their existing runtime/timer intent and config/pause/generation behavior, including when `--migrate` finds no conversion necessary.
+
+The lower-level `--stopped --migration-only` explicit-source bootstrap remains available for supported 2/3-to-4 installation selection without conversion. It disables boot activation and never starts or repairs participation; use canonical standalone preview/apply with caller-managed stopping for noncanonical foreground installations. Partial bootstrap failures retain bounded `bootstrap_recovery` evidence for disable, definition restoration and manager reload; inspect actual selected release and manager state before retrying, never automatically enable/start.
 
 Eligible initial unbound schema-1 authority additionally requires `adopt_legacy: true`. Preview returns the proposed initial database ID in `request`; reuse it. Conversion and initial authority sealing share one durable transaction. Missing or conflicting established schema-2 authority is never recreated.
 
@@ -309,6 +312,15 @@ If interrupted, inspect the sealed migration without starting participation:
 ```
 
 **`config migrate resume` finishes conversion; it does not resume participation.** Use the token from migration status. Exact old bytes can be replaced by the sealed candidate; exact new bytes can be verified and finished. Different configuration/guidance or authority is a conflict, never permission to overwrite. Keep stopped, inspect the private export and restore approved inputs deliberately; do not edit journal or authority records.
+
+Integrated `update --migrate --release "$RELEASE_ID" --expected-token "$TOKEN"` may finish the same canonical pending seal only when the selected release and exact token match. Use the verified incoming/retained executable, not an arbitrary stale CLI on PATH. A pending seal is recovery, not permission to generate a new proposal, retarget historical approval, repeat pause or adopt authority. After the first committed conversion seal (or config publication for config-only conversion), do not restart the old writer. If incoming selection succeeded before conversion or a later installer step failed, inspect migration and installation phases independently: failure never means rollback. Boot-disable/stopped maintenance intent is not automatically restored after interruption or cold restart.
+
+Integrated recovery reports `pending` separately from further work. Only a pending
+seal gets an old-token continuation. A completed target-3 seal gets a fresh,
+separate current-format preparation, never reuse of its old approval. A completed
+pre-gate seal exposes the bounded `authority_adoption` prerequisite: keep every
+controller/native task stopped, inspect admission authority and separately approve
+canonical `recover adopt`. Neither prerequisite authorizes service activation.
 
 A recognized historical seal without an explicit target resumes only its exact original target-3 conversion, retaining its token and archived seal. It then needs a separate explicit 3-to-current preview/apply. Never relabel that seal or run the intermediate journal with the current binary. New conversion approvals authenticate both permanent writer and account-admission inodes without resetting database identity or witness. Authentic earlier explicit-4 approvals finish their unchanged writer-only destination; stopped `recover adopt` separately establishes the missing account-gate anchor before ordinary use. Completed migration resume only acknowledges completion, never retrofits anchors. Missing or contradictory established authority is a refusal, not a repair opportunity.
 
@@ -598,15 +610,15 @@ activation. Archives cannot supply arbitrary extraction paths or symlinks.
 HTTPS trusts that publisher's release assets; checksums are integrity checks, not
 independent signatures or protection against a compromised publisher.
 
-`--check` and `--dry-run` do not activate or repair anything. A successful check
-can report no compatible update or unverifiable source ordering; inspect its
-availability/reason rather than treating exit zero as installability. Automatic
-activation requires a compatible managed installation and conservative
-version/commit ancestry evidence. Dirty, divergent or unproven source ordering is
-not resolved by downgrading. Different commits with the same package version are
-not treated as the same build. A selected-release fence is rechecked under the
-installer lock, preventing a concurrent update from invalidating the download's
-original decision. Explicit local sources below remain operator-selected.
+`--check` and `--dry-run` never execute incoming code, activate, repair or convert.
+They report operational compatibility as `not_assessed`, not installability; this
+also applies with `--migrate`. A successful publication check may report no
+compatible update or unverifiable source ordering. Inspect availability/reason.
+Automatic activation requires verified host/build compatibility, protocol fencing
+and conservative version/commit ancestry evidence. Dirty, divergent or unproven
+source ordering is not resolved by downgrading. Different commits with the same
+package version are not the same build. The selected-release fence is rechecked
+under the installer lock. Explicit local sources remain operator-selected.
 
 Incoming published builds must advertise `update_protocol=1` in their verified
 build manifest: this guarantees support for the lock-held selected-release fence.
@@ -615,21 +627,31 @@ unknown protocols are reported as incompatible during discovery, never offered
 for automatic activation. Explicit local installation remains available; the
 updater does not weaken its concurrency safeguard to accommodate older installers.
 
-Downloads finish before the existing managed installer performs the cutover.
+Protocol 1 guarantees that fence, not universal configuration/journal compatibility.
+Future ordinary compatible releases can use the existing verified incoming public-CLI
+handoff without a bridge release or update-protocol bump. Older delegating parents
+may discard unfamiliar child migration fields or report generic failure; the
+one-time verified-new-CLI path above remains the honest escape hatch.
+
+For ordinary compatible updates, downloads finish before managed installer cutover.
 Configuration bytes, credentials, model/reasoning settings, core/user guidance,
 pause intent and generation remain unchanged. No template is reapplied, account
 is reinitialized, model is abandoned, or journal snapshot is restored. A service
 that was running may resume its previously authorized participation after restart.
 
-After a successful update/no-op, the selected executable runs read-only doctor.
+After a successful ordinary compatible update/no-op, the selected executable runs read-only doctor.
 `--repair` additionally authorizes its existing guarded refusal recovery, including
 the disclosed legacy-429 policy limitation; it is not permission to replay
 uncertain writes or clear history. Checks/dry runs never repair, and `--check`
 cannot be combined with `--repair`. A failed update does not proceed to repair.
 
-JSON `data.update`, `data.repair` and `data.readiness` are separate outcomes.
-Update/repair failure exits nonzero without hiding a completed activation or
-partial repair. An unhealthy doctor report does not undo a successful update;
+JSON `data.update`, `data.installation`, `data.compatibility`, `data.migration`,
+`data.repair` and `data.readiness` are separate outcomes. Finite migration outcomes
+are `migration_required`, `migration_prepared`, `migration_complete_stopped` and
+`recovery_required`; preparation can exit zero only as preparation. Migration
+refusal/preparation/completion/recovery never runs doctor or automatic repair/resume.
+Update/repair failure exits nonzero without hiding completed activation, conversion
+or partial repair. Unhealthy doctor evidence does not undo an ordinary update;
 readiness may be unavailable if the selected binary cannot provide that contract.
 The report identifies that doctor executable's release and rechecks selection
 afterward. Changed or unverifiable selection makes diagnosis `stale` and removes
@@ -847,6 +869,16 @@ The process fixture also supports `--harness hermes` for its Python-only fake na
 `python3 tests/native_bridge_smoke.py` executes the actual embedded Python and Node bridges against isolated native API substitutes. It covers authentication-route checks, isolation settings, policy delivery, failure cleanup and encoded input limits without live credentials. This is separate from the scheduler fixtures' fake inference transports.
 
 CI also runs `tests/systemd_smoke.py` inside the disposable image defined by `tests/systemd_fixture.Dockerfile`. The container owns its user manager, home and units; it has no external network or host home/bus/cgroup mounts. This exercises real install/update/retained-release activation and post-switch failure cleanup. Do not run this fixture against a production user's services.
+
+Automated-update acceptance also exercised checksum-verified published v0.1.0 and
+v0.1.1 journal-2 clients through the documented verified-new-CLI bootstrap,
+unchanged-policy source-3 conversion with sealed interruption/public pinned recovery,
+and journal-4 marker removal from a running old writer. These synthetic, loopback-only
+accounts retained authority and approved policy and finished paused, stopped and
+boot-disabled. Compatible updates preserved independent runtime/timer intent.
+Use a release-profile executable for the resource-capped fixture; debug builds are
+not production performance evidence. These updater runs did not include a fresh
+kernel reboot or production/native-provider authentication.
 
 Local protocol/model fixtures exercise deterministic lifecycle boundaries; they do not prove production authentication or live network outcomes. Production activation needs separate end-to-end verification with the real account and configured harness.
 

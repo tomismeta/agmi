@@ -50,6 +50,10 @@ pub struct Options<'a> {
     pub repair: bool,
     pub stopped: bool,
     pub migration_only: bool,
+    pub migrate: bool,
+    pub proposal: Option<&'a Value>,
+    pub expected_token: Option<&'a str>,
+    pub accept_risk_change: Option<&'a str>,
     /// Internal incoming-installer fence; not a release-selection override.
     pub expected_release: Option<&'a str>,
 }
@@ -560,9 +564,11 @@ async fn embedded_identity(binary: &Path, published: &str) -> Result<()> {
 
 fn report(options: &Options<'_>, source: &str) -> Value {
     json!({"success":true,"update":{"status":"not_started","reason":"not_started","source":source,
-        "check":options.check,"dry_run":options.dry_run,"repository":"tomismeta/agmi",
+        "check":options.check,"dry_run":options.dry_run,"migrate":options.migrate,"repository":"tomismeta/agmi",
         "trust":"GitHub HTTPS publisher origin; SHA256 integrity is not an independent signature"},
         "repair":{"status":if options.repair && options.dry_run {"planned"} else if options.repair {"pending"} else {"not_requested"}},
+        "compatibility":{"classification":"not_assessed","migration_required":false,"target_journal_format":crate::journal::CURRENT_JOURNAL_FORMAT},
+        "migration":{"phase":"unknown","participation_resumed":false},
         "readiness":null})
 }
 fn outcome(report: &mut Value, success: bool, status: &str, reason: &str) {
@@ -578,6 +584,52 @@ fn outcome(report: &mut Value, success: bool, status: &str, reason: &str) {
         report["repair"]["status"] = json!("not_run");
     }
 }
+// A publication no-op does not prove the selected installation's data compatible.
+// Use the canonical read-only inspector; never activate just to obtain this fact.
+fn inspect_current(report: &mut Value, path: &Path, release: &str) -> bool {
+    use crate::store::migration::{UpgradeKind, inspect_upgrade};
+    let Ok(inspected) = inspect_upgrade(path) else {
+        // Preserve honest not_assessed and the existing ordinary diagnostic path.
+        return true;
+    };
+    let (classification, phase) = match inspected.kind {
+        UpgradeKind::Compatible => ("compatible", "not_required"),
+        UpgradeKind::MarkerOnly => ("marker_only", "required"),
+        UpgradeKind::Conversion => ("conversion", "required"),
+        UpgradeKind::Pending => ("pending", "recovery_required"),
+    };
+    let required = inspected.kind != UpgradeKind::Compatible;
+    let mut migration = inspected.pending.unwrap_or_else(|| json!({}));
+    migration["phase"] = json!(phase);
+    migration["release_id"] = json!(release);
+    migration["participation_resumed"] = json!(false);
+    if migration["recovery_prerequisite"].is_string() {
+        migration["recovery_prerequisite"] = json!("authority_adoption");
+    }
+    if let Some(paused) = inspected.paused {
+        migration["paused"] = json!(paused);
+    }
+    let metadata = lifecycle::installer_evidence(Some(&json!({
+        "compatibility":{"classification":classification,"migration_required":required,
+            "target_journal_format":crate::journal::CURRENT_JOURNAL_FORMAT},
+        "migration":migration
+    })));
+    for key in ["compatibility", "migration"] {
+        if let Some(value) = metadata.get(key) {
+            report[key] = value.clone();
+        }
+    }
+    if required {
+        let (status, reason) = if inspected.kind == UpgradeKind::Pending {
+            ("recovery_required", "migration_recovery_required")
+        } else {
+            ("migration_required", "migration_required")
+        };
+        outcome(report, false, status, reason);
+    }
+    !required
+}
+
 fn installed() -> Result<(installer::InstalledIdentity, Identity)> {
     let current =
         installer::installed_identity().map_err(|_| failure("update_installation_unverified"))?;
@@ -882,38 +934,155 @@ async fn diagnose(report: &mut Value, repair: bool) {
     }
 }
 
-fn install(report: &mut Value, arguments: &[String], dry_run: bool) -> bool {
-    match lifecycle::installer(arguments, dry_run) {
-        Ok(result) => {
-            report["installation"] = result
-                .get("installation")
-                .cloned()
-                .unwrap_or_else(|| lifecycle::installer_evidence(Some(&result)));
-            outcome(
-                report,
-                true,
-                if dry_run { "planned" } else { "updated" },
-                if dry_run {
-                    "installer_plan_only"
-                } else {
-                    "installer_completed"
-                },
-            );
-            true
-        }
-        Err(error) => {
-            if let Some(error) = error.downcast_ref::<lifecycle::InstallerError>() {
-                report["installation"] = error.evidence.clone();
-            }
-            outcome(report, false, "failed", "installer_failed");
-            false
+// Keep process-boundary metadata bounded independently of private preview data.
+fn installer_outcome(
+    report: &mut Value,
+    result: &Value,
+    success: bool,
+    dry_run: bool,
+    private_preparation: bool,
+) {
+    let installation = result.get("installation").unwrap_or(result);
+    report["installation"] = lifecycle::installer_evidence(Some(installation));
+    let metadata = lifecycle::installer_evidence(Some(result));
+    for key in ["compatibility", "migration"] {
+        if let Some(value) = metadata
+            .get(key)
+            .or_else(|| report["installation"].get(key))
+            .filter(|value| !dry_run && value.is_object())
+            .cloned()
+        {
+            report[key] = value;
         }
     }
+    // Neither arbitrary child output nor an apply's input belongs in the report.
+    if private_preparation
+        && success
+        && !dry_run
+        && report["migration"]["phase"] == "prepared"
+        && result["private"] == true
+        && let Some(preview) = result.get("preview").filter(|value| value.is_object())
+    {
+        report["private"] = json!(true);
+        report["preview"] = preview.clone();
+    }
+    let (status, reason) = if dry_run && success {
+        ("planned", "installer_plan_only")
+    } else if report["installation"]["failure_code"] == "migration_required"
+        || report["migration"]["phase"] == "required"
+    {
+        ("migration_required", "migration_required")
+    } else if matches!(
+        report["migration"]["phase"].as_str(),
+        Some("recovery_required" | "journal_ready")
+    ) || report["migration"]["further_migration_required"] == true
+        || report["migration"]["recovery_prerequisite"] == "authority_adoption"
+    {
+        ("recovery_required", "migration_recovery_required")
+    } else if !success || report["migration"]["phase"] == "failed" {
+        ("failed", "installer_failed")
+    } else if report["migration"]["phase"] == "prepared" {
+        ("migration_prepared", "migration_approval_required")
+    } else if report["migration"]["phase"] == "complete" {
+        (
+            "migration_complete_stopped",
+            "migration_completed_participation_not_resumed",
+        )
+    } else {
+        ("updated", "installer_completed")
+    };
+    outcome(
+        report,
+        success
+            && !matches!(
+                status,
+                "migration_required" | "recovery_required" | "failed"
+            ),
+        status,
+        reason,
+    );
+}
+
+fn install(
+    report: &mut Value,
+    arguments: &[String],
+    dry_run: bool,
+    private_preparation: bool,
+) -> bool {
+    match lifecycle::installer(arguments, dry_run) {
+        Ok(result) => installer_outcome(report, &result, true, dry_run, private_preparation),
+        Err(error) => {
+            let evidence = error
+                .downcast_ref::<lifecycle::InstallerError>()
+                .map(|error| error.evidence.clone())
+                .unwrap_or(Value::Null);
+            installer_outcome(report, &evidence, false, dry_run, false);
+        }
+    }
+    report["success"] == true && report["update"]["status"] == "updated"
+}
+
+// Own this private file until the synchronous installer (including handoff) ends.
+// The public CLI has already consumed explicit stdin; children receive only a path.
+fn migration_arguments(
+    options: &Options<'_>,
+    arguments: &mut Vec<String>,
+) -> Result<Option<tempfile::NamedTempFile>> {
+    if !options.migrate {
+        return Ok(None);
+    }
+    arguments.push("--migrate".into());
+    let proposal = if let Some(value) = options
+        .proposal
+        .filter(|_| !options.dry_run && !options.check)
+    {
+        let mut file = tempfile::Builder::new()
+            .prefix("agmi-update-proposal-")
+            .tempfile()
+            .map_err(|_| failure("update_proposal_unavailable"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(|_| failure("update_proposal_unavailable"))?;
+        }
+        serde_json::to_writer(file.as_file_mut(), value)
+            .map_err(|_| failure("update_invalid_proposal"))?;
+        ensure!(
+            file.as_file()
+                .metadata()
+                .map_err(|_| failure("update_proposal_unavailable"))?
+                .len()
+                <= TEXT_LIMIT as u64,
+            failure("update_invalid_proposal")
+        );
+        file.as_file_mut()
+            .flush()
+            .map_err(|_| failure("update_proposal_unavailable"))?;
+        arguments.extend([
+            "--proposal".into(),
+            file.path()
+                .to_str()
+                .ok_or_else(|| failure("update_proposal_unavailable"))?
+                .into(),
+        ]);
+        Some(file)
+    } else {
+        None
+    };
+    if let Some(token) = options.expected_token {
+        arguments.extend(["--expected-token".into(), token.into()]);
+    }
+    if let Some(token) = options.accept_risk_change {
+        arguments.extend(["--accept-risk-change".into(), token.into()]);
+    }
+    Ok(proposal)
 }
 
 /// Discover the fixed publisher's latest stable release, or explicitly select a
 /// local release. Preview paths do not initialize or mutate any user state.
-pub async fn run(_config_path: &Path, options: Options<'_>) -> Result<Value> {
+pub async fn run(config_path: &Path, options: Options<'_>) -> Result<Value> {
     ensure!(
         !(options.release.is_some() && (options.binary.is_some() || options.sha256.is_some()))
             && options.binary.is_some() == options.sha256.is_some(),
@@ -925,6 +1094,17 @@ pub async fn run(_config_path: &Path, options: Options<'_>) -> Result<Value> {
                 && (options.binary.is_some() || options.release.is_some())
                 && !options.check
                 && !options.repair),
+        failure("update_invalid_arguments")
+    );
+    ensure!(
+        (!options.migrate || (!options.repair && !options.migration_only))
+            && (options.proposal.is_none()
+                || (options.migrate && options.proposal.is_some_and(Value::is_object)))
+            && (options.expected_token.is_none()
+                || (options.migrate && options.release.is_some() && !options.check))
+            && (options.accept_risk_change.is_none()
+                || (options.expected_token.is_some()
+                    && options.accept_risk_change == options.expected_token)),
         failure("update_invalid_arguments")
     );
     ensure!(
@@ -943,6 +1123,7 @@ pub async fn run(_config_path: &Path, options: Options<'_>) -> Result<Value> {
                 .is_some_and(|digest| hex(digest, 64))
                 && (options.binary.is_some() || options.release.is_some())
                 && !options.repair
+                && !options.dry_run
                 && !options.check
         }),
         failure("update_invalid_expected_release")
@@ -981,10 +1162,16 @@ pub async fn run(_config_path: &Path, options: Options<'_>) -> Result<Value> {
             arguments.extend(["--expected-release".into(), expected.into()]);
         }
         let mut report = report(&options, "operator_selected_local");
-        if install(&mut report, &arguments, options.dry_run)
-            && !options.dry_run
+        let _proposal = migration_arguments(&options, &mut arguments)?;
+        if install(
+            &mut report,
+            &arguments,
+            options.dry_run,
+            options.migrate && options.expected_token.is_none() && !options.dry_run,
+        ) && !options.dry_run
             && options.expected_release.is_none()
             && !options.migration_only
+            && !options.migrate
         {
             diagnose(&mut report, options.repair).await;
         }
@@ -1041,6 +1228,7 @@ pub async fn run(_config_path: &Path, options: Options<'_>) -> Result<Value> {
         failure("update_manifest_invalid")
     );
     complete_discovery(
+        config_path,
         options,
         report,
         current,
@@ -1056,6 +1244,7 @@ pub async fn run(_config_path: &Path, options: Options<'_>) -> Result<Value> {
 }
 
 async fn complete_discovery(
+    config_path: &Path,
     options: Options<'_>,
     mut report: Value,
     current: Result<(installer::InstalledIdentity, Identity)>,
@@ -1116,8 +1305,20 @@ async fn complete_discovery(
     match order {
         Ordering::Current(reason) => {
             outcome(&mut report, true, "current", reason);
-            if !options.check && !options.dry_run {
-                diagnose(&mut report, options.repair).await;
+            if !options.check && !options.dry_run && !options.migrate {
+                if inspect_current(&mut report, config_path, &selected.release) {
+                    diagnose(&mut report, options.repair).await;
+                }
+            } else if options.migrate && !options.check && !options.dry_run {
+                let mut arguments = vec!["activate".into(), selected.release.clone()];
+                arguments.extend(["--expected-release".into(), selected.release]);
+                let _proposal = migration_arguments(&options, &mut arguments)?;
+                install(
+                    &mut report,
+                    &arguments,
+                    false,
+                    options.expected_token.is_none(),
+                );
             }
             return Ok(report);
         }
@@ -1208,7 +1409,14 @@ async fn complete_discovery(
     if options.stopped {
         arguments.push("--stopped".into());
     }
-    if install(&mut report, &arguments, false) {
+    let _proposal = migration_arguments(&options, &mut arguments)?;
+    if install(
+        &mut report,
+        &arguments,
+        false,
+        options.migrate && options.expected_token.is_none(),
+    ) && !options.migrate
+    {
         diagnose(&mut report, options.repair).await;
     }
     Ok(report)
@@ -1217,6 +1425,241 @@ async fn complete_discovery(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn current_noop_classifies_marker_without_mutation_or_diagnosis() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.toml");
+        let mut config = crate::config::Config {
+            state_dir: root.path().join("uncreated-state"),
+            ..crate::config::Config::default()
+        };
+        config.network.chain = format!(
+            "test-noop-{}",
+            root.path()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .replace('.', "")
+        );
+        config.network.address = format!("poa1{}", "1".repeat(32));
+        config.network.credential_file = root.path().join("unused-private-key");
+        let current = toml::to_string(&config).unwrap();
+        let release = format!("r-{}", "a".repeat(64));
+        for (bytes, compatible, classification, phase) in [
+            (current.clone(), true, "compatible", "not_required"),
+            (
+                format!("schema_version = 2\n{current}"),
+                false,
+                "marker_only",
+                "required",
+            ),
+        ] {
+            crate::admin::persist(&path, bytes.as_bytes()).unwrap();
+            let mut report = report(&options(), "test");
+            outcome(
+                &mut report,
+                true,
+                "current",
+                "published_binary_already_installed",
+            );
+            assert_eq!(inspect_current(&mut report, &path, &release), compatible);
+            assert_eq!(report["compatibility"]["classification"], classification);
+            assert_eq!(report["migration"]["phase"], phase);
+            assert_eq!(report["success"], compatible);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), bytes);
+            assert!(!config.state_dir.exists());
+            assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+            assert!(report["readiness"].is_null());
+        }
+        std::fs::write(&path, "private-invalid-config = [").unwrap();
+        let mut report = report(&options(), "test");
+        assert!(inspect_current(&mut report, &path, &release));
+        assert_eq!(report["compatibility"]["classification"], "not_assessed");
+        assert!(!report.to_string().contains("private-invalid-config"));
+    }
+
+    fn options<'a>() -> Options<'a> {
+        Options {
+            release: None,
+            binary: None,
+            sha256: None,
+            check: false,
+            dry_run: false,
+            repair: false,
+            stopped: false,
+            migration_only: false,
+            migrate: false,
+            proposal: None,
+            expected_token: None,
+            accept_risk_change: None,
+            expected_release: None,
+        }
+    }
+
+    #[test]
+    fn installer_contract_preserves_phases_without_private_child_leaks() {
+        for (phase, success, expected) in [
+            ("not_required", true, "updated"),
+            ("required", false, "migration_required"),
+            ("prepared", true, "migration_prepared"),
+            ("complete", true, "migration_complete_stopped"),
+            ("complete", false, "failed"),
+            ("recovery_required", false, "recovery_required"),
+            ("journal_ready", false, "recovery_required"),
+            ("failed", false, "failed"),
+        ] {
+            let mut report = report(&options(), "test");
+            let child = json!({
+                "installation":{"activation":"loaded_verified","service":"stopped",
+                    "failure_code":if success {"none"} else {"migration_failed"},
+                    "message":"private-child-message"},
+                "compatibility":{"classification":"conversion","migration_required":true,
+                    "target_journal_format":crate::journal::CURRENT_JOURNAL_FORMAT,"raw":"private-config"},
+                "migration":{"phase":phase,"token":format!("agmi.atomic-migration.v1:{}", "a".repeat(64)),"release_id":format!("r-{}", "b".repeat(64)),
+                    "participation_resumed":true,"candidate_toml":"private-candidate"},
+                "private":true,"preview":{"request":{"candidate_toml":"private-preview"}},
+                "output":"private-child-output",
+            });
+            installer_outcome(&mut report, &child, success, false, false);
+            assert_eq!(report["update"]["status"], expected, "{phase}");
+            assert_eq!(report["success"], success && phase != "required");
+            assert_eq!(report["migration"]["phase"], phase);
+            assert_eq!(report["migration"]["participation_resumed"], false);
+            assert_eq!(
+                report["migration"]["token"],
+                format!("agmi.atomic-migration.v1:{}", "a".repeat(64))
+            );
+            assert_eq!(report["compatibility"]["classification"], "conversion");
+            assert!(report["readiness"].is_null());
+            assert!(report.get("preview").is_none());
+            assert!(!report.to_string().contains("private-"));
+        }
+    }
+
+    #[test]
+    fn historical_completion_keeps_followup_prerequisites_without_private_text() {
+        for (further, prerequisite, expected) in [
+            (true, Value::Null, "recovery_required"),
+            (false, json!("authority_adoption"), "recovery_required"),
+            (false, Value::Null, "migration_complete_stopped"),
+        ] {
+            let mut report = report(&options(), "test");
+            let child = json!({"installation":{"failure_code":"none"},
+                "migration":{"phase":"complete","pending":false,"target_journal_format":4,
+                    "further_migration_required":further,"recovery_prerequisite":prerequisite}});
+            installer_outcome(&mut report, &child, true, false, false);
+            assert_eq!(report["update"]["status"], expected);
+            assert_eq!(report["success"], expected == "migration_complete_stopped");
+            assert_eq!(report["migration"]["pending"], false);
+            assert_eq!(report["migration"]["recovery_prerequisite"], prerequisite);
+        }
+        let mut report = report(&options(), "test");
+        installer_outcome(
+            &mut report,
+            &json!({"migration":{"phase":"complete",
+            "recovery_prerequisite":"private-unbounded-instruction"}}),
+            true,
+            false,
+            false,
+        );
+        assert!(!report.to_string().contains("private-unbounded-instruction"));
+    }
+
+    #[test]
+    fn private_preview_is_only_explicit_successful_preparation() {
+        let child = json!({"installation":{"failure_code":"none"},
+            "migration":{"phase":"prepared"},"private":true,
+            "preview":{"request":{"candidate_toml":"private-preview"}}});
+        let mut prepared = report(&options(), "test");
+        installer_outcome(&mut prepared, &child, true, false, true);
+        assert_eq!(prepared["private"], true);
+        assert_eq!(prepared["preview"], child["preview"]);
+        for (success, dry_run, explicit) in [
+            (false, false, true),
+            (true, true, true),
+            (true, false, false),
+        ] {
+            let mut report = report(&options(), "test");
+            installer_outcome(&mut report, &child, success, dry_run, explicit);
+            assert!(report.get("preview").is_none());
+            assert!(!report.to_string().contains("private-preview"));
+            if dry_run {
+                assert_eq!(report["compatibility"]["classification"], "not_assessed");
+                assert_eq!(report["migration"]["phase"], "unknown");
+            }
+        }
+    }
+
+    #[test]
+    fn proposal_transport_is_owned_private_file_never_json_argv() {
+        let proposal = json!({"candidate_toml":"private-proposal-body"});
+        let mut options = options();
+        options.migrate = true;
+        options.proposal = Some(&proposal);
+        let mut arguments = vec!["activate".into(), format!("r-{}", "a".repeat(64))];
+        let file = migration_arguments(&options, &mut arguments)
+            .unwrap()
+            .unwrap();
+        let path = file.path().to_owned();
+        assert!(!arguments.join(" ").contains("private-proposal-body"));
+        assert!(!arguments.iter().any(|argument| argument == "-"));
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), proposal);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                file.as_file().metadata().unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        drop(file);
+        assert!(!path.exists());
+        options.dry_run = true;
+        let mut arguments = Vec::new();
+        assert!(
+            migration_arguments(&options, &mut arguments)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!arguments.iter().any(|argument| argument == "--proposal"));
+    }
+
+    #[tokio::test]
+    async fn token_continuation_never_resolves_latest_or_accepts_unpinned_source() {
+        let digest = "a".repeat(64);
+        let token = format!("agmi.atomic-migration.v1:{digest}");
+        for (release, binary, migrate, risk) in [
+            (None, None, true, None),
+            (None, Some(Path::new("/missing")), true, None),
+            (Some("r-invalid"), None, false, None),
+            (Some("r-invalid"), None, true, Some("different")),
+        ] {
+            let result = run(
+                Path::new("/missing"),
+                Options {
+                    release,
+                    binary,
+                    migrate,
+                    expected_token: Some(&token),
+                    accept_risk_change: risk,
+                    sha256: binary.map(|_| digest.as_str()),
+                    ..options()
+                },
+            )
+            .await;
+            let error = result.unwrap_err();
+            assert_eq!(
+                error
+                    .downcast_ref::<lifecycle::LifecycleError>()
+                    .unwrap()
+                    .code,
+                "update_invalid_arguments"
+            );
+            assert!(!error.to_string().contains("different"));
+        }
+    }
 
     #[test]
     fn published_metadata_requires_stable_tag_fixed_origin_and_bounded_assets() {
@@ -1381,10 +1824,15 @@ mod tests {
             repair: false,
             stopped: false,
             migration_only: false,
+            migrate: false,
+            proposal: None,
+            expected_token: None,
+            accept_risk_change: None,
             expected_release: None,
         };
         let initial = report(&options, "github_latest_stable");
         let result = complete_discovery(
+            &root.path().join("config.toml"),
             options,
             initial,
             Ok((current, published)),
@@ -1410,6 +1858,10 @@ mod tests {
             repair: false,
             stopped: false,
             migration_only: false,
+            migrate: false,
+            proposal: None,
+            expected_token: None,
+            accept_risk_change: None,
             expected_release: None,
         };
         let mut result = report(&options, "test");
@@ -1691,6 +2143,10 @@ mod tests {
             repair: true,
             stopped: false,
             migration_only: false,
+            migrate: false,
+            proposal: None,
+            expected_token: None,
+            accept_risk_change: None,
             expected_release: None,
         };
         let mut report = report(&options, "test");
@@ -1743,6 +2199,10 @@ mod tests {
                 repair: true,
                 stopped: false,
                 migration_only: false,
+                migrate: false,
+                proposal: None,
+                expected_token: None,
+                accept_risk_change: None,
                 expected_release: None,
             },
         )

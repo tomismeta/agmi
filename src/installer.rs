@@ -116,6 +116,7 @@ pub(crate) fn run(arguments: &[String], dry_run: bool) -> Result<Value> {
 #[cfg(unix)]
 mod native {
     use super::*;
+    use crate::store::migration::{self, UpgradeKind};
     use sha2::{Digest, Sha256};
     #[cfg(target_os = "linux")]
     use std::os::fd::AsRawFd;
@@ -587,6 +588,10 @@ mod native {
         expected_release: Option<&'a str>,
         stopped: bool,
         migration_only: bool,
+        migrate: bool,
+        proposal: Option<&'a str>,
+        expected_token: Option<&'a str>,
+        accept_risk_change: Option<&'a str>,
     }
     impl<'a> Request<'a> {
         fn parse(arguments: &'a [String]) -> Result<Self> {
@@ -599,6 +604,10 @@ mod native {
                 expected_release: None,
                 stopped: action == "install",
                 migration_only: false,
+                migrate: false,
+                proposal: None,
+                expected_token: None,
+                accept_risk_change: None,
             };
             let mut rest = arguments[2..].iter();
             let mut stopped_seen = false;
@@ -623,6 +632,32 @@ mod native {
                             && !request.migration_only =>
                     {
                         request.migration_only = true;
+                    }
+                    "--migrate" if matches!(action, "update" | "activate") && !request.migrate => {
+                        request.migrate = true;
+                    }
+                    "--proposal" if request.proposal.is_none() => {
+                        request.proposal = Some(rest.next().context("missing proposal path")?);
+                    }
+                    "--expected-token" if request.expected_token.is_none() => {
+                        let token = rest.next().context("missing expected token")?;
+                        ensure!(
+                            token
+                                .strip_prefix("agmi.atomic-migration.v1:")
+                                .is_some_and(|hash| hex(hash, 64)),
+                            "invalid expected token"
+                        );
+                        request.expected_token = Some(token);
+                    }
+                    "--accept-risk-change" if request.accept_risk_change.is_none() => {
+                        let token = rest.next().context("missing risk approval")?;
+                        ensure!(
+                            token
+                                .strip_prefix("agmi.atomic-migration.v1:")
+                                .is_some_and(|hash| hex(hash, 64)),
+                            "invalid risk approval"
+                        );
+                        request.accept_risk_change = Some(token);
                     }
                     "--stopped" if matches!(action, "activate" | "update") && !stopped_seen => {
                         stopped_seen = true;
@@ -651,6 +686,18 @@ mod native {
                 !request.migration_only || request.stopped,
                 "migration-only requires stopped activation"
             );
+            ensure!(
+                (!request.migrate || !request.migration_only)
+                    && (request.migrate
+                        || (request.proposal.is_none()
+                            && request.expected_token.is_none()
+                            && request.accept_risk_change.is_none()))
+                    && (request.expected_token.is_none() || action == "activate")
+                    && request
+                        .accept_risk_change
+                        .is_none_or(|token| request.expected_token == Some(token)),
+                "invalid migration request"
+            );
             Ok(request)
         }
     }
@@ -677,6 +724,18 @@ mod native {
         }
         if let Some(expected) = request.expected_release {
             command.args(["--expected-release", expected]);
+        }
+        if request.migrate {
+            command.arg("--migrate");
+        }
+        for (flag, value) in [
+            ("--proposal", request.proposal),
+            ("--expected-token", request.expected_token),
+            ("--accept-risk-change", request.accept_risk_change),
+        ] {
+            if let Some(value) = value {
+                command.args([flag, value]);
+            }
         }
         let output = capture(&mut command, true).map_err(|error| {
             if error
@@ -756,6 +815,13 @@ mod native {
         failure: &'static str,
         stop_on_failure: bool,
         migration_only: bool,
+        migrate: bool,
+        proposal: Value,
+        expected_token: Option<String>,
+        inspection: Option<crate::store::migration::UpgradeInspection>,
+        compatibility: Value,
+        migration: Value,
+        preview: Option<Value>,
         lock: Option<InstallLock>,
         output: String,
         bootstrap_recovery: Option<BootstrapRecovery>,
@@ -781,6 +847,13 @@ mod native {
                 failure: "preparation_failed",
                 stop_on_failure: false,
                 migration_only: false,
+                migrate: false,
+                proposal: json!({}),
+                expected_token: None,
+                inspection: None,
+                compatibility: Value::Null,
+                migration: Value::Null,
+                preview: None,
                 lock: None,
                 output: String::new(),
                 bootstrap_recovery: None,
@@ -792,8 +865,275 @@ mod native {
             installer_evidence(Some(
                 &json!({"stage":self.phase,"staging":self.staging,"activation":self.activation,
                 "service":self.service,"failure_code":if success { "none" } else { self.failure },
-                "bootstrap_recovery":self.bootstrap_recovery}),
+                "bootstrap_recovery":self.bootstrap_recovery,
+                "compatibility":self.compatibility,"migration":self.migration}),
             ))
+        }
+        fn record_migration_failure(&mut self, status: Option<Value>, expected: Option<&str>) {
+            let observed = status.filter(|status| {
+                status["pending"] == true
+                    || (status["phase"] == "complete"
+                        && status["token"].as_str().is_some_and(|token| {
+                            Some(token) == self.migration["token"].as_str().or(expected)
+                        }))
+            });
+            if !matches!(
+                self.migration["phase"].as_str(),
+                Some("complete" | "recovery_required")
+            ) {
+                self.migration["phase"] = json!("failed");
+            }
+            if let Some(status) = observed {
+                self.migration = json!({
+                    "phase":if status["pending"] == true { "recovery_required" } else { "complete" },
+                    "participation_resumed":false,"release_id":self.migration["release_id"],
+                    "token":status["token"],"target_journal_format":status["target_journal_format"],
+                    "recovery_supported":status["recovery_supported"],
+                    "further_migration_required":status["further_migration_required"],
+                    "pending":status["pending"],
+                    "recovery_prerequisite":if status["recovery_prerequisite"].is_string() {
+                        Some("authority_adoption")
+                    } else { None }});
+            }
+        }
+
+        fn maintenance(&self) -> bool {
+            self.migrate
+                && self.inspection.as_ref().is_some_and(|inspection| {
+                    inspection.kind != UpgradeKind::Compatible || self.expected_token.is_some()
+                })
+        }
+
+        fn inspect_upgrade(&mut self) -> Result<PathBuf> {
+            let inspection = migration::inspect_upgrade(&self.config)?;
+            let required = inspection.kind != UpgradeKind::Compatible;
+            let classification = match inspection.kind {
+                UpgradeKind::Compatible => "compatible",
+                UpgradeKind::MarkerOnly => "marker_only",
+                UpgradeKind::Conversion => "conversion",
+                UpgradeKind::Pending => "pending",
+            };
+            self.compatibility = json!({"classification":classification,
+                "migration_required":required,"target_journal_format":CURRENT_JOURNAL_FORMAT});
+            self.migration = json!({"phase":if required { "required" } else { "not_required" },
+                "participation_resumed":false});
+            self.failure = "migration_conflict";
+            if let Some(previous) = &self.inspection {
+                ensure!(
+                    previous.source_sha256 == inspection.source_sha256,
+                    "configuration changed during upgrade"
+                );
+                ensure!(
+                    previous.state_dir == inspection.state_dir,
+                    "state location changed during upgrade"
+                );
+            }
+            if required && !self.migrate {
+                self.failure = "migration_required";
+                anyhow::bail!("explicit stopped migration is required");
+            }
+            if inspection.kind == UpgradeKind::Pending
+                || (inspection.kind == UpgradeKind::Compatible && self.expected_token.is_some())
+            {
+                let status = match &inspection.pending {
+                    Some(status) => status.clone(),
+                    None => migration::status(&inspection.state_dir)?,
+                };
+                self.migration = json!({"phase":"recovery_required","participation_resumed":false,
+                    "token":status["token"],"target_journal_format":status["target_journal_format"],
+                    "recovery_supported":status["recovery_supported"],
+                    "further_migration_required":status["further_migration_required"],
+                    "pending":status["pending"],
+                    "recovery_prerequisite":if status["recovery_prerequisite"].is_string() {
+                        Some("authority_adoption")
+                    } else { None }});
+                if inspection.kind == UpgradeKind::Pending {
+                    self.failure = "migration_conflict";
+                    ensure!(
+                        self.proposal == json!({}),
+                        "pending recovery does not accept a new proposal"
+                    );
+                    ensure!(
+                        status["recovery_supported"] == true,
+                        "sealed recovery is unsupported"
+                    );
+                }
+                if self.expected_token.is_some()
+                    && matches!(
+                        inspection.kind,
+                        UpgradeKind::Pending | UpgradeKind::Compatible
+                    )
+                {
+                    ensure!(
+                        status["token"].as_str() == self.expected_token.as_deref(),
+                        "sealed continuation token changed"
+                    );
+                    if inspection.kind == UpgradeKind::Compatible {
+                        ensure!(
+                            status["phase"] == "complete" && inspection.paused == Some(true),
+                            "completed migration no longer has its stopped intent"
+                        );
+                    }
+                }
+            }
+            if required && inspection.kind != UpgradeKind::Pending {
+                migration::validate_upgrade_proposal(&self.config, &self.proposal)?;
+                if inspection.kind == UpgradeKind::MarkerOnly {
+                    ensure!(
+                        self.proposal == json!({}) && self.expected_token.is_none(),
+                        "marker-only migration does not accept a policy or external approval"
+                    );
+                }
+                if self.expected_token.is_some()
+                    && inspection.journal_format.is_some_and(|v| v >= 3)
+                {
+                    ensure!(
+                        inspection.paused == Some(true),
+                        "approved pause intent changed"
+                    );
+                }
+            }
+            let state = inspection.state_dir.clone();
+            self.inspection = Some(inspection);
+            Ok(state)
+        }
+
+        fn pause_for_upgrade(&mut self) -> Result<()> {
+            let inspection = self.inspection.as_ref().context("upgrade not inspected")?;
+            if inspection.kind == UpgradeKind::Pending
+                || inspection.journal_format.is_none_or(|version| version < 3)
+                || inspection.paused == Some(true)
+            {
+                return Ok(());
+            }
+            // No configuration/account/lane locks are held across the old CLI.
+            // Its own control path is the only authority to pause its source format.
+            self.failure = "migration_pause_failed";
+            let selected = fs::read_link(self.root.join("current"))?;
+            let id = selected.to_str().context("invalid retained release")?;
+            let release = self.root.join(id);
+            validate_release_metadata(&release, id, true)?;
+            let output = capture(
+                Command::new(release.join("agmi"))
+                    .arg("--config")
+                    .arg(&self.config)
+                    .args(["--json", "pause"]),
+                true,
+            )?;
+            ensure!(
+                output.status.success(),
+                "retained runtime could not persist pause"
+            );
+            self.verify_upgrade_stopped()?;
+            self.inspect_upgrade()?;
+            ensure!(
+                self.inspection
+                    .as_ref()
+                    .is_some_and(|value| value.paused == Some(true)),
+                "retained runtime did not persist pause"
+            );
+            Ok(())
+        }
+
+        fn continue_upgrade(&mut self, id: &str) -> Result<()> {
+            self.phase = "activation_preflight";
+            self.failure = "release_invalid";
+            let release = self.root.join(id);
+            validate_release(&release, id)?;
+            ensure!(
+                metadata(
+                    &fs::read_to_string(release.join("MANIFEST"))?,
+                    "journal_schema"
+                )? == CURRENT_JOURNAL_FORMAT.to_string(),
+                "continuation requires selected current-format executable"
+            );
+            self.space_checks(&release.join("agmi"), 0, true)?;
+            self.failure = "migration_conflict";
+            self.verify_units(&release)?;
+            self.loaded(id)?;
+            self.verify_upgrade_stopped()?;
+            self.verify_autostart_disabled()?;
+            self.activation = "loaded_verified";
+            self.service = "stopped";
+            self.stop_on_failure = true;
+            Ok(())
+        }
+
+        fn finish_upgrade(&mut self, id: &str, request: &Request<'_>) -> Result<()> {
+            if !self.maintenance() {
+                return Ok(());
+            }
+            self.phase = "migration";
+            self.failure = "migration_failed";
+            self.migration["release_id"] = json!(id);
+            self.verify_upgrade_stopped()?;
+            self.verify_autostart_disabled()?;
+            ensure!(
+                fs::read_link(self.root.join("current"))? == Path::new(id),
+                "selected release changed before migration"
+            );
+            let inspection = self.inspection.as_ref().context("upgrade not inspected")?;
+            let kind = inspection.kind;
+            let state = inspection.state_dir.clone();
+            if kind == UpgradeKind::Pending && request.expected_token.is_none() {
+                self.migration["release_id"] = json!(id);
+            } else if kind == UpgradeKind::Conversion && request.expected_token.is_none() {
+                let preview = migration::preview(&self.config, &self.proposal)?;
+                self.migration = json!({"phase":"prepared","participation_resumed":false,
+                    "release_id":id,"token":preview["token"],"approval_required":true,
+                    "risk_change_required":preview["risk_change_required"],
+                    "target_journal_format":CURRENT_JOURNAL_FORMAT});
+                self.preview = Some(preview);
+            } else {
+                let completed = if matches!(kind, UpgradeKind::Pending | UpgradeKind::Compatible) {
+                    migration::resume(
+                        &self.config,
+                        &state,
+                        request
+                            .expected_token
+                            .context("missing exact continuation")?,
+                    )?
+                } else if kind == UpgradeKind::MarkerOnly {
+                    let preview = migration::preview(&self.config, &self.proposal)?;
+                    self.migration["token"] = preview["token"].clone();
+                    migration::apply(
+                        &self.config,
+                        &preview["request"],
+                        preview["token"]
+                            .as_str()
+                            .context("missing canonical token")?,
+                        None,
+                    )?
+                } else {
+                    migration::apply(
+                        &self.config,
+                        &self.proposal,
+                        request.expected_token.context("missing exact approval")?,
+                        request.accept_risk_change,
+                    )?
+                };
+                let prerequisite = completed["recovery_prerequisite"].is_string()
+                    || completed["further_migration_required"] == true;
+                self.migration = json!({"phase":if prerequisite { "recovery_required" } else { "complete" },
+                    "participation_resumed":false,"release_id":id,"token":completed["token"],
+                    "target_journal_format":completed["target_journal_format"].as_i64()
+                        .or_else(|| (completed["branch"] == "config_only").then_some(CURRENT_JOURNAL_FORMAT)),
+                    "paused":completed["paused"],"generation":completed["generation"],
+                    "recovery_supported":completed["recovery_supported"],
+                    "further_migration_required":completed["further_migration_required"],
+                    "pending":false,"recovery_prerequisite":if completed["recovery_prerequisite"].is_string() {
+                        Some("authority_adoption")
+                    } else { None }});
+            }
+            ensure!(
+                fs::read_link(self.root.join("current"))? == Path::new(id),
+                "selected release changed during migration"
+            );
+            self.verify_upgrade_stopped()?;
+            self.verify_autostart_disabled()?;
+            self.phase = "complete";
+            self.output.push_str("Migration maintenance leaves services stopped and boot activation disabled; participation is not resumed.\n");
+            Ok(())
         }
         fn systemctl(&self, arguments: &[&str], cancellable: bool) -> Result<Output> {
             capture(
@@ -897,6 +1237,41 @@ mod native {
                 self.property("agmi.service", "MainPID", true)? == "0",
                 "stopped runtime still owns a process"
             );
+            Ok(())
+        }
+        fn verify_upgrade_stopped(&self) -> Result<()> {
+            self.verify_stopped()?;
+            for unit in ["agmi.service", "agmi-health.service"] {
+                let group = self.property(unit, "ControlGroup", true)?;
+                if !group.is_empty() {
+                    Self::verify_empty_cgroup(Path::new("/sys/fs/cgroup"), &group)?;
+                }
+            }
+            Ok(())
+        }
+
+        fn verify_empty_cgroup(root: &Path, group: &str) -> Result<()> {
+            let group = Path::new(group);
+            ensure!(
+                group.is_absolute()
+                    && group
+                        .components()
+                        .all(|part| { matches!(part, Component::RootDir | Component::Normal(_)) }),
+                "invalid unit cgroup location"
+            );
+            let directory = root.join(group.strip_prefix("/")?);
+            match fs::read_to_string(directory.join("cgroup.events")) {
+                Ok(events) => ensure!(
+                    events
+                        .lines()
+                        .any(|line| { line.split_whitespace().eq(["populated", "0"]) }),
+                    "stopped unit still owns descendants"
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    ensure!(!directory.try_exists()?, "cannot verify unit descendants");
+                }
+                Err(error) => return Err(error.into()),
+            }
             Ok(())
         }
         fn verify_autostart_disabled(&self) -> Result<()> {
@@ -1078,51 +1453,57 @@ mod native {
         ) -> Result<()> {
             use std::fmt::Write;
             self.failure = "configuration_invalid";
-            // Only the retained binary interprets its legacy config, and only
-            // to report the state path. No runtime or journal command is run.
-            let retained_binary;
-            let binary = if self.migration_only {
-                let selected = fs::read_link(self.root.join("current"))?;
-                let id = selected.to_str().context("invalid retained release")?;
-                let release = self.root.join(id);
-                validate_release_metadata(&release, id, true)?;
-                ensure!(
-                    matches!(
-                        metadata(
-                            &fs::read_to_string(release.join("MANIFEST"))?,
-                            "journal_schema"
-                        )?,
-                        "2" | "3"
-                    ),
-                    "migration-only requires a retained format2 or format3 release"
-                );
-                retained_binary = release.join("agmi");
-                retained_binary.as_path()
+            let state = if self.migrate {
+                self.inspect_upgrade()?
             } else {
-                binary
-            };
-            let result = capture(
-                Command::new(binary)
-                    .arg("--config")
-                    .arg(&self.config)
-                    .args(["config", "state-path"]),
-                true,
-            )
-            .map_err(|error| {
-                if error
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied)
-                {
-                    installer_preflight_error("candidate_execution_unavailable")
+                // Only the retained binary interprets its legacy config, and only
+                // to report the state path. No runtime or journal command is run.
+                let retained_binary;
+                let binary = if self.migration_only {
+                    let selected = fs::read_link(self.root.join("current"))?;
+                    let id = selected.to_str().context("invalid retained release")?;
+                    let release = self.root.join(id);
+                    validate_release_metadata(&release, id, true)?;
+                    ensure!(
+                        matches!(
+                            metadata(
+                                &fs::read_to_string(release.join("MANIFEST"))?,
+                                "journal_schema"
+                            )?,
+                            "2" | "3"
+                        ),
+                        "migration-only requires a retained format2 or format3 release"
+                    );
+                    retained_binary = release.join("agmi");
+                    retained_binary.as_path()
                 } else {
-                    error
+                    binary
+                };
+                let result = capture(
+                    Command::new(binary)
+                        .arg("--config")
+                        .arg(&self.config)
+                        .args(["config", "state-path"]),
+                    true,
+                )
+                .map_err(|error| {
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied)
+                    {
+                        installer_preflight_error("candidate_execution_unavailable")
+                    } else {
+                        error
+                    }
+                })?;
+                if !result.status.success() {
+                    // The ordinary parser stays strict. Recognized historical state
+                    // gets actionable refusal, never an implicit migration.
+                    let _ = self.inspect_upgrade();
+                    anyhow::bail!("cannot inspect configured state path");
                 }
-            })?;
-            ensure!(
-                result.status.success(),
-                "cannot inspect configured state path"
-            );
-            let state = PathBuf::from(String::from_utf8(result.stdout)?.trim_end_matches('\n'));
+                PathBuf::from(String::from_utf8(result.stdout)?.trim_end_matches('\n'))
+            };
             ensure!(state.is_absolute(), "state path must be absolute");
             let canonical_state = resolve_missing(&state)?;
             let canonical_root = fs::canonicalize(&self.root)?;
@@ -1168,7 +1549,7 @@ mod native {
             self.state_dir = Some(canonical_state);
             Ok(())
         }
-        fn verify_journal_activation(&self) -> Result<()> {
+        fn verify_journal_activation(&mut self) -> Result<()> {
             let state = self
                 .state_dir
                 .as_deref()
@@ -1176,8 +1557,16 @@ mod native {
             if let Some((format, complete)) =
                 crate::store::migration::activation_journal_format(state)?
             {
+                if !self.migration_only
+                    && !self.maintenance()
+                    && (!complete || format != CURRENT_JOURNAL_FORMAT)
+                {
+                    self.inspect_upgrade()?;
+                }
                 ensure!(
-                    if self.migration_only {
+                    if self.maintenance() {
+                        (1..=CURRENT_JOURNAL_FORMAT).contains(&format)
+                    } else if self.migration_only {
                         matches!(format, 1..=3)
                     } else {
                         complete && format == CURRENT_JOURNAL_FORMAT
@@ -1342,17 +1731,26 @@ mod native {
                 validate_release_metadata(&self.root.join(previous), previous, true)?;
                 let old = fs::read_to_string(self.root.join(previous).join("MANIFEST"))?;
                 let new = fs::read_to_string(release.join("MANIFEST"))?;
-                activation_schema(
-                    metadata(&old, "journal_schema")?,
-                    metadata(&new, "journal_schema")?,
-                    request.migration_only,
-                    request.stopped,
-                )?;
+                if self.maintenance() {
+                    ensure!(
+                        matches!(metadata(&old, "journal_schema")?, "2" | "3" | "4")
+                            && metadata(&new, "journal_schema")?
+                                == CURRENT_JOURNAL_FORMAT.to_string(),
+                        "unsupported stopped upgrade pair"
+                    );
+                } else {
+                    activation_schema(
+                        metadata(&old, "journal_schema")?,
+                        metadata(&new, "journal_schema")?,
+                        request.migration_only,
+                        request.stopped,
+                    )?;
+                }
                 self.output
                     .push_str(&format!("retained_previous_release={previous}\n"));
             } else {
                 ensure!(
-                    !request.migration_only,
+                    !request.migration_only && !self.maintenance(),
                     "migration-only requires an installed format2 or format3 release"
                 );
             }
@@ -1371,14 +1769,29 @@ mod native {
             self.failure = "stop_failed";
             self.activation = "in_progress";
             self.stop_on_failure = true;
+            if self.maintenance() {
+                // Preserve recoverable launcher/unit definitions before changing
+                // boot intent, then prevent reboot from racing a one-way change.
+                self.backup_legacy()?;
+                self.disable_autostart()?;
+            }
             self.stop_units(true)?;
-            self.verify_stopped()?;
+            if self.maintenance() {
+                self.verify_upgrade_stopped()?;
+            } else {
+                self.verify_stopped()?;
+            }
+            if self.maintenance() {
+                self.pause_for_upgrade()?;
+            }
             self.failure = "journal_incompatible";
             self.verify_journal_activation()?;
             self.service = "stopped";
             self.phase = "switching";
             self.failure = "switch_failed";
-            self.backup_legacy()?;
+            if !self.maintenance() {
+                self.backup_legacy()?;
+            }
             for (name, destination) in std::iter::once(("agmi", self.bin.join("agmi"))).chain(
                 UNITS
                     .iter()
@@ -1408,8 +1821,8 @@ mod native {
             self.control(&["daemon-reload"])?;
             self.loaded(id)?;
             self.activation = "loaded_verified";
-            if request.stopped {
-                if request.migration_only {
+            if request.stopped || self.maintenance() {
+                if request.migration_only || self.maintenance() {
                     self.failure = "stop_failed";
                     self.verify_autostart_disabled()?;
                     self.output.push_str("Migration bootstrap disabled boot activation. After local migration, explicitly enable/start services; participation still requires resume.\n");
@@ -2037,6 +2450,8 @@ mod native {
         let mut installation =
             Installation::new(std::env::var_os("HOME").context("HOME unavailable")?.into())?;
         installation.migration_only = request.migration_only;
+        installation.migrate = request.migrate;
+        installation.expected_token = request.expected_token.map(str::to_owned);
         // Keep all owned input and lock paths alive until post-switch cleanup is done.
         let mut private = None;
         let result = (|| -> Result<Option<Value>> {
@@ -2053,6 +2468,17 @@ mod native {
             } else {
                 None
             };
+            if let Some(path) = request.proposal {
+                installation.failure = "invalid_arguments";
+                let bytes = crate::admin::read_optional(Path::new(path), true)?
+                    .context("private proposal missing")?;
+                ensure!(bytes.len() <= 64 * 1024, "proposal too large");
+                installation.proposal = serde_json::from_slice(&bytes)?;
+                ensure!(
+                    installation.proposal.is_object(),
+                    "proposal must be an object"
+                );
+            }
             if request.action != "stage" {
                 installation.failure = "manager_context_mismatch";
                 installation.account_context()?;
@@ -2086,6 +2512,13 @@ mod native {
                     "selected release changed before staging"
                 );
             }
+            if request.expected_token.is_some() {
+                installation.failure = "migration_conflict";
+                ensure!(
+                    fs::read_link(installation.root.join("current"))? == Path::new(request.target),
+                    "continuation must use the prepared selected release"
+                );
+            }
             if request.action == "install" && !request.migration_only {
                 installation.fresh()?;
             }
@@ -2099,7 +2532,12 @@ mod native {
                 request.target.to_owned()
             };
             if request.action != "stage" {
-                installation.activate(&id, &request)?;
+                if request.expected_token.is_some() {
+                    installation.continue_upgrade(&id)?;
+                } else {
+                    installation.activate(&id, &request)?;
+                }
+                installation.finish_upgrade(&id, &request)?;
             }
             checkpoint()?;
             installation.stop_on_failure = false;
@@ -2117,17 +2555,39 @@ mod native {
                     Ok(delegated)
                 }
             }
-            Ok(None) => Ok(
-                json!({"plan":plan,"installation":installation.evidence(true),"output":installation.output}),
-            ),
+            Ok(None) => {
+                let evidence = installation.evidence(true);
+                let mut result =
+                    json!({"plan":plan,"installation":evidence,"output":installation.output});
+                for key in ["compatibility", "migration"] {
+                    if !result["installation"][key].is_null() {
+                        result[key] = result["installation"][key].clone();
+                    }
+                }
+                if let Some(preview) = installation.preview.take() {
+                    result["private"] = json!(true);
+                    result["preview"] = preview;
+                }
+                Ok(result)
+            }
             Err(error) => {
                 if installation.stop_on_failure {
-                    installation.service = if installation.stop_units(false).is_ok() {
+                    installation.service = if installation.stop_units(false).is_ok()
+                        && (!installation.maintenance()
+                            || installation.verify_upgrade_stopped().is_ok())
+                    {
                         "stopped"
                     } else {
                         "unknown"
                     };
                     installation.stop_on_failure = false;
+                }
+                if installation.phase == "migration" {
+                    let status = installation
+                        .state_dir
+                        .as_ref()
+                        .and_then(|state| migration::status(state).ok());
+                    installation.record_migration_failure(status, request.expected_token);
                 }
                 // Private-copy errors precede staging, but failures at a later
                 // boundary must retain that boundary's actual machine evidence.
@@ -2221,6 +2681,88 @@ mod native {
                 installation.migration_only = migration_only;
                 assert!(installation.verify_journal_activation().is_err());
             }
+            Ok(())
+        }
+
+        #[test]
+        fn committed_internal_migration_survives_independent_postcondition_failure() -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            let token = format!("agmi.atomic-migration.v1:{}", "a".repeat(64));
+            for (observed, phase) in [
+                (
+                    json!({"phase":"complete","token":token,"target_journal_format":4}),
+                    "complete",
+                ),
+                (
+                    json!({"phase":"complete","token":format!("agmi.atomic-migration.v1:{}", "b".repeat(64))}),
+                    "failed",
+                ),
+                (
+                    json!({"phase":"journal_ready","pending":true,"token":token,"target_journal_format":4}),
+                    "recovery_required",
+                ),
+            ] {
+                let mut installation = Installation::new(temp.path().to_owned())?;
+                installation.phase = "migration";
+                installation.activation = "loaded_verified";
+                installation.service = "unknown";
+                installation.failure = "stop_failed";
+                installation.migration = json!({"phase":"required","token":token,
+                    "release_id":format!("r-{}", "c".repeat(64))});
+                installation.record_migration_failure(Some(observed), None);
+                let evidence = installation.evidence(false);
+                assert_eq!(evidence["migration"]["phase"], phase);
+                assert_eq!(evidence["failure_code"], "stop_failed");
+                assert_eq!(evidence["activation"], "loaded_verified");
+                assert_eq!(evidence["service"], "unknown");
+                assert_eq!(evidence["migration"]["participation_resumed"], false);
+            }
+            let mut completed = Installation::new(temp.path().to_owned())?;
+            completed.migration = json!({"phase":"complete","token":token});
+            completed.record_migration_failure(None, None);
+            assert_eq!(completed.evidence(false)["migration"]["phase"], "complete");
+            Ok(())
+        }
+
+        #[test]
+        fn stopped_migration_refuses_live_descendants_and_unsafe_locations() -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            let group = temp.path().join("unit");
+            fs::create_dir(&group)?;
+            let events = group.join("cgroup.events");
+            fs::write(&events, "populated 1\nfrozen 0\n")?;
+            assert!(Installation::verify_empty_cgroup(temp.path(), "/unit").is_err());
+            fs::write(&events, "populated 0\nfrozen 0\n")?;
+            Installation::verify_empty_cgroup(temp.path(), "/unit")?;
+            fs::remove_file(events)?;
+            assert!(Installation::verify_empty_cgroup(temp.path(), "/unit").is_err());
+            Installation::verify_empty_cgroup(temp.path(), "/already-removed")?;
+            for unsafe_path in ["relative", "/../elsewhere"] {
+                assert!(Installation::verify_empty_cgroup(temp.path(), unsafe_path).is_err());
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn migration_approval_keeps_canonical_token_and_pins_continuation() -> Result<()> {
+            let token = format!("agmi.atomic-migration.v1:{}", "a".repeat(64));
+            let args = vec![
+                "activate".into(),
+                format!("r-{}", "b".repeat(64)),
+                "--migrate".into(),
+                "--expected-token".into(),
+                token.clone(),
+                "--accept-risk-change".into(),
+                token.clone(),
+            ];
+            assert_eq!(Request::parse(&args)?.expected_token, Some(token.as_str()));
+            let mut wrong = args.clone();
+            wrong[6] = format!("agmi.atomic-migration.v1:{}", "c".repeat(64));
+            assert!(Request::parse(&wrong).is_err());
+            let mut legacy = args;
+            legacy.push("--migration-only".into());
+            legacy.push("--stopped".into());
+            assert!(Request::parse(&legacy).is_err());
             Ok(())
         }
 
@@ -2471,6 +3013,10 @@ esac
                 expected_release: None,
                 stopped: true,
                 migration_only: true,
+                migrate: false,
+                proposal: None,
+                expected_token: None,
+                accept_risk_change: None,
             };
             let refusal = temporary.path.join("refuse-disable");
             fs::write(&refusal, [])?;
@@ -2880,6 +3426,10 @@ esac
                 expected_release: None,
                 stopped: true,
                 migration_only: false,
+                migrate: false,
+                proposal: None,
+                expected_token: None,
+                accept_risk_change: None,
             };
             fs::write(&active_state, "activating")?;
             assert!(installation.activate(&id, &request).is_err());

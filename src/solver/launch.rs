@@ -50,9 +50,16 @@ pub struct InferenceFlight {
 }
 
 fn new_invocation_id() -> Result<String> {
+    #[cfg(not(target_env = "musl"))]
+    use libc::getentropy;
+    // libc omits this declaration on musl, which exports the same POSIX ABI.
+    #[cfg(target_env = "musl")]
+    unsafe extern "C" {
+        fn getentropy(buffer: *mut libc::c_void, length: libc::size_t) -> libc::c_int;
+    }
     let mut bytes = [0_u8; 16];
     // SAFETY: the buffer is writable for its full length, below getentropy's limit.
-    if unsafe { libc::getentropy(bytes.as_mut_ptr().cast(), bytes.len()) } != 0 {
+    if unsafe { getentropy(bytes.as_mut_ptr().cast(), bytes.len()) } != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
     bytes[6] = (bytes[6] & 0x0f) | 0x40;

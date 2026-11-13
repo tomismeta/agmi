@@ -576,6 +576,11 @@ pub(crate) fn installer_evidence(value: Option<&Value>) -> Value {
                 "reload_failed",
                 "start_failed",
                 "service_failed",
+                "migration_required",
+                "migration_pending",
+                "migration_conflict",
+                "migration_failed",
+                "migration_pause_failed",
             ][..],
         ),
         (
@@ -588,6 +593,7 @@ pub(crate) fn installer_evidence(value: Option<&Value>) -> Value {
                 "switching",
                 "reloading",
                 "starting",
+                "migration",
                 "service",
                 "status",
                 "complete",
@@ -642,6 +648,80 @@ pub(crate) fn installer_evidence(value: Option<&Value>) -> Value {
             "definitions_restored": definitions,
             "manager_reload_succeeded": reload
         });
+    }
+    if let Some(compatibility) = value.and_then(|value| value.get("compatibility"))
+        && let Some(classification) = compatibility["classification"].as_str().filter(|value| {
+            matches!(
+                *value,
+                "compatible" | "marker_only" | "conversion" | "pending" | "not_assessed"
+            )
+        })
+    {
+        result["compatibility"] = json!({
+            "classification":classification,
+            "migration_required":compatibility["migration_required"].as_bool(),
+            "target_journal_format":compatibility["target_journal_format"].as_i64()
+                .filter(|format| (1..=crate::journal::CURRENT_JOURNAL_FORMAT).contains(format))
+        });
+    }
+    if let Some(migration) = value.and_then(|value| value.get("migration"))
+        && let Some(phase) = migration["phase"].as_str().filter(|value| {
+            matches!(
+                *value,
+                "not_required"
+                    | "required"
+                    | "prepared"
+                    | "complete"
+                    | "journal_ready"
+                    | "recovery_required"
+                    | "failed"
+                    | "unknown"
+            )
+        })
+    {
+        let mut bounded = json!({"phase":phase,"participation_resumed":false});
+        for key in ["release_id", "token"] {
+            if let Some(text) = migration[key].as_str()
+                && match key {
+                    "release_id" => text.strip_prefix("r-"),
+                    _ => text.strip_prefix("agmi.atomic-migration.v1:"),
+                }
+                .is_some_and(|hash| {
+                    hash.len() == 64
+                        && hash
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                })
+            {
+                bounded[key] = json!(text);
+            }
+        }
+        for key in [
+            "approval_required",
+            "risk_change_required",
+            "recovery_supported",
+            "further_migration_required",
+            "paused",
+            "pending",
+        ] {
+            if let Some(value) = migration[key].as_bool() {
+                bounded[key] = json!(value);
+            }
+        }
+        if migration["recovery_prerequisite"] == "authority_adoption" {
+            bounded["recovery_prerequisite"] = json!("authority_adoption");
+        } else if migration
+            .get("recovery_prerequisite")
+            .is_some_and(Value::is_null)
+        {
+            bounded["recovery_prerequisite"] = Value::Null;
+        }
+        for key in ["target_journal_format", "generation"] {
+            if let Some(value) = migration[key].as_i64().filter(|value| *value >= 0) {
+                bounded[key] = json!(value);
+            }
+        }
+        result["migration"] = bounded;
     }
     result
 }

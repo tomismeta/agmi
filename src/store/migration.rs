@@ -461,6 +461,290 @@ fn prepare(path: &Path, input: &Value) -> Result<Prepared> {
         legacy,
     })
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UpgradeKind {
+    Compatible,
+    MarkerOnly,
+    Conversion,
+    Pending,
+}
+
+pub(crate) struct UpgradeInspection {
+    pub kind: UpgradeKind,
+    pub state_dir: PathBuf,
+    pub source_sha256: String,
+    pub journal_format: Option<i64>,
+    pub paused: Option<bool>,
+    pub pending: Option<Value>,
+}
+
+/// Classify an installed source without provisioning locks, policy or authority.
+pub(crate) fn inspect_upgrade(path: &Path) -> Result<UpgradeInspection> {
+    let path = absolute(path)?;
+    let source = bytes(&path)?;
+    let text = std::str::from_utf8(&source)?;
+    let parsed: toml::Value = toml::from_str(text)?;
+    let global = global_shape(&parsed)?;
+    let marked = parsed.get("schema_version").is_some();
+    let config = if global {
+        // This baseline is metadata only, never a proposal or chosen lane policy.
+        let legacy = legacy::Legacy::parse(&source)?;
+        let baseline = legacy.candidate(Some(&json!({"answer":1,"judge":1,"mine":1})))?;
+        Config::parse_bytes(&path, baseline.as_bytes(), false)?
+    } else if marked {
+        Config::parse_bytes(&path, unversioned(text)?.as_bytes(), false)?
+    } else {
+        Config::parse_bytes(&path, &source, false)?
+    };
+    let mut result = UpgradeInspection {
+        kind: if global {
+            UpgradeKind::Conversion
+        } else if marked {
+            UpgradeKind::MarkerOnly
+        } else {
+            UpgradeKind::Compatible
+        },
+        state_dir: config.state_dir.clone(),
+        source_sha256: digest(&source),
+        journal_format: None,
+        paused: None,
+        pending: None,
+    };
+    let Some(db) = open_existing(&config.state_dir, false)? else {
+        ensure!(
+            read_binding(&config)?.is_none() && marker(&config)?.is_empty(),
+            "bound journal missing; not an uninitialized configuration"
+        );
+        return Ok(result);
+    };
+    let tx = db.unchecked_transaction()?;
+    let (version, paused): (i64, bool) = tx.query_row(
+        "SELECT version,paused FROM control WHERE singleton=1",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    ensure!(
+        matches!(version, 1..=CURRENT_JOURNAL_FORMAT),
+        "unsupported source journal format"
+    );
+    result.journal_format = Some(version);
+    result.paused = Some(paused);
+    if table_exists(&tx, "capability_migration")? {
+        let (phase, token, sealed) = record(&tx, None)?;
+        let target = seals::target(&token, &sealed).context(MigrationError::UnsupportedRecovery)?;
+        ensure!(
+            matches!(phase.as_str(), "journal_ready" | "complete"),
+            MigrationError::UnsupportedRecovery
+        );
+        if phase != "complete" {
+            inspect_pending(&path, &source, &config, &tx, target, &sealed)
+                .context(MigrationError::Conflict)?;
+            result.kind = UpgradeKind::Pending;
+            result.pending = Some(status_value(&tx)?);
+            return Ok(result);
+        }
+    } else {
+        ensure!(
+            !table_exists(&tx, "capability_migration_evidence")?,
+            "migration evidence exists without its active seal; explicit recovery required"
+        );
+    }
+    ensure!(
+        if global {
+            matches!(version, 1 | 2)
+        } else {
+            matches!(version, 3 | CURRENT_JOURNAL_FORMAT)
+        },
+        "configuration shape does not match the supported source journal format"
+    );
+    inspect_source_authority(&config, &tx, version)?;
+    if version != CURRENT_JOURNAL_FORMAT {
+        result.kind = UpgradeKind::Conversion;
+    }
+    Ok(result)
+}
+
+/// Check the canonical proposal and existing eligibility before maintenance.
+/// Pause, exact-token approval and risk acknowledgment remain preview/apply concerns.
+pub(crate) fn validate_upgrade_proposal(path: &Path, input: &Value) -> Result<()> {
+    let inspected = inspect_upgrade(path)?;
+    ensure!(
+        inspected.kind != UpgradeKind::Pending,
+        MigrationError::Pending
+    );
+    let p = prepare(&absolute(path)?, input)?;
+    if let Some(version) = inspected.journal_format {
+        if version == 1 {
+            ensure!(
+                input["adopt_legacy"] == true,
+                MigrationError::AdoptionApprovalRequired
+            );
+            if let Some(id) = input.get("initial_database_id") {
+                ensure!(
+                    id.as_str().is_some_and(valid_id),
+                    "initial_database_id must be 32 hexadecimal digits"
+                );
+            }
+        } else if read_binding(&p.config)?.is_none() {
+            ensure!(
+                version == 2 && input["adopt_legacy"] == true,
+                "unbound authority requires eligible legacy marker and explicit adoption"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn inspect_source_authority(config: &Config, db: &Connection, version: i64) -> Result<()> {
+    if version == CURRENT_JOURNAL_FORMAT {
+        validate_required_lane_state(db)?;
+    } else {
+        conversion::validate_source(db, version)?;
+    }
+    let stored: String =
+        db.query_row("SELECT identity FROM control WHERE singleton=1", [], |r| {
+            r.get(0)
+        })?;
+    ensure!(stored == identity(config)?, "journal identity mismatch");
+    let binding = read_binding(config)?;
+    let witness = marker(config)?;
+    let legacy_marker = digest(config.state_dir.as_os_str().as_encoded_bytes());
+    if version == 1 {
+        ensure!(
+            binding.is_none()
+                && witness == legacy_marker.as_bytes()
+                && !table_exists(db, "authority")?,
+            "schema1 initial adoption proof missing"
+        );
+    } else {
+        let (id, sequence) = authority(db)?;
+        if let Some(binding) = binding {
+            binding.check_context(config)?;
+            ensure!(
+                witness == WRITER_MARKER
+                    && binding.database_id == id
+                    && binding.dispatch_sequence <= sequence,
+                "journal binding continuity mismatch"
+            );
+            let writer = lock_path(config, "writer")?;
+            if version == CURRENT_JOURNAL_FORMAT || binding.writer_inode.is_some() {
+                binding.check_writer(&writer, &fs::symlink_metadata(&writer)?)?;
+            }
+            let admission = lock_path(config, "admission")?;
+            if version == CURRENT_JOURNAL_FORMAT || binding.admission_inode.is_some() {
+                binding.check_admission(&admission, &fs::symlink_metadata(&admission)?)?;
+            } else if version == 3 {
+                // Format3 preview requires this existing gate, but may anchor it later.
+                lane_control::opened_file(&admission, false, false)?;
+            }
+        } else {
+            ensure!(
+                version == 2 && witness == legacy_marker.as_bytes(),
+                "unbound authority requires eligible legacy marker and explicit adoption"
+            );
+        }
+    }
+    let profile: Option<String> = if table_exists(db, "routing_profile")? {
+        db.query_row(
+            "SELECT profile FROM routing_profile WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?
+    } else {
+        None
+    };
+    let expected = serde_json::to_string(&config.network.api)?;
+    ensure!(
+        profile.as_deref().map_or(
+            digest(&expected) == crate::endpoints::LEGACY_API_FINGERPRINT,
+            |profile| profile == expected
+        ),
+        "migration cannot rotate API routing"
+    );
+    Ok(())
+}
+
+fn inspect_pending(
+    path: &Path,
+    source: &[u8],
+    config: &Config,
+    db: &Connection,
+    target: i64,
+    sealed: &Value,
+) -> Result<()> {
+    ensure!(
+        sealed["config_path"] == json!(path),
+        "sealed configuration path mismatch"
+    );
+    ensure!(
+        sealed["snapshot"]["state_dir"] == json!(config.state_dir)
+            && (sealed["source_toml"].as_str().map(str::as_bytes) == Some(source)
+                || sealed["candidate_toml"].as_str().map(str::as_bytes) == Some(source)),
+        "installed configuration conflicts with sealed migration"
+    );
+    let candidate = sealed_config(
+        path,
+        sealed["candidate_toml"]
+            .as_str()
+            .context("sealed candidate missing")?,
+    )?;
+    let writer_path = lock_path(&candidate, "writer")?;
+    let writer = lane_control::opened_file(&writer_path, false, false)?;
+    let admission_path = lock_path(&candidate, "admission")?;
+    let admission = lane_control::opened_file(&admission_path, false, false)?;
+    let snapshot = &sealed["snapshot"];
+    ensure!(
+        metadata_identity(&writer.metadata()?)? == snapshot["writer_inode"]
+            && (approved_admission_inode(snapshot)?.is_none()
+                || metadata_identity(&admission.metadata()?)? == snapshot["admission_inode"]),
+        "sealed authority inode changed"
+    );
+    check_sealed_contents(db, &candidate, sealed, target)?;
+    if target == CURRENT_JOURNAL_FORMAT {
+        check_current_binding(&candidate, snapshot)?;
+        return Ok(());
+    }
+    let binding = read_private_bytes(&lock_path(&candidate, "binding")?, 4096)?;
+    let original: Option<Vec<u8>> = serde_json::from_value(snapshot["binding_bytes"].clone())?;
+    let witness = marker(&candidate)?;
+    let old_witness: Vec<u8> = serde_json::from_value(snapshot["marker"].clone())?;
+    if snapshot["branch"] == "established_authority" {
+        ensure!(
+            binding == original && witness == old_witness,
+            "sealed binding changed"
+        );
+    } else {
+        let expected = Binding {
+            location: snapshot["location"]
+                .as_str()
+                .context("location missing")?
+                .into(),
+            identity: digest(identity(&candidate)?),
+            database_id: snapshot["database_id"]
+                .as_str()
+                .context("ID missing")?
+                .into(),
+            dispatch_sequence: snapshot["dispatch_sequence"]
+                .as_i64()
+                .context("sequence missing")?,
+            writer_inode: None,
+            admission_inode: None,
+        };
+        ensure!(
+            (binding.is_none() && witness == old_witness)
+                || (binding
+                    .as_ref()
+                    .map(|raw| serde_json::from_slice::<Value>(raw))
+                    .transpose()?
+                    == Some(serde_json::to_value(expected)?)
+                    && (witness == old_witness || witness == WRITER_MARKER)),
+            "sealed historical adoption conflicts"
+        );
+    }
+    Ok(())
+}
 fn rows(db: &Connection, table: &str, mut visit: impl FnMut(Value) -> Result<()>) -> Result<()> {
     // Names come exclusively from sqlite_schema; quoted identifiers cannot become SQL.
     let quoted = table.replace('"', "\"\"");
@@ -910,13 +1194,28 @@ fn check_sealed(
     locks.check(config)?;
     if target == CURRENT_JOURNAL_FORMAT {
         ensure!(locks.lanes.is_some(), "required lane gates are not fenced");
-        validate_required_lane_state(db)?;
     }
     let s = &sealed["snapshot"];
     locks.check_approved_admission(s)?;
     ensure!(
-        file_identity(&config.state_dir.join("state.sqlite3"))? == s["database_inode"]
-            && locks.writer_identity == s["writer_inode"],
+        locks.writer_identity == s["writer_inode"],
+        "sealed authority inode changed"
+    );
+    check_sealed_contents(db, config, sealed, target)
+}
+
+fn check_sealed_contents(
+    db: &Connection,
+    config: &Config,
+    sealed: &Value,
+    target: i64,
+) -> Result<()> {
+    if target == CURRENT_JOURNAL_FORMAT {
+        validate_required_lane_state(db)?;
+    }
+    let s = &sealed["snapshot"];
+    ensure!(
+        file_identity(&config.state_dir.join("state.sqlite3"))? == s["database_inode"],
         "sealed authority inode changed"
     );
     let (id, sequence) = authority(db)?;
@@ -1074,17 +1373,12 @@ fn current_destination(config: &Config, snapshot: &Value) -> Result<Vec<u8>> {
     Ok(serde_json::to_vec(&binding)?)
 }
 
-fn install_current_binding(config: &Config, snapshot: &Value, locks: &mut Locks) -> Result<()> {
-    locks.check(config)?;
-    ensure!(
-        locks.writer_identity == snapshot["writer_inode"],
-        "approved writer inode changed"
-    );
-    locks.check_approved_admission(snapshot)?;
+// Read-only eligibility is shared by installer inspection and exact sealed recovery.
+fn check_current_binding(config: &Config, snapshot: &Value) -> Result<Vec<u8>> {
     let destination = current_destination(config, snapshot)?;
     let path = lock_path(config, "binding")?;
     let current = read_private_bytes(&path, 4096)?;
-    let current_marker = writer_marker(&locks.writer.0)?;
+    let current_marker = marker(config)?;
     let original_marker: Vec<u8> = serde_json::from_value(snapshot["marker"].clone())?;
     if snapshot["branch"] == "established_authority" {
         let source: Vec<u8> = serde_json::from_value(snapshot["binding_bytes"].clone())?;
@@ -1105,7 +1399,6 @@ fn install_current_binding(config: &Config, snapshot: &Value, locks: &mut Locks)
         } else {
             None
         };
-        // Only pre-gate approvals emitted the four-field installed intermediate.
         ensure!(
             (current.as_deref().is_some_and(|bytes| {
                 bytes == destination || historical.as_deref() == Some(bytes)
@@ -1114,6 +1407,18 @@ fn install_current_binding(config: &Config, snapshot: &Value, locks: &mut Locks)
             "adoption binding conflict"
         );
     }
+    Ok(destination)
+}
+
+fn install_current_binding(config: &Config, snapshot: &Value, locks: &mut Locks) -> Result<()> {
+    locks.check(config)?;
+    ensure!(
+        locks.writer_identity == snapshot["writer_inode"],
+        "approved writer inode changed"
+    );
+    locks.check_approved_admission(snapshot)?;
+    let destination = check_current_binding(config, snapshot)?;
+    let path = lock_path(config, "binding")?;
     locks.check(config)?;
     locks.check_approved_admission(snapshot)?;
     // Republish even an already installed destination: its prior rename may have
@@ -1317,10 +1622,14 @@ pub fn status(state_dir: &Path) -> Result<Value> {
     let Some(db) = open_existing(state_dir, false)? else {
         return Ok(json!({"phase":"absent","journal_present":false}));
     };
-    if !table_exists(&db, "capability_migration")? {
+    status_value(&db)
+}
+
+fn status_value(db: &Connection) -> Result<Value> {
+    if !table_exists(db, "capability_migration")? {
         return Ok(json!({"phase":"not_started","journal_present":true}));
     }
-    let (phase, token, sealed) = record(&db, None)?;
+    let (phase, token, sealed) = record(db, None)?;
     let target = seals::target(&token, &sealed).ok();
     let marked_candidate = target.is_some()
         && toml::from_str::<toml::Value>(
@@ -1338,7 +1647,7 @@ pub fn status(state_dir: &Path) -> Result<Value> {
             Some(target) => authority_prerequisite(target, &sealed),
         },
         "further_migration_required":target.is_some_and(|target| target != CURRENT_JOURNAL_FORMAT) || marked_candidate,
-        "history":seals::history(&db)?,
+        "history":seals::history(db)?,
         "branch":sealed["snapshot"]["branch"],"paused_generation":sealed["sealed_generation"],
         "source_sha256":sealed["source_sha256"],"candidate_sha256":sealed["candidate_sha256"],"risk_acknowledged":sealed["risk_acknowledged"],
         "private_export_available":true,"participation_resumed":false}),
