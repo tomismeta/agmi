@@ -4939,7 +4939,8 @@ esac
             let temporary =
                 OwnedPath::directory(&std::env::temp_dir(), "agmi-repair-preflight-test")?;
             let directory = &temporary.path;
-            let installation = repair_fixture(directory)?;
+            let installation =
+                repair_fixture(directory).context("prepare repair preflight fixture")?;
             let refused = || -> Result<()> {
                 fs::write(directory.join("events"), "")?;
                 let error = installation
@@ -5005,7 +5006,10 @@ esac
             refused()?;
             replace_link(&id, &installation.root.join("current"))?;
             assert_eq!(
-                installation.repair_runtime(|| Ok(repair_report()))?["repairs"]["restoration"]["verified"],
+                installation
+                    .repair_runtime(|| Ok(repair_report()))
+                    .context("repair validated installation after refusal cases")?["repairs"]["restoration"]
+                    ["verified"],
                 true
             );
             Ok(())
