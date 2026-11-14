@@ -1058,6 +1058,21 @@ def main():
         assert digest(fixture.database) == journal
         install('update', second)
         selected(second)
+        # The invoker has first's bytes, while current selects the distinct real
+        # second CLI. Match discovery's current/no-op activation arguments so the
+        # incoming target must parse the fence rather than a permissive mock.
+        assert digest(binary) != hashes[second]
+        no_op = cli('update', '--release', ids[second], '--expected-release', ids[second])
+        assert no_op['installation']['activation'] == 'loaded_verified'
+        selected(second)
+        mismatch = cli('update', '--release', ids[second],
+                       '--expected-release', ids[first], success=False)
+        assert mismatch['installation']['failure_code'] == 'release_invalid'
+        assert mismatch['installation']['activation'] == 'not_started'
+        selected(second)
+        assert digest(fixture.database) == journal
+        assert not (releases / '.update-state.json').exists()
+        print('PASS distinct retained CLI accepts fenced no-op and refuses stale selected-release fence', flush=True)
         activate(first)
         selected(first)
         assert digest(fixture.database) == journal
@@ -1079,6 +1094,11 @@ def main():
         selected(first, runtime=True, timer=True)
         install('update', second)
         selected(second, runtime=True, timer=True)
+        runtime_pid = property_value('agmi.service', 'MainPID')
+        no_op = cli('update', '--release', ids[second], '--expected-release', ids[second])
+        assert no_op['installation']['activation'] == 'loaded_verified'
+        selected(second, runtime=True, timer=True)
+        assert property_value('agmi.service', 'MainPID') == runtime_pid
         activate(first)
         selected(first, runtime=True, timer=True)
         print('PASS running forward update and retained activation with real process identity', flush=True)

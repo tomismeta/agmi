@@ -41,6 +41,44 @@ fn update_check_cannot_authorize_repair_or_mix_release_sources() {
     }
 }
 
+#[test]
+fn expected_release_requires_one_explicit_source_and_no_preview_or_repair() {
+    let release = format!("r-{}", "a".repeat(64));
+    let digest = &release[2..];
+    for source in [
+        vec![],
+        vec!["--binary", "/candidate"],
+        vec!["--sha256", digest],
+        vec![
+            "--release",
+            release.as_str(),
+            "--binary",
+            "/candidate",
+            "--sha256",
+            digest,
+        ],
+        vec!["--release", release.as_str(), "--check"],
+        vec!["--release", release.as_str(), "--repair"],
+        vec!["--release", release.as_str(), "--dry-run"],
+        vec!["--binary", "/candidate", "--sha256", digest, "--check"],
+        vec!["--binary", "/candidate", "--sha256", digest, "--repair"],
+        vec!["--binary", "/candidate", "--sha256", digest, "--dry-run"],
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let output = binary()
+            .env("HOME", root.path())
+            .args(["--json", "update", "--expected-release", &release])
+            .args(source)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(error["error"]["code"], "invalid_arguments");
+        assert!(!root.path().join(".local").exists());
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn update_repair_dry_run_preserves_user_files_and_never_executes_candidate() {

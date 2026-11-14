@@ -27,6 +27,7 @@ include = [
     "/examples/judge/core-guidance.md",
     "/examples/judge/user-guidance.md",
     "/docs/OPERATIONS.md",
+    "/docs/assets/architecture.svg",
     "/README.md",
     "/LICENSE",
     "/ARCHITECTURE.md",

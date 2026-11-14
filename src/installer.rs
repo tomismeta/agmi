@@ -1612,6 +1612,8 @@ mod native {
             }
             Ok(())
         }
+        // Fresh installation and migration-only bootstrap stay stopped.
+        // Managed updates alone capture and restore independent lifecycle intent.
         fn activate(&mut self, id: &str, request: &Request<'_>) -> Result<()> {
             self.bootstrap_recovery = None;
             self.phase = "activation_preflight";
@@ -1673,8 +1675,8 @@ mod native {
                 );
             }
             self.failure = "service_state_unavailable";
-            let runtime_active = self.active("agmi.service")?;
-            let timer_active = self.active("agmi-health.timer")?;
+            self.active("agmi.service")?;
+            self.active("agmi-health.timer")?;
             checkpoint()?;
             self.phase = "stopping";
             self.failure = "stop_failed";
@@ -1717,38 +1719,14 @@ mod native {
             self.control(&["daemon-reload"])?;
             self.loaded(id)?;
             self.activation = "loaded_verified";
-            if request.stopped {
-                if request.migration_only {
-                    self.failure = "stop_failed";
-                    self.verify_autostart_disabled()?;
-                    self.output.push_str("Migration bootstrap disabled boot activation. After local migration, explicitly enable/start services; participation still requires resume.\n");
-                } else if request.action == "install" {
-                    self.control(&["enable", "agmi.service", "agmi-health.timer"])?;
-                }
-                self.verify_stopped()?;
-            } else {
-                self.phase = "starting";
-                self.failure = "start_failed";
-                self.service = "unknown";
-                if runtime_active {
-                    self.control(&["start", "agmi.service"])?;
-                    self.control(&["is-active", "--quiet", "agmi.service"])?;
-                    let pid = self.property("agmi.service", "MainPID", true)?;
-                    ensure!(
-                        pid.parse::<u32>().is_ok_and(|pid| pid > 0),
-                        "no runtime process identity"
-                    );
-                    ensure!(
-                        digest(File::open(format!("/proc/{pid}/exe"))?)? == id[2..],
-                        "runtime binary identity mismatch"
-                    );
-                }
-                if timer_active {
-                    self.control(&["start", "agmi-health.timer"])?;
-                    self.control(&["is-active", "--quiet", "agmi-health.timer"])?;
-                }
-                self.service = "previous_intent_restored";
+            if request.migration_only {
+                self.failure = "stop_failed";
+                self.verify_autostart_disabled()?;
+                self.output.push_str("Migration bootstrap disabled boot activation. After local migration, explicitly enable/start services; participation still requires resume.\n");
+            } else if request.action == "install" {
+                self.control(&["enable", "agmi.service", "agmi-health.timer"])?;
             }
+            self.verify_stopped()?;
             self.status()?;
             checkpoint()?;
             self.phase = "complete";

@@ -121,15 +121,15 @@ enum Command {
     )]
     Update {
         /// Select a retained compatible release instead of downloading.
-        #[arg(long, conflicts_with_all = ["binary", "sha256"])]
+        #[arg(long, group = "update_source", conflicts_with_all = ["binary", "sha256"])]
         release: Option<String>,
         /// Select a local binary instead of downloading; requires its trusted digest.
-        #[arg(long, requires = "sha256")]
+        #[arg(long, group = "update_source", requires = "sha256")]
         binary: Option<PathBuf>,
         #[arg(long, requires = "binary")]
         sha256: Option<String>,
         /// Internal compare-and-swap fence for incoming verified installer handoff.
-        #[arg(long, hide = true, requires = "binary", conflicts_with_all = ["check", "repair", "dry_run"])]
+        #[arg(long, hide = true, requires = "update_source", conflicts_with_all = ["check", "repair", "dry_run"])]
         expected_release: Option<String>,
         /// Query latest stable without installing or repairing.
         #[arg(long, conflicts_with_all = ["release", "binary", "sha256", "stopped", "dry_run", "repair"])]
@@ -1892,6 +1892,23 @@ mod tests {
                 status == "migration_prepared"
             );
             assert!(!argv.contains(&json!("--accept-risk-change")));
+        }
+    }
+
+    #[test]
+    fn expected_release_accepts_either_explicit_update_source() {
+        let release = format!("r-{}", "a".repeat(64));
+        for source in [
+            vec!["--release", release.as_str()],
+            vec!["--binary", "/candidate", "--sha256", &release[2..]],
+        ] {
+            let mut arguments = vec!["agmi", "update", "--expected-release", release.as_str()];
+            arguments.extend(source);
+            let cli = Cli::try_parse_from(arguments).unwrap();
+            assert!(matches!(
+                cli.command,
+                Command::Update { expected_release: Some(expected), .. } if expected == release
+            ));
         }
     }
 

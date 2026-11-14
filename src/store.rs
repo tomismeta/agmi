@@ -1657,12 +1657,6 @@ impl Store {
     }
 
     fn routing_profile(&self) -> Result<Option<String>> {
-        let exists: bool = self.db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='routing_profile')",
-            [], |row| row.get(0))?;
-        if !exists {
-            return Ok(None);
-        }
         Ok(self
             .db
             .query_row(
@@ -1674,10 +1668,6 @@ impl Store {
     }
 
     fn routing_busy(&self, config: &Config) -> Result<bool> {
-        // Read-only inspection of an older schema cannot prove its retry lane drained.
-        if !self.has_table("operation_links")? {
-            return Ok(true);
-        }
         // Retained unresolved native work stays busy independent of eligibility.
         let unresolved: bool = self.db.query_row(
             "SELECT EXISTS(SELECT 1 FROM operations WHERE state IN
@@ -2854,9 +2844,6 @@ impl Store {
         cutoff: AdmissionCutoff,
     ) -> Result<Option<bool>> {
         let Some(epoch) = epoch else { return Ok(None) };
-        if !self.has_table("manual_grants")? || !self.has_table("manual_grant_revocations")? {
-            return Ok(None);
-        }
         Ok(Some(self.db.query_row(
             "SELECT EXISTS(SELECT 1 FROM manual_grants WHERE epoch=?1 AND kind=?2 AND generation=?3
              AND id<=?4 AND created_at<=?5 AND consumed_by IS NULL
@@ -4166,25 +4153,15 @@ impl Store {
 
     pub(crate) fn grants(&self, before: Option<i64>, limit: usize) -> Result<Value> {
         validate_page(before, limit)?;
-        if !self.has_table("manual_grants")? {
-            return Ok(json!({"grants":[],"next_before":null}));
-        }
         let snapshot = self.db.unchecked_transaction()?;
         let control = self.control()?;
-        let (revoked_column, revoked_join) = if self.has_table("manual_grant_revocations")? {
-            (
-                "r.revoked_at",
-                "LEFT JOIN manual_grant_revocations r ON r.grant_id=g.id",
-            )
-        } else {
-            ("NULL", "")
-        };
-        let mut statement = self.db.prepare(&format!(
-            "SELECT g.id,g.epoch,g.kind,g.generation,g.created_at,g.consumed_by,{revoked_column},
+        let mut statement = self.db.prepare(
+            "SELECT g.id,g.epoch,g.kind,g.generation,g.created_at,g.consumed_by,r.revoked_at,
                 g.lane_control_revision,COALESCE(g.lane_control_revision=l.control_revision,0)
-            FROM manual_grants g LEFT JOIN lane_control l ON l.lane=g.kind {revoked_join}
+            FROM manual_grants g LEFT JOIN lane_control l ON l.lane=g.kind
+            LEFT JOIN manual_grant_revocations r ON r.grant_id=g.id
             WHERE (?1 IS NULL OR g.id<?1) ORDER BY g.id DESC LIMIT ?2",
-        ))?;
+        )?;
         let mut grants = statement.query_map(params![before,(limit+1) as i64], |r| {
             let generation: i64 = r.get(3)?;
             let consumed_by: Option<i64> = r.get(5)?;
@@ -5917,6 +5894,47 @@ mod tests {
             (2, 1, 1, 1)
         );
         assert_eq!(accounting.historical[0].operation_id, retry.id);
+    }
+
+    #[test]
+    fn required_routing_profile_table_fails_instead_of_using_default_profile() {
+        let (_temp, config, store) = participation_fixture();
+        assert!(store.routing_profile().unwrap().is_none());
+        assert_eq!(
+            store.routing_status(&config).unwrap()["matches_config"],
+            true
+        );
+        store
+            .db
+            .execute_batch("DROP TABLE routing_profile")
+            .unwrap();
+        drop(store);
+        let store = Store::read_only(&config).unwrap().unwrap();
+        assert!(store.routing_profile().is_err());
+        assert!(store.routing_status(&config).is_err());
+        assert!(store.routing_change_allowed(&config).is_err());
+    }
+
+    #[test]
+    fn required_operation_links_table_fails_routing_retry_assessment_when_missing() {
+        let (_temp, mut config, mut store) = participation_fixture();
+        config.capabilities.answer.preparation.max_attempts_per_work = CountLimit::Bounded(1);
+        begin(&mut store, LaneId::Answer, "7:retry", "rejected");
+        assert!(!store.routing_busy(&config).unwrap());
+        store
+            .db
+            .execute_batch("DROP TABLE operation_links")
+            .unwrap();
+        drop(store);
+        let store = Store::read_only(&config).unwrap().unwrap();
+        let mut changed = config.clone();
+        changed.network.api.routes.insert(
+            crate::endpoints::Endpoint::Challenge,
+            "/different-challenge".into(),
+        );
+        assert!(store.routing_busy(&changed).is_err());
+        assert!(store.routing_status(&changed).is_err());
+        assert!(store.routing_change_allowed(&changed).is_err());
     }
 
     #[test]
@@ -7694,6 +7712,31 @@ mod tests {
                 .operations_list(None, Some("unknown' OR 1"), None, 1)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn required_grant_tables_fail_inventory_and_authorization_when_missing() {
+        for table in ["manual_grants", "manual_grant_revocations"] {
+            let (_temp, config, store) = participation_fixture();
+            assert_eq!(store.grants(None, 10).unwrap()["grants"], json!([]));
+            assert_eq!(store.manual_authorized(LaneId::Answer, None).unwrap(), None);
+            assert_eq!(
+                store.manual_authorized(LaneId::Answer, Some(7)).unwrap(),
+                Some(false)
+            );
+            store
+                .db
+                .execute_batch(&format!("DROP TABLE {table}"))
+                .unwrap();
+            drop(store);
+            let store = Store::read_only(&config).unwrap().unwrap();
+            assert!(store.grants(None, 10).is_err(), "{table}");
+            assert!(
+                store.manual_authorized(LaneId::Answer, Some(7)).is_err(),
+                "{table}"
+            );
+            assert_eq!(store.manual_authorized(LaneId::Answer, None).unwrap(), None);
+        }
     }
 
     #[test]

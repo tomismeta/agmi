@@ -71,21 +71,7 @@ impl EffectIntent {
         deadline: EffectDeadline,
         meta: RequestMeta,
     ) -> Result<impl Future<Output = Result<HostedResponse>> + Send + 'static + use<>> {
-        validate_payload(self.lane(), payload)?;
-        ensure!(
-            protocol.key.is_some() && !protocol.address.is_empty(),
-            "submission requires configured identity"
-        );
-        ensure!(
-            meta.owner == Some(self.lane()),
-            "effect owner does not match typed intent"
-        );
-        let payload = if matches!(self, Self::Mine(_)) {
-            None
-        } else {
-            Some(payload)
-        };
-        protocol.request_query(self.endpoint(), None, payload, None, deadline.0, meta)
+        protocol.prepare_submission(self.lane(), payload, deadline, meta)
     }
 }
 const HALT_MIDDLEWARE_ERROR: &str = "endpoint temporarily halted — API hardening in progress";

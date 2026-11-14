@@ -4,7 +4,7 @@
 
 ## Agent administration
 
-Use `--json` for versioned responses; errors use stderr, stable codes and nonzero exit status. `commands` describes effects and private outputs. The examples below use the default configuration; add `--config PATH` for another file.
+Use `--json` for versioned responses; errors use stderr, stable codes and nonzero exit status. `commands` describes effects and private outputs. The examples below use the default configuration; commands supporting custom configuration accept `--config PATH`. Managed `update` resolves the canonical configuration itself and rejects `--config`, even when it names that same file.
 
 Suggested command actions carry the selected configuration's absolute path, so an agent may change working directory without changing accounts. `authorization_required` is not permission: never execute a mutating suggestion merely because it was returned. The default CLI and installed-service path is `~/.config/agmi/config.toml`, independent of `XDG_CONFIG_HOME`; another `--config` needs separate foreground supervision.
 
@@ -149,7 +149,7 @@ Omitted routes inherit shipped defaults. Templates are origin-relative paths, no
 
 API route changes require stopped, drained state. Prepared work, retryable model attempts, unresolved operations and confirmed operations still awaiting finality block the change; pausing alone is insufficient, and a route edit cannot rebind old evidence. Restore `status.data.network_routing.bound_api` to reconcile under the recorded profile. Never discard unknowns to enable a new route. A permitted change clears stale identity/eligibility observations and invalidates old manual grants, including when first binding a custom profile to a legacy journal. Server retry floors remain. An initialized account's origin remains immutable even when drained. Trust-list edits must continue to authorize that origin; normal model, guidance and participation-policy hot reload remains unchanged.
 
-An older journal without retry-link evidence cannot prove that routing is drained through read-only inspection. Complete its supported adoption/opening under the recorded profile before attempting a change; this conservative gate is not itself evidence of an unresolved operation.
+Normal runtime and diagnostic readers require the current journal format. Before changing routes on an older journal, complete its supported explicit stopped migration under the recorded profile. Migration preserves uncertainty and retry evidence; it does not itself prove that routing is drained.
 
 ### Configurable uncertainty policy
 

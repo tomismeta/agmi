@@ -2,239 +2,104 @@
 
 **Agents Gonna Mine It.**
 
-[![agmi release](https://img.shields.io/github/v/release/tomismeta/agmi?label=agmi)](https://github.com/tomismeta/agmi/releases/latest)
-[![Rust](https://img.shields.io/badge/Rust-1.96%2B-93450a)](#install-the-cli)
-[![Status](https://img.shields.io/badge/status-experimental-d97706)](./SECURITY.md)
+[![Release](https://img.shields.io/github/v/release/tomismeta/agmi?label=release)](https://github.com/tomismeta/agmi/releases/latest)
 [![License](https://img.shields.io/badge/license-MIT-6f42c1)](./LICENSE)
 
-Rust infrastructure for MinePOA: answer challenges, judge assigned answers and attest through the mining API. Models produce content; agmi owns scheduling, durable state and submissions. Each instance keeps its own identity, credentials and history.
+A single-binary Rust runtime for MinePOA: answer challenges, judge assigned answers, and mine through the hosted API. Your models produce content; agmi owns scheduling, durable state, and submissions. Each instance keeps its own identity, credentials, and history.
 
-**Unreleased source change:** this branch uses unversioned capability-owned configuration and journal format 4. Plain managed updates perform supported policy-preserving conversions; [policy, risk and authority decisions](docs/OPERATIONS.md#atomic-capability-migration) remain explicit.
+[![agmi architecture: operator policy controls answer, judge and model-free mining lanes. Answer and judge use native model harnesses for content; agmi journals local state and owns submissions to MinePOA.](docs/assets/architecture.svg)](docs/assets/architecture.svg)
 
-```mermaid
-flowchart LR
-    A["Answer lane"] <--> AH["Answer harness / model"]
-    J["Judge lane"] <--> JH["Judge harness / model"]
-    A --> G["Shared effect gate + journal"]
-    J --> G
-    M["Model-free mining lane"] --> G
-    G -->|"Submissions"| P["MinePOA"]
-```
+## Quickstart
 
-## Install the CLI
+**Unreleased source:** these steps describe this checkout's capability-owned configuration and journal format 4. Published v0.1.0/v0.1.1 use an older format; follow their release instructions or the [upgrade guide](docs/OPERATIONS.md#atomic-capability-migration). Existing installations should upgrade, not repeat initialization.
 
-**Prebuilt Linux x86-64 binary:** download the archive and checksums from [Releases](https://github.com/tomismeta/agmi/releases/latest). **No Rust or C compiler is needed to run it.** Follow the release's verification and extraction instructions.
+### 1. Install
 
-**Build from source (Linux/macOS):** requires Rust/Cargo 1.96+ and a C compiler/linker to build bundled SQLite and native cryptographic dependencies:
+**Linux x86-64:** get the binary and checksums from [Releases](https://github.com/tomismeta/agmi/releases/latest), following that release's verification instructions. No compiler is needed to run it.
+
+**From this checkout (Linux/macOS):** requires Rust/Cargo 1.96+ and a C compiler/linker for bundled SQLite and native cryptographic dependencies:
 
 ```sh
-git clone https://github.com/tomismeta/agmi.git
-cd agmi
 cargo install --path . --locked
 agmi --help
 ```
 
-Put Cargo's binary directory (normally `~/.cargo/bin`) on `PATH`. This installs only the CLI—not services, native harnesses or authentication. Linux [service installation and updates](docs/OPERATIONS.md#supervision) are separate explicit commands; a fresh service install stays stopped and never resumes participation.
+Put Cargo's binary directory (normally `~/.cargo/bin`) on `PATH`. agmi is not published to crates.io; use a release or `--path`, not `cargo install agmi`.
 
-Both installation methods require a separately installed, authenticated [Hermes or OpenClaw runtime](docs/OPERATIONS.md#native-model-routes) for answer/judge work, including compatible Python or Node.js.
+This installs the CLI only. Answer and judge need a separately installed, authenticated [Hermes or OpenClaw runtime](docs/OPERATIONS.md#native-model-routes); mining needs no model. agmi does not install or reconfigure your harnesses or copy their credentials.
 
-The CLI runs as your user; no root/admin access or background service is required.
-agmi does not install, patch or reconfigure Hermes/OpenClaw. Explicit model runs use
-your separately authenticated runtime, which may write its own sessions, caches or
-authentication-refresh data; this is not a sandbox. Linux supervision uses user
-services; enabling logout-independent operation may require administrator-approved
-user lingering.
+### 2. Connect an existing account
 
-Version **0.1.1** is not published to crates.io; `publish = false` remains intentional. Use a release binary, this source workflow or the [local package workflow](docs/OPERATIONS.md#verification-and-publication), not `cargo install agmi`.
-
-## Set up an identity
-
-Choose one path. Stop any other software submitting work for this account first. Neither path starts participation.
-
-### Existing account
+Stop any other software submitting for this account, then initialize with your public account address:
 
 ```sh
 agmi init --account YOUR_PUBLIC_ACCOUNT_ADDRESS --key-prompt
 ```
 
-Replace the address with your public MinePOA address. The prompt reads the hosted API key privately. For agents and scripts, use a private credential file:
+The prompt reads the hosted API key privately. For automation, use `--api-key-file` or `--key-stdin`; never put secrets in command arguments or chat.
 
-```sh
-agmi init --account YOUR_PUBLIC_ACCOUNT_ADDRESS --api-key-file /path/to/private/api-key --json
-```
+Init creates private configuration at `~/.config/agmi/config.toml` and leaves participation paused/read-only. For a new account, see [registration and recovery](docs/OPERATIONS.md#identity-onboarding-and-recovery); public registration has not yet been live-validated.
 
-Alternatively, use `--key-stdin`; never put credentials in command arguments.
-
-### Brand-new account
-
-```sh
-agmi identity create --label my-agent
-```
-
-This is a nonmutating plan. Follow [registration approval and onboarding](docs/OPERATIONS.md#identity-onboarding-and-recovery) to verify the proof-of-work algorithm, explicitly confirm creation and initialize the returned account. Public registration has not yet been live-validated.
-
-**The API key is returned once.** A crash before durable capture can lose it. After interruption, inspect `agmi identity status --json`; never repeat an uncertain registration or delete its evidence. [Recovery details](docs/OPERATIONS.md#identity-onboarding-and-recovery).
-
-## Configure and run
-
-Init leaves private configuration at `~/.config/agmi/config.toml`, with participation paused/read-only. Inspect it:
+### 3. Configure your lanes
 
 ```sh
 agmi config show --json
 agmi agents --json
 ```
 
-Edit that file or use [revision-checked configuration](docs/OPERATIONS.md#agent-administration) (`config schema`, `config show`, then `config apply`). Select the harness, executable, model and reasoning separately for answer/judge. Authenticate through the harness itself—never copy another account's auth; `agents` reports configuration, not successful authentication. Supervision also requires the runtime on the [service PATH](docs/OPERATIONS.md#native-model-routes).
+Edit the generated TOML or use [revision-checked configuration](docs/OPERATIONS.md#agent-administration):
 
-### Choose how your agent participates
+- Set `mode` under `capabilities.answer`, `.judge`, and `.mine` to `active`, `read_only`, or `off`. Enable only the lanes you intend to run.
+- For answer and judge, choose each lane's harness, executable, model, reasoning, timing, and retry policy. `agents` shows configuration, not proof of authentication.
+- Personalize the provisioned `answer/user-guidance.md` and `judge/user-guidance.md`. Keep core task instructions intact; guidance is sent to models and retained locally, so never include secrets.
 
-Answering, judging and mining own their modes, timing, scheduling and participation policy. Each can be paused independently. Answer and judge also own separate harnesses, models, reasoning, guidance and inference-retry limits. Identity and same-account effect safety remain shared.
+The [annotated configuration](examples/config.toml) covers every setting. Review [participation risk](docs/OPERATIONS.md#configurable-uncertainty-policy) and model costs before activation. Ordinary model, guidance, and policy changes hot-reload; account and network-routing changes have separate restrictions.
 
-| Lever | Setting or command | What it changes |
-| --- | --- | --- |
-| Runtime and model | `capabilities.answer.model` / `capabilities.judge.model`: `harness`, `executable`, `model`, `reasoning` | Which native agent produces each artifact; mining has no model. |
-| Your perspective | Each model route's `guidance_file` | Your expertise, voice, preferred approaches and reviewing style. |
-| Task instructions | Each model route's `core_guidance_file` | Answer requirements or judging rubric; keep these intact when personalizing. |
-| Participation | `capabilities.<lane>.mode` | `off`, `read_only` or `active`, independently. |
-| Pause one lane | `lane show`, `lane pause`, `lane resume` | A token-checked admission override; sibling lanes keep their own controls. |
-| Timing and cost | Each lane's `schedule`, `timeouts`; answer/judge `preparation` | Independent cadence, original execution deadlines and finite or explicitly recurring model attempts. |
-| Observation validity | Each lane's `schedule.observation_max_age_seconds` | Freshness independent of HTTP timeout; successful discovery refreshes before this age when no retry floor intervenes. |
-| Uncertain outcomes | Each lane's `participation` | Finite exposure or explicit unbounded participation-first admission; strict is the default. |
-
-See the [annotated configuration](examples/config.toml) for exact fields. Model, guidance and normal scheduling changes hot-reload for new attempts; in-flight work retains its captured settings. Account and network-routing changes have separate safety restrictions.
-
-For continuous fresh-work participation, explicitly choose `mode = "participation_first"` and `max_unresolved_operations = "unbounded"`. Historical unknowns then remain recorded without consuming fresh-work capacity or imposing blanket uncertainty grace. This never authorizes replay of the same uncertain work. It accepts potentially growing remote exposure and history; existing numeric limits remain finite.
-
-Model retry spending is separate: `max_attempts_per_work = "unbounded"` permits paced retries after proven completion/nonexecution, while `retry_uncertain` and `max_uncertain_replacements_per_work` separately bound possibly overlapping inference. Neither setting is a dollar budget. See [participation and recovery](docs/OPERATIONS.md) before enabling either policy.
-
-Use `agmi lane show judge --json` to obtain `desired.control_token`, then pass it to `agmi lane pause judge --expected-control "$CONTROL_TOKEN"`. Resume uses the latest token and removes only that override: it does not change modes, grant retries or prove admission open. [Lane controls and acknowledgement limits](docs/OPERATIONS.md#lane-controls).
-
-### Make submissions your own
-
-**Replace the example user guidance with your own perspective before enabling answers.** Choosing a model alone does not give it your expertise or voice.
-
-`agmi init` creates editable guidance beside your configuration. With the default location, edit:
-
-- `~/.config/agmi/answer/user-guidance.md` — your interests, reasoning approach and writing voice.
-- `~/.config/agmi/judge/user-guidance.md` — your evidence standards and reviewing style, without favoring authors or predetermined scores.
-
-For example, write a short answer preference in your own words:
-
-```text
-My background is distributed systems. When relevant, examine failure modes,
-operating costs and who can verify the proposed mechanism.
-Use direct language and concrete trade-offs. Choose the approach that fits
-this challenge rather than repeating a favorite mechanism or template.
-```
-
-Specific preferences help differentiate submissions; they do not guarantee uniqueness, quality or rewards. User guidance is optional and subordinate to core instructions and the actual challenge. The shipped files are examples, not your personal configuration.
-
-Guidance is sent to the selected model and saved with private attempt state: **never include secrets or credentials**. Use atomic file replacement or [revision-checked `guidance set`](docs/OPERATIONS.md#agent-administration), then run `agmi config check`. New attempts read the updated files without a restart; existing drafts keep their original guidance. [Guidance details and limits](docs/OPERATIONS.md#core-and-user-guidance).
-
-### Enable participation
-
-To enable all capabilities and per-epoch attestation, update the existing tables:
-
-```toml
-[capabilities.answer]
-mode = "active"
-
-[capabilities.judge]
-mode = "active"
-
-[capabilities.mine]
-mode = "active"
-
-[capabilities.mine.schedule]
-each_epoch = true
-```
-
-Other settings retain their defaults. Separate capacity is not separate wallet authority: review each lane's [participation risk policy](docs/OPERATIONS.md#configurable-uncertainty-policy). Strict remains the default. Optional answer-only `accepted_linked` accounting retains original unknowns and accepts accumulating historical risk, not proof that old requests failed.
+### 4. Check, then start
 
 ```sh
 agmi config check
 agmi run --once
 agmi status --json
-# After reviewing configuration and local evidence:
+```
+
+The bounded run leaves participation paused; it is not proof of live readiness. After reviewing your configured lanes, model costs, and participation policy:
+
+```sh
 agmi resume
 agmi run
 ```
 
-The first bounded run initializes paused state, not live readiness. `--once` takes a finite entry-time plan; it does not wait for future retry deadlines or continuously replenish work. Resume does not change capability modes. For unattended Linux operation, use [install/service/update](docs/OPERATIONS.md#supervision) instead of the foreground process.
+For unattended Linux operation, use [user-systemd installation](docs/OPERATIONS.md#supervision) instead of foreground `run`. Service installation is separate, uses the canonical configuration, and stays stopped until explicitly started. Native harnesses must be available on the service's `PATH`; logout-independent operation may require administrator-approved user lingering.
 
-## Inspect and administer
+## Operate
 
-| Need | Command |
-| --- | --- |
-| Current work, controls and retained risk | `agmi status` |
-| Readiness of the core and each lane; meaningful exit status | `agmi health` |
-| What to do next, what can wait, and eligible repairs | `agmi doctor` |
-| Recorded API reads or process logs | `agmi reads` / `agmi logs --follow` |
+- `agmi status` — current work and retained risk.
+- `agmi health` — local operational readiness.
+- `agmi doctor` — waits and intervention needs.
+- `agmi pause` — pause new participation.
+- `agmi lane show judge` — inspect one lane's control state.
+- `agmi update --check` / `agmi update` — check or apply a managed update.
 
-Add `--json` for structured agent evidence. Default diagnostics are compact; add
-`--verbose` for complete retained evidence; `agmi lane show <lane>` inspects control
-and admission evidence, not operational health.
-`status`, `health` and `doctor` share current-work semantics across controller,
-answer, judge and mine; `assessment_scope` identifies which checks were performed.
-Unknown/stale admission is never permission or readiness, even when a lane reads `ok`.
+Add `--json` for agent-readable responses or `--verbose` for full diagnostic evidence. Use `agmi <command> --help` or `agmi --json commands` for discovery; [lane controls](docs/OPERATIONS.md#lane-controls) can pause one capability independently.
 
-`healthy` and the health exit status mean operationally clear under the selected
-checks—not proof of remote availability or settlement. Retained unknowns stay visible
-as risk/warnings, so healthy can still carry `attention required`. Historical unknowns
-alone never fail a lane with a genuinely open fresh path, under finite or unbounded
-participation-first policy. Active blockers, stale or missing evidence, overdue work,
-exhausted finite capacity and strict-policy uncertainty gates do fail.
-`--expect-participation false` permits intentional pause/read-only operation, not
-accounting faults, stopped controllers or current-work failures. Disk faults belong
-to the core, not every lane. Fresh complete empty judging inventory is idle and
-healthy; stale or partial inventory never proves no available work.
-`status` exit success means the snapshot was read. `doctor` exit success means
-an unattended path exists without repair failure; neither substitutes for the
-health exit check.
+Managed updates preserve identity, configuration meaning, models, guidance, and history, restoring prior runtime/timer/boot/pause intent. Interrupted updates remain pinned: rerun `agmi update`. Policy, risk, and authority decisions still require approval. [Update guarantees and older-client bootstrap](docs/OPERATIONS.md#stable-release-updates).
 
-`status.lane_participation` distinguishes sourced answer/judge opportunity assessments, model attempts and recorded operation outcomes. Read-only assessments can hydrate judging evidence without inference or submissions. Missing, partial, stale or stopped evidence remains explicit; these counts do not establish grading correctness, payment or finality.
+Health is a local operational assessment, not proof of remote availability, settlement, or rewards. Pause cannot recall transmitted requests. Preserve the journal and uncertainty; never reset state or restore an older database to regain availability. [Reliability boundaries](docs/OPERATIONS.md#reliability-boundaries).
 
-`doctor` gives separate answer/judge/mine progress and distinguishes automatic
-waiting from operator intervention or insufficient evidence; current actions take
-precedence over background reconciliation, which stays visible without requiring
-replay, clearing unknowns, or raising budgets. `agmi doctor --repair` applies only
-eligible, audited refusal repairs and normalizes ambiguous legacy identity
-flags—not a blanket unknown cleanup or credential repair. It preserves runtime intent and
-unresolved evidence, and never guarantees every retained outcome will resolve or proves independent finality. [Doctor and recovery limits](docs/OPERATIONS.md#doctor-and-unattended-status).
+## Develop
 
-Run one authoritative writer per account. Preserve the journal, account binding and credentials across updates; never erase uncertainty to regain availability. `agmi pause` closes new admission but cannot retract requests or disable server-side auto-mining. Local observations are not fresh remote confirmations or proof of rewards.
-
-### Keep the managed service current
+Requires Unix, Rust/Cargo 1.96+, and a C compiler/linker. Tests additionally require Node.js and Python 3, but no live credentials or OpenClaw installation.
 
 ```sh
-agmi update --check     # Latest stable release; no changes
-agmi update             # Verify, convert if needed, restore prior operating intent
-agmi update --repair    # Also authorize eligible guarded repairs
+cargo build --locked
+cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
+cargo fmt --all -- --check
 ```
 
-Updates preserve identity, credentials, configuration meaning, model settings,
-guidance and history. Compatible updates leave configuration bytes, pause and
-generation unchanged. Required conversion can normalize formatting and invalidate
-stale grants, never reset accounting or replay uncertain work.
+The development CLI is `target/debug/agmi`. [Verification and packaging](docs/OPERATIONS.md#verification-and-publication) covers protocol fixtures, isolated systemd acceptance, and release checks. Cargo builds never provision services, native harnesses, or authentication.
 
-Prior runtime/timer activity, independent boot enablement and global pause intent
-are restored automatically. Interrupted work remains pinned: rerun `agmi update`.
-Policy/risk/adoption choices still require explicit approval; `--migrate` retains
-stopped, boot-disabled maintenance when conversion is needed.
+[Operations](docs/OPERATIONS.md) · [Architecture](ARCHITECTURE.md) · [Security](SECURITY.md) · [Changelog](CHANGELOG.md)
 
-An untagged or newer build is not replaced merely because it shares a version
-number with an older published release. Installation, restoration, repair and remote
-readiness are separate outcomes. [Update guarantees and older-client bootstrap](docs/OPERATIONS.md#stable-release-updates).
-
-Use `agmi <command> --help` for examples and effects, or `agmi --json commands`
-for agent-facing discovery. `agmi completions bash`, `zsh` or `fish` prints a shell
-completion script without modifying your shell configuration.
-
-- [Configuration, guidance and network profiles](docs/OPERATIONS.md#configuration-and-reload)
-- [Identity recovery and credentials](docs/OPERATIONS.md#identity-onboarding-and-recovery)
-- [Services, release activation and updates](docs/OPERATIONS.md#supervision)
-- [Health and agent-owned forwarding](docs/OPERATIONS.md#local-health-checks)
-
-[Operations reference](docs/OPERATIONS.md) · [Architecture](ARCHITECTURE.md) · [Security](SECURITY.md) · [Changelog](CHANGELOG.md)
-
-Experimental protocol; no earnings guarantees.
+Experimental network; no earnings guarantees.
