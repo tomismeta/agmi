@@ -418,6 +418,39 @@ async fn lane_observations_are_attributed_and_cannot_roll_answer_epoch_backward(
 
 #[tokio::test]
 async fn external_admission_contention_defers_once_without_an_attempt_or_wait() {
+    // Shutdown drains process-global native scratch; unrelated model tests must
+    // not turn this runtime's admission-deferral bound into their cleanup wait.
+    const ISOLATED: &str = "AGMI_TEST_ISOLATED_ADMISSION_CONTENTION";
+    const RECEIPT: &str = "AGMI_TEST_ADMISSION_CONTENTION_RECEIPT";
+    if std::env::var_os(ISOLATED).is_none() {
+        let receipt = tempfile::NamedTempFile::new().unwrap();
+        let output = tokio::time::timeout(
+            Duration::from_secs(30),
+            tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "runtime::host::tests::coordination_tests::external_admission_contention_defers_once_without_an_attempt_or_wait",
+                    "--nocapture",
+                ])
+                .env(ISOLATED, "1")
+                .env(RECEIPT, receipt.path())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("isolated admission regression exceeded its deadline")
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert_eq!(std::fs::read(receipt.path()).unwrap(), b"x");
+        return;
+    }
+    let receipt = std::env::var_os(RECEIPT).expect("missing admission fixture entry receipt");
+    std::fs::write(receipt, b"x").unwrap();
     let (_temp, mut runtime, _stop) = fixture();
     no_discovery(&runtime);
     let gate = AccountAdmissionGuard::acquire(&runtime.config).unwrap();

@@ -3755,6 +3755,8 @@ mod native {
     mod tests {
         use super::*;
 
+        static TEST_SERIAL: Mutex<()> = Mutex::new(());
+
         // Fixture writers belong to a dedicated process: unrelated libtest spawns
         // must not inherit writable descriptors for executables being staged.
         fn run_fixture_in_subprocess(name: &str) -> Result<bool> {
@@ -3765,6 +3767,8 @@ mod native {
                 fs::write(receipt, b"x")?;
                 return Ok(false);
             }
+            // Preserve the fixture group's existing serialization of syncfs-heavy work.
+            let _serial = TEST_SERIAL.lock().unwrap();
             let mut receipt = tempfile::NamedTempFile::new()?;
             let output = Command::new(std::env::current_exe()?)
                 .args(["--exact", name, "--nocapture"])
