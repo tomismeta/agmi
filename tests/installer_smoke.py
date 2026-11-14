@@ -6,12 +6,14 @@ cancellation require --isolated-home in the verified disposable systemd containe
 its guard reads that manager, but installer commands use only fixture tools.
 """
 import contextlib
+import fcntl
 import hashlib
 import json
 import os
 import pathlib
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -101,6 +103,11 @@ if args[0] == 'show':
         print('active' if (root / ('active-' + args[1])).exists() else 'inactive')
     elif prop == 'FragmentPath': print(home / '.config/systemd/user' / args[1])
     elif prop == 'MainPID': print('0')
+    elif prop in ('Job', 'ControlPID'): print('0')
+    elif prop == 'SubState':
+        print('running' if (root / ('active-' + args[1])).exists() else 'dead')
+    elif prop == 'NeedDaemonReload': print('no')
+    elif prop == 'ControlGroup': print('')
     elif prop == 'UnitFileState':
         print('enabled' if (root / ('enabled-' + args[1])).exists() else 'linked')
     elif prop == 'DropInPaths': print('')
@@ -229,15 +236,61 @@ else:
     (root / 'wrong-manager').unlink()
 
     lock = releases / '.install-lock'
-    lock.mkdir()
-    error = cli('service', 'stop', success=False)
-    assert error['details']['failure_code'] == 'installer_busy' and lock.is_dir()
-    error = cli('service', 'stop', success=False, environment=dict(env, PATH=str(root / 'missing-tools')))
-    assert error['details']['failure_code'] == 'missing_prerequisite' and lock.is_dir()
-    error = cli('service', 'status', success=False, environment=dict(env, PATH=str(root / 'missing-tools')))
-    assert error['details']['failure_code'] == 'missing_prerequisite', error
-    lock.rmdir()
-    cli('update', '--release', first_id, '--stopped')
+    lease_metadata = lock.lstat()
+    assert stat.S_ISREG(lease_metadata.st_mode), 'Installer lease must be a regular file'
+    lease_identity = (lease_metadata.st_dev, lease_metadata.st_ino)
+
+    def assert_lease_identity():
+        metadata = lock.lstat()
+        assert stat.S_ISREG(metadata.st_mode)
+        assert (metadata.st_dev, metadata.st_ino) == lease_identity, 'Installer replaced its permanent lease'
+
+    def assert_lease_available():
+        assert_lease_identity()
+        with lock.open('r+b') as available:
+            metadata = os.fstat(available.fileno())
+            assert (metadata.st_dev, metadata.st_ino) == lease_identity
+            fcntl.flock(available, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    before = len(calls())
+    with lock.open('r+b') as held:
+        metadata = os.fstat(held.fileno())
+        assert (metadata.st_dev, metadata.st_ino) == lease_identity
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        error = cli('service', 'stop', success=False)
+        assert error['details']['failure_code'] == 'update_in_progress'
+        assert_lease_identity()
+        error = cli('service', 'stop', success=False, environment=dict(env, PATH=str(root / 'missing-tools')))
+        assert error['details']['failure_code'] == 'missing_prerequisite'
+        error = cli('service', 'status', success=False, environment=dict(env, PATH=str(root / 'missing-tools')))
+        assert error['details']['failure_code'] == 'missing_prerequisite', error
+        assert_lease_identity()
+    assert not any(call[0] == 'systemctl' and call[2] in
+                   ('stop', 'start', 'restart', 'enable', 'disable', 'daemon-reload')
+                   for call in calls()[before:])
+    assert_lease_available()
+
+    # An old directory lease is a separate installation, never a replacement
+    # for the permanent regular inode established above.
+    legacy_home = root / 'legacy-home'
+    legacy_releases = legacy_home / '.local/share/agmi/releases'
+    for directory in (legacy_home, legacy_home / '.local', legacy_home / '.local/share',
+                      legacy_home / '.local/share/agmi', legacy_releases):
+        directory.mkdir(mode=0o700)
+    legacy_lock = legacy_releases / '.install-lock'
+    legacy_lock.mkdir(mode=0o700)
+    legacy_identity = legacy_lock.stat()
+    before = len(calls())
+    error = cli('install', '--stage-only', '--binary', str(binary), '--sha256', digest(binary),
+                success=False, environment=dict(env, HOME=str(legacy_home)))
+    assert error['details']['failure_code'] == 'legacy_install_lock', error
+    observed = legacy_lock.lstat()
+    assert stat.S_ISDIR(observed.st_mode)
+    assert (observed.st_dev, observed.st_ino) == (legacy_identity.st_dev, legacy_identity.st_ino)
+    assert list(legacy_releases.iterdir()) == [legacy_lock]
+    assert len(calls()) == before, 'Legacy lease refusal contacted manager or verifier'
+    assert_lease_available()
+    cli('install', '--binary', str(releases / first_id / 'agmi'), '--sha256', trusted)
     assert (home / '.local/bin/agmi').is_symlink(), 'Activation did not publish the CLI link'
     assert (home / '.config/systemd/user/agmi.service').is_symlink(), 'Activation did not publish unit definitions'
     status_tools = root / 'status-tools'
@@ -250,14 +303,14 @@ else:
     (root / 'state-query-failed').touch()
     before = len(calls())
     error = cli('update', '--release', second_id, '--stopped', success=False)
-    assert error['installation']['failure_code'] == 'service_state_unavailable'
+    assert error['installation']['failure_code'] == 'service_state_unavailable', error
     assert not any(call[2] == 'stop' for call in calls()[before:])
     assert os.readlink(releases / 'current') == first_id
     (root / 'state-query-failed').unlink()
 
-    # Retained schema2 is executable metadata only, never an ordinary candidate.
-    # Construct a checksum-consistent legacy release; this is not a journal or a
-    # simulated migration. The real installer performs all validation/cutover.
+    # Metadata-only coverage for explicit stopped bootstrap and downgrade refusal.
+    # Normal canonical conversion requires authentic source configurations/journals,
+    # not this deliberately limited executable shim.
     embedded = subprocess.run([str(binary), 'build-info', '--manifest'],
                               capture_output=True, text=True, check=True).stdout.rstrip('\n')
     current_schema = dict(line.split('=', 1) for line in embedded.splitlines())['journal_schema']
@@ -288,10 +341,6 @@ else:
                                             for name in artifacts))
     (releases / 'current').unlink()
     (releases / 'current').symlink_to(legacy_id)
-    before = len(calls())
-    cli('update', '--release', first_id, '--stopped', success=False)
-    assert os.readlink(releases / 'current') == legacy_id
-    assert not any(call[2] == 'stop' for call in calls()[before:])
     for unit in ('agmi.service', 'agmi-health.timer'):
         (root / ('active-' + unit)).touch()
         (root / ('enabled-' + unit)).touch()
@@ -319,8 +368,10 @@ else:
     assert not any(root.glob('active-*'))
     assert not any(root.glob('enabled-*')), 'bootstrap left automatic boot activation enabled'
     for extra in ([], ['--migration-only']):
-        cli('update', '--release', legacy_id, '--stopped', *extra, success=False)
+        refusal = cli('update', '--release', legacy_id, '--stopped', *extra, success=False)
         assert os.readlink(releases / 'current') == first_id
+        pending = releases / '.update-state.json'
+        assert not pending.exists(), {'refusal': refusal, 'pending': json.loads(pending.read_text())}
     assert config.read_bytes() == legacy_config and not state.exists()
     config.write_bytes(original_config)
     print(json.dumps({'scenario': 'explicit_stopped_schema2_to_current',
@@ -350,9 +401,15 @@ else:
         assert os.readlink(releases / 'current') == selected, 'Cancellation silently reverted current'
         stopped = [call[-1] for call in calls()[before:] if call[:3] == ['systemctl', '--user', 'stop']]
         assert stopped == ['agmi-health.timer', 'agmi-health.service', 'agmi.service'] * 2, stopped
-        assert not lock.exists()
+        assert_lease_available()
         assert not list(releases.glob('.agmi-link.*'))
         (root / 'block-reload').unlink()
+        # Finish the pinned interrupted operation before choosing the next target.
+        cli('update')
+        assert not (releases / '.update-state.json').exists()
+        assert os.readlink(releases / 'current') == selected
+        assert not any(root.glob('active-*'))
+        assert_lease_available()
         print(json.dumps({'scenario': 'post_selection_cancellation', 'signal': interruption.name,
                           'delegated': delegated, 'pointer_retained': True, 'cleanup_stopped_units': True}))
 
@@ -395,6 +452,7 @@ else:
         assert evidence['stage'] == 'complete' and evidence['activation'] == 'loaded_verified'
         assert evidence['service'] != 'unknown'
         assert os.readlink(releases / 'current') == second_id
+        assert_lease_available()
         print(json.dumps({'scenario': 'cancelled_parent_after_child_success',
                           'completed_cutover_evidence_preserved': True}))
     finally:
@@ -409,4 +467,5 @@ else:
     assert not state.exists()
     assert (releases / first_id).is_dir() and (releases / second_id).is_dir()
     print(json.dumps({'scenario': 'safe_failure_categories', 'private_inputs_unchanged': True,
-                      'failure_codes': ['digest_mismatch', 'unit_invalid', 'installer_busy', 'missing_prerequisite', 'reload_failed']}))
+                      'failure_codes': ['digest_mismatch', 'unit_invalid', 'update_in_progress',
+                                        'legacy_install_lock', 'missing_prerequisite', 'reload_failed']}))

@@ -2140,7 +2140,9 @@ mod native {
             self.control(&["daemon-reload"])
         }
         fn capture_transaction(&mut self, id: &str, request: &Request<'_>) -> Result<()> {
-            let intent = self.repair_intent()?;
+            let intent = self.repair_intent().inspect_err(|_| {
+                self.failure = "service_state_unavailable";
+            })?;
             self.loaded(
                 fs::read_link(self.root.join("current"))?
                     .to_str()
@@ -3753,7 +3755,38 @@ mod native {
     mod tests {
         use super::*;
 
-        static TEST_SERIAL: Mutex<()> = Mutex::new(());
+        // Fixture writers belong to a dedicated process: unrelated libtest spawns
+        // must not inherit writable descriptors for executables being staged.
+        fn run_fixture_in_subprocess(name: &str) -> Result<bool> {
+            const SELECTED: &str = "AGMI_INSTALLER_FIXTURE_TEST";
+            const RECEIPT: &str = "AGMI_INSTALLER_FIXTURE_RECEIPT";
+            if std::env::var(SELECTED).ok().as_deref() == Some(name) {
+                let receipt = std::env::var_os(RECEIPT).context("missing fixture entry receipt")?;
+                fs::write(receipt, b"x")?;
+                return Ok(false);
+            }
+            let mut receipt = tempfile::NamedTempFile::new()?;
+            let output = Command::new(std::env::current_exe()?)
+                .args(["--exact", name, "--nocapture"])
+                .env(SELECTED, name)
+                .env(RECEIPT, receipt.path())
+                .output()
+                .context("run isolated installer fixture")?;
+            ensure!(
+                output.status.success(),
+                "isolated installer fixture failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            // libtest succeeds when an exact filter matches zero cases.
+            let mut entered = [0];
+            receipt
+                .as_file_mut()
+                .read_exact(&mut entered)
+                .context("isolated installer case did not enter its original body")?;
+            ensure!(entered == *b"x", "invalid fixture entry receipt");
+            Ok(true)
+        }
 
         #[test]
         fn target_evidence_preserves_future_schema_and_real_restoration() {
@@ -4024,7 +4057,11 @@ mod native {
         }
         #[test]
         fn migration_bootstrap_requires_durable_disabled_boot_intent() -> Result<()> {
-            let _serial = TEST_SERIAL.lock().unwrap();
+            if run_fixture_in_subprocess(
+                "installer::native::tests::migration_bootstrap_requires_durable_disabled_boot_intent",
+            )? {
+                return Ok(());
+            }
             let _cancellation = InstallerCancellation::acquire()?;
             let temporary = OwnedPath::directory(&std::env::temp_dir(), "agmi-bootstrap-test")?;
             let home = temporary.path.join("home");
@@ -4375,7 +4412,11 @@ esac
         /// manifest validation, publication, fsync and RAII run unchanged.
         #[test]
         fn filesystem_publication_and_failure_boundaries() -> Result<()> {
-            let _serial = TEST_SERIAL.lock().unwrap();
+            if run_fixture_in_subprocess(
+                "installer::native::tests::filesystem_publication_and_failure_boundaries",
+            )? {
+                return Ok(());
+            }
             let _cancellation = InstallerCancellation::acquire()?;
             let temporary =
                 OwnedPath::directory(&std::env::temp_dir(), "agmi-native-installer-test")?;
@@ -4759,7 +4800,11 @@ esac
 
         #[test]
         fn repair_restores_active_intent_after_actions_errors_and_cancellation() -> Result<()> {
-            let _serial = TEST_SERIAL.lock().unwrap();
+            if run_fixture_in_subprocess(
+                "installer::native::tests::repair_restores_active_intent_after_actions_errors_and_cancellation",
+            )? {
+                return Ok(());
+            }
             let _cancellation = InstallerCancellation::acquire()?;
             let temporary = OwnedPath::directory(&std::env::temp_dir(), "agmi-repair-test")?;
             let directory = &temporary.path;
@@ -4850,7 +4895,11 @@ esac
 
         #[test]
         fn repair_stop_and_restore_failures_never_hide_completed_actions() -> Result<()> {
-            let _serial = TEST_SERIAL.lock().unwrap();
+            if run_fixture_in_subprocess(
+                "installer::native::tests::repair_stop_and_restore_failures_never_hide_completed_actions",
+            )? {
+                return Ok(());
+            }
             let _cancellation = InstallerCancellation::acquire()?;
             let temporary =
                 OwnedPath::directory(&std::env::temp_dir(), "agmi-repair-failure-test")?;
@@ -4934,7 +4983,11 @@ esac
 
         #[test]
         fn repair_refuses_unvalidated_installations_before_manager_actions() -> Result<()> {
-            let _serial = TEST_SERIAL.lock().unwrap();
+            if run_fixture_in_subprocess(
+                "installer::native::tests::repair_refuses_unvalidated_installations_before_manager_actions",
+            )? {
+                return Ok(());
+            }
             let _cancellation = InstallerCancellation::acquire()?;
             let temporary =
                 OwnedPath::directory(&std::env::temp_dir(), "agmi-repair-preflight-test")?;
