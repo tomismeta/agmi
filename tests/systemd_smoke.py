@@ -40,6 +40,7 @@ import shutil
 import subprocess
 import sys
 import time
+import tomllib
 
 from participation_smoke import ANSWER, Fixture
 
@@ -147,7 +148,7 @@ def file_inventory(*roots):
     return result
 
 
-def compatibility(binary, old, expected_old_hash, home):
+def compatibility(binary, old, expected_old_hash, home, no_selection=False, automatic=False):
     assert old is not None and expected_old_hash, 'preserved old ELF and external SHA256 are mandatory'
     assert digest(old) == expected_old_hash and digest(old) != digest(binary)
     old_manifest, current_manifest = embedded_manifest(old), embedded_manifest(binary)
@@ -234,45 +235,49 @@ print(json.dumps({'provider': 'openai-codex', 'model': payload['model'],
         private = {str(path): digest(path) for path in (fixture.config, fixture.key, fixture.core, old_reader)}
         writes = len(fixture.writes)
 
-        # No release pointer is not evidence of a fresh account.
-        cli(binary, 'install', '--binary', str(binary), '--sha256', digest(binary), success=False)
-        assert not (releases / 'current').exists()
-        assert journal_rows(fixture.database, columns)[0] == baseline
+        # The new permanent lease cannot be consumed by the frozen installer's
+        # old mkdir lock. Exercise missing selection in a separate fresh case.
+        if no_selection:
+            cli(binary, 'install', '--binary', str(binary), '--sha256', digest(binary), success=False)
+            assert not (releases / 'current').exists()
+            assert journal_rows(fixture.database, columns)[0] == baseline
+            assert all(digest(pathlib.Path(path)) == value for path, value in private.items())
+            print('PASS missing selection never makes an authentic historical journal fresh', flush=True)
+            return
         cli(old, 'install', '--binary', str(old), '--sha256', expected_old_hash)
         assert os.readlink(releases / 'current') == old_id
-        cli(binary, 'update', '--binary', str(binary), '--sha256', digest(binary), '--stopped', success=False)
+        if automatic:
+            result = cli(binary, 'update', '--binary', str(binary), '--sha256', digest(binary))
+            assert result['update']['status'] == 'updated'
+            assert result['migration']['phase'] == 'complete'
+            assert result['restoration']['verified'] is True
+            assert_conversion_preserved(fixture.database, baseline, columns)
+            expected = tomllib.loads(old_reader.read_text())
+            expected.pop('schema_version')
+            assert tomllib.loads(fixture.config.read_text()) == expected
+            assert all(digest(pathlib.Path(path)) == value for path, value in private.items()
+                       if pathlib.Path(path) != fixture.config)
+            assert all(not active(unit) for unit in UNITS)
+            assert len(fixture.writes) == writes
+            assert not (releases / '.update-state.json').exists()
+            print('PASS plain authentic source3 upgrade preserves uncertain history, policy and stopped/paused intent', flush=True)
+            return
+        cli(binary, 'update', '--binary', str(binary), '--sha256', digest(binary),
+            '--stopped', '--dry-run')
         assert os.readlink(releases / 'current') == old_id
-        prepared = cli(binary, 'update', '--binary', str(binary), '--sha256', digest(binary), '--migrate')
-        assert prepared['update']['status'] == 'migration_prepared'
-        assert prepared['migration']['phase'] == 'prepared'
-        assert prepared['private'] is True
-        assert os.readlink(releases / 'current') == current_id
-        assert all(not active(unit) for unit in UNITS)
-        assert all(property_value(unit, 'UnitFileState') in ('disabled', 'linked')
-                   for unit in ('agmi.service', 'agmi-health.timer'))
-        assert journal_rows(fixture.database, columns)[0] == baseline
-        assert all(digest(pathlib.Path(path)) == value for path, value in private.items())
-
-        proposal = prepared['preview']
-        import tomllib
         original_policy = tomllib.loads(fixture.config.read_text())
         assert original_policy.pop('schema_version') == 2
-        assert tomllib.loads(proposal['candidate_toml']) == original_policy
-        assert proposal['target_journal_format'] == current
-        token = proposal['token']
         command = ['strace', '-f', '-o', str(home / 'conversion.strace'),
                    '-e', 'trace=rename,renameat,renameat2',
-                   '-e', 'inject=rename:delay_enter=30s',
-                   '-e', 'inject=renameat:delay_enter=30s',
-                   '-e', 'inject=renameat2:delay_enter=30s',
-                   str(binary), '--config', str(fixture.config), '--json', 'config', 'migrate', 'apply',
-                   '--expected-token', token]
-        child = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                   '-e', 'inject=rename:delay_enter=2s',
+                   '-e', 'inject=renameat:delay_enter=2s',
+                   '-e', 'inject=renameat2:delay_enter=2s',
+                   str(binary), '--json', 'update', '--binary', str(binary),
+                   '--sha256', digest(binary), '--migrate']
+        child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                  text=True, start_new_session=True)
-        child.stdin.write(json.dumps(proposal['request']))
-        child.stdin.close()
         try:
-            deadline = time.monotonic() + 20
+            deadline = time.monotonic() + 60
             while time.monotonic() < deadline:
                 if child.poll() is not None:
                     raise AssertionError(('conversion exited before interruption', child.returncode, child.stderr.read()))
@@ -290,13 +295,17 @@ print(json.dumps({'provider': 'openai-codex', 'model': payload['model'],
             child.stdout.close()
             child.stderr.close()
         pending = cli(binary, 'config', 'migrate', 'status', '--state-dir', str(fixture.database.parent))
-        assert pending['phase'] == 'journal_ready' and pending['token'] == token
+        assert pending['phase'] == 'journal_ready'
+        token = pending['token']
+        sealed = cli(binary, 'config', 'migrate', 'export',
+                     '--state-dir', str(fixture.database.parent), '--expected-token', token)
+        assert tomllib.loads(sealed['candidate_toml']) == original_policy
         cli(binary, 'run', success=False)
-        recovered = cli(binary, 'update', '--release', current_id, '--migrate', '--expected-token', token)
+        recovered = cli(binary, 'update')
         assert recovered['migration']['phase'] == 'complete'
         assert recovered['migration']['token'] == token
         assert recovered['migration']['participation_resumed'] is False
-        expected_config = hashlib.sha256(proposal['candidate_toml'].encode()).hexdigest()
+        expected_config = hashlib.sha256(sealed['candidate_toml'].encode()).hexdigest()
         assert digest(fixture.config) == expected_config, 'configuration differs from approved candidate'
         private[str(fixture.config)] = expected_config
         assert_conversion_preserved(fixture.database, baseline, columns)
@@ -423,18 +432,526 @@ def after_reboot(binary, home):
     print('PASS real kernel reboot preserves disabled boot intent, journal/evidence, authority inodes, configuration, guidance and credential', flush=True)
 
 
+def seamless(binary, old, expected_old_hash, home, maintenance=False, config_only=False):
+    assert old is not None and expected_old_hash, 'authentic pre-feature format4 source required'
+    assert digest(old) == expected_old_hash and digest(old) != digest(binary)
+    assert embedded_manifest(old)['journal_schema'] == '4'
+    config_root = home / '.config/agmi'
+    config_root.mkdir(parents=True, mode=0o700)
+    fixture = Fixture(str(binary), config_root)
+    for lane in fixture.lanes.values():
+        lane['mode'] = 'off'
+    fixture.configure()
+    if not config_only:
+        fixture.invoke('pause')
+    fixture.config.write_text('schema_version = 2\n' + fixture.config.read_text())
+    fixture.config.chmod(0o600)
+    original = tomllib.loads(fixture.config.read_text())
+    expected = dict(original)
+    expected.pop('schema_version')
+    private_files = {path: path.read_bytes()
+                     for path in (fixture.key, fixture.core)}
+    releases = home / '.local/share/agmi/releases'
+    record = releases / '.update-state.json'
+    candidates = home / 'seamless-candidates'
+    candidates.mkdir(mode=0o700)
+    alternate = candidates / 'agmi-alternate'
+    shutil.copy2(binary, alternate)
+    alternate.chmod(0o700)
+    with alternate.open('ab') as stream:
+        stream.write(b'\nagmi seamless fixture alternate image\n')
+    hashes = {path: digest(path) for path in (binary, alternate)}
+
+    def cli(executable, *words):
+        result = run([str(executable), '--json', *words])
+        envelope = json.loads(result.stdout)
+        assert envelope['ok'] is True, envelope
+        return envelope['data']
+
+    def control():
+        with closing(sqlite3.connect(fixture.database.as_uri() + '?mode=ro', uri=True)) as db:
+            return db.execute('SELECT paused,generation,version FROM control WHERE singleton=1').fetchone()
+
+    def authority():
+        with closing(sqlite3.connect(fixture.database.as_uri() + '?mode=ro', uri=True)) as db:
+            return db.execute('SELECT database_id,dispatch_sequence FROM authority WHERE singleton=1').fetchone()
+
+    def assert_intent(candidate, paused, runtime, timer, service_boot, timer_boot):
+        assert (releases / 'current').resolve().name == 'r-' + hashes[candidate]
+        assert active('agmi.service') is runtime
+        assert active('agmi-health.timer') is timer
+        assert property_value('agmi.service', 'UnitFileState') == service_boot
+        assert property_value('agmi-health.timer', 'UnitFileState') == timer_boot
+        assert bool(control()[0]) is paused
+        assert tomllib.loads(fixture.config.read_text()) == expected
+        assert all(path.read_bytes() == value for path, value in private_files.items())
+        assert authority() == initial_authority
+        assert not fixture.writes and not fixture.model_calls('answer')
+        if runtime:
+            pid = int(property_value('agmi.service', 'MainPID'))
+            assert digest(pathlib.Path(f'/proc/{pid}/exe')) == hashes[candidate]
+            policy = fixture.status()['effective_runtime']['policy']
+            assert policy['process']['pid'] == pid
+            assert policy['process']['invocation_id'] == property_value('agmi.service', 'InvocationID')
+        else:
+            assert property_value('agmi.service', 'MainPID') == '0'
+
+    def prior_boot_input():
+        captured = json.loads(record.read_text())
+        simulated_prior_boot = '11111111-1111-4111-8111-111111111111'
+        assert captured['payload']['boot'] != simulated_prior_boot
+        captured['payload']['boot'] = simulated_prior_boot
+        temporary = record.with_suffix('.fixture-input')
+        temporary.write_text(json.dumps(captured))
+        temporary.chmod(0o600)
+        temporary.replace(record)
+
+    def interrupt(candidate, boundary='prepared'):
+        assert not record.exists()
+        trace = home / f'seamless-interrupted-{boundary}.trace'
+        command = [str(binary), '--json', 'update', '--binary', str(candidate),
+                   '--sha256', hashes[candidate]]
+        env = dict(os.environ)
+        gate = home / 'seamless-disable-returned'
+        if boundary == 'disabled':
+            if maintenance:
+                command.append('--migrate')
+            wrapper_dir = home / 'systemctl-reply-gate'
+            wrapper_dir.mkdir(mode=0o700)
+            wrapper = wrapper_dir / 'systemctl'
+            # The real manager removes its actual definition links. Hold only
+            # the client's return so the updater can be killed before repair.
+            wrapper.write_text('#!/bin/sh\n/usr/bin/systemctl "$@"\nstatus=$?\n'
+                               'for arg do\nif [ "$arg" = disable ]; then\n'
+                               f': > {gate}\nsleep 45\nfi\ndone\nexit "$status"\n')
+            wrapper.chmod(0o700)
+            env['PATH'] = str(wrapper_dir) + os.pathsep + env['PATH']
+        else:
+            command = ['strace', '-f', '-o', str(trace),
+                       '-e', 'trace=rename,renameat,renameat2',
+                       '-e', 'inject=rename:delay_exit=2s', *command]
+        with (home / f'seamless-interrupted-{boundary}.stdout').open('w') as output, \
+                (home / f'seamless-interrupted-{boundary}.stderr').open('w') as errors:
+            child = subprocess.Popen(command, stdout=output, stderr=errors,
+                                     start_new_session=True, env=env)
+            try:
+                deadline = time.monotonic() + 45
+                while time.monotonic() < deadline:
+                    assert child.poll() is None, 'updater exited before interruption boundary'
+                    if record.exists():
+                        phase = json.loads(record.read_text())['payload']['phase']
+                        reached = (
+                            boundary == 'prepared'
+                            or (boundary == 'ready' and phase in ('runtime_ready', 'restoring', 'complete'))
+                            or (boundary == 'complete' and phase == 'complete')
+                            or (boundary == 'config_only' and phase == 'converting'
+                                and tomllib.loads(fixture.config.read_text()) == expected)
+                            or (boundary == 'disabled' and gate.exists() and any(
+                                not (home / '.config/systemd/user' / unit).is_symlink()
+                                for unit in UNITS)))
+                        if reached:
+                            break
+                    time.sleep(0.01)
+                else:
+                    raise AssertionError('did not observe durable update interruption boundary')
+            finally:
+                if child.poll() is None:
+                    os.killpg(child.pid, signal.SIGKILL)
+                child.wait(timeout=10)
+        assert record.exists(), 'hard kill lost pinned original intent'
+
+
+    try:
+        cli(old, 'install', '--binary', str(old), '--sha256', expected_old_hash)
+        if config_only:
+            interrupt(binary, 'config_only')
+            assert not fixture.database.exists()
+            cli(binary, 'service', 'stop')
+            result = cli(binary, 'update')
+            assert result['migration']['phase'] == 'complete'
+            assert result['restoration']['status'] == 'cancelled'
+            assert result['restoration']['verified'] is False
+            assert not fixture.database.exists() and not record.exists()
+            assert tomllib.loads(fixture.config.read_text()) == expected
+            assert all(path.read_bytes() == value for path, value in private_files.items())
+            assert all(not active(unit) for unit in UNITS)
+            print('PASS cancelled config-only commit finishes without inventing a journal or replaying intent', flush=True)
+            return
+        cli(old, 'resume')
+        cli(old, 'service', 'enable')
+        cli(old, 'service', 'start')
+        initial_authority = authority()
+        before = control()
+        old_pid = property_value('agmi.service', 'MainPID')
+        interrupt(binary, 'disabled')
+        assert control() == before
+        result = cli(binary, 'update')
+        if maintenance:
+            assert result['update']['status'] == 'migration_complete_stopped'
+            assert result['installation']['operation_mode'] == 'maintenance'
+            assert result['restoration']['status'] == 'not_needed'
+            assert result['restoration']['verified'] is False
+            assert control() == (1, before[1] + 1, before[2])
+            assert_intent(binary, True, False, False, 'linked', 'linked')
+            assert not record.exists()
+            print('PASS plain pinned rerun preserves explicit stopped maintenance and reports its persisted mode', flush=True)
+            return
+        assert result['update']['status'] == 'updated'
+        assert result['restoration']['verified'] is True
+        assert control() == (0, before[1] + 2, before[2])
+        assert property_value('agmi.service', 'MainPID') != old_pid
+        assert_intent(binary, False, True, True, 'enabled', 'enabled')
+        print('PASS one-command authentic marker4 conversion restores running/unpaused intent and identity', flush=True)
+        print('PASS hard kill after real boot-disable link removal recovers original definitions and intent', flush=True)
+
+        pid = property_value('agmi.service', 'MainPID')
+        before = control()
+        for flags in ((), ('--migrate',)):
+            result = cli(binary, 'update', '--release', 'r-' + hashes[binary], *flags)
+            assert result['update']['status'] == 'current'
+            assert property_value('agmi.service', 'MainPID') == pid and control() == before
+        print('PASS already-current update does not interrupt the controller or advance generation', flush=True)
+
+        cli(binary, 'pause')
+        cli(binary, 'service', 'disable')
+        systemctl('stop', 'agmi-health.timer', 'agmi-health.service')
+        before = control()
+        result = cli(binary, 'update', '--binary', str(alternate), '--sha256', hashes[alternate])
+        assert result['restoration']['verified'] is True and control() == before
+        assert_intent(alternate, True, True, False, 'linked', 'linked')
+        print('PASS paused active runtime and inactive timer retain independent disabled boot intent', flush=True)
+
+        cli(alternate, 'resume')
+        cli(alternate, 'service', 'stop')
+        systemctl('enable', '--runtime', 'agmi-health.timer')
+        systemctl('start', 'agmi-health.timer')
+        before = control()
+        result = cli(binary, 'update', '--binary', str(binary), '--sha256', hashes[binary])
+        assert result['restoration']['verified'] is True and control() == before
+        assert_intent(binary, False, False, True, 'linked', 'enabled-runtime')
+        print('PASS stopped unpaused runtime and runtime-only timer enablement remain independent', flush=True)
+
+        # Delay real rename returns; SIGKILL updater children after publication.
+        interrupt(alternate)
+        before = control()
+        for flag in ('--stopped', '--migrate'):
+            refused = run([str(binary), '--json', 'update', flag], success=False)
+            assert json.loads(refused.stdout)['data']['update']['status'] == 'recovery_required'
+            assert control() == before and record.exists()
+            assert_intent(binary, False, False, True, 'linked', 'enabled-runtime')
+        result = cli(binary, 'update')
+        assert result['update']['status'] in ('updated', 'current')
+        assert result['restoration']['verified'] is True
+        assert_intent(alternate, False, False, True, 'linked', 'enabled-runtime')
+        assert not record.exists()
+        print('PASS killed updater releases lease and plain offline rerun finishes exact pinned target', flush=True)
+
+        # A later canonical command, even with the same pause value, cancels
+        # historical restoration after cutover instead of resurrecting a timer.
+        interrupt(binary, 'ready')
+        before = control()
+        cli(binary, 'resume')
+        assert control() == (0, before[1] + 1, before[2])
+        cli(binary, 'service', 'stop')
+        operator_control = control()
+        result = cli(binary, 'update')
+        assert result['restoration']['status'] == 'cancelled'
+        assert result['restoration']['verified'] is False
+        assert control() == operator_control
+        assert_intent(binary, False, False, False, 'linked', 'enabled-runtime')
+        assert not record.exists()
+        print('PASS same-valued newer operator control cancels stale timer and pause restoration', flush=True)
+
+        before = control()
+        interrupt(alternate, 'complete')
+        result = cli(binary, 'update')
+        assert result['restoration']['verified'] is True and control() == before
+        assert result['migration']['phase'] == 'not_required'
+        assert_intent(alternate, False, False, False, 'linked', 'enabled-runtime')
+        assert not record.exists()
+        print('PASS complete-before-unlink recovery revalidates intent without a false incomplete report', flush=True)
+
+        # Simulate only the saved prior-boot input, not a kernel reboot. Real
+        # systemd activity is restored independently of expired runtime links.
+        for runtime_only_unit, candidate in (
+                ('agmi.service', binary), ('agmi-health.timer', alternate)):
+            cli(binary, 'service', 'disable')
+            cli(binary, 'service', 'start')
+            systemctl('enable', '--runtime', runtime_only_unit)
+            before = control()
+            interrupt(candidate)
+            prior_boot_input()
+            systemctl('stop', *UNITS)
+            systemctl('disable', '--runtime', runtime_only_unit)
+            systemctl('daemon-reload')
+            result = cli(binary, 'update')
+            assert result['restoration']['verified'] is True and control() == before
+            assert_intent(candidate, False, True, True, 'linked', 'linked')
+            assert not record.exists()
+            print(f'PASS simulated changed-boot preserves both active roles while {runtime_only_unit} runtime-only enablement expires', flush=True)
+
+        # A complete record is cleanup, not permission to replay prior-boot
+        # activity. Model both boot-disabled stop and persistent autostart.
+        cli(binary, 'service', 'disable')
+        before = control()
+        interrupt(binary, 'complete')
+        prior_boot_input()
+        systemctl('stop', *UNITS)
+        result = cli(binary, 'update')
+        assert result['restoration']['status'] == 'not_needed'
+        assert result['restoration']['verified'] is False
+        assert result['installation']['service'] == 'unchanged'
+        assert control() == before and not record.exists()
+        assert_intent(binary, False, False, False, 'linked', 'linked')
+        print('PASS simulated post-completion reboot clears record without replaying active/boot-disabled roles', flush=True)
+
+        cli(binary, 'service', 'enable')
+        before = control()
+        interrupt(alternate, 'complete')
+        prior_boot_input()
+        systemctl('start', 'agmi.service', 'agmi-health.timer')
+        result = cli(binary, 'update')
+        assert result['restoration']['status'] == 'not_needed'
+        assert result['installation']['service'] == 'unchanged'
+        assert control() == before and not record.exists()
+        assert_intent(alternate, False, True, True, 'enabled', 'enabled')
+        print('PASS simulated post-completion reboot accepts persistent autostart without replaying formerly stopped roles', flush=True)
+    finally:
+        primary_failure = sys.exc_info()[0] is not None
+        try:
+            try:
+                loaded = [unit for unit in reversed(UNITS)
+                          if property_value(unit, 'LoadState') != 'not-found']
+                if loaded:
+                    systemctl('stop', *loaded)
+            finally:
+                fixture.close()
+        except Exception as error:
+            if not primary_failure:
+                raise
+            print(f'Additional fixture cleanup failure: {error}', file=sys.stderr)
+
+
+def future_handoff(binary, future, expected_hash, home, recovery=False):
+    assert future is not None and expected_hash and digest(future) == expected_hash
+    assert int(embedded_manifest(future)['journal_schema']) > int(embedded_manifest(binary)['journal_schema'])
+    config_root = home / '.config/agmi'
+    config_root.mkdir(parents=True, mode=0o700)
+    fixture = Fixture(str(future if recovery else binary), config_root)
+    for lane in fixture.lanes.values():
+        lane['mode'] = 'off'
+    fixture.configure()
+    fixture.invoke('pause')
+    releases = home / '.local/share/agmi/releases'
+    record = releases / '.update-state.json'
+    source = future if recovery else binary
+    private = {path: path.read_bytes() for path in (fixture.config, fixture.key, fixture.core)}
+    protected = ('control', 'authority', 'operations', 'operation_evidence', 'manual_grants',
+                 'manual_grant_revocations', 'lane_control')
+    baseline = {table: fixture.rows(f'SELECT * FROM {table} ORDER BY rowid') for table in protected}
+    assert baseline['control'][0]['version'] == int(embedded_manifest(source)['journal_schema'])
+    try:
+        run([str(source), '--json', 'install', '--binary', str(source), '--sha256', digest(source)])
+        if recovery:
+            run([str(binary), '--config', str(fixture.config), '--json', 'status'], success=False)
+            alternate = home / 'agmi-future-alternate'
+            shutil.copy2(future, alternate)
+            alternate.chmod(0o700)
+            with alternate.open('ab') as stream:
+                stream.write(b'\nagmi future recovery fixture alternate image\n')
+            target = 'r-' + digest(alternate)
+            with (home / 'future-interrupted.stdout').open('w') as output, \
+                    (home / 'future-interrupted.stderr').open('w') as errors:
+                child = subprocess.Popen([
+                    'strace', '-f', '-o', str(home / 'future-interrupted.trace'),
+                    '-e', 'trace=rename,renameat,renameat2', '-e', 'inject=rename:delay_exit=2s',
+                    str(future), '--json', 'update', '--binary', str(alternate),
+                    '--sha256', digest(alternate),
+                ], stdout=output, stderr=errors, start_new_session=True)
+                try:
+                    deadline = time.monotonic() + 30
+                    while time.monotonic() < deadline and not record.exists():
+                        assert child.poll() is None, 'future updater exited before durable record'
+                        time.sleep(0.01)
+                    assert record.exists()
+                finally:
+                    if child.poll() is None:
+                        os.killpg(child.pid, signal.SIGKILL)
+                    child.wait(timeout=10)
+            # This older caller cannot open the actual newer journal. Recovery
+            # must route the pinned target before latest discovery or data reads.
+            completed = run([str(binary), '--json', 'update'])
+            report = json.loads(completed.stdout)['data']
+            assert report['restoration']['verified'] is True
+            assert (releases / 'current').resolve().name == target and not record.exists()
+            print('PASS older caller completes pinned newer-journal transaction offline through its real target', flush=True)
+        else:
+            trace = home / 'future-refusal.trace'
+            refused = run(['strace', '-f', '-s', '4096', '-e', 'trace=execve', '-o', str(trace),
+                           str(binary), '--json', 'update', '--binary', str(future),
+                           '--sha256', expected_hash], success=False)
+            assert json.loads(refused.stdout)['ok'] is False
+            delegated = False
+            for line in trace.read_text().splitlines():
+                if 'execve(' not in line or ' = 0' not in line or expected_hash not in line:
+                    continue
+                executable, arguments = line.split('execve(', 1)[1].split(', [', 1)
+                executable = json.loads(executable)
+                arguments = json.loads('[' + arguments.split('],', 1)[0] + ']')
+                if 'update' in arguments and '--binary' in arguments:
+                    delegated |= (executable != str(binary)
+                                  and arguments[arguments.index('--binary') + 1] == executable)
+            assert delegated, 'verified incoming target never received its own public update handoff'
+            assert (releases / 'current').resolve().name == 'r-' + digest(binary)
+            assert not record.exists()
+            print('PASS future-format acquisition delegates source compatibility refusal to the real incoming target', flush=True)
+        assert all(path.read_bytes() == value for path, value in private.items())
+        assert {table: fixture.rows(f'SELECT * FROM {table} ORDER BY rowid')
+                for table in protected} == baseline
+        assert all(not active(unit) for unit in UNITS)
+        assert not fixture.writes and not fixture.model_calls('answer')
+    finally:
+        primary_failure = sys.exc_info()[0] is not None
+        try:
+            try:
+                loaded = [unit for unit in reversed(UNITS)
+                          if property_value(unit, 'LoadState') != 'not-found']
+                if loaded:
+                    systemctl('stop', *loaded)
+            finally:
+                fixture.close()
+        except Exception as error:
+            if not primary_failure:
+                raise
+            print(f'Additional fixture cleanup failure: {error}', file=sys.stderr)
+
+
+def published_upgrade(binary, old, expected_hash, home):
+    assert old is not None and expected_hash and digest(old) == expected_hash
+    assert embedded_manifest(old)['journal_schema'] == '2'
+    config_root = home / '.config/agmi'
+    config_root.mkdir(parents=True, mode=0o700)
+    fixture = Fixture(str(binary), config_root)
+    def table(name, values):
+        value = lambda item: str(item).lower() if isinstance(item, bool) else json.dumps(item)
+        return '[' + name + ']\n' + '\n'.join(
+            f'{key} = {value(item)}' for key, item in values.items()) + '\n'
+    source = 'state_dir = ' + json.dumps(str(fixture.database.parent)) + '\n'
+    source += table('network', dict(base_url=f'http://127.0.0.1:{fixture.server.server_port}',
+                                   chain=fixture.chain, address=fixture.address,
+                                   credential_file=str(fixture.key)))
+    source += table('capabilities', dict(answer='off', judge='off', mine='off'))
+    for lane in ('answer', 'judge'):
+        source += table('solver.' + lane, dict(harness='hermes', executable=str(fixture.native),
+                        model='openai/test', reasoning='high', guidance_file=str(fixture.core)))
+    source += table('timeouts', dict(http_seconds=2, read_http_seconds=2,
+                                    model_seconds=10, shutdown_seconds=2))
+    source += table('schedule', dict(poll_seconds=1, mine_seconds=86400,
+                                    retry_seconds=1, backoff_max_seconds=900, jitter_seconds=0))
+    source += table('participation', dict(mode='participation_first', uncertainty_grace_seconds=1,
+                                        max_unresolved_operations=4, allow_answer=True,
+                                        allow_judge=False, allow_mine=True))
+    fixture.config.write_text(source)
+    fixture.config.chmod(0o600)
+    releases = home / '.local/share/agmi/releases'
+    candidate = home / 'agmi-approved-incoming'
+    shutil.copy2(binary, candidate)
+    candidate.chmod(0o700)
+    with candidate.open('ab') as stream:
+        stream.write(b'\nagmi published-client approval handoff fixture\n')
+    candidate_hash = digest(candidate)
+    def cli(executable, *words, success=True):
+        result = run([str(executable), '--json', *words], success=success)
+        return json.loads(result.stdout)['data']
+    try:
+        cli(old, 'pause')
+        assert fixture.rows('SELECT version FROM control')[0]['version'] == 2
+        identity = fixture.rows('SELECT * FROM authority')
+        control = fixture.rows('SELECT * FROM control')
+        private = {path: path.read_bytes() for path in (fixture.key, fixture.core)}
+        cli(old, 'install', '--binary', str(old), '--sha256', expected_hash)
+        missing = cli(binary, 'update', '--binary', str(candidate), '--sha256', candidate_hash, success=False)
+        assert missing['update']['status'] == 'decision_required'
+        assert missing['migration']['decision_reason'] == 'lane_limits_required'
+        help_action = next(action for action in missing['next_actions']
+                           if action.get('argv', [])[-4:] == ['config', 'migrate', 'preview', '--help'])
+        run([str(binary), *help_action['argv'][1:]])
+        human = run([str(binary), 'update', '--binary', str(candidate),
+                     '--sha256', candidate_hash], success=False)
+        print(human.stdout, end='', flush=True)
+        assert (releases / 'current').resolve().name == 'r-' + expected_hash
+        assert fixture.config.read_text() == source and fixture.rows('SELECT * FROM control') == control
+        request_file = config_root / 'explicit-upgrade.json'
+        request_file.write_text(json.dumps({'caps': dict(answer=1, judge=1, mine=1)}))
+        request_file.chmod(0o600)
+        prepared = cli(binary, 'update', '--binary', str(candidate), '--sha256', candidate_hash,
+                       '--proposal', str(request_file), success=False)
+        assert prepared['update']['status'] == 'decision_required' and prepared['private'] is True
+        preview = prepared['preview']
+        token = prepared['migration']['token']
+        release = prepared['migration']['release_id']
+        request_file.write_text(json.dumps(preview['request']))
+        arguments = ['update', '--release', release, '--proposal', str(request_file),
+                     '--expected-token', token]
+        if preview['risk_change_required']:
+            arguments += ['--accept-risk-change', token]
+        completed = cli(binary, *arguments)
+        assert completed['migration']['phase'] == 'complete'
+        assert completed['restoration']['verified'] is True
+        assert fixture.rows('SELECT version,paused FROM control') == [dict(version=4, paused=1)]
+        assert fixture.rows('SELECT * FROM authority') == identity
+        assert digest(fixture.config) == hashlib.sha256(preview['candidate_toml'].encode()).hexdigest()
+        assert all(path.read_bytes() == value for path, value in private.items())
+        assert all(not active(unit) for unit in UNITS)
+        assert not fixture.writes and not fixture.model_calls('answer')
+        assert not (releases / '.update-state.json').exists()
+        print('PASS authentic published journal2 client requires explicit quotas, then exact approved upgrade preserves identity and intent', flush=True)
+    finally:
+        primary_failure = sys.exc_info()[0] is not None
+        try:
+            try:
+                loaded = [unit for unit in reversed(UNITS)
+                          if property_value(unit, 'LoadState') != 'not-found']
+                if loaded:
+                    systemctl('stop', *loaded)
+            finally:
+                fixture.close()
+        except Exception as error:
+            if not primary_failure:
+                raise
+            print(f'Additional fixture cleanup failure: {error}', file=sys.stderr)
+
+
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('binary', type=pathlib.Path)
-    parser.add_argument('--suite', choices=('current', 'compatibility', 'after-reboot'), default='current')
+    parser.add_argument('--suite', choices=('current', 'seamless', 'seamless-maintenance', 'seamless-config-only', 'future-refusal', 'future-recovery', 'compatibility', 'compatibility-no-selection', 'compatibility-auto', 'published010', 'published011', 'after-reboot'), default='current')
     parser.add_argument('--old-binary', type=pathlib.Path)
     parser.add_argument('--old-sha256')
+    parser.add_argument('--future-binary', type=pathlib.Path)
+    parser.add_argument('--future-sha256')
     args = parser.parse_args()
     binary = args.binary.resolve(strict=True)
     home = isolation(existing=args.suite == 'after-reboot')
-    if args.suite == 'compatibility':
+    if args.suite in ('published010', 'published011'):
+        published_upgrade(binary, args.old_binary.resolve(strict=True) if args.old_binary else None,
+                          args.old_sha256, home)
+        return
+    if args.suite in ('future-refusal', 'future-recovery'):
+        future_handoff(binary, args.future_binary.resolve(strict=True) if args.future_binary else None,
+                       args.future_sha256, home, recovery=args.suite == 'future-recovery')
+        return
+    if args.suite in ('seamless', 'seamless-maintenance', 'seamless-config-only'):
+        seamless(binary, args.old_binary.resolve(strict=True) if args.old_binary else None,
+                 args.old_sha256, home, maintenance=args.suite == 'seamless-maintenance',
+                 config_only=args.suite == 'seamless-config-only')
+        return
+    if args.suite in ('compatibility', 'compatibility-no-selection', 'compatibility-auto'):
         compatibility(binary, args.old_binary.resolve(strict=True) if args.old_binary else None,
-                      args.old_sha256, home)
+                      args.old_sha256, home, no_selection=args.suite == 'compatibility-no-selection',
+                      automatic=args.suite == 'compatibility-auto')
         return
     if args.suite == 'after-reboot':
         after_reboot(binary, home)
@@ -584,7 +1101,6 @@ def main():
         runtime_override.mkdir(parents=True, mode=0o700)
         (runtime_override / 'fixture.conf').write_text('[Unit]\nDescription=isolated fixture post-switch rejection\n')
         error = cli('update', '--release', ids[first], success=False)
-        assert error['update']['reason'] == 'installer_failed'
         evidence = error['installation']
         assert evidence['failure_code'] == 'reload_failed'
         assert evidence['stage'] == 'reloading' and evidence['activation'] == 'selected'

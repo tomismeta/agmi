@@ -522,6 +522,49 @@ async fn rotate_inner(path: &Path, bytes: &[u8], dry_run: bool) -> Result<Value>
     )
 }
 
+#[cfg(unix)]
+pub(crate) mod update_state;
+
+/// Owns the managed installation lease until the operator mutation completes.
+pub struct ManagedMutationGuard {
+    #[cfg(unix)]
+    _lease: update_state::Lease,
+}
+
+pub fn guard_managed_mutation(config_path: &Path) -> Result<Option<ManagedMutationGuard>> {
+    #[cfg(unix)]
+    {
+        let Some(root) = crate::installer::managed_root(config_path)? else {
+            return Ok(None);
+        };
+        crate::installer::pending_update_target(config_path)?;
+        let lease = update_state::Lease::acquire(&root)?;
+        if !lease.inherited
+            && let Some(mut record) = update_state::read(&root)?
+        {
+            record.cancelled = true;
+            update_state::save(&root, &record)?;
+        }
+        Ok(Some(ManagedMutationGuard { _lease: lease }))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = config_path;
+        Ok(None)
+    }
+}
+
+/// The runtime never owns the updater lease: its parent waits for startup evidence.
+pub fn guard_managed_run(config_path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        crate::installer::guard_managed_run(config_path)?;
+    }
+    #[cfg(not(unix))]
+    let _ = config_path;
+    Ok(())
+}
+
 /// Safe, bounded evidence from the canonical installer, never child output text.
 #[derive(Debug)]
 pub struct InstallerError {
@@ -547,8 +590,12 @@ pub(crate) fn installer_preflight_error(code: &'static str) -> anyhow::Error {
 pub(crate) fn installer_evidence(value: Option<&Value>) -> Value {
     let mut result = json!({"stage":"unknown","staging":"unknown","activation":"unknown","service":"unknown",
         "failure_code":"unknown","evidence":"this_invocation_only","installation_state":"not_inspected",
-        "bootstrap_recovery":null});
+        "bootstrap_recovery":null,"operation_mode":"unknown"});
     for (key, allowed) in [
+        (
+            "operation_mode",
+            &["unknown", "standard", "maintenance"][..],
+        ),
         (
             "failure_code",
             &[
@@ -562,6 +609,11 @@ pub(crate) fn installer_evidence(value: Option<&Value>) -> Value {
                 "candidate_execution_unavailable",
                 "digest_mismatch",
                 "installer_busy",
+                "update_in_progress",
+                "legacy_install_lock",
+                "decision_required",
+                "recovery_required",
+                "restoration_incomplete",
                 "preparation_failed",
                 "release_invalid",
                 "configuration_invalid",
@@ -594,6 +646,7 @@ pub(crate) fn installer_evidence(value: Option<&Value>) -> Value {
                 "reloading",
                 "starting",
                 "migration",
+                "restoring",
                 "service",
                 "status",
                 "complete",
@@ -625,6 +678,7 @@ pub(crate) fn installer_evidence(value: Option<&Value>) -> Value {
                 "unknown",
                 "stopped",
                 "command_completed",
+                "unchanged",
                 "previous_intent_restored",
             ][..],
         ),
@@ -661,7 +715,7 @@ pub(crate) fn installer_evidence(value: Option<&Value>) -> Value {
             "classification":classification,
             "migration_required":compatibility["migration_required"].as_bool(),
             "target_journal_format":compatibility["target_journal_format"].as_i64()
-                .filter(|format| (1..=crate::journal::CURRENT_JOURNAL_FORMAT).contains(format))
+                .filter(|format| (1..=i64::from(u32::MAX)).contains(format))
         });
     }
     if let Some(migration) = value.and_then(|value| value.get("migration"))
@@ -674,12 +728,13 @@ pub(crate) fn installer_evidence(value: Option<&Value>) -> Value {
                     | "complete"
                     | "journal_ready"
                     | "recovery_required"
+                    | "decision_required"
                     | "failed"
                     | "unknown"
             )
         })
     {
-        let mut bounded = json!({"phase":phase,"participation_resumed":false});
+        let mut bounded = json!({"phase":phase,"participation_resumed":migration["participation_resumed"].as_bool()});
         for key in ["release_id", "token"] {
             if let Some(text) = migration[key].as_str()
                 && match key {
@@ -695,6 +750,14 @@ pub(crate) fn installer_evidence(value: Option<&Value>) -> Value {
             {
                 bounded[key] = json!(text);
             }
+        }
+        if let Some(reason) = migration["decision_reason"].as_str().filter(|reason| {
+            matches!(
+                *reason,
+                "lane_limits_required" | "authority_adoption_required" | "risk_review_required"
+            )
+        }) {
+            bounded["decision_reason"] = json!(reason);
         }
         for key in [
             "approval_required",
@@ -717,11 +780,41 @@ pub(crate) fn installer_evidence(value: Option<&Value>) -> Value {
             bounded["recovery_prerequisite"] = Value::Null;
         }
         for key in ["target_journal_format", "generation"] {
-            if let Some(value) = migration[key].as_i64().filter(|value| *value >= 0) {
+            if let Some(value) = migration[key].as_i64().filter(|value| {
+                if key == "target_journal_format" {
+                    (1..=i64::from(u32::MAX)).contains(value)
+                } else {
+                    *value >= 0
+                }
+            }) {
                 bounded[key] = json!(value);
             }
         }
         result["migration"] = bounded;
+    }
+    if let Some(restoration) = value.and_then(|v| v.get("restoration")) {
+        let mut bounded = json!({"status":"pending","runtime":"unknown","timer":"unknown","pause_state":"unknown","verified":false});
+        for (key, allowed) in [
+            (
+                "status",
+                &["not_needed", "restored", "pending", "cancelled", "failed"][..],
+            ),
+            ("runtime", &["running", "stopped", "unknown"][..]),
+            ("timer", &["active", "stopped", "unknown"][..]),
+            (
+                "pause_state",
+                &["paused", "unpaused", "absent", "unknown"][..],
+            ),
+        ] {
+            if let Some(text) = restoration[key]
+                .as_str()
+                .filter(|text| allowed.contains(text))
+            {
+                bounded[key] = json!(text);
+            }
+        }
+        bounded["verified"] = json!(restoration["verified"].as_bool().unwrap_or(false));
+        result["restoration"] = bounded;
     }
     result
 }

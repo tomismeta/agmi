@@ -95,13 +95,15 @@ struct Identity {
     update_protocol: u64,
 }
 impl Identity {
-    fn parse(text: &str, published: bool, retained: bool) -> Result<Self> {
+    fn parse(text: &str, published: bool) -> Result<Self> {
         let map = fields(text)?;
         let get = |key| map.get(key).copied().context("missing identity field");
         ensure!(get("build_format")? == "1", "unsupported build format");
+        let journal = get("journal_schema")?;
+        let journal_format = journal.parse::<u32>()?;
         ensure!(
-            (get("journal_schema")?.parse::<i64>()? == crate::journal::CURRENT_JOURNAL_FORMAT
-                || (retained && matches!(get("journal_schema")?, "2" | "3")))
+            journal_format > 0
+                && journal.bytes().all(|byte| byte.is_ascii_digit())
                 && get("stop_timeout")? == "infinity",
             "incompatible release policy"
         );
@@ -151,6 +153,9 @@ enum Ordering {
     Refused(&'static str),
 }
 fn ordering(current: &Identity, published: &Identity) -> Ordering {
+    if published.update_protocol != 1 {
+        return Ordering::Refused("published_installer_protocol_unsupported");
+    }
     if current.digest == published.digest {
         return Ordering::Current("published_binary_already_installed");
     }
@@ -165,9 +170,6 @@ fn ordering(current: &Identity, published: &Identity) -> Ordering {
     }
     if current.commit == published.commit {
         return Ordering::Refused("same_commit_different_build_preserved");
-    }
-    if published.update_protocol != 1 {
-        return Ordering::Refused("published_installer_protocol_unsupported");
     }
     // Version alone does not prove source ordering, including a higher release tag.
     Ordering::Compare
@@ -550,6 +552,10 @@ async fn embedded_identity(binary: &Path, published: &str) -> Result<()> {
     ensure!(success, failure("update_binary_identity_invalid"));
     let text =
         std::str::from_utf8(&bytes).map_err(|_| failure("update_binary_identity_invalid"))?;
+    verify_embedded_identity(text, published)
+}
+
+fn verify_embedded_identity(text: &str, published: &str) -> Result<()> {
     let actual = fields(text).map_err(|_| failure("update_binary_identity_invalid"))?;
     let expected = fields(published).map_err(|_| failure("update_binary_identity_invalid"))?;
     ensure!(
@@ -567,7 +573,7 @@ fn report(options: &Options<'_>, source: &str) -> Value {
         "check":options.check,"dry_run":options.dry_run,"migrate":options.migrate,"repository":"tomismeta/agmi",
         "trust":"GitHub HTTPS publisher origin; SHA256 integrity is not an independent signature"},
         "repair":{"status":if options.repair && options.dry_run {"planned"} else if options.repair {"pending"} else {"not_requested"}},
-        "compatibility":{"classification":"not_assessed","migration_required":false,"target_journal_format":crate::journal::CURRENT_JOURNAL_FORMAT},
+        "compatibility":{"classification":"not_assessed","migration_required":false,"target_journal_format":null},
         "migration":{"phase":"unknown","participation_resumed":false},
         "readiness":null})
 }
@@ -584,56 +590,11 @@ fn outcome(report: &mut Value, success: bool, status: &str, reason: &str) {
         report["repair"]["status"] = json!("not_run");
     }
 }
-// A publication no-op does not prove the selected installation's data compatible.
-// Use the canonical read-only inspector; never activate just to obtain this fact.
-fn inspect_current(report: &mut Value, path: &Path, release: &str) -> bool {
-    use crate::store::migration::{UpgradeKind, inspect_upgrade};
-    let Ok(inspected) = inspect_upgrade(path) else {
-        // Preserve honest not_assessed and the existing ordinary diagnostic path.
-        return true;
-    };
-    let (classification, phase) = match inspected.kind {
-        UpgradeKind::Compatible => ("compatible", "not_required"),
-        UpgradeKind::MarkerOnly => ("marker_only", "required"),
-        UpgradeKind::Conversion => ("conversion", "required"),
-        UpgradeKind::Pending => ("pending", "recovery_required"),
-    };
-    let required = inspected.kind != UpgradeKind::Compatible;
-    let mut migration = inspected.pending.unwrap_or_else(|| json!({}));
-    migration["phase"] = json!(phase);
-    migration["release_id"] = json!(release);
-    migration["participation_resumed"] = json!(false);
-    if migration["recovery_prerequisite"].is_string() {
-        migration["recovery_prerequisite"] = json!("authority_adoption");
-    }
-    if let Some(paused) = inspected.paused {
-        migration["paused"] = json!(paused);
-    }
-    let metadata = lifecycle::installer_evidence(Some(&json!({
-        "compatibility":{"classification":classification,"migration_required":required,
-            "target_journal_format":crate::journal::CURRENT_JOURNAL_FORMAT},
-        "migration":migration
-    })));
-    for key in ["compatibility", "migration"] {
-        if let Some(value) = metadata.get(key) {
-            report[key] = value.clone();
-        }
-    }
-    if required {
-        let (status, reason) = if inspected.kind == UpgradeKind::Pending {
-            ("recovery_required", "migration_recovery_required")
-        } else {
-            ("migration_required", "migration_required")
-        };
-        outcome(report, false, status, reason);
-    }
-    !required
-}
 
 fn installed() -> Result<(installer::InstalledIdentity, Identity)> {
     let current =
         installer::installed_identity().map_err(|_| failure("update_installation_unverified"))?;
-    let identity = Identity::parse(&current.manifest, false, true)
+    let identity = Identity::parse(&current.manifest, false)
         .map_err(|_| failure("update_installed_identity_invalid"))?;
     Ok((current, identity))
 }
@@ -897,9 +858,13 @@ fn qualify_diagnosis(
         report["readiness"] = Value::Null;
     }
 }
-async fn diagnose(report: &mut Value, repair: bool) {
+async fn diagnose(report: &mut Value, repair: bool, target: Option<&str>) {
     let result = async {
         let (current, _) = installed()?;
+        ensure!(
+            target.is_none_or(|target| current.release == target),
+            failure("update_diagnostic_target_changed")
+        );
         let args = if repair {
             vec!["--json", "doctor", "--repair"]
         } else {
@@ -945,7 +910,7 @@ fn installer_outcome(
     let installation = result.get("installation").unwrap_or(result);
     report["installation"] = lifecycle::installer_evidence(Some(installation));
     let metadata = lifecycle::installer_evidence(Some(result));
-    for key in ["compatibility", "migration"] {
+    for key in ["compatibility", "migration", "restoration"] {
         if let Some(value) = metadata
             .get(key)
             .or_else(|| report["installation"].get(key))
@@ -955,11 +920,19 @@ fn installer_outcome(
             report[key] = value;
         }
     }
+    if report["restoration"]["status"] == "cancelled"
+        && report["installation"]["service"] == "previous_intent_restored"
+    {
+        report["installation"]["service"] = json!("unknown");
+    }
     // Neither arbitrary child output nor an apply's input belongs in the report.
     if private_preparation
         && success
         && !dry_run
-        && report["migration"]["phase"] == "prepared"
+        && matches!(
+            report["migration"]["phase"].as_str(),
+            Some("prepared" | "decision_required")
+        )
         && result["private"] == true
         && let Some(preview) = result.get("preview").filter(|value| value.is_object())
     {
@@ -968,6 +941,24 @@ fn installer_outcome(
     }
     let (status, reason) = if dry_run && success {
         ("planned", "installer_plan_only")
+    } else if report["installation"]["failure_code"] == "decision_required"
+        || report["installation"]["status"] == "decision_required"
+        || result["status"] == "decision_required"
+        || report["migration"]["phase"] == "decision_required"
+        || report["migration"]["phase"] == "prepared"
+    {
+        ("decision_required", "migration_approval_required")
+    } else if result["status"] == "conflict" || report["installation"]["status"] == "conflict" {
+        ("conflict", "update_transaction_conflict")
+    } else if result["status"] == "recovery_required"
+        || report["installation"]["status"] == "recovery_required"
+        || report["installation"]["failure_code"] == "recovery_required"
+    {
+        ("recovery_required", "migration_recovery_required")
+    } else if result["status"] == "restoration_incomplete"
+        || report["installation"]["status"] == "restoration_incomplete"
+    {
+        ("restoration_incomplete", "previous_intent_not_restored")
     } else if report["installation"]["failure_code"] == "migration_required"
         || report["migration"]["phase"] == "required"
     {
@@ -979,15 +970,33 @@ fn installer_outcome(
         || report["migration"]["recovery_prerequisite"] == "authority_adoption"
     {
         ("recovery_required", "migration_recovery_required")
+    } else if success
+        && report["restoration"]["status"] == "cancelled"
+        && matches!(
+            report["migration"]["phase"].as_str(),
+            Some("complete" | "not_required")
+        )
+    {
+        ("updated", "installer_completed_restoration_cancelled")
+    } else if report["restoration"].is_object()
+        && !(report["restoration"]["status"] == "not_needed"
+            || (report["restoration"]["status"] == "restored"
+                && report["restoration"]["verified"] == true))
+    {
+        ("restoration_incomplete", "previous_intent_not_restored")
     } else if !success || report["migration"]["phase"] == "failed" {
         ("failed", "installer_failed")
-    } else if report["migration"]["phase"] == "prepared" {
-        ("migration_prepared", "migration_approval_required")
-    } else if report["migration"]["phase"] == "complete" {
+    } else if report["migration"]["phase"] == "complete"
+        && (report["installation"]["operation_mode"] == "maintenance"
+            || (report["installation"]["operation_mode"] == "unknown"
+                && report["update"]["migrate"] == true))
+    {
         (
             "migration_complete_stopped",
             "migration_completed_participation_not_resumed",
         )
+    } else if result["status"] == "current" || report["installation"]["status"] == "current" {
+        ("current", "installer_completed")
     } else {
         ("updated", "installer_completed")
     };
@@ -996,7 +1005,12 @@ fn installer_outcome(
         success
             && !matches!(
                 status,
-                "migration_required" | "recovery_required" | "failed"
+                "migration_required"
+                    | "decision_required"
+                    | "recovery_required"
+                    | "restoration_incomplete"
+                    | "conflict"
+                    | "failed"
             ),
         status,
         reason,
@@ -1019,7 +1033,11 @@ fn install(
             installer_outcome(report, &evidence, false, dry_run, false);
         }
     }
-    report["success"] == true && report["update"]["status"] == "updated"
+    report["success"] == true
+        && matches!(
+            report["update"]["status"].as_str(),
+            Some("updated" | "current")
+        )
 }
 
 // Own this private file until the synchronous installer (including handoff) ends.
@@ -1028,10 +1046,9 @@ fn migration_arguments(
     options: &Options<'_>,
     arguments: &mut Vec<String>,
 ) -> Result<Option<tempfile::NamedTempFile>> {
-    if !options.migrate {
-        return Ok(None);
+    if options.migrate {
+        arguments.push("--migrate".into());
     }
-    arguments.push("--migrate".into());
     let proposal = if let Some(value) = options
         .proposal
         .filter(|_| !options.dry_run && !options.check)
@@ -1080,6 +1097,17 @@ fn migration_arguments(
     Ok(proposal)
 }
 
+fn validate_pending_target(options: &Options<'_>, target: &str) -> Result<()> {
+    ensure!(
+        options.release.is_none_or(|release| release == target)
+            && options
+                .binary
+                .is_none_or(|_| options.sha256 == target.strip_prefix("r-")),
+        failure("update_pending_target_conflict")
+    );
+    Ok(())
+}
+
 /// Discover the fixed publisher's latest stable release, or explicitly select a
 /// local release. Preview paths do not initialize or mutate any user state.
 pub async fn run(config_path: &Path, options: Options<'_>) -> Result<Value> {
@@ -1098,10 +1126,11 @@ pub async fn run(config_path: &Path, options: Options<'_>) -> Result<Value> {
     );
     ensure!(
         (!options.migrate || (!options.repair && !options.migration_only))
-            && (options.proposal.is_none()
-                || (options.migrate && options.proposal.is_some_and(Value::is_object)))
+            && (!options.migration_only
+                || (options.proposal.is_none() && options.expected_token.is_none()))
+            && (options.proposal.is_none() || options.proposal.is_some_and(Value::is_object))
             && (options.expected_token.is_none()
-                || (options.migrate && options.release.is_some() && !options.check))
+                || (options.release.is_some() && !options.check && !options.dry_run))
             && (options.accept_risk_change.is_none()
                 || (options.expected_token.is_some()
                     && options.accept_risk_change == options.expected_token)),
@@ -1113,6 +1142,7 @@ pub async fn run(config_path: &Path, options: Options<'_>) -> Result<Value> {
                 || options.binary.is_some()
                 || options.stopped
                 || options.repair
+                || options.proposal.is_some()
                 || options.dry_run),
         failure("update_invalid_arguments")
     );
@@ -1128,8 +1158,19 @@ pub async fn run(config_path: &Path, options: Options<'_>) -> Result<Value> {
         }),
         failure("update_invalid_expected_release")
     );
-    if options.release.is_some() || options.binary.is_some() {
-        let mut arguments = if let Some(release) = options.release {
+    // Recovery routing is deliberately before release discovery, no-op handling,
+    // or any interpretation of configuration/journal data by this executable.
+    let pending = if options.check || options.dry_run {
+        None
+    } else {
+        installer::pending_update_target(config_path)?
+    };
+    if let Some(target) = pending.as_deref() {
+        validate_pending_target(&options, target)?;
+    }
+    let release = pending.as_deref().or(options.release);
+    if release.is_some() || options.binary.is_some() {
+        let mut arguments = if let Some(release) = release {
             ensure!(
                 release
                     .strip_prefix("r-")
@@ -1152,6 +1193,9 @@ pub async fn run(config_path: &Path, options: Options<'_>) -> Result<Value> {
                 digest.into(),
             ]
         };
+        let target = release
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("r-{}", options.sha256.unwrap_or_default()));
         if options.stopped {
             arguments.push("--stopped".into());
         }
@@ -1161,19 +1205,27 @@ pub async fn run(config_path: &Path, options: Options<'_>) -> Result<Value> {
         if let Some(expected) = options.expected_release {
             arguments.extend(["--expected-release".into(), expected.into()]);
         }
-        let mut report = report(&options, "operator_selected_local");
+        let mut report = report(
+            &options,
+            if pending.is_some() {
+                "pending_transaction"
+            } else {
+                "operator_selected_local"
+            },
+        );
         let _proposal = migration_arguments(&options, &mut arguments)?;
         if install(
             &mut report,
             &arguments,
             options.dry_run,
-            options.migrate && options.expected_token.is_none() && !options.dry_run,
+            options.proposal.is_some() && options.expected_token.is_none() && !options.dry_run,
         ) && !options.dry_run
             && options.expected_release.is_none()
             && !options.migration_only
             && !options.migrate
+            && report["installation"]["operation_mode"] != "maintenance"
         {
-            diagnose(&mut report, options.repair).await;
+            diagnose(&mut report, options.repair, Some(&target)).await;
         }
         return Ok(report);
     }
@@ -1221,8 +1273,8 @@ pub async fn run(config_path: &Path, options: Options<'_>) -> Result<Value> {
         build_info.as_bytes(),
         &checksum(&sums, "BUILD-INFO.txt").map_err(|_| failure("update_metadata_invalid"))?,
     )?;
-    let published = Identity::parse(&build_info, true, false)
-        .map_err(|_| failure("update_manifest_invalid"))?;
+    let published =
+        Identity::parse(&build_info, true).map_err(|_| failure("update_manifest_invalid"))?;
     ensure!(
         published.version == version,
         failure("update_manifest_invalid")
@@ -1244,7 +1296,7 @@ pub async fn run(config_path: &Path, options: Options<'_>) -> Result<Value> {
 }
 
 async fn complete_discovery(
-    config_path: &Path,
+    _config_path: &Path,
     options: Options<'_>,
     mut report: Value,
     current: Result<(installer::InstalledIdentity, Identity)>,
@@ -1305,20 +1357,23 @@ async fn complete_discovery(
     match order {
         Ordering::Current(reason) => {
             outcome(&mut report, true, "current", reason);
-            if !options.check && !options.dry_run && !options.migrate {
-                if inspect_current(&mut report, config_path, &selected.release) {
-                    diagnose(&mut report, options.repair).await;
-                }
-            } else if options.migrate && !options.check && !options.dry_run {
+            if !options.check && !options.dry_run {
                 let mut arguments = vec!["activate".into(), selected.release.clone()];
-                arguments.extend(["--expected-release".into(), selected.release]);
+                arguments.extend(["--expected-release".into(), selected.release.clone()]);
+                if options.stopped {
+                    arguments.push("--stopped".into());
+                }
                 let _proposal = migration_arguments(&options, &mut arguments)?;
-                install(
+                if install(
                     &mut report,
                     &arguments,
                     false,
-                    options.expected_token.is_none(),
-                );
+                    options.proposal.is_some() && options.expected_token.is_none(),
+                ) && !options.migrate
+                    && report["installation"]["operation_mode"] != "maintenance"
+                {
+                    diagnose(&mut report, options.repair, Some(&selected.release)).await;
+                }
             }
             return Ok(report);
         }
@@ -1396,6 +1451,7 @@ async fn complete_discovery(
         latest.release == selected.release && latest.digest == selected.digest,
         failure("update_installation_changed")
     );
+    let target = format!("r-{}", published.digest);
     let mut arguments = vec![
         "update".into(),
         binary
@@ -1414,10 +1470,11 @@ async fn complete_discovery(
         &mut report,
         &arguments,
         false,
-        options.migrate && options.expected_token.is_none(),
+        options.proposal.is_some() && options.expected_token.is_none(),
     ) && !options.migrate
+        && report["installation"]["operation_mode"] != "maintenance"
     {
-        diagnose(&mut report, options.repair).await;
+        diagnose(&mut report, options.repair, Some(&target)).await;
     }
     Ok(report)
 }
@@ -1427,56 +1484,169 @@ mod tests {
     use super::*;
 
     #[test]
-    fn current_noop_classifies_marker_without_mutation_or_diagnosis() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("config.toml");
-        let mut config = crate::config::Config {
-            state_dir: root.path().join("uncreated-state"),
-            ..crate::config::Config::default()
-        };
-        config.network.chain = format!(
-            "test-noop-{}",
-            root.path()
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .replace('.', "")
+    fn future_journal_keeps_fixed_embedded_protocol_one_envelope() {
+        let mut manifest = String::new();
+        for key in IDENTITY_FIELDS {
+            let value = match *key {
+                "build_format" | "update_protocol" => "1".to_owned(),
+                "package_version" => "0.5.0".to_owned(),
+                "commit" => "a".repeat(40),
+                "source_dirty" => "clean".to_owned(),
+                "target" => "x86_64-unknown-linux-musl".to_owned(),
+                "profile" => "release".to_owned(),
+                "journal_schema" => "5".to_owned(),
+                "stop_timeout" => "infinity".to_owned(),
+                _ => "b".repeat(64),
+            };
+            manifest.push_str(&format!("{key}={value}\n"));
+        }
+        let published = format!("{manifest}binary_sha256={}\n", "c".repeat(64));
+        let future = Identity::parse(&published, true).unwrap();
+        assert_eq!(future.update_protocol, 1);
+        assert_eq!(
+            ordering(&identity("0.4.0", 'd', false), &future),
+            Ordering::Compare
         );
-        config.network.address = format!("poa1{}", "1".repeat(32));
-        config.network.credential_file = root.path().join("unused-private-key");
-        let current = toml::to_string(&config).unwrap();
-        let release = format!("r-{}", "a".repeat(64));
-        for (bytes, compatible, classification, phase) in [
-            (current.clone(), true, "compatible", "not_required"),
-            (
-                format!("schema_version = 2\n{current}"),
-                false,
-                "marker_only",
-                "required",
-            ),
+        assert!(verify_embedded_identity(&manifest, &published).is_ok());
+        for changed in [
+            manifest.replace("journal_schema=5", "journal_schema=4"),
+            manifest.replace("journal_schema=5\n", ""),
+            format!("{manifest}journal_schema=5\n"),
+            format!("{manifest}future_field=private\n"),
         ] {
-            crate::admin::persist(&path, bytes.as_bytes()).unwrap();
-            let mut report = report(&options(), "test");
-            outcome(
-                &mut report,
-                true,
-                "current",
-                "published_binary_already_installed",
+            assert!(verify_embedded_identity(&changed, &published).is_err());
+        }
+        for protocol in ["0", "2"] {
+            let unsupported =
+                published.replace("update_protocol=1", &format!("update_protocol={protocol}"));
+            let unsupported = Identity::parse(&unsupported, true).unwrap();
+            assert_eq!(
+                ordering(&unsupported, &unsupported),
+                Ordering::Refused("published_installer_protocol_unsupported")
             );
-            assert_eq!(inspect_current(&mut report, &path, &release), compatible);
-            assert_eq!(report["compatibility"]["classification"], classification);
-            assert_eq!(report["migration"]["phase"], phase);
-            assert_eq!(report["success"], compatible);
-            assert_eq!(std::fs::read_to_string(&path).unwrap(), bytes);
-            assert!(!config.state_dir.exists());
-            assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
+    fn incoming_completion_preserves_restoration_and_future_journal_evidence() {
+        for (maintenance, restoration, verified, expected, success) in [
+            (false, "restored", true, "updated", true),
+            (false, "not_needed", true, "updated", true),
+            (true, "not_needed", true, "migration_complete_stopped", true),
+            (false, "pending", false, "restoration_incomplete", false),
+            (false, "failed", false, "restoration_incomplete", false),
+            (false, "cancelled", false, "updated", true),
+            (false, "restored", false, "restoration_incomplete", false),
+        ] {
+            let options = Options {
+                migrate: maintenance,
+                ..options()
+            };
+            let mut report = report(&options, "test");
+            let child = json!({
+                "installation":{"failure_code":"none"},
+                "compatibility":{"classification":"conversion","migration_required":true,
+                    "target_journal_format":5},
+                "migration":{"phase":"complete","target_journal_format":5,
+                    "participation_resumed":!maintenance},
+                "restoration":{"status":restoration,"runtime":"running","timer":"stopped",
+                    "pause_state":"unpaused","verified":verified,"secret":"private-restoration"}
+            });
+            installer_outcome(&mut report, &child, true, false, false);
+            assert_eq!(report["update"]["status"], expected);
+            assert_eq!(report["success"], success);
+            assert_eq!(report["compatibility"]["target_journal_format"], 5);
+            assert_eq!(report["migration"]["target_journal_format"], 5);
+            assert_eq!(report["migration"]["participation_resumed"], !maintenance);
+            assert_eq!(report["restoration"]["status"], restoration);
+            assert_eq!(report["restoration"]["verified"], verified);
+            assert!(!report.to_string().contains("private-restoration"));
             assert!(report["readiness"].is_null());
         }
-        std::fs::write(&path, "private-invalid-config = [").unwrap();
-        let mut report = report(&options(), "test");
-        assert!(inspect_current(&mut report, &path, &release));
-        assert_eq!(report["compatibility"]["classification"], "not_assessed");
-        assert!(!report.to_string().contains("private-invalid-config"));
+    }
+
+    #[test]
+    fn cancelled_restoration_distinguishes_completed_upgrade_from_recovery() {
+        for (phase, failure_code, succeeded, expected) in [
+            ("complete", "none", true, "updated"),
+            ("not_required", "none", true, "updated"),
+            ("required", "recovery_required", false, "recovery_required"),
+            ("complete", "recovery_required", false, "recovery_required"),
+            ("complete", "none", false, "restoration_incomplete"),
+        ] {
+            let mut report = report(&options(), "test");
+            installer_outcome(
+                &mut report,
+                &json!({"installation":{"failure_code":failure_code,
+                    "service":"previous_intent_restored"},
+                    "migration":{"phase":phase},
+                    "restoration":{"status":"cancelled","verified":false,
+                        "runtime":"stopped","timer":"stopped","pause_state":"paused"}}),
+                succeeded,
+                false,
+                false,
+            );
+            assert_eq!(report["update"]["status"], expected);
+            assert_eq!(report["success"], succeeded);
+            assert_eq!(report["restoration"]["status"], "cancelled");
+            assert_eq!(report["restoration"]["verified"], false);
+            assert_ne!(
+                report["installation"]["service"],
+                "previous_intent_restored"
+            );
+            if succeeded {
+                assert_eq!(
+                    report["update"]["reason"],
+                    "installer_completed_restoration_cancelled"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn incoming_decisions_conflicts_and_current_are_not_generic_success() {
+        for (status, success) in [
+            ("decision_required", false),
+            ("conflict", false),
+            ("restoration_incomplete", false),
+            ("recovery_required", false),
+            ("current", true),
+        ] {
+            let mut report = report(&options(), "test");
+            installer_outcome(&mut report, &json!({"status":status}), true, false, false);
+            assert_eq!(report["update"]["status"], status);
+            assert_eq!(report["success"], success);
+        }
+    }
+
+    #[test]
+    fn pending_target_rejects_retargeting_without_replacing_approval() {
+        let target = format!("r-{}", "a".repeat(64));
+        let other = format!("r-{}", "b".repeat(64));
+        let token = format!("agmi.atomic-migration.v1:{}", "c".repeat(64));
+        assert!(validate_pending_target(&options(), &target).is_ok());
+        let mut continuation = Options {
+            release: Some(&target),
+            expected_token: Some(&token),
+            accept_risk_change: Some(&token),
+            ..options()
+        };
+        assert!(validate_pending_target(&continuation, &target).is_ok());
+        continuation.release = Some(&other);
+        let error = validate_pending_target(&continuation, &target).unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<lifecycle::LifecycleError>()
+                .unwrap()
+                .code,
+            "update_pending_target_conflict"
+        );
+        continuation.release = None;
+        continuation.binary = Some(Path::new("/not-executed"));
+        continuation.sha256 = other.strip_prefix("r-");
+        assert!(validate_pending_target(&continuation, &target).is_err());
+        continuation.sha256 = target.strip_prefix("r-");
+        assert!(validate_pending_target(&continuation, &target).is_ok());
     }
 
     fn options<'a>() -> Options<'a> {
@@ -1502,8 +1672,8 @@ mod tests {
         for (phase, success, expected) in [
             ("not_required", true, "updated"),
             ("required", false, "migration_required"),
-            ("prepared", true, "migration_prepared"),
-            ("complete", true, "migration_complete_stopped"),
+            ("prepared", true, "decision_required"),
+            ("complete", true, "updated"),
             ("complete", false, "failed"),
             ("recovery_required", false, "recovery_required"),
             ("journal_ready", false, "recovery_required"),
@@ -1523,9 +1693,12 @@ mod tests {
             });
             installer_outcome(&mut report, &child, success, false, false);
             assert_eq!(report["update"]["status"], expected, "{phase}");
-            assert_eq!(report["success"], success && phase != "required");
+            assert_eq!(
+                report["success"],
+                success && !matches!(phase, "required" | "prepared")
+            );
             assert_eq!(report["migration"]["phase"], phase);
-            assert_eq!(report["migration"]["participation_resumed"], false);
+            assert_eq!(report["migration"]["participation_resumed"], true);
             assert_eq!(
                 report["migration"]["token"],
                 format!("agmi.atomic-migration.v1:{}", "a".repeat(64))
@@ -1542,7 +1715,7 @@ mod tests {
         for (further, prerequisite, expected) in [
             (true, Value::Null, "recovery_required"),
             (false, json!("authority_adoption"), "recovery_required"),
-            (false, Value::Null, "migration_complete_stopped"),
+            (false, Value::Null, "updated"),
         ] {
             let mut report = report(&options(), "test");
             let child = json!({"installation":{"failure_code":"none"},
@@ -1550,7 +1723,7 @@ mod tests {
                     "further_migration_required":further,"recovery_prerequisite":prerequisite}});
             installer_outcome(&mut report, &child, true, false, false);
             assert_eq!(report["update"]["status"], expected);
-            assert_eq!(report["success"], expected == "migration_complete_stopped");
+            assert_eq!(report["success"], expected == "updated");
             assert_eq!(report["migration"]["pending"], false);
             assert_eq!(report["migration"]["recovery_prerequisite"], prerequisite);
         }
@@ -1575,6 +1748,14 @@ mod tests {
         installer_outcome(&mut prepared, &child, true, false, true);
         assert_eq!(prepared["private"], true);
         assert_eq!(prepared["preview"], child["preview"]);
+        assert_eq!(prepared["success"], false);
+        assert_eq!(prepared["update"]["status"], "decision_required");
+        let mut decision = child.clone();
+        decision["migration"]["phase"] = json!("decision_required");
+        installer_outcome(&mut prepared, &decision, true, false, true);
+        assert_eq!(prepared["private"], true);
+        assert_eq!(prepared["preview"], child["preview"]);
+        assert_eq!(prepared["success"], false);
         for (success, dry_run, explicit) in [
             (false, false, true),
             (true, true, true),
@@ -1595,8 +1776,10 @@ mod tests {
     fn proposal_transport_is_owned_private_file_never_json_argv() {
         let proposal = json!({"candidate_toml":"private-proposal-body"});
         let mut options = options();
-        options.migrate = true;
         options.proposal = Some(&proposal);
+        let token = format!("agmi.atomic-migration.v1:{}", "c".repeat(64));
+        options.expected_token = Some(&token);
+        options.accept_risk_change = Some(&token);
         let mut arguments = vec!["activate".into(), format!("r-{}", "a".repeat(64))];
         let file = migration_arguments(&options, &mut arguments)
             .unwrap()
@@ -1604,6 +1787,17 @@ mod tests {
         let path = file.path().to_owned();
         assert!(!arguments.join(" ").contains("private-proposal-body"));
         assert!(!arguments.iter().any(|argument| argument == "-"));
+        assert!(!arguments.iter().any(|argument| argument == "--migrate"));
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["--expected-token", token.as_str()])
+        );
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["--accept-risk-change", token.as_str()])
+        );
         let bytes = std::fs::read(&path).unwrap();
         assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), proposal);
         #[cfg(unix)]
@@ -1627,13 +1821,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn check_rejects_private_proposal_before_discovery() {
+        let proposal = json!({});
+        let error = run(
+            Path::new("/not-read"),
+            Options {
+                check: true,
+                proposal: Some(&proposal),
+                ..options()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<lifecycle::LifecycleError>()
+                .unwrap()
+                .code,
+            "update_invalid_arguments"
+        );
+    }
+
+    #[tokio::test]
     async fn token_continuation_never_resolves_latest_or_accepts_unpinned_source() {
         let digest = "a".repeat(64);
         let token = format!("agmi.atomic-migration.v1:{digest}");
         for (release, binary, migrate, risk) in [
             (None, None, true, None),
             (None, Some(Path::new("/missing")), true, None),
-            (Some("r-invalid"), None, false, None),
             (Some("r-invalid"), None, true, Some("different")),
         ] {
             let result = run(
@@ -2095,38 +2310,27 @@ mod tests {
             include_str!(env!("AGMI_BUILD_MANIFEST_PATH")),
             "a".repeat(64)
         );
-        assert!(
-            Identity::parse(
-                &manifest.replace(
-                    &format!("journal_schema={}", crate::journal::CURRENT_JOURNAL_FORMAT),
-                    "journal_schema=2",
-                ),
-                false,
-                false
-            )
-            .is_err()
-        );
-        for schema in ["2", "3"] {
-            let retained = manifest.replace(
+        for schema in ["1", "2", "3", "5", "4294967295"] {
+            let future = manifest.replace(
                 &format!("journal_schema={}", crate::journal::CURRENT_JOURNAL_FORMAT),
                 &format!("journal_schema={schema}"),
             );
-            assert!(Identity::parse(&retained, false, true).is_ok());
-            assert!(Identity::parse(&retained, false, false).is_err());
+            assert!(Identity::parse(&future, false).is_ok());
+        }
+        for schema in ["0", "-1", "+5", "4294967296", "five"] {
+            let invalid = manifest.replace(
+                &format!("journal_schema={}", crate::journal::CURRENT_JOURNAL_FORMAT),
+                &format!("journal_schema={schema}"),
+            );
+            assert!(Identity::parse(&invalid, false).is_err(), "{schema}");
         }
         assert!(
-            Identity::parse(
-                &manifest.replace("binary_sha256=", "not_a_digest="),
-                false,
-                false
-            )
-            .is_err()
+            Identity::parse(&manifest.replace("binary_sha256=", "not_a_digest="), false).is_err()
         );
-        assert!(Identity::parse(&(manifest.clone() + "target=other\n"), false, false).is_err());
+        assert!(Identity::parse(&(manifest.clone() + "target=other\n"), false).is_err());
         assert!(
             Identity::parse(
                 &manifest.replace("stop_timeout=infinity", "stop_timeout=30"),
-                false,
                 false
             )
             .is_err()

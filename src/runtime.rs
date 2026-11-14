@@ -20,13 +20,13 @@ mod judge;
 mod mine;
 mod registry;
 mod services;
-pub(crate) use host::status_evidence;
 use host::{AnswerModelSlot, GradeModelSlot, ReadFlight, ReadyEffect};
 pub use host::{
     build_info, events, operations_list, pause, reads, recover_model, recovery_adopt,
     recovery_authorize, recovery_grants, recovery_inspect, recovery_resolve, recovery_revoke,
     resume, run, status,
 };
+pub(crate) use host::{restore_update_pause, status_evidence};
 use registry::NativeLanes;
 use services::{AnswerServices, GradeServices, MineServices};
 

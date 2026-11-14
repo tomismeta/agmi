@@ -93,15 +93,15 @@ fn update_repair_dry_run_preserves_user_files_and_never_executes_candidate() {
 }
 
 #[test]
-fn update_migration_flags_require_explicit_mode_and_release_pinned_approval() {
+fn update_approval_flags_require_release_pinning_and_preserve_private_errors() {
     let private = "private-approval-or-path-value";
     for json in [false, true] {
         for arguments in [
             vec!["update", "--migrate", "--repair"],
             vec!["update", "--migrate", "--migration-only", "--stopped"],
-            vec!["update", "--proposal", private],
+            vec!["update", "--check", "--proposal", private],
             vec!["update", "--migrate", "--expected-token", private],
-            vec!["update", "--release", private, "--expected-token", private],
+            vec!["update", "--expected-token", private],
             vec!["update", "--migrate", "--accept-risk-change", private],
             vec![
                 "update",
@@ -176,7 +176,7 @@ fn update_private_proposals_are_bounded_objects_and_errors_never_echo_inputs() {
                 command.arg("--json");
             }
             let output = command
-                .args(["update", "--migrate", "--dry-run", "--proposal"])
+                .args(["update", "--dry-run", "--proposal"])
                 .arg(&proposal)
                 .output()
                 .unwrap();
@@ -192,7 +192,7 @@ fn update_private_proposals_are_bounded_objects_and_errors_never_echo_inputs() {
     }
     fs::remove_file(&proposal).unwrap();
     let output = binary()
-        .args(["--json", "update", "--migrate", "--proposal"])
+        .args(["--json", "update", "--proposal"])
         .arg(&proposal)
         .output()
         .unwrap();
@@ -202,7 +202,7 @@ fn update_private_proposals_are_bounded_objects_and_errors_never_echo_inputs() {
 
 #[cfg(unix)]
 #[test]
-fn update_migration_dry_run_never_executes_or_transports_private_proposal() {
+fn update_dry_run_never_executes_or_transports_private_proposal() {
     use sha2::Digest;
     use std::{io::Write, os::unix::fs::PermissionsExt, process::Stdio};
     let root = tempfile::tempdir().unwrap();
@@ -231,7 +231,7 @@ fn update_migration_dry_run_never_executes_or_transports_private_proposal() {
             .env("TMPDIR", &temporary)
             .env("PATH", root.path())
             .env("AGMI_PREVIEW_MARKER", &marker)
-            .args(["--json", "update", "--migrate", "--dry-run", "--binary"])
+            .args(["--json", "update", "--dry-run", "--binary"])
             .arg(&candidate)
             .args(["--sha256", &digest]);
         if let Some(source) = source {

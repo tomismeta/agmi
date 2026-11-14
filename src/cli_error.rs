@@ -299,7 +299,7 @@ pub(crate) fn execution(error: &Error, config: Option<&Path>) -> Value {
             action(None, &["update", "--help"], false),
             action(None, &["service", "status"], false),
             {"kind":"instruction","authorization_required":false,
-             "message":"Preserve the installed release and user state. Failed or unverifiable discovery is not authorization to downgrade, replay work or clear uncertainty."}
+             "message":"Preserve the pinned update record, retained releases and user state. Inspect the reported operation before retrying; failure never authorizes an older-journal restore, stale-intent restart, work replay or uncertainty reset."}
         ]);
     }
     if code.starts_with("logs_") {

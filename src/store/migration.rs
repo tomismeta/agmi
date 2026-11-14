@@ -476,6 +476,9 @@ pub(crate) struct UpgradeInspection {
     pub source_sha256: String,
     pub journal_format: Option<i64>,
     pub paused: Option<bool>,
+    pub generation: Option<i64>,
+    pub database_id: Option<String>,
+    pub dispatch_sequence: Option<i64>,
     pub pending: Option<Value>,
 }
 
@@ -509,6 +512,9 @@ pub(crate) fn inspect_upgrade(path: &Path) -> Result<UpgradeInspection> {
         source_sha256: digest(&source),
         journal_format: None,
         paused: None,
+        generation: None,
+        database_id: None,
+        dispatch_sequence: None,
         pending: None,
     };
     let Some(db) = open_existing(&config.state_dir, false)? else {
@@ -519,10 +525,10 @@ pub(crate) fn inspect_upgrade(path: &Path) -> Result<UpgradeInspection> {
         return Ok(result);
     };
     let tx = db.unchecked_transaction()?;
-    let (version, paused): (i64, bool) = tx.query_row(
-        "SELECT version,paused FROM control WHERE singleton=1",
+    let (version, paused, generation): (i64, bool, i64) = tx.query_row(
+        "SELECT version,paused,generation FROM control WHERE singleton=1",
         [],
-        |r| Ok((r.get(0)?, r.get(1)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
     ensure!(
         matches!(version, 1..=CURRENT_JOURNAL_FORMAT),
@@ -530,6 +536,13 @@ pub(crate) fn inspect_upgrade(path: &Path) -> Result<UpgradeInspection> {
     );
     result.journal_format = Some(version);
     result.paused = Some(paused);
+    ensure!(generation >= 0, "invalid control generation");
+    result.generation = Some(generation);
+    if version >= 2 {
+        let (id, sequence) = authority(&tx)?;
+        result.database_id = Some(id);
+        result.dispatch_sequence = Some(sequence);
+    }
     if table_exists(&tx, "capability_migration")? {
         let (phase, token, sealed) = record(&tx, None)?;
         let target = seals::target(&token, &sealed).context(MigrationError::UnsupportedRecovery)?;
@@ -563,6 +576,93 @@ pub(crate) fn inspect_upgrade(path: &Path) -> Result<UpgradeInspection> {
         result.kind = UpgradeKind::Conversion;
     }
     Ok(result)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AutomaticUpgrade {
+    Preserving,
+    DecisionRequired(&'static str),
+}
+
+/// Read-only preflight. Inspection rejects unsafe authority before missing policy
+/// can be classified as an operator choice; metadata baselines never become input.
+pub(crate) fn automatic_upgrade(path: &Path) -> Result<AutomaticUpgrade> {
+    let inspected = inspect_upgrade(path)?;
+    ensure!(
+        inspected.kind != UpgradeKind::Pending,
+        MigrationError::Pending
+    );
+    let p = match prepare(&absolute(path)?, &json!({})) {
+        Ok(p) => p,
+        Err(error)
+            if matches!(
+                error.downcast_ref::<MigrationError>(),
+                Some(MigrationError::LimitsRequired)
+            ) =>
+        {
+            return Ok(AutomaticUpgrade::DecisionRequired("lane_limits_required"));
+        }
+        Err(error) => return Err(error),
+    };
+    if inspected.journal_format.is_some() && read_binding(&p.config)?.is_none() {
+        return Ok(AutomaticUpgrade::DecisionRequired(
+            "authority_adoption_required",
+        ));
+    }
+    let unresolved = match open_existing(&p.config.state_dir, false)? {
+        Some(db) => unresolved_counts(&db)?,
+        None => [0; 3],
+    };
+    Ok(if preservation_proven(&preservation_risk(&p, unresolved)) {
+        AutomaticUpgrade::Preserving
+    } else {
+        AutomaticUpgrade::DecisionRequired("risk_review_required")
+    })
+}
+
+/// An internal approval is always a fresh canonical exact-{} preview, never a
+/// retargeted seal or an operator candidate with inferred risk acknowledgment.
+pub(crate) fn automatic_preview(path: &Path) -> Result<Value> {
+    ensure!(
+        automatic_upgrade(path)? == AutomaticUpgrade::Preserving,
+        MigrationError::RiskApprovalRequired
+    );
+    let result = preview(path, &json!({}))?;
+    ensure!(
+        matches!(
+            result["snapshot"]["branch"].as_str(),
+            Some("config_only" | "established_authority")
+        ) && preservation_proven(&result["risk"])
+            && result["risk_change_required"] == false
+            && result["request"].get("adopt_legacy").is_none()
+            && result["request"].get("caps").is_none()
+            && result["request"].get("initial_database_id").is_none(),
+        MigrationError::RiskApprovalRequired
+    );
+    Ok(result)
+}
+
+fn unresolved_counts(db: &Connection) -> Result<[u64; 3]> {
+    let mut unresolved = [0; 3];
+    for (i, kind) in ["answer", "judge", "mine"].iter().enumerate() {
+        unresolved[i] = db.query_row("SELECT count(*) FROM operations WHERE kind=?1 AND state IN ('dispatching','queued','unknown','included_pending')",[kind],|r| r.get(0))?;
+    }
+    Ok(unresolved)
+}
+
+fn preservation_risk(p: &Prepared, unresolved: [u64; 3]) -> Value {
+    p.legacy.as_ref().map_or_else(
+        || {
+            json!({"preservation_proven":true,"risk_change_required":false,
+            "unresolved_by_kind":unresolved,"configuration_preserved":true})
+        },
+        |legacy| legacy.risk(&p.config, unresolved),
+    )
+}
+
+fn preservation_proven(risk: &Value) -> bool {
+    // Require the canonical positive proof, not merely absent risk diagnostics.
+    risk["preservation_proven"] == true && risk["risk_change_required"] == false
 }
 
 /// Check the canonical proposal and existing eligibility before maintenance.
@@ -924,10 +1024,7 @@ fn snapshot(
         ),
         "migration cannot rotate API routing"
     );
-    let mut unresolved = [0u64; 3];
-    for (i, kind) in ["answer", "judge", "mine"].iter().enumerate() {
-        unresolved[i] = db.query_row("SELECT count(*) FROM operations WHERE kind=?1 AND state IN ('dispatching','queued','unknown','included_pending')",[kind],|r| r.get(0))?;
-    }
+    let unresolved = unresolved_counts(db)?;
     result["branch"] = json!(branch);
     result["source_schema"] = json!(version);
     result["database_inode"] = file_identity(&config.state_dir.join("state.sqlite3"))?;
@@ -991,13 +1088,7 @@ fn preview_value(
         },
         "configuration shape does not match the supported source journal format"
     );
-    let risk = p.legacy.as_ref().map_or_else(
-        || {
-            json!({"preservation_proven":true,"risk_change_required":false,
-            "unresolved_by_kind":unresolved,"configuration_preserved":true})
-        },
-        |legacy| legacy.risk(&p.config, unresolved),
-    );
+    let risk = preservation_risk(p, unresolved);
     let seal = json!({"format":FORMAT,"target_journal_format":CURRENT_JOURNAL_FORMAT,
         "config_path":path,"source_sha256":digest(&p.source),
         "candidate_sha256":digest(p.candidate.as_bytes()),"effective_revision":p.config.revision()?,

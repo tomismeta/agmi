@@ -23,7 +23,7 @@ const SCHEMA: &str = "agmi.cli.v1";
     version,
     about = "Agents Gonna Mine It.",
     long_about = "Reliable, configurable MinePOA participation. New installations are paused; diagnostics never submit work.",
-    after_help = "EVERYDAY WORKFLOW\n  agmi health                 Check core and individual lane health\n  agmi status                 Inspect local participation evidence\n  agmi doctor                 Distinguish automatic waits from intervention\n  agmi doctor --repair        Explicitly authorize eligible guarded repairs\n  agmi logs --follow          Follow sanitized local events\n  agmi update --check         Check latest stable without changes\n  agmi update                 Compatible update, then diagnose readiness\n  agmi update --repair        Update and authorize guarded repairs\n  agmi update --migrate       Explicit stopped migration maintenance\n\nOrdinary compatible updates preserve configuration, guidance, credentials and pause intent.\nMigration maintenance may change pause/generation/revisions and never resumes participation.\nUnknown submissions are never replayed or erased by maintenance.\nUse agmi <command> --help for examples and agmi --json commands for effect metadata."
+    after_help = "EVERYDAY WORKFLOW\n  agmi health                 Check core and individual lane health\n  agmi status                 Inspect local participation evidence\n  agmi doctor                 Distinguish automatic waits from intervention\n  agmi doctor --repair        Explicitly authorize eligible guarded repairs\n  agmi logs --follow          Follow sanitized local events\n  agmi update --check         Check latest stable without changes\n  agmi update                 Update, convert if needed, restore prior intent\n  agmi update --repair        Update and authorize guarded repairs\n  agmi update --migrate       Explicit stopped migration maintenance\n\nUpdates preserve identity, configuration, guidance, credentials and participation intent.\nNecessary conversion may advance generation/revisions and invalidate stale grants/captures.\nUnknown submissions are never replayed or erased by maintenance.\nUse agmi <command> --help for examples and agmi --json commands for effect metadata."
 )]
 struct Cli {
     /// Local TOML configuration. Credentials are referenced, never embedded.
@@ -115,9 +115,9 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Update compatible releases, or explicitly prepare stopped migration maintenance.
+    /// Update to latest, convert when needed, and restore prior operating intent.
     #[command(
-        after_help = "EXAMPLES\n  agmi update --check\n  agmi update\n  agmi update --repair\n  agmi update --dry-run\n  agmi update --binary /path/to/agmi --sha256 <trusted-digest>\n  agmi update --migrate --proposal proposal.json\n  agmi update --release r-<selected-sha256> --migrate --proposal request.json --expected-token <token>\n\nDefault source: published stable releases from tomismeta/agmi, never main.\nChecks/dry runs never execute incoming code or assess operational compatibility.\nOrdinary compatible updates preserve configuration, pause/generation and runtime intent.\n--migrate is disruptive maintenance: disable boot activation, stop and if needed pause.\nExact marker-only conversion completes automatically; other conversion prepares a\nprivate preview for exact request/token approval pinned to the selected --release.\nNo migration automatically starts or resumes participation. Changed revisions can\ninvalidate grants/captures. --proposal FILE|- reads private JSON (64 KiB maximum);\nonly explicit '-' reads stdin. Use --json and private output files for preparation.\nPublished 0.1.0/0.1.1 clients need a one-time independently verified new executable\ninvoked directly; old online discovery cannot bootstrap the journal-format crossing.\n--repair authorizes only guarded refusal recovery, not abandonment or replay.\nUpdate, conversion and readiness are separate outcomes. Managed updates use only\nthe default configuration. No force, automatic risk approval, rollback or resume."
+        after_help = "EXAMPLES\n  agmi update --check\n  agmi update\n  agmi update --repair\n  agmi update --dry-run\n  agmi update --binary /path/to/agmi --sha256 <trusted-digest>\n  agmi update --proposal proposal.json\n  agmi update --release r-<selected-sha256> --proposal request.json --expected-token <token>\n\nDefault source: published stable releases from tomismeta/agmi, never main.\nChecks/dry runs never execute incoming code or assess operational compatibility.\nPlain update stops cleanly when needed, performs supported policy-preserving\nconversion, verifies local structure and restores prior service/timer/boot/pause\nintent. Previously stopped or paused participation is never turned on by default.\nIncomplete work stays pinned to its verified target; rerun update to reconcile it.\nMissing policy choices, changed/unproven risk or initial authority adoption need\nexplicit private proposal/token approval, never invented defaults. --proposal\nFILE|- reads private JSON (64 KiB maximum); only explicit '-' reads stdin.\nUse --json and private output files when a decision returns a private preview.\n--migrate explicitly requests conservative stopped, boot-disabled maintenance;\nit is not needed for ordinary upgrades and does not resume participation.\nChanged revisions may invalidate stale grants/captures, never reset accounting.\nPublished 0.1.0 lacks latest discovery; 0.1.1 cannot discover a newer journal format.\nThese frozen clients need a one-time trusted new executable invoked directly.\n--repair authorizes only guarded refusal recovery, not abandonment or replay.\nManaged updates use the default configuration. Remote outages are separate from\ninstallation success. No force, automatic risk approval or older-journal rollback."
     )]
     Update {
         /// Select a retained compatible release instead of downloading.
@@ -147,10 +147,10 @@ enum Command {
         #[arg(long, conflicts_with_all = ["repair", "migration_only"])]
         migrate: bool,
         /// Private JSON proposal, at most 64 KiB; only an explicit '-' reads stdin.
-        #[arg(long, requires = "migrate", value_name = "FILE|-")]
+        #[arg(long, conflicts_with = "check", value_name = "FILE|-")]
         proposal: Option<PathBuf>,
         /// Apply the exact prepared token; requires an explicit selected-release pin.
-        #[arg(long, requires_all = ["migrate", "release"], conflicts_with_all = ["binary", "sha256"])]
+        #[arg(long, requires = "release", conflicts_with_all = ["binary", "sha256"])]
         expected_token: Option<String>,
         /// Explicit risk approval; must equal --expected-token.
         #[arg(long, requires = "expected_token")]
@@ -598,16 +598,30 @@ fn update_proposal(path: &Path) -> Result<Value> {
     Ok(value)
 }
 
+fn update_decision_guidance(data: &Value) -> Option<&'static str> {
+    match data["migration"]["decision_reason"].as_str()? {
+        "lane_limits_required" => Some(
+            "Choose explicit positive caps for answer, judge and mine in private JSON, then use update --proposal. Run config migrate preview --help for the proposal shape; no quotas are inferred.",
+        ),
+        "authority_adoption_required" => Some(
+            "Review original authority before explicitly including adopt_legacy: true in a private update proposal. Established authority is never recreated. Run config migrate preview --help for this initial-adoption path.",
+        ),
+        "risk_review_required" => Some(
+            "Unchanged exposure, model spending or backlog could not be proved. Supply a private update proposal and inspect its canonical preview; any risk acknowledgment must use its exact token. Run config migrate preview --help.",
+        ),
+        _ => None,
+    }
+}
+
 fn update_actions(data: &mut Value) {
     // Keep a specific continuation if an earlier layer already supplied one.
     if data["next_actions"].is_array() {
         return;
     }
     let commands: Vec<(&[&str], bool)> = match data["update"]["status"].as_str() {
-        Some("migration_required") => vec![
-            (&["update", "--migrate"], true),
-            (&["update", "--help"], false),
-        ],
+        Some("migration_required" | "decision_required") => {
+            vec![(&["config", "migrate", "preview", "--help"], false)]
+        }
         Some("migration_prepared") => vec![
             (&["update", "--help"], false),
             (&["config", "migrate", "apply", "--help"], false),
@@ -617,7 +631,12 @@ fn update_actions(data: &mut Value) {
             (&["status"], false),
             (&["service", "status"], false),
         ],
-        Some("recovery_required") => vec![
+        Some("updated" | "current") => {
+            vec![(&["status"], false), (&["health"], false)]
+        }
+        Some("recovery_required" | "restoration_incomplete" | "conflict") => vec![
+            (&["update"], true),
+            (&["service", "status"], false),
             (&["config", "migrate", "status", "--help"], false),
             (&["config", "migrate", "export", "--help"], false),
         ],
@@ -637,7 +656,20 @@ fn update_actions(data: &mut Value) {
         .into_iter()
         .map(|(argv, authorization)| cli_error::action(None, argv, authorization))
         .collect();
-    let prepared = data["update"]["status"] == "migration_prepared";
+    if let Some(message) = update_decision_guidance(data) {
+        actions.insert(
+            0,
+            json!({"kind":"instruction","authorization_required":true,"message":message}),
+        );
+    }
+    let prepared = data["update"]["status"] == "migration_prepared"
+        || (data["update"]["status"] == "decision_required"
+            && data["private"] == true
+            && data["preview"].is_object()
+            && matches!(
+                data["migration"]["phase"].as_str(),
+                Some("prepared" | "decision_required")
+            ));
     if data["migration"]["pending"] == false
         && data["migration"]["recovery_prerequisite"] == "authority_adoption"
     {
@@ -651,10 +683,11 @@ fn update_actions(data: &mut Value) {
         && data["migration"]["further_migration_required"] == true
     {
         if let Some(release) = data["migration"]["release_id"].as_str() {
-            actions.insert(
-                0,
-                cli_error::action(None, &["update", "--release", release, "--migrate"], true),
-            );
+            let mut argv = vec!["update", "--release", release];
+            if data["update"]["migrate"] == true {
+                argv.push("--migrate");
+            }
+            actions.insert(0, cli_error::action(None, &argv, true));
         }
         actions.insert(0, json!({"kind":"instruction","authorization_required":false,
             "message":"The original historical seal is complete. Prepare and review a separate current-format conversion with a new request/token; the old approval cannot authorize it. Keep services stopped and boot-disabled."}));
@@ -666,7 +699,10 @@ fn update_actions(data: &mut Value) {
             data["migration"]["token"].as_str(),
         )
     {
-        let mut argv = vec!["update", "--release", release, "--migrate"];
+        let mut argv = vec!["update", "--release", release];
+        if data["update"]["migrate"] == true {
+            argv.push("--migrate");
+        }
         if prepared {
             argv.extend(["--proposal", "request.json"]);
         }
@@ -687,19 +723,45 @@ fn update_actions(data: &mut Value) {
 fn migration_can_offer_activation(data: &Value) -> bool {
     data["migration"]["phase"] == "complete"
         && data["migration"]["pending"] == false
-        && data["migration"]["target_journal_format"] == agmi::journal::CURRENT_JOURNAL_FORMAT
-        && data["migration"]["further_migration_required"] != true
+        && data["migration"]["target_journal_format"]
+            .as_u64()
+            .is_some_and(|target| target > 0 && target <= u64::from(u32::MAX))
+        && data["migration"]["further_migration_required"] == false
         && data["migration"].get("recovery_prerequisite") == Some(&Value::Null)
 }
 
 fn update_consequences(data: &Value) {
     match data["update"]["status"].as_str() {
+        Some("updated" | "current") => {
+            if data["restoration"]["status"] == "restored"
+                && data["restoration"]["verified"] == true
+            {
+                println!(
+                    "Prior operating intent verified: runtime={}, timer={}, participation={}. Remote health is reported separately.",
+                    data["restoration"]["runtime"].as_str().unwrap_or("unknown"),
+                    data["restoration"]["timer"].as_str().unwrap_or("unknown"),
+                    data["restoration"]["pause_state"]
+                        .as_str()
+                        .unwrap_or("unknown"),
+                );
+            } else if data["restoration"]["status"] == "cancelled" {
+                println!(
+                    "Update complete; a newer operator command cancelled restoration. Earlier runtime, timer and participation intent was not reapplied."
+                );
+            }
+        }
         Some("migration_required") => println!(
-            "Migration required; ordinary update has not authorized conversion. Use --migrate for stopped, boot-disabled maintenance. Pause/revision changes may invalidate grants/captures; participation will not automatically resume."
+            "{}",
+            update_decision_guidance(data).unwrap_or(
+                "Update needs an explicit migration decision. Run config migrate preview --help for supported source and proposal requirements; no private preview or policy defaults are implied."
+            )
         ),
-        Some("migration_prepared") => {
+        Some("migration_prepared" | "decision_required") => {
             println!(
-                "Preparation only: conversion awaits exact request/token approval pinned to the selected release. Services remain stopped and boot-disabled; participation is not resumed."
+                "{}",
+                update_decision_guidance(data).unwrap_or(
+                    "Decision required: supply or review the exact private proposal/request/token pinned to the selected release. Run config migrate preview --help; no automatic risk approval is supplied."
+                )
             );
             if data["private"] == true && data["preview"].is_object() {
                 println!("Private migration preview (do not publish):");
@@ -731,8 +793,8 @@ fn update_consequences(data: &Value) {
         Some("migration_complete_stopped") => println!(
             "Migration complete, not participation readiness: services remain stopped and boot-disabled; migration does not unpause participation. Check configuration and local status; separately enable/start services and review readiness before explicit resume."
         ),
-        Some("recovery_required") => println!(
-            "Migration recovery required. Keep participation stopped; inspect canonical migration status/export and finish only the exact sealed token/target. Never restart an incompatible old writer."
+        Some("recovery_required" | "restoration_incomplete" | "conflict") => println!(
+            "Update recovery or intent restoration is incomplete. Rerun update to inspect its pinned operation; conflicting authority or policy needs an explicit decision. Never restart an incompatible old writer or restore an older journal."
         ),
         _ if matches!(
             data["migration"]["phase"].as_str(),
@@ -872,6 +934,49 @@ fn discovery() -> Value {
     value
 }
 
+fn managed_control_mutation(command: &Command) -> bool {
+    match command {
+        Command::Identity {
+            command: IdentityCommand::Create { confirm, .. } | IdentityCommand::Resume { confirm },
+        } => *confirm,
+        Command::Init { dry_run, .. }
+        | Command::Credentials {
+            command: CredentialCommand::Rotate { dry_run, .. },
+        }
+        | Command::Config {
+            command: ConfigCommand::Apply { dry_run, .. },
+        }
+        | Command::Guidance {
+            command: GuidanceCommand::Set { dry_run, .. },
+        } => !dry_run,
+        Command::Config {
+            command:
+                ConfigCommand::Init
+                | ConfigCommand::Migrate {
+                    command: MigrationCommand::Apply { .. } | MigrationCommand::Resume { .. },
+                },
+        }
+        | Command::Lane {
+            command: LaneCommand::Pause { .. } | LaneCommand::Resume { .. },
+        }
+        | Command::Pause
+        | Command::Resume
+        | Command::RecoverModel
+        | Command::Recover {
+            command:
+                RecoveryCommand::Adopt
+                | RecoveryCommand::Authorize { .. }
+                | RecoveryCommand::Revoke { .. },
+        } => true,
+        Command::Recover {
+            command: RecoveryCommand::Resolve { refusal, apply, .. },
+        } => !refusal || apply.is_some(),
+        // Installation/service/repair owners take their own lease after delegation.
+        // Holding an outer lease would deadlock the incoming installer.
+        _ => false,
+    }
+}
+
 async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
     if matches!(cli.command, Command::BuildInfo { .. }) {
         return Ok(("build_info", runtime::build_info()));
@@ -909,6 +1014,14 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
             .into());
         }
     };
+    let _managed_control = if managed_control_mutation(&cli.command) {
+        lifecycle::guard_managed_mutation(&path)?
+    } else {
+        None
+    };
+    if matches!(cli.command, Command::Run { .. }) {
+        lifecycle::guard_managed_run(&path)?;
+    }
     match &cli.command {
         Command::Identity { command } => {
             return match command {
@@ -1748,29 +1861,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn migration_outcomes_keep_actionable_steps_without_doctor_or_automatic_resume() {
-        for (status, phase) in [
-            ("migration_required", "required"),
-            ("migration_prepared", "prepared"),
-            ("migration_complete_stopped", "complete"),
-            ("recovery_required", "recovery_required"),
-            ("failed", "complete"),
-            ("failed", "failed"),
-        ] {
-            let mut report = json!({"update":{"status":status},"migration":{"phase":phase}});
-            update_actions(&mut report);
-            let actions = report["next_actions"].to_string();
-            assert!(!actions.contains("\"doctor\""));
-            assert!(!actions.contains("\"resume\""));
-            assert!(!actions.contains("\"start\""));
-            let specific = report["next_actions"].clone();
-            update_actions(&mut report);
-            assert_eq!(report["next_actions"], specific);
-        }
-        let mut ordinary =
-            json!({"update":{"status":"updated"},"migration":{"phase":"not_required"}});
-        update_actions(&mut ordinary);
-        assert!(ordinary["next_actions"].to_string().contains("\"doctor\""));
+    fn update_continuations_preserve_exact_approval_without_automatic_risk_consent() {
         for status in ["migration_prepared", "recovery_required"] {
             let release = format!("r-{}", "a".repeat(64));
             let token = format!("agmi.atomic-migration.v1:{}", "b".repeat(64));
@@ -1831,8 +1922,9 @@ mod tests {
                             == json!(["agmi", "recover", "adopt", "--help"]))
                 );
             } else {
-                assert!(actions.iter().any(|action| action["argv"]
-                    == json!(["agmi", "update", "--release", release, "--migrate"])));
+                assert!(actions.iter().any(
+                    |action| action["argv"] == json!(["agmi", "update", "--release", release])
+                ));
             }
         }
         let mut completed = json!({"migration":{"phase":"complete","pending":false,
@@ -1844,45 +1936,6 @@ mod tests {
             .unwrap()
             .remove("recovery_prerequisite");
         assert!(!migration_can_offer_activation(&completed));
-    }
-
-    #[test]
-    fn pinned_migration_preview_and_dry_run_arguments_parse_without_unstated_input() {
-        for arguments in [
-            vec!["agmi", "update", "--migrate"],
-            vec!["agmi", "update", "--migrate", "--check"],
-            vec![
-                "agmi",
-                "update",
-                "--migrate",
-                "--dry-run",
-                "--proposal",
-                "-",
-            ],
-            vec![
-                "agmi",
-                "update",
-                "--release",
-                "r-pin",
-                "--migrate",
-                "--expected-token",
-                "token",
-                "--accept-risk-change",
-                "token",
-            ],
-            vec![
-                "agmi",
-                "update",
-                "--release",
-                "r-pin",
-                "--migrate",
-                "--dry-run",
-                "--expected-token",
-                "token",
-            ],
-        ] {
-            assert!(Cli::try_parse_from(arguments).is_ok());
-        }
     }
 
     #[test]

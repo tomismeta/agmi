@@ -1819,6 +1819,69 @@ impl Store {
             .context("global control commit uncertain; reread pause state and generation before retrying")
     }
 
+    /// Commit only the recorded update transition. Re-entry after an uncertain
+    /// acknowledgment accepts its exact post-state without repeating control.
+    pub(crate) fn restore_update_pause(
+        &mut self,
+        database_id: &str,
+        expected_generation: i64,
+        expected_paused: bool,
+        desired_paused: bool,
+        account: &AccountAdmissionGuard,
+    ) -> Result<Value> {
+        if expected_generation < 0 {
+            bail!("update restoration has an invalid generation");
+        }
+        let post_generation = if expected_paused == desired_paused {
+            expected_generation
+        } else {
+            expected_generation
+                .checked_add(1)
+                .context("update restoration generation exhausted")?
+        };
+        self.check_pause_guard(account)?;
+        self.continuity()?;
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        account.validated_binding()?;
+        Self::continuity_in(&tx, &self.binding, &self.writer_path, &self.database_file)?;
+        let id: String = tx.query_row(
+            "SELECT database_id FROM authority WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )?;
+        if id != database_id {
+            bail!("update restoration database identity conflict");
+        }
+        let (paused, generation): (bool, i64) = tx.query_row(
+            "SELECT paused,generation FROM control WHERE singleton=1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let before = paused == expected_paused && generation == expected_generation;
+        let already_applied = !before && paused == desired_paused && generation == post_generation;
+        if !before && !already_applied {
+            bail!("update restoration control conflict");
+        }
+        let applied = before && expected_paused != desired_paused;
+        if applied {
+            Self::write_pause(&tx, desired_paused)?;
+        }
+        account.validated_binding()?;
+        Self::continuity_in(&tx, &self.binding, &self.writer_path, &self.database_file)?;
+        tx.commit().context(
+            "update restoration commit uncertain; retry only the same conditional transition",
+        )?;
+        self.check_pause_guard(account)
+            .and_then(|()| self.continuity())
+            .context(
+                "update restoration commit uncertain; retry only the same conditional transition",
+            )?;
+        Ok(json!({"paused":desired_paused,"generation":post_generation,
+            "applied":applied,"already_applied":already_applied}))
+    }
+
     fn check_pause_guard(&self, account: &AccountAdmissionGuard) -> Result<()> {
         let (path, expected) = self
             .binding
@@ -3186,6 +3249,11 @@ impl Store {
         let tx = self.db.unchecked_transaction()?;
         let mut policy = json!({"capabilities":config.capabilities,
             "identity":config.identity,"runtime":config.runtime,"build":crate::runtime::build_info()});
+        policy["process"] = json!({
+            "pid":std::process::id(),
+            "invocation_id":std::env::var("INVOCATION_ID").ok().filter(|id|
+                id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        });
         let mut revisions = serde_json::Map::new();
         for lane in LaneId::ALL {
             revisions.insert(

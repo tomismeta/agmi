@@ -238,6 +238,33 @@ pub fn resume(config: &Config) -> Result<()> {
     AccountLock::control_store(config, &gate)?.set_paused(false, &gate)
 }
 
+pub(crate) fn restore_update_pause(
+    config: &Config,
+    database_id: &str,
+    expected_generation: i64,
+    expected_paused: bool,
+    desired_paused: bool,
+) -> Result<Value> {
+    if !desired_paused {
+        config.validate()?;
+        if config.network.address.is_empty()
+            || config.network.credential_file.as_os_str().is_empty()
+        {
+            bail!("resume requires a configured account and credential file");
+        }
+    }
+    // Restoration requires existing anchored authority; unlike ordinary initial
+    // control, this must never create a journal, account witness or admission gate.
+    let gate = AccountAdmissionGuard::acquire(config)?;
+    AccountLock::control_store(config, &gate)?.restore_update_pause(
+        database_id,
+        expected_generation,
+        expected_paused,
+        desired_paused,
+        &gate,
+    )
+}
+
 /// Explicitly release model-only uncertainty while the writer is stopped.
 /// A possibly-sent protocol request is never eligible.
 pub fn recover_model(config: &Config) -> Result<usize> {

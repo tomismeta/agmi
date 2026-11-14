@@ -1912,6 +1912,13 @@ fn upgrade_inspection_and_proposal_preflight_never_initialize_config_only_source
         );
         assert_eq!(inspected.journal_format, None);
         assert_eq!(inspected.paused, None);
+        assert_eq!(inspected.generation, None);
+        assert_eq!(inspected.database_id, None);
+        assert_eq!(inspected.dispatch_sequence, None);
+        assert_eq!(
+            automatic_upgrade(&fixture.path).unwrap(),
+            AutomaticUpgrade::Preserving
+        );
         assert!(inspected.pending.is_none());
         validate_upgrade_proposal(&fixture.path, &json!({})).unwrap();
         assert_eq!(upgrade_inspection_evidence(&fixture), before);
@@ -1936,6 +1943,12 @@ fn upgrade_legacy_inspection_discovers_without_caps_but_never_invents_policy_or_
         assert_eq!(inspected.kind, UpgradeKind::Conversion);
         assert_eq!(inspected.journal_format, Some(schema));
         assert_eq!(inspected.paused, Some(false));
+        assert_eq!(inspected.generation, Some(4));
+        assert_eq!(inspected.dispatch_sequence, (schema == 2).then_some(7));
+        assert_eq!(
+            automatic_upgrade(&fixture.path).unwrap(),
+            AutomaticUpgrade::DecisionRequired("lane_limits_required")
+        );
         let missing = validate_upgrade_proposal(&fixture.path, &json!({})).unwrap_err();
         assert!(matches!(
             missing.downcast_ref::<MigrationError>(),
@@ -1973,6 +1986,10 @@ fn upgrade_legacy_inspection_discovers_without_caps_but_never_invents_policy_or_
     );
     assert!(validate_upgrade_proposal(&fixture.path, &json!({})).is_err());
     validate_upgrade_proposal(&fixture.path, &json!({"adopt_legacy":true})).unwrap();
+    assert_eq!(
+        automatic_upgrade(&fixture.path).unwrap(),
+        AutomaticUpgrade::DecisionRequired("authority_adoption_required")
+    );
 }
 
 #[test]
@@ -2006,6 +2023,10 @@ fn upgrade_marker4_and_source3_preflight_do_not_require_or_change_the_future_pau
         assert_eq!(inspected.journal_format, Some(if current { 4 } else { 3 }));
         assert_eq!(inspected.paused, Some(false));
         validate_upgrade_proposal(&fixture.path, &json!({})).unwrap();
+        assert_eq!(
+            automatic_upgrade(&fixture.path).unwrap(),
+            AutomaticUpgrade::Preserving
+        );
         assert!(
             validate_upgrade_proposal(
                 &fixture.path,
@@ -2024,6 +2045,7 @@ fn upgrade_marker4_and_source3_preflight_do_not_require_or_change_the_future_pau
         );
         assert_eq!(upgrade_inspection_evidence(&fixture), before);
         assert!(preview(&fixture.path, &json!({})).is_err());
+        assert!(automatic_preview(&fixture.path).is_err());
     }
 }
 
@@ -2079,6 +2101,8 @@ fn upgrade_pending_discovery_preserves_canonical_target_token_and_prerequisites_
         assert!(pending.get("candidate_toml").is_none());
         assert!(pending.get("seal").is_none());
         assert!(validate_upgrade_proposal(&fixture.path, &json!({})).is_err());
+        assert!(automatic_upgrade(&fixture.path).is_err());
+        assert!(automatic_preview(&fixture.path).is_err());
         assert_eq!(upgrade_inspection_evidence(&fixture), before);
     }
     let (fixture, token, _) = Fixture::historical_pending(1);
@@ -2089,6 +2113,8 @@ fn upgrade_pending_discovery_preserves_canonical_target_token_and_prerequisites_
     assert_eq!(pending["token"], token);
     assert_eq!(pending["target_journal_format"], 3);
     assert_eq!(pending["further_migration_required"], true);
+    assert!(automatic_upgrade(&fixture.path).is_err());
+    assert!(automatic_preview(&fixture.path).is_err());
     assert_eq!(upgrade_inspection_evidence(&fixture), before);
 }
 
@@ -2181,6 +2207,7 @@ fn upgrade_inspection_rejects_conflicting_unsupported_and_corrupt_states_without
         drop(db);
         let before = upgrade_inspection_evidence(&fixture);
         assert!(inspect_upgrade(&fixture.path).is_err(), "{mutation}");
+        assert!(automatic_upgrade(&fixture.path).is_err(), "{mutation}");
         assert_eq!(upgrade_inspection_evidence(&fixture), before);
     }
     for mutation in ["version", "authority", "binding", "journal", "lane"] {
@@ -2202,6 +2229,7 @@ fn upgrade_inspection_rejects_conflicting_unsupported_and_corrupt_states_without
         }
         let before = upgrade_inspection_evidence(&fixture);
         assert!(inspect_upgrade(&fixture.path).is_err(), "{mutation}");
+        assert!(automatic_upgrade(&fixture.path).is_err(), "{mutation}");
         assert_eq!(upgrade_inspection_evidence(&fixture), before);
     }
     let fixture = Fixture::new(None);
@@ -2224,4 +2252,175 @@ fn upgrade_inspection_rejects_conflicting_unsupported_and_corrupt_states_without
         assert!(inspect_upgrade(&fixture.path).is_err());
         assert_eq!(upgrade_inspection_evidence(&fixture), before);
     }
+}
+
+#[test]
+fn automatic_conversion_uses_only_canonical_mapping_and_preserves_control_identity() {
+    for source in [2, 3, 4] {
+        let fixture = match source {
+            2 => Fixture::new(Some(2)),
+            3 => Fixture::format3(),
+            _ => current_upgrade_fixture(),
+        };
+        if source == 4 {
+            let marked = format!(
+                "schema_version=2\n{}",
+                String::from_utf8(bytes(&fixture.path).unwrap()).unwrap()
+            );
+            crate::admin::persist(&fixture.path, marked.as_bytes()).unwrap();
+        }
+        let before = inspect_upgrade(&fixture.path).unwrap();
+        let witness = marker(&fixture.config).unwrap();
+        let proposal = automatic_preview(&fixture.path).unwrap();
+        assert_eq!(proposal["risk"]["preservation_proven"], true);
+        assert_eq!(proposal["risk_change_required"], false);
+        assert_eq!(proposal["request"].as_object().unwrap().len(), 1);
+        assert_eq!(
+            proposal["request"]["candidate_toml"],
+            proposal["candidate_toml"]
+        );
+        if source == 2 {
+            // The real strict source cap is four, not the metadata-only baseline one.
+            let candidate =
+                validated(&fixture.path, proposal["candidate_toml"].as_str().unwrap()).unwrap();
+            for lane in LaneId::ALL {
+                assert_eq!(
+                    candidate
+                        .participation(lane)
+                        .max_unresolved_operations
+                        .finite(),
+                    Some(4)
+                );
+            }
+        }
+        apply(
+            &fixture.path,
+            &proposal["request"],
+            proposal["token"].as_str().unwrap(),
+            None,
+        )
+        .unwrap();
+        let after = inspect_upgrade(&fixture.path).unwrap();
+        assert_eq!(after.kind, UpgradeKind::Compatible);
+        assert_eq!(after.database_id, before.database_id);
+        assert_eq!(after.dispatch_sequence, before.dispatch_sequence);
+        assert_eq!(
+            after.generation,
+            before.generation.map(|g| g + i64::from(source == 2))
+        );
+        assert_eq!(after.paused, Some(true));
+        assert_eq!(marker(&fixture.config).unwrap(), witness);
+    }
+}
+
+#[test]
+fn automatic_decision_never_masks_unsafe_authority_or_infers_missing_proof() {
+    let fixture = Fixture::new(Some(1));
+    assert_eq!(
+        automatic_upgrade(&fixture.path).unwrap(),
+        AutomaticUpgrade::DecisionRequired("authority_adoption_required")
+    );
+    let fixture = Fixture::new(Some(2));
+    let mut legacy = legacy::Legacy::parse(&fixture.source).unwrap();
+    legacy.participation.mode = ParticipationMode::ParticipationFirst;
+    crate::admin::persist(&fixture.path, toml::to_string(&legacy).unwrap().as_bytes()).unwrap();
+    fs::remove_file(lock_path(&fixture.config, "binding").unwrap()).unwrap();
+    assert!(automatic_upgrade(&fixture.path).is_err());
+    for risk in [
+        json!({}),
+        json!({"risk_change_required":false}),
+        json!({"preservation_proven":true}),
+        json!({"preservation_proven":true,"risk_change_required":true}),
+    ] {
+        assert!(!preservation_proven(&risk));
+    }
+}
+
+#[test]
+fn update_pause_restoration_is_conditional_idempotent_and_never_provisions() {
+    let absent = Fixture::new(None);
+    let before = upgrade_inspection_evidence(&absent);
+    assert!(
+        crate::runtime::restore_update_pause(
+            &absent.config,
+            "0123456789abcdef0123456789abcdef",
+            0,
+            true,
+            false
+        )
+        .is_err()
+    );
+    assert_eq!(upgrade_inspection_evidence(&absent), before);
+
+    let fixture = current_upgrade_fixture();
+    let config = Config::load(&fixture.path).unwrap();
+    let inspected = inspect_upgrade(&fixture.path).unwrap();
+    let id = inspected.database_id.unwrap();
+    let generation = inspected.generation.unwrap();
+    let unchanged =
+        crate::runtime::restore_update_pause(&config, &id, generation, true, true).unwrap();
+    assert_eq!(
+        unchanged,
+        json!({"paused":true,"generation":generation,"applied":false,"already_applied":false})
+    );
+    assert!(
+        crate::runtime::restore_update_pause(
+            &config,
+            "fedcba9876543210fedcba9876543210",
+            generation,
+            true,
+            false
+        )
+        .is_err()
+    );
+    let result =
+        crate::runtime::restore_update_pause(&config, &id, generation, true, false).unwrap();
+    assert_eq!(
+        result,
+        json!({"paused":false,"generation":generation+1,"applied":true,"already_applied":false})
+    );
+    // Simulate loss of the committed acknowledgment, keeping the original expectation.
+    let replay =
+        crate::runtime::restore_update_pause(&config, &id, generation, true, false).unwrap();
+    assert_eq!(
+        replay,
+        json!({"paused":false,"generation":generation+1,"applied":false,"already_applied":true})
+    );
+    // A later same-valued operator control is still newer intent.
+    crate::runtime::resume(&config).unwrap();
+    assert!(crate::runtime::restore_update_pause(&config, &id, generation, true, false).is_err());
+    let after = inspect_upgrade(&fixture.path).unwrap();
+    assert_eq!(after.generation, Some(generation + 2));
+    assert_eq!(after.paused, Some(false));
+    // Even an exact post-state cannot authorize restoration after authority loss.
+    fs::remove_file(lock_path(&config, "binding").unwrap()).unwrap();
+    assert!(
+        crate::runtime::restore_update_pause(&config, &id, generation + 1, true, false).is_err()
+    );
+}
+
+#[test]
+fn runtime_policy_publishes_local_process_identity_without_external_probes() {
+    let fixture = current_upgrade_fixture();
+    let config = Config::load(&fixture.path).unwrap();
+    let (_account, store) = AccountLock::acquire(&config).unwrap();
+    store.runtime_state(&config, false).unwrap();
+    let policy: String = store
+        .db
+        .query_row(
+            "SELECT policy FROM runtime_policy WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let policy: Value = serde_json::from_str(&policy).unwrap();
+    assert_eq!(policy["process"]["pid"], std::process::id());
+    assert_eq!(
+        policy["process"]["invocation_id"],
+        json!(
+            std::env::var("INVOCATION_ID")
+                .ok()
+                .filter(|id| id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        )
+    );
 }

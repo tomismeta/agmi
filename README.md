@@ -9,7 +9,7 @@
 
 Rust infrastructure for MinePOA: answer challenges, judge assigned answers and attest through the mining API. Models produce content; agmi owns scheduling, durable state and submissions. Each instance keeps its own identity, credentials and history.
 
-**Unreleased source change:** this branch uses one current capability-owned configuration shape and journal format 4. Released v0.1.1 layouts and earlier per-lane configurations carrying `schema_version` require [explicit stopped migration](docs/OPERATIONS.md#atomic-capability-migration), not a normal update.
+**Unreleased source change:** this branch uses unversioned capability-owned configuration and journal format 4. Plain managed updates perform supported policy-preserving conversions; [policy, risk and authority decisions](docs/OPERATIONS.md#atomic-capability-migration) remain explicit.
 
 ```mermaid
 flowchart LR
@@ -208,17 +208,23 @@ Run one authoritative writer per account. Preserve the journal, account binding 
 
 ```sh
 agmi update --check     # Latest stable release; no changes
-agmi update             # Verified update, then read-only doctor
+agmi update             # Verify, convert if needed, restore prior operating intent
 agmi update --repair    # Also authorize eligible guarded repairs
 ```
 
-Updates preserve your configuration, credentials, model settings, core/user guidance
-and pause intent. They retain compatible rollback binaries and never rewind journal
-history. An untagged or newer build is not replaced merely because it shares a
-version number with an older published release. Update, repair and participation
-readiness are reported separately. [Update guarantees and limits](docs/OPERATIONS.md#stable-release-updates).
+Updates preserve identity, credentials, configuration meaning, model settings,
+guidance and history. Compatible updates leave configuration bytes, pause and
+generation unchanged. Required conversion can normalize formatting and invalidate
+stale grants, never reset accounting or replay uncertain work.
 
-Ordinary updates do not convert configuration or journal schemas. The [migration-only bootstrap](docs/OPERATIONS.md#atomic-capability-migration) stays stopped and never repairs, converts or resumes participation automatically.
+Prior runtime/timer activity, independent boot enablement and global pause intent
+are restored automatically. Interrupted work remains pinned: rerun `agmi update`.
+Policy/risk/adoption choices still require explicit approval; `--migrate` retains
+stopped, boot-disabled maintenance when conversion is needed.
+
+An untagged or newer build is not replaced merely because it shares a version
+number with an older published release. Installation, restoration, repair and remote
+readiness are separate outcomes. [Update guarantees and older-client bootstrap](docs/OPERATIONS.md#stable-release-updates).
 
 Use `agmi <command> --help` for examples and effects, or `agmi --json commands`
 for agent-facing discovery. `agmi completions bash`, `zsh` or `fish` prints a shell
