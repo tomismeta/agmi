@@ -156,10 +156,10 @@ async fn stale_job_minima_ingest_before_binding_cas_and_split_queued_headers_sta
         let current_key = Store::operation_read_key(&advanced).unwrap();
         stream.write_all(body.as_bytes()).await.unwrap();
         let result = read_result(&mut runtime, &mut flight).await;
-        let response = runtime.finish_read(&flight, result).unwrap().unwrap();
-        runtime
-            .recovery_response(&mut original, &old_key, &response)
-            .unwrap();
+        assert!(
+            runtime.finish_read(&flight, result).unwrap().is_none(),
+            "a stale binding may retain restrictions but not reach state bookkeeping"
+        );
         let current = runtime.store.operation(original.id).unwrap().unwrap();
         assert_eq!(current.state, "included_pending");
         assert_eq!(current.binding_revision, advanced.binding_revision);
@@ -281,7 +281,7 @@ async fn once_keeps_entry_recoveries_when_newer_bound_work_arrives() {
     let (_temp, mut runtime, _stop) = fixture_with(config);
     let first = seed_bound(&mut runtime, LaneId::Judge, "entry-first", "entry-first");
     let second = seed_bound(&mut runtime, LaneId::Judge, "entry-second", "entry-second");
-    runtime.once = Some(OncePlan::capture(&runtime).unwrap());
+    runtime.once = Some(OncePlan::capture(&mut runtime).unwrap());
     let later = seed_bound(&mut runtime, LaneId::Judge, "later", "later");
     runtime.plan().unwrap();
     let db = rusqlite::Connection::open(runtime.config.state_dir.join("state.sqlite3")).unwrap();
@@ -405,7 +405,7 @@ async fn discovery_retry_reload_and_restart_use_one_clock_without_losing_server_
     );
     assert!(!runtime.discovery_allowed(LaneId::Answer).unwrap());
     assert!(
-        !OncePlan::capture(&runtime)
+        !OncePlan::capture(&mut runtime)
             .unwrap()
             .lane(LaneId::Answer)
             .discovery
@@ -421,7 +421,7 @@ async fn discovery_retry_reload_and_restart_use_one_clock_without_losing_server_
     drop(runtime);
     let store = Store::open(&config).unwrap();
     let (_stop, stop) = watch::channel(false);
-    let runtime = HostAccess::new(path, config, protocol, store, stop, true).unwrap();
+    let mut runtime = HostAccess::new(path, config, protocol, store, stop, true).unwrap();
     runtime.store.reschedule_all_reads(&runtime.config).unwrap();
     assert_eq!(runtime.store.read_backoff(&key).unwrap(), shortened);
     assert_eq!(
@@ -451,7 +451,7 @@ async fn discovery_retry_reload_and_restart_use_one_clock_without_losing_server_
     assert!(runtime.store.next_at(LaneId::Answer).unwrap() > now());
     assert!(runtime.discovery_allowed(LaneId::Answer).unwrap());
     assert!(
-        OncePlan::capture(&runtime)
+        OncePlan::capture(&mut runtime)
             .unwrap()
             .lane(LaneId::Answer)
             .discovery

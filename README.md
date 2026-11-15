@@ -11,7 +11,7 @@ A single-binary Rust runtime for MinePOA: answer challenges, judge assigned answ
 
 ## Quickstart
 
-**Unreleased source:** these steps describe this checkout's capability-owned configuration and journal format 4. Published v0.1.0/v0.1.1 use an older format; follow their release instructions or the [upgrade guide](docs/OPERATIONS.md#atomic-capability-migration). Existing installations should upgrade, not repeat initialization.
+**Unreleased 0.2.0 candidate:** these steps describe this checkout's capability-owned configuration and journal format 4. Published v0.1.0/v0.1.1 use an older format; follow their release instructions or the [upgrade guide](docs/OPERATIONS.md#atomic-capability-migration). Existing installations should upgrade, not repeat initialization.
 
 ### 1. Install
 
@@ -79,11 +79,14 @@ For unattended Linux operation, use [user-systemd installation](docs/OPERATIONS.
 - `agmi doctor` — waits and intervention needs.
 - `agmi pause` — pause new participation.
 - `agmi lane show judge` — inspect one lane's control state.
-- `agmi update --check` / `agmi update` — check or apply a managed update.
+- `agmi epoch --work-epoch N` — local outcome evidence; `--close-epoch C --refresh` explicitly fetches public reports.
+- `agmi update --check` / `agmi update` — refresh release evidence or apply a managed update.
 
 Add `--json` for agent-readable responses or `--verbose` for full diagnostic evidence. Use `agmi <command> --help` or `agmi --json commands` for discovery; [lane controls](docs/OPERATIONS.md#lane-controls) can pause one capability independently.
 
 Managed updates preserve identity, configuration meaning, models, guidance, and history, restoring prior runtime/timer/boot/pause intent. Interrupted updates remain pinned: rerun `agmi update`. Policy, risk, and authority decisions still require approval. [Update guarantees and older-client bootstrap](docs/OPERATIONS.md#stable-release-updates).
+
+Health/status show cached release notices without networking. Managed daemons check in the background; `AGMI_UPDATE_CHECKS=0` disables those checks. No messages, automatic installs or notification channels. [Evidence and update checks](docs/OPERATIONS.md#passive-release-notices).
 
 Health is a local operational assessment, not proof of remote availability, settlement, or rewards. Pause cannot recall transmitted requests. Preserve the journal and uncertainty; never reset state or restore an older database to regain availability. [Reliability boundaries](docs/OPERATIONS.md#reliability-boundaries).
 

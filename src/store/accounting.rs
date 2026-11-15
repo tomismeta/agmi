@@ -45,6 +45,7 @@ fn accumulate(
     config: &Config,
     lane: LaneId,
     capture_blockers: bool,
+    retain_examples: bool,
 ) {
     let policy = config.participation(lane);
     let answer = &config.capabilities.answer.participation;
@@ -61,7 +62,7 @@ fn accumulate(
     if exempt {
         result.exempt += 1;
         result.own_exempt += 1;
-        if result.historical.len() < HISTORICAL_EXAMPLE_LIMIT {
+        if retain_examples && result.historical.len() < HISTORICAL_EXAMPLE_LIMIT {
             result.historical.push(HistoricalAnswer {
                 operation_id: row.id,
                 accepted_answer_id: row.witness.expect("exempt row has direct witness"),
@@ -83,7 +84,7 @@ fn accumulate(
     );
 }
 
-fn apply_floor(
+pub(super) fn apply_floor(
     db: &Connection,
     config: &Config,
     lane: LaneId,
@@ -118,7 +119,7 @@ pub(super) fn uncertainty_accounting(
         if Some(row.id) == excluding {
             return;
         }
-        accumulate(&mut result, row, config, kind, capture_blockers);
+        accumulate(&mut result, row, config, kind, capture_blockers, true);
         if Some(row.id) == retry_of {
             result.retry_grace_until = row.since.saturating_add(
                 i64::try_from(
@@ -191,6 +192,30 @@ pub(super) fn uncertainty_accounting_unbounded(
     Ok(result)
 }
 
+/// One lazy pass-local streaming accumulation. Explicit unbounded lanes use
+/// their indexed canonical fast path instead and never require this visit.
+pub(super) fn reconciliation_totals(
+    db: &Connection,
+    config: &Config,
+) -> Result<[UncertaintyAccounting; LaneId::COUNT]> {
+    let mut totals = std::array::from_fn(|_| UncertaintyAccounting::default());
+    visit_uncertain(db, |row| {
+        for (index, lane) in LaneId::ALL.into_iter().enumerate() {
+            let policy = config.participation(lane);
+            if policy.mode != ParticipationMode::ParticipationFirst
+                || policy.max_unresolved_operations != CountLimit::Unbounded
+            {
+                accumulate(&mut totals[index], row, config, lane, false, false);
+            }
+        }
+    })?;
+    for (index, lane) in LaneId::ALL.into_iter().enumerate() {
+        apply_floor(db, config, lane, &mut totals[index])?;
+        totals[index].history_evaluated = true;
+    }
+    Ok(totals)
+}
+
 #[derive(Clone)]
 pub(super) struct AdmissionProjection {
     pub(super) value: Value,
@@ -222,7 +247,7 @@ impl AccountingReadSnapshot {
                 witness_ranks.insert(row.id, witness_ranks.len() as u64 + 1);
             }
             for (&lane, result) in &mut lanes {
-                accumulate(result, row, config, lane, true);
+                accumulate(result, row, config, lane, true, true);
             }
             rows.insert(row.id, row);
         })?;
@@ -252,7 +277,7 @@ impl AccountingReadSnapshot {
             let mut result = UncertaintyAccounting::default();
             for row in self.rows.values() {
                 if Some(row.id) != excluding {
-                    accumulate(&mut result, *row, config, lane, true);
+                    accumulate(&mut result, *row, config, lane, true, true);
                 }
             }
             result.retry_not_before = base.retry_not_before;

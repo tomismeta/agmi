@@ -45,6 +45,23 @@ Guidance commands read/write private UTF-8 content, not model instructions in ar
 
 For interrupted identity creation, inspect `identity status`. A complete retained success can provide `identity resume --confirm`, which validates and publishes only local files without the original registration options or network profile. Omit `--confirm` to inspect the plan. Missing/incomplete capture remains uncertain; resume never requests proof work or another registration.
 
+## Epoch evidence
+
+```sh
+agmi --json epoch --work-epoch "$WORK_EPOCH"
+agmi --json epoch --close-epoch "$CLOSE_EPOCH" --refresh
+agmi --json epoch --work-epoch "$WORK_EPOCH" --close-epoch "$CLOSE_EPOCH" --refresh --raw
+```
+
+At least one selector is required; both are useful when older work settles at a later close. The default is local-only, with 50 rows; `--limit 1..100` and `next_before`/`--before` paginate selected operation history. Counts describe that page and its coverage, not an inferred complete account history. Passed, failed, expired, pending-as-of-close and unknown remain distinct; jury alignment is not proof a local grade transaction settled.
+
+`--refresh` requires a close epoch and explicitly reads up to three bounded public reports without credentials, guidance or models. Unsupported/custom authorities refuse rather than query another network. Failed refreshes preserve each source's original last-good time and coverage and exit nonzero even when some positive evidence was retained. A local view may succeed with unknown outcomes. Reports never resolve journal uncertainty or authorize replay.
+
+`--raw` additionally downloads a bounded close record to a private temporary file, verifies the publisher-index length/hash, then retains relevant facts. It can read up to 65 MiB beyond compact reports and take another 60 seconds. An exact account reward is a node-reported close amount, not independently verified payment or an allocation to answers/lanes. Explicit zero differs from a missing account entry. Aggregate expiry reports and absent rows cannot prove an individual answer failed or remains pending.
+
+`--private` exposes private bindings, submitted content and actual captured novelty context; the retained last-eight-answer context is not a complete mechanism taxonomy. Keep that output private. Disposable mode-0600 caches live under owned `state_dir/reports`; only explicit refresh creates or replaces them. No recurring report poll, strategy change or new inference is introduced.
+
+
 
 ## Modes and effects
 
@@ -71,6 +88,8 @@ Each lane's schedule defaults to 120-second polling, 180-second retry, a 900-sec
 The mining interval starts with a new operation's first durable dispatch intent, not preparation. A draft discarded during fresh challenge validation does not consume the interval; a possibly-sent request does, including an unknown outcome. This local cadence survives restart, while safe retries of that same operation do not restart it. `each_epoch = true` instead limits new mining attempts to one per observed epoch; neither mode bypasses server-imposed request minima.
 
 The latest completed mining operation remains visible in `status.work.mine` during the current epoch's scheduled wait. Health requires fresh matching epoch evidence; completion does not hide newer failed work or pending/uncertain work, or satisfy a new epoch or an already-due interval. For interval mining, `completion_valid_until` carries the deadline and health rechecks it at report time.
+
+New completed mining records retain validated `ok` and unsigned `attested`, including zero. Operation pages label old absent evidence `not_recorded`, not zero. Completion/counts are node observations, never payment proof; evidence retained before a bookkeeping crash does not settle the operation.
 
 Failures belong to identity, one lane's discovery, one assignment, or an operation's exact job/receipt binding revision. A slow or missing job does not impose local backoff on another job or lane. Rebinding retires the old read key; late completions cannot update the replacement binding's clocks or state. Genuine account/route/resource restrictions still constrain every applicable request.
 
@@ -214,6 +233,10 @@ The selected lane must be active with manual policy and resumed intent. Account 
 **Grace authorizes risk, not certainty.** A delayed old request can execute after a new one, causing duplicate effects or nonce conflicts. Lowering a cap can stop new dispatches but never clears existing work. A cap is not a lifetime-write budget. Fresh identity and eligibility remain mandatory; no timer guarantees participation during an upstream outage.
 
 Reconciliation is separately paced per lane with bounded read slots, fair service for recent/ordinary bound work and sparse service for repeatedly missing jobs. Fresh discovery remains independent. Repeated 404s can reduce polling urgency but never establish failure or permit a duplicate POST. A bound `408 job_expired` is different: it supplies positive nonprocessing evidence. Upstream finished-job retention is not a local retirement timer measured from submission. Identifierless uncertainty has no job to poll.
+
+Operation pages add sanitized `reconciliation` explanations: binding presence/age source, latest check versus usable evidence, missing streak, original floors and next eligible follow-up. Bearer IDs stay private. Identifierless work cannot be polled; a missing job stays unresolved without authoritative terminal evidence.
+
+Extra slow polling requires positively historical, nonblocking work and two consecutive complete 404s under the current binding/runtime authority. At 24 hours it adds a six-hour cadence; at seven days, one day, plus at most five minutes of jitter. Every original floor still applies. New bindings use committed binding time; legacy bindings wait from first observation, never operation creation. Cancellation, non-404 responses and authority changes reset the streak. Changed relevance or stale proof removes only this extra delay. Finite totals stream once per relevant scheduling pass; the unbounded path avoids cumulative history reconstruction.
 
 Capacity/scheduling changes need not discard valid unsent model output: reuse requires unchanged producer/input provenance, nonrevoked authority and fresh dispatch checks. Genuine model/guidance changes and insufficient historical provenance remain fences. The immutable producer record is not retagged with the new dispatch policy.
 
@@ -625,13 +648,15 @@ independent signatures or protection against a compromised publisher.
 
 `--check` and `--dry-run` never execute incoming code, activate, repair or convert.
 They report operational compatibility as `not_assessed`, not installability; this
-also applies with `--migrate`. A successful publication check may report no
-compatible update or unverifiable source ordering. Inspect availability/reason.
+also applies with `--migrate`. Standalone `--check` needs no configuration, journal
+or daemon, and writes only private passive release evidence. Failed/refused fresh
+checks exit nonzero. Inspect availability, reason and dated last-good evidence.
 Automatic activation requires verified host/build compatibility, protocol fencing
 and conservative version/commit ancestry evidence. Dirty, divergent or unproven
 source ordering is not resolved by downgrading. Different commits with the same
 package version are not the same build. The selected-release fence is rechecked
 under the installer lock. Explicit local sources remain operator-selected.
+
 
 Incoming published builds must advertise `update_protocol=1` in their verified
 build manifest: this guarantees support for the lock-held selected-release fence.
@@ -741,6 +766,16 @@ Retained binaries are rollback candidates only when journal compatibility matche
 
 The example uses control-group cleanup, restrictive umask, private temporary files and restart-on-failure. Account locks live under `.agmi-account-locks` in the operating-system user's canonical home, independently of the state directory and `HOME`/XDG overrides; a tighter sandbox must allow access there. The example is not a complete security sandbox for a compromised harness or local account.
 
+### Passive release notices
+
+Human/JSON `health`, `status` and `doctor` show `release_advisory` from the local cache without networking or changing their verdict. Availability (`current`, `available`, `unknown`) and freshness (`fresh`, `stale`, `missing`, `unavailable`) differ. Notices compare the selected managed release, not a stale invoking CLI or last-reported daemon. Running/selected mismatch calls for service inspection, not another installation. Unmanaged/custom builds use their installation owner; a notice is not permission or proof an update is installable.
+
+A normal managed daemon checks asynchronously with startup staggering and at least six hours between automatic attempts. `AGMI_UPDATE_CHECKS=0` disables them; invalid values also disable them. Set it in the foreground process or a user-service environment override. Effective background policy is captured separately from TOML. Disabling it does not hide applicable cached evidence or prohibit explicit checks.
+
+Checks share a private OS lease and `~/.cache/agmi/update.json` (`XDG_CACHE_HOME` when set), bounded to 128 KiB. Explicit checks have a 20-second total budget and five-second logical request budgets; source throttling floors also apply explicitly. Failed checks preserve dated good evidence, not fresh success. There is no sender, automatic install, delivery ledger or channel credential store; notices are not host-down monitoring.
+
+Normal shutdown cancels discovery and allows 500 ms for local finalization, preserving prior evidence and source floors. A hard kill or failed/stalled cache commit can instead leave `previous_attempt_incomplete`; further checks then refuse because a missing source floor has no provable expiry. Inspect storage before recovery—deleting the cache is not proof that a restriction expired. This exceptional advisory failure never blocks participation or changes account health.
+
 ### Help, completions and following logs
 
 `agmi --help` lists everyday workflows; command-specific help explains examples
@@ -821,6 +856,8 @@ Missing or incomplete captured policy, including any lane revision, yields `effe
 
 `operational.status` separates `clear` (no observed operational issue under the requested checks), `blocked` (admission fenced), `degraded` (other operational issues) and `unknown` (required policy or admission evidence unavailable). Top-level `healthy` and the exit status reflect these operational conditions. Retained unknown outcomes are warnings (`pending_outcome_uncertain`), not operational failures by themselves: healthy participation can report `attention_required = true` and `risk.attention_required = true`. Actual admission blocks still fail health, as do stale or missing observations, overdue work, exhausted finite capacity, strict-policy uncertainty gates and other operational faults. Background-resource failure never poisons a healthy sibling lane. This classification never changes journal outcomes, risk counts, admission limits or replay safeguards, and never guarantees every retained outcome will resolve or proves independent finality.
 
+`operational_now` labels current state; `historical_uncertainty` conservatively describes retained-history scope, and `operator_action_required` separates intervention from audit attention. `severity` retains unknown/blocked/degraded distinctions. Refresh failure is transient only while original complete proof for that same lane remains valid; no new grace timer or borrowed freshness hides authentication, admission or overdue-work faults.
+
 Health exposes `components.controller`, `.answer`, `.judge`, `.mine` and `api.identity`, `api.lanes.{answer,judge,mine}`, plus per-binding `api.resources`. Each health entry has `state`, bounded `reasons`, nullable observation/age and structured next actions; lane entries include effective mode. Resource entries identify owner, purpose, local operation and binding revision—not raw bearer identifiers.
 
 `api.resources_truncated` discloses bounded read presentation; missing coverage is unknown, not proof of automatic recovery. Health still evaluates every `pending_work` operation independently of this presentation cap. Effective timing thresholds are lane-owned under `thresholds.lanes`; no lane borrows another's desired timeout.
@@ -870,18 +907,13 @@ Awaiting inference admission uses the captured original pending deadline, not a 
 
 Controller heartbeat advances before each bounded HTTP wait, not just at the start of a potentially long cycle. Manual recovery does not refresh it or reload model guidance. Missing both captured and effective model timing produces `model_deadline_unavailable`, not a deadline guessed from desired configuration.
 
-`last_reported_build` and `heartbeat_recent` are persisted local evidence, **not proof of a currently running process**; CLI status/health report `process_identity = "unverified"`. A killed controller can leave a recent report. Use installer `status` for the independently observed systemd process/executable identity.
+`last_reported_build` and `heartbeat_recent` are persisted reports, not live identity. `process_identity` is `not_assessed`, `observed_match`, `mismatch`, `stopped` or `unavailable`, with bounded `process_observation` details. Managed Linux inspection compares invocation, PID start identity, authority/configuration and stable selected/running executable objects within a 500 ms observation budget. `observed_match` is not a new SHA256 check, immutable-file guarantee or cryptographic attestation. Unsupported/standalone/permission-limited inspection stays explicit without independently failing health; conclusive mismatch/stopped evidence matters. Explicit installer lifecycle checks retain full integrity verification.
 
-Disk headroom warns below the larger of 512 MiB or four times `--min-free-mib`; the configured minimum remains the unhealthy floor. Zero disables both disk checks. The two-minute timer keeps failures local in exit status/journal. Agents own any forwarding; agmi does not add a notification transport.
+Disk headroom warns below the larger of 512 MiB or four times `--min-free-mib`; the configured minimum remains the unhealthy floor. Zero disables both. The two-minute timer keeps findings local in exit status/journal. Default diagnostics use a bounded allowlist; `--verbose` retains detail. Presentation truncation never supplies admission or recovery proof.
 
-### Agent-owned forwarding
+### One local notification surface
 
-Agents can read agmi's structured health, events and warnings and optionally forward relevant findings through their existing native channels. agmi itself does not configure external destinations, manage notification credentials/state or send Telegram/webhook messages. Forwarding policy and delivery belong to the agent, not the participation runtime; the shared installer does not enable forwarding.
-Forward `work` progress and `intervention` for each action. Distinguish automatic
-waits, operator-required blockers and insufficient evidence; historical warnings
-alone are not a request for a restart or model abandonment.
-
-Local health remains read-only even when another agent consumes its output. Forward only sanitized evidence, never private payloads, model output, credentials or native diagnostics. Agent forwarding is not proof of human receipt or host-down coverage; use independent monitoring for an offline host. Neither health findings nor forwarding outcomes authorize replaying uncertain work, restarting native gateways or deleting participation state.
+Use health/status and the existing service journal. agmi sends no Telegram/webhook/native-channel messages and maintains no delivery state. Retire only positively identified AGMI-specific delivery jobs through supported per-job controls, retaining private recovery copies and any uncertain in-flight sends; never disable inference, chat, gateways or unrelated schedules. Retirement is separate operational work, not an installer side effect. Local signals do not establish human receipt or host-down coverage or authorize replay, restarts or deleting uncertainty.
 
 ## Verification and publication
 

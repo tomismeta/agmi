@@ -28,16 +28,35 @@ use lane_control::{
     validate_required_lane_state,
 };
 pub(crate) use model_attempt::{ModelProducerDraft, ModelProducerProvenance};
+mod epoch;
+mod inspection;
 pub mod migration;
 mod projection;
 mod reads;
 mod schema;
-pub(crate) use reads::{DiscoverySource, LaneObservation, LaneObservationStamp, ReadKey};
+pub(crate) use reads::{
+    DiscoverySource, LaneObservation, LaneObservationStamp, ReadKey, ReconciliationPass,
+};
 use schema::initialize_schema;
 #[cfg(test)]
 mod atomic_tests;
 #[cfg(test)]
 mod writer_continuity_tests;
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReconciliationProvenance {
+    binding_revision: i64,
+    bound_since: Option<i64>,
+    first_observed_at: i64,
+    consecutive_404: u8,
+    last_result_at: Option<i64>,
+    last_status: Option<u16>,
+    #[serde(default)]
+    observer_authority_epoch: Option<u64>,
+    #[serde(default)]
+    active_request_sequence: Option<u64>,
+}
 
 #[derive(Debug)]
 pub struct RoutingProfileError;
@@ -2358,6 +2377,15 @@ impl Store {
                 WHERE operation_id=?1 AND binding_revision!=?2 AND retired=0",
                 params![op.id, binding_revision],
             )?;
+            Self::capture_reconciliation_binding(
+                tx,
+                op.id,
+                binding_revision,
+                op.job_id.is_some()
+                    && op.txid.is_none()
+                    && matches!(target_state, "queued" | "unknown"),
+                now(),
+            )?;
         }
         if predecessor != target_state {
             if matches!(
@@ -3025,6 +3053,56 @@ impl Store {
         Ok(())
     }
 
+    fn capture_reconciliation_binding(
+        db: &Connection,
+        operation_id: i64,
+        binding_revision: i64,
+        bound_job: bool,
+        at: i64,
+    ) -> Result<()> {
+        let saved: Option<String> = db
+            .query_row(
+                "SELECT policy FROM operation_evidence WHERE operation_id=?1",
+                [operation_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        if !bound_job && saved.is_none() {
+            return Ok(());
+        }
+        let mut policy: Value = saved
+            .map(|text| serde_json::from_str(&text))
+            .transpose()?
+            .unwrap_or_else(|| json!({}));
+        let object = policy
+            .as_object_mut()
+            .context("captured operation policy is not an object")?;
+        if bound_job {
+            object.insert(
+                "reconciliation".into(),
+                serde_json::to_value(ReconciliationProvenance {
+                    binding_revision,
+                    bound_since: Some(at),
+                    first_observed_at: at,
+                    consecutive_404: 0,
+                    last_result_at: None,
+                    last_status: None,
+                    observer_authority_epoch: None,
+                    active_request_sequence: None,
+                })?,
+            );
+        } else if object.remove("reconciliation").is_none() {
+            return Ok(());
+        }
+        db.execute(
+            "INSERT INTO operation_evidence(operation_id,policy) VALUES (?1,?2)
+             ON CONFLICT(operation_id) DO UPDATE SET policy=excluded.policy",
+            params![operation_id, serde_json::to_string(&policy)?],
+        )?;
+        Ok(())
+    }
+
     fn captured_retry_floor(evidence: &Value, observed_at: Option<i64>) -> i64 {
         evidence["retry_after_seconds"]
             .as_u64()
@@ -3236,11 +3314,27 @@ impl Store {
         let tx = self.db.unchecked_transaction()?;
         let mut policy = json!({"capabilities":config.capabilities,
             "identity":config.identity,"runtime":config.runtime,"build":crate::runtime::build_info()});
+        let (authority_epoch, runtime_instance, account_generation): (
+            Option<u64>,
+            Option<String>,
+            i64,
+        ) = tx.query_row(
+            "SELECT (SELECT authority_epoch FROM runtime_authority WHERE singleton=1),
+                    (SELECT runtime_instance FROM runtime_state WHERE singleton=1),
+                    generation FROM control WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
         policy["process"] = json!({
             "pid":std::process::id(),
+            "start_ticks":crate::installer::current_start_ticks(),
+            "authority_epoch":authority_epoch,
+            "runtime_instance":runtime_instance,
+            "account_generation":account_generation,
             "invocation_id":std::env::var("INVOCATION_ID").ok().filter(|id|
                 id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit()))
         });
+        policy["update_background"] = crate::update::advisory::background_policy();
         let mut revisions = serde_json::Map::new();
         for lane in LaneId::ALL {
             revisions.insert(
@@ -4055,6 +4149,7 @@ impl Store {
 
     pub(crate) fn operations_list(
         &self,
+        config: &Config,
         kind: Option<LaneId>,
         state: Option<&str>,
         before: Option<i64>,
@@ -4117,7 +4212,7 @@ impl Store {
                 "retry_not_before":r.get::<_,Option<i64>>(15)?,
             }),r.get::<_,String>(3)?,r.get::<_,Option<String>>(16)?)),
         )?;
-        let mut operations = Vec::with_capacity(limit.min(100));
+        let mut operations = Vec::with_capacity(limit);
         let mut more = false;
         for row in rows {
             let (mut operation, request, model_attempt) = row?;
@@ -4143,6 +4238,21 @@ impl Store {
                     current,
                 );
             operations.push(operation);
+        }
+        let ids: Vec<_> = operations
+            .iter()
+            .filter_map(|row| row["operation_id"].as_i64())
+            .collect();
+        let inspections = self.operation_inspection(config, &ids, current)?;
+        if inspections.len() != operations.len() {
+            bail!("operation inspection snapshot is incomplete");
+        }
+        for (row, inspection) in operations.iter_mut().zip(inspections) {
+            if row["operation_id"].as_i64() != Some(inspection.operation_id) {
+                bail!("operation inspection snapshot mismatch");
+            }
+            row["mining"] = inspection.mining;
+            row["reconciliation"] = inspection.reconciliation;
         }
         let next_before = more
             .then(|| operations.last().and_then(|op| op["operation_id"].as_i64()))
@@ -4835,7 +4945,12 @@ mod tests {
                 assert!(store.attempted(kind, &op.key).unwrap());
                 assert!(store.preparation(kind).unwrap().is_none());
                 assert!(store.effect().unwrap().is_none());
-                assert!(store.reconciliation_batch(kind).unwrap().is_empty());
+                assert!(
+                    store
+                        .reconciliation_batch(&config, kind, &mut Default::default())
+                        .unwrap()
+                        .is_empty()
+                );
                 assert!(store.uncertain_answer(1).unwrap().is_none());
                 assert!(!store.routing_busy(&config).unwrap());
                 if kind == LaneId::Answer {
@@ -4846,7 +4961,7 @@ mod tests {
                 }
                 assert_eq!(
                     store
-                        .operations_list(None, Some("refused"), None, 10)
+                        .operations_list(&config, None, Some("refused"), None, 10)
                         .unwrap()["operations"][0]["state"],
                     "refused"
                 );
@@ -5995,7 +6110,7 @@ mod tests {
         );
         assert!(
             store
-                .reconciliation_batch(LaneId::Answer)
+                .reconciliation_batch(&config, LaneId::Answer, &mut Default::default())
                 .unwrap()
                 .iter()
                 .any(|pending| pending.id == op.id)
@@ -6858,7 +6973,8 @@ mod tests {
             min_free_mib: 0,
             ..Options::default()
         };
-        let health = health::check(&config, options).unwrap();
+        let health =
+            health::check(&config.state_dir.join("config.toml"), &config, options).unwrap();
         assert_eq!(health["components"]["mine"]["state"], "ok", "{health}");
         assert_eq!(store.db.total_changes(), changes);
 
@@ -7494,7 +7610,7 @@ mod tests {
         drop(store);
         let store = Store::read_only(&config).unwrap().unwrap();
         let inventory = store
-            .operations_list(Some(LaneId::Answer), None, None, 1)
+            .operations_list(&config, Some(LaneId::Answer), None, None, 1)
             .unwrap();
         assert_eq!(
             inventory["operations"][0]["wait"]["model_captured_at"],
@@ -7511,11 +7627,13 @@ mod tests {
 
     #[test]
     fn durable_wait_evidence_survives_event_pruning_without_mutable_timestamp_fallback() {
-        let (_temp, _config, mut store) = participation_fixture();
+        let (_temp, config, mut store) = participation_fixture();
         let mut op = begin(&mut store, LaneId::Answer, "1:wait", "generating");
         op.state = "generated".into();
         store.save(&op, "model_result_captured").unwrap();
-        let before = store.operations_list(None, None, None, 1).unwrap()["operations"][0]["wait"]["model_captured_at"].clone();
+        let before = store.operations_list(&config, None, None, None, 1).unwrap()["operations"][0]
+            ["wait"]["model_captured_at"]
+            .clone();
         store
             .db
             .execute_batch(
@@ -7528,7 +7646,7 @@ mod tests {
             .db
             .execute("UPDATE operations SET updated_at=1 WHERE id=?1", [op.id])
             .unwrap();
-        let inventory = store.operations_list(None, None, None, 1).unwrap();
+        let inventory = store.operations_list(&config, None, None, None, 1).unwrap();
         assert_eq!(
             inventory["operations"][0]["wait"]["model_captured_at"],
             before
@@ -7541,7 +7659,7 @@ mod tests {
                 [op.id],
             )
             .unwrap();
-        let missing = store.operations_list(None, None, None, 1).unwrap();
+        let missing = store.operations_list(&config, None, None, None, 1).unwrap();
         assert!(missing["operations"][0]["wait"]["model_captured_at"].is_null());
         assert!(missing["operations"][0]["wait"]["unsent_since_capture_seconds"].is_null());
     }
@@ -7586,7 +7704,7 @@ mod tests {
             .db
             .execute("UPDATE operations SET updated_at=1 WHERE id=?1", [op.id])
             .unwrap();
-        let inventory = store.operations_list(None, None, None, 1).unwrap();
+        let inventory = store.operations_list(&config, None, None, None, 1).unwrap();
         assert_eq!(inventory["operations"][0]["wait"]["queued_since"], queued);
         assert!(
             inventory["operations"][0]["wait"]["queued_age_seconds"]
@@ -7617,7 +7735,7 @@ mod tests {
             store.operation_poll_timing(op.id).unwrap(),
             (None, op.next_at)
         );
-        let pruned = store.operations_list(None, None, None, 1).unwrap();
+        let pruned = store.operations_list(&config, None, None, None, 1).unwrap();
         assert!(pruned["operations"][0]["wait"]["queued_since"].is_null());
         assert!(pruned["operations"][0]["wait"]["effect_since"].is_i64());
     }
@@ -7675,7 +7793,7 @@ mod tests {
                 Some((&answer, true)),
             )
             .unwrap();
-        let first = store.operations_list(None, None, None, 2).unwrap();
+        let first = store.operations_list(&config, None, None, None, 2).unwrap();
         assert_eq!(first["operations"].as_array().unwrap().len(), 2);
         assert_eq!(first["operations"][0]["operation_id"], retry.id);
         assert_eq!(first["operations"][0]["retry_of"], answer.id);
@@ -7683,7 +7801,7 @@ mod tests {
         drop(store);
         let store = Store::read_only(&config).unwrap().unwrap();
         let second = store
-            .operations_list(None, None, first["next_before"].as_i64(), 2)
+            .operations_list(&config, None, None, first["next_before"].as_i64(), 2)
             .unwrap();
         assert_eq!(second["operations"].as_array().unwrap().len(), 2);
         assert!(second["next_before"].is_null());
@@ -7701,15 +7819,23 @@ mod tests {
             assert!(!serialized.contains(secret));
         }
         let filtered = store
-            .operations_list(Some(LaneId::Answer), Some("unknown"), None, 100)
+            .operations_list(&config, Some(LaneId::Answer), Some("unknown"), None, 100)
             .unwrap();
         assert_eq!(filtered["operations"].as_array().unwrap().len(), 1);
         assert_eq!(filtered["operations"][0]["operation_id"], answer.id);
-        assert!(store.operations_list(None, None, None, 1001).is_err());
-        assert!(store.operations_list(None, None, Some(0), 1).is_err());
         assert!(
             store
-                .operations_list(None, Some("unknown' OR 1"), None, 1)
+                .operations_list(&config, None, None, None, 1001)
+                .is_err()
+        );
+        assert!(
+            store
+                .operations_list(&config, None, None, Some(0), 1)
+                .is_err()
+        );
+        assert!(
+            store
+                .operations_list(&config, None, Some("unknown' OR 1"), None, 1)
                 .is_err()
         );
     }
@@ -8400,13 +8526,17 @@ mod tests {
             min_free_mib: 0,
             ..Options::default()
         };
-        let health = health::check(&config, options).unwrap();
+        let health =
+            health::check(&config.state_dir.join("config.toml"), &config, options).unwrap();
         assert_eq!(health["healthy"], false);
         assert_eq!(health["hosted_identity"]["rejection"], "identity_mismatch");
         store
             .record_identity_outcome(HostedIdentityOutcome::Verified)
             .unwrap();
-        assert_eq!(health::check(&config, options).unwrap()["healthy"], true);
+        assert_eq!(
+            health::check(&config.state_dir.join("config.toml"), &config, options).unwrap()["healthy"],
+            true
+        );
         drop(store);
         let reader = Store::read_only(&config).unwrap().unwrap();
         assert_eq!(
@@ -8556,7 +8686,7 @@ mod tests {
         assert_eq!(confirmed["account_unresolved"], 0);
         assert!(
             store
-                .reconciliation_batch(LaneId::Answer)
+                .reconciliation_batch(&config, LaneId::Answer, &mut Default::default())
                 .unwrap()
                 .iter()
                 .any(|pending| pending.id == op.id)
@@ -8565,7 +8695,7 @@ mod tests {
         store.save(&op, "receipt_final").unwrap();
         assert!(
             store
-                .reconciliation_batch(LaneId::Answer)
+                .reconciliation_batch(&config, LaneId::Answer, &mut Default::default())
                 .unwrap()
                 .is_empty()
         );
@@ -8726,7 +8856,8 @@ mod tests {
                 json!({"first_observed_at":1,"answered":answered})
             );
             assert_eq!(status["hosted_identity_verified"], true);
-            let health = health::check(&config, options).unwrap();
+            let health =
+                health::check(&config.state_dir.join("config.toml"), &config, options).unwrap();
             assert_eq!(health["healthy"], answered);
             assert_eq!(
                 health["issues"],
@@ -8750,7 +8881,8 @@ mod tests {
         assert_eq!(status["epoch_evidence"]["answered"], false);
         assert_eq!(status["observation"]["epoch"], 55);
         assert_eq!(status["hosted_identity_verified"], true);
-        let report = health::check(&config, options).unwrap();
+        let report =
+            health::check(&config.state_dir.join("config.toml"), &config, options).unwrap();
         assert_eq!(report["healthy"], true, "{report}");
     }
 
@@ -8777,7 +8909,8 @@ mod tests {
             min_free_mib: 0,
             ..Options::default()
         };
-        let report = health::check(&config, options).unwrap();
+        let report =
+            health::check(&config.state_dir.join("config.toml"), &config, options).unwrap();
         assert_eq!(report["healthy"], true, "{report}");
         assert_eq!(store.events(1000).unwrap(), before);
         assert_eq!(store.db.total_changes(), changes);

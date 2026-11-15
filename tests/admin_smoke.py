@@ -116,7 +116,8 @@ def main():
             base = [binary, '--json', '--config', str(config)]
             environment = dict(os.environ, HOME=str(root / 'home'),
                                XDG_CONFIG_HOME=str(root / 'xdg-config'),
-                               XDG_DATA_HOME=str(root / 'xdg-data'))
+                               XDG_DATA_HOME=str(root / 'xdg-data'),
+                               XDG_CACHE_HOME=str(root / 'cache'), AGMI_UPDATE_CHECKS='0')
 
             def invoke(*words, stdin=b'', expected=None):
                 result = subprocess.run(base + list(words), input=stdin, capture_output=True,

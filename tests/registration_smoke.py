@@ -55,6 +55,7 @@ class Fixture:
         self.env = {**os.environ, 'HOME': str(self.root / 'home'),
                     'XDG_CONFIG_HOME': str(self.root / 'home/config'),
                     'XDG_DATA_HOME': str(self.root / 'home/data'),
+                    'XDG_CACHE_HOME': str(self.root / 'home/cache'), 'AGMI_UPDATE_CHECKS': '0',
                     'HTTP_PROXY': 'http://127.0.0.1:1', 'HTTPS_PROXY': 'http://127.0.0.1:1',
                     'ALL_PROXY': 'http://127.0.0.1:1', 'NO_PROXY': ''}
         fixture = self

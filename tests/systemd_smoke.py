@@ -935,6 +935,10 @@ def main():
     args = parser.parse_args()
     binary = args.binary.resolve(strict=True)
     home = isolation(existing=args.suite == 'after-reboot')
+    os.environ['AGMI_UPDATE_CHECKS'] = '0'
+    os.environ['XDG_CACHE_HOME'] = str(home / '.cache')
+    run(['systemctl', '--user', 'set-environment', 'AGMI_UPDATE_CHECKS=0',
+         f'XDG_CACHE_HOME={home / ".cache"}'])
     if args.suite in ('published010', 'published011'):
         published_upgrade(binary, args.old_binary.resolve(strict=True) if args.old_binary else None,
                           args.old_sha256, home)

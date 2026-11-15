@@ -18,6 +18,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+pub mod reports;
 mod transport;
 use std::sync::atomic::{AtomicU64, Ordering};
 pub use transport::{
@@ -253,6 +254,12 @@ pub enum ResponseSource {
     BoundJob,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MiningEvidence {
+    pub ok: bool,
+    pub attested: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DiagnosticEvidence {
     pub stage: ResponseSource,
@@ -264,6 +271,8 @@ pub struct DiagnosticEvidence {
     /// Diagnostic vocabulary only; it never grants retry or recovery authority.
     #[serde(default)]
     pub error_category: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mining: Option<MiningEvidence>,
 }
 
 /// Private, untrusted leads only. Deliberately no Debug: job IDs are bearer
@@ -1138,16 +1147,26 @@ fn response_error_category(kind: LaneId, response: &Response) -> Option<&'static
     }
 }
 
-/// Static bounded labels only: never copy arbitrary errors, text or identifiers.
+/// Bounded labels and validated facts only: never copy arbitrary text or identifiers.
 pub fn response_evidence(
     kind: LaneId,
     source: ResponseSource,
     response: Option<&Response>,
 ) -> DiagnosticEvidence {
-    let (reason, shape) = match response {
-        None => ("transport_unknown".to_owned(), "unavailable"),
+    let (reason, shape, mining) = match response {
+        None => ("transport_unknown".to_owned(), "unavailable", None),
         Some(response) => {
-            let reason = match classify_source(kind, response, source) {
+            let outcome = classify_source(kind, response, source);
+            let mining = if kind == LaneId::Mine && matches!(&outcome, Outcome::Completed) {
+                response
+                    .body
+                    .get("attested")
+                    .and_then(Value::as_u64)
+                    .map(|attested| MiningEvidence { ok: true, attested })
+            } else {
+                None
+            };
+            let reason = match outcome {
                 Outcome::Queued { .. } => "queued".into(),
                 Outcome::Included { .. } => "included".into(),
                 Outcome::Rejected { code } | Outcome::ProcessedRejected { code, .. } => code,
@@ -1163,6 +1182,7 @@ pub fn response_evidence(
                 } else {
                     "unavailable"
                 },
+                mining,
             )
         }
     };
@@ -1178,6 +1198,7 @@ pub fn response_evidence(
                 response_error_category(kind, value).or_else(|| failure_category(value))
             })
             .map(str::to_owned),
+        mining,
     }
 }
 

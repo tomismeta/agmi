@@ -8,6 +8,103 @@ use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::path::Path;
 
+/// Local metadata evidence only; lifecycle checksum verification remains separate.
+#[derive(serde::Serialize)]
+pub(crate) struct SelectedObservation {
+    ownership: &'static str,
+    state: &'static str,
+    reason: &'static str,
+    inspected_at: i64,
+    root: Option<std::path::PathBuf>,
+    release: Option<String>,
+    digest: Option<String>,
+    manifest: Option<String>,
+    image: Option<ImageObservation>,
+    evidence_scope: &'static str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+struct ImageObservation {
+    device: u64,
+    inode: u64,
+    size: u64,
+    mtime: i64,
+    mtime_nsec: i64,
+    ctime: i64,
+    ctime_nsec: i64,
+}
+
+#[derive(serde::Serialize)]
+pub(crate) struct ProcessObservation {
+    state: &'static str,
+    reason: &'static str,
+    inspected_at: i64,
+    pid: Option<u32>,
+    start_ticks: Option<u64>,
+    invocation_id: Option<String>,
+    image_relation: &'static str,
+    evidence_scope: &'static str,
+}
+
+pub(crate) fn observe_selected(config_path: &Path) -> SelectedObservation {
+    let mut observation = SelectedObservation {
+        ownership: "unknown",
+        state: "unavailable",
+        reason: "inspection_unavailable",
+        inspected_at: crate::store::now(),
+        root: None,
+        release: None,
+        digest: None,
+        manifest: None,
+        image: None,
+        evidence_scope: "owned_manifest_and_stable_file_metadata_not_rehashed",
+    };
+    #[cfg(unix)]
+    native::observe_selected_into(config_path, &mut observation);
+    #[cfg(not(unix))]
+    {
+        let _ = config_path;
+        observation.reason = "unsupported_platform";
+    }
+    observation
+}
+
+pub(crate) fn observe_process(config_path: &Path, status: &Value) -> ProcessObservation {
+    let observation = ProcessObservation {
+        state: "not_assessed",
+        reason: "unsupported_platform",
+        inspected_at: crate::store::now(),
+        pid: None,
+        start_ticks: None,
+        invocation_id: None,
+        image_relation: "unknown",
+        evidence_scope: "managed_invocation_and_stable_file_object_not_checksum_attestation",
+    };
+    #[cfg(target_os = "linux")]
+    let observation = {
+        let mut observation = observation;
+        native::observe_process_into(config_path, status, &mut observation);
+        observation
+    };
+    #[cfg(not(target_os = "linux"))]
+    let _ = (config_path, status);
+    observation
+}
+
+pub(crate) fn current_start_ticks() -> Option<u64> {
+    static START: std::sync::LazyLock<Option<u64>> = std::sync::LazyLock::new(|| {
+        #[cfg(target_os = "linux")]
+        {
+            native::self_start_ticks()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+    });
+    *START
+}
+
 pub(crate) fn pending_update_target(config_path: &Path) -> Result<Option<String>> {
     #[cfg(unix)]
     {
@@ -368,6 +465,439 @@ mod native {
             .open(path)?;
         ensure!(file.metadata()?.is_file(), "artifact is not a regular file");
         Ok(file)
+    }
+
+    fn image_metadata(m: &fs::Metadata) -> ImageObservation {
+        ImageObservation {
+            device: m.dev(),
+            inode: m.ino(),
+            size: m.len(),
+            mtime: m.mtime(),
+            mtime_nsec: m.mtime_nsec(),
+            ctime: m.ctime(),
+            ctime_nsec: m.ctime_nsec(),
+        }
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    fn bounded_bytes(path: &Path) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        regular(path)?.take(16_385).read_to_end(&mut bytes)?;
+        ensure!(bytes.len() <= 16_384, "observation input exceeds bound");
+        Ok(bytes)
+    }
+
+    pub(super) fn observe_selected_into(path: &Path, result: &mut SelectedObservation) {
+        let inspected = (|| -> Result<()> {
+            let home = crate::store::account_home()?;
+            if resolve_missing(path)? != resolve_missing(&home.join(".config/agmi/config.toml"))? {
+                result.ownership = "unmanaged";
+                result.state = "not_assessed";
+                result.reason = "noncanonical_config";
+                return Ok(());
+            }
+            let root = home.join(".local/share/agmi/releases");
+            let launcher = home.join(".local/bin/agmi");
+            if !exists(&root)?
+                && !exists(&launcher)?
+                && !exists(&home.join(".config/systemd/user/agmi.service"))?
+            {
+                result.ownership = "unmanaged";
+                result.state = "not_assessed";
+                result.reason = "no_managed_installation";
+                return Ok(());
+            }
+            let (release, manifest, image) = selected_metadata(&home, &root, &launcher)?;
+            result.digest = Some(release[2..].to_owned());
+            result.release = Some(release);
+            result.manifest = Some(manifest);
+            result.image = Some(image);
+            result.root = Some(root);
+            result.ownership = "managed";
+            result.state = "observed";
+            result.reason = "stable_selected_object";
+            Ok(())
+        })();
+        if inspected.is_err() {
+            result.reason = "managed_identity_unavailable";
+        }
+    }
+
+    fn selected_metadata(
+        home: &Path,
+        root: &Path,
+        launcher: &Path,
+    ) -> Result<(String, String, ImageObservation)> {
+        account_owned_ancestors(root, home)?;
+        ensure!(fs::symlink_metadata(root)?.is_dir(), "invalid release root");
+        let selected = fs::read_link(root.join("current"))?;
+        let id = selected.to_str().context("invalid selection")?;
+        ensure!(valid_id(id), "invalid selected release");
+        let release = root.join(id);
+        account_owned_ancestors(&release, home)?;
+        ensure!(
+            fs::symlink_metadata(&release)?.is_dir(),
+            "invalid release directory"
+        );
+        account_owned_ancestors(launcher.parent().context("missing launcher parent")?, home)?;
+        ensure!(
+            fs::read_link(launcher)? == root.join("current/agmi"),
+            "foreign launcher"
+        );
+        let binary = regular(&release.join("agmi"))?;
+        let manifest_file = regular(&release.join("MANIFEST"))?;
+        account_owned(&release.join("agmi"))?;
+        account_owned(&release.join("MANIFEST"))?;
+        let before = image_metadata(&binary.metadata()?);
+        let manifest_before = image_metadata(&manifest_file.metadata()?);
+        ensure!(
+            binary.metadata()?.permissions().mode() & 0o111 != 0,
+            "not executable"
+        );
+        let mut manifest = String::new();
+        (&manifest_file)
+            .take(16_385)
+            .read_to_string(&mut manifest)?;
+        ensure!(manifest.len() <= 16_384, "manifest too large");
+        ensure!(
+            metadata(&manifest, "release_id")? == id
+                && metadata(&manifest, "binary_sha256")? == &id[2..]
+                && metadata(&manifest, "build_format")? == "1"
+                && metadata(&manifest, "update_protocol")? == "1"
+                && hex(metadata(&manifest, "commit")?, 40)
+                && matches!(metadata(&manifest, "source_dirty")?, "clean" | "dirty")
+                && metadata(&manifest, "journal_schema")?.parse::<u32>()? > 0
+                && !metadata(&manifest, "target")?.is_empty()
+                && !metadata(&manifest, "package_version")?.is_empty(),
+            "invalid manifest identity"
+        );
+        ensure!(
+            before == image_metadata(&binary.metadata()?)
+                && before == image_metadata(&regular(&release.join("agmi"))?.metadata()?)
+                && manifest_before == image_metadata(&manifest_file.metadata()?)
+                && manifest_before
+                    == image_metadata(&regular(&release.join("MANIFEST"))?.metadata()?)
+                && fs::read_link(root.join("current"))? == selected
+                && fs::read_link(launcher)? == root.join("current/agmi"),
+            "selected identity changed"
+        );
+        Ok((id.to_owned(), manifest, before))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn process_start(bytes: &[u8]) -> Result<u64> {
+        let text = std::str::from_utf8(bytes)?;
+        let (_, fields) = text.rsplit_once(") ").context("invalid process stat")?;
+        fields
+            .split_whitespace()
+            .nth(19)
+            .context("missing process start")?
+            .parse()
+            .map_err(Into::into)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn self_start_ticks() -> Option<u64> {
+        process_start(&bounded_bytes(Path::new("/proc/self/stat")).ok()?).ok()
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    fn managed_argv(command: &[u8], binary: &Path, config: &Path) -> bool {
+        command.split(|byte| *byte == 0).eq([
+            binary.as_os_str().as_bytes(),
+            b"--config",
+            config.as_os_str().as_bytes(),
+            b"run",
+            b"",
+        ])
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    fn related_runtime_snapshot(tuple: &Value, status: &Value) -> bool {
+        let policy = &status["effective_runtime"]["policy"]["process"];
+        tuple["process"] == *policy
+            && tuple["generation"] == status["generation"]
+            && tuple["revision"] == status["effective_runtime"]["revision"]
+            && tuple["runtime_instance"] == status["effective_runtime"]["runtime_instance"]
+            && tuple["authority_epoch"] == status["effective_runtime"]["authority_epoch"]
+            && tuple["runtime_instance"]
+                .as_str()
+                .is_some_and(|v| !v.is_empty())
+            && tuple["authority_epoch"].as_u64().is_some()
+            && tuple["generation"].as_i64().is_some()
+            && policy["runtime_instance"] == tuple["runtime_instance"]
+            && policy["authority_epoch"] == tuple["authority_epoch"]
+            && policy["account_generation"] == tuple["generation"]
+    }
+
+    #[cfg(target_os = "linux")]
+    fn observation_properties(
+        deadline: std::time::Instant,
+        remaining: &mut usize,
+    ) -> Result<std::collections::BTreeMap<String, String>> {
+        use std::os::unix::process::CommandExt;
+        let mut child = Command::new("systemctl")
+            .args(["--user", "show", "agmi.service", "--no-pager",
+                "--property=MainPID,InvocationID,ActiveState,SubState,LoadState,FragmentPath,DropInPaths,User"])
+            .env("SYSTEMD_PAGER", "").stdin(Stdio::null())
+            .stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0).spawn()?;
+        let result = (|| -> Result<Vec<u8>> {
+            let mut stdout = child.stdout.take().context("missing stdout")?;
+            let mut stderr = child.stderr.take().context("missing stderr")?;
+            for fd in [stdout.as_raw_fd(), stderr.as_raw_fd()] {
+                ensure!(
+                    unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) } >= 0,
+                    "cannot bound manager output"
+                );
+            }
+            let mut output = Vec::new();
+            let mut eof = [false; 2];
+            let mut buffer = [0u8; 4096];
+            loop {
+                ensure!(std::time::Instant::now() < deadline, "observation deadline");
+                for (index, pipe) in [&mut stdout as &mut dyn Read, &mut stderr as &mut dyn Read]
+                    .into_iter()
+                    .enumerate()
+                {
+                    match pipe.read(&mut buffer) {
+                        Ok(0) => eof[index] = true,
+                        Ok(n) => {
+                            ensure!(n <= *remaining, "manager output limit");
+                            *remaining -= n;
+                            if index == 0 {
+                                output.extend_from_slice(&buffer[..n]);
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+                if let Some(status) = child.try_wait()? {
+                    ensure!(status.success(), "manager unavailable");
+                    if eof == [true, true] {
+                        return Ok(output);
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        })();
+        // Also terminate descendants retaining pipe handles. Always reap our child.
+        if result.is_err() {
+            unsafe {
+                libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+            }
+            let _ = child.kill();
+        }
+        let _ = child.wait();
+        let text = String::from_utf8(result?)?;
+        let mut properties = std::collections::BTreeMap::new();
+        for line in text.lines() {
+            let (key, value) = line.split_once('=').context("invalid manager properties")?;
+            ensure!(
+                properties
+                    .insert(key.to_owned(), value.to_owned())
+                    .is_none(),
+                "duplicate manager property"
+            );
+        }
+        for key in [
+            "MainPID",
+            "InvocationID",
+            "ActiveState",
+            "SubState",
+            "LoadState",
+            "FragmentPath",
+            "DropInPaths",
+            "User",
+        ] {
+            ensure!(properties.contains_key(key), "missing manager property");
+        }
+        Ok(properties)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn runtime_tuple(config: &crate::config::Config) -> Result<Value> {
+        use rusqlite::{Connection, OpenFlags};
+        let path = config.state_dir.join("state.sqlite3");
+        account_owned_ancestors(&config.state_dir, &crate::store::account_home()?)?;
+        let file = regular(&path)?;
+        account_owned(&path)?;
+        ensure!(
+            file.metadata()?.mode() & 0o077 == 0 && file.metadata()?.nlink() == 1,
+            "journal is not a private single-link file"
+        );
+        let before = image_metadata(&file.metadata()?);
+        let db = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
+        db.busy_timeout(Duration::ZERO)?;
+        let tuple = db.query_row(
+            "SELECT s.runtime_instance,s.effective_revision,s.controller_stopped,
+             a.authority_epoch,c.generation,json_extract(p.policy,'$.process')
+             FROM runtime_state s,runtime_authority a,control c,runtime_policy p
+             WHERE s.singleton=1 AND a.singleton=1 AND c.singleton=1 AND p.singleton=1
+             AND length(p.policy)<=1048576",
+            [],
+            |r| {
+                Ok((
+                    r.get::<_, Option<String>>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, bool>(2)?,
+                    r.get::<_, u64>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, String>(5)?,
+                ))
+            },
+        )?;
+        ensure!(
+            tuple.5.len() <= 16_384
+                && before.device == file.metadata()?.dev()
+                && before.inode == fs::symlink_metadata(&path)?.ino(),
+            "journal changed"
+        );
+        Ok(
+            json!({"runtime_instance":tuple.0,"revision":tuple.1,"stopped":tuple.2,
+            "authority_epoch":tuple.3,"generation":tuple.4,
+            "process":serde_json::from_str::<Value>(&tuple.5)?}),
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn observe_process_into(
+        path: &Path,
+        status: &Value,
+        result: &mut ProcessObservation,
+    ) {
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        let selected = super::observe_selected(path);
+        if selected.ownership == "unmanaged" {
+            result.reason = "unmanaged_installation";
+            return;
+        }
+        result.state = "unavailable";
+        result.reason = "inspection_unavailable";
+        let inspected = (|| -> Result<()> {
+            ensure!(selected.state == "observed", "selected unavailable");
+            let home = crate::store::account_home()?;
+            let root = selected.root.as_ref().context("missing root")?;
+            let mut remaining = 65_536;
+            let before = observation_properties(deadline, &mut remaining)?;
+            let unit = home.join(".config/systemd/user/agmi.service");
+            account_owned_ancestors(unit.parent().context("missing unit parent")?, &home)?;
+            account_owned(&unit)?;
+            regular(&unit)?;
+            ensure!(
+                before["LoadState"] == "loaded"
+                    && before["DropInPaths"].is_empty()
+                    && fs::canonicalize(&before["FragmentPath"])? == fs::canonicalize(&unit)?,
+                "foreign managed unit"
+            );
+            let pid: u32 = before["MainPID"].parse()?;
+            result.pid = Some(pid);
+            if pid == 0 {
+                let after = observation_properties(deadline, &mut remaining)?;
+                let final_selected = super::observe_selected(path);
+                ensure!(
+                    before == after
+                        && final_selected.state == "observed"
+                        && selected.release == final_selected.release
+                        && selected.image == final_selected.image
+                        && std::time::Instant::now() < deadline,
+                    "snapshot rollover"
+                );
+                if matches!(before["ActiveState"].as_str(), "inactive" | "failed") {
+                    result.state = "stopped";
+                    result.reason = "managed_service_inactive";
+                }
+                return Ok(());
+            }
+            let config = crate::config::Config::load_metadata(path)?;
+            let tuple = runtime_tuple(&config)?;
+            ensure!(
+                before["ActiveState"] == "active" && hex(&before["InvocationID"], 32),
+                "transitional invocation"
+            );
+            result.invocation_id = Some(before["InvocationID"].clone());
+            let process = PathBuf::from(format!("/proc/{pid}"));
+            ensure!(
+                fs::metadata(&process)?.uid() == unsafe { libc::geteuid() },
+                "foreign process owner"
+            );
+            let start = process_start(&bounded_bytes(&process.join("stat"))?)?;
+            result.start_ticks = Some(start);
+            let executable = File::open(process.join("exe"))?;
+            let image = image_metadata(&executable.metadata()?);
+            ensure!(executable.metadata()?.is_file(), "nonregular executable");
+            let command = bounded_bytes(&process.join("cmdline"))?;
+            let binary = root
+                .join(selected.release.as_ref().context("missing release")?)
+                .join("agmi");
+            let canonical_config = home.join(".config/agmi/config.toml");
+            let argv_matches = managed_argv(&command, &binary, &canonical_config);
+            let policy = &status["effective_runtime"]["policy"]["process"];
+            ensure!(
+                related_runtime_snapshot(&tuple, status),
+                "unrelated runtime snapshot"
+            );
+            let identity_matches = policy["pid"].as_u64() == Some(u64::from(pid))
+                && policy["invocation_id"] == before["InvocationID"]
+                && policy["start_ticks"]
+                    .as_u64()
+                    .is_none_or(|ticks| ticks == start)
+                && tuple["stopped"] == false;
+            let after = observation_properties(deadline, &mut remaining)?;
+            ensure!(
+                before == after
+                    && start == process_start(&bounded_bytes(&process.join("stat"))?)?
+                    && image == image_metadata(&executable.metadata()?)
+                    && image == image_metadata(&File::open(process.join("exe"))?.metadata()?)
+                    && command == bounded_bytes(&process.join("cmdline"))?
+                    && fs::metadata(&process)?.uid() == unsafe { libc::geteuid() }
+                    && tuple == runtime_tuple(&config)?,
+                "snapshot rollover"
+            );
+            let final_selected = super::observe_selected(path);
+            ensure!(
+                selected.release == final_selected.release
+                    && selected.image == final_selected.image
+                    && final_selected.state == "observed"
+                    && std::time::Instant::now() < deadline,
+                "selected rollover or deadline"
+            );
+            let same_image = selected.image.as_ref() == Some(&image);
+            result.image_relation = if same_image {
+                "same_object"
+            } else {
+                "different_object"
+            };
+            result.state = if same_image && argv_matches && identity_matches {
+                "observed_match"
+            } else {
+                "mismatch"
+            };
+            result.reason = if !same_image {
+                "running_selected_object_differs"
+            } else if !argv_matches {
+                "managed_arguments_differ"
+            } else if !identity_matches {
+                "recorded_invocation_differs"
+            } else {
+                "stable_managed_invocation"
+            };
+            Ok(())
+        })();
+        if inspected.is_err() {
+            result.state = "unavailable";
+            result.reason = if std::time::Instant::now() >= deadline {
+                "observation_budget_exceeded"
+            } else {
+                "identity_or_snapshot_unavailable"
+            };
+            result.image_relation = "unknown";
+        }
     }
     fn digest(file: File) -> Result<String> {
         digest_cancellable(file, true)
@@ -3734,6 +4264,121 @@ mod native {
         use super::*;
 
         static TEST_SERIAL: Mutex<()> = Mutex::new(());
+
+        #[test]
+        fn observed_selection_is_metadata_not_checksum_attestation() -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700))?;
+            let root = temp.path().join("releases");
+            fs::create_dir(&root)?;
+            let id = format!("r-{}", "a".repeat(64));
+            let release = root.join(&id);
+            fs::create_dir(&release)?;
+            let binary = release.join("agmi");
+            fs::write(&binary, b"not the claimed checksum")?;
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o700))?;
+            let manifest = format!(
+                "build_format=1\npackage_version=0.2.0\ncommit={}\nsource_dirty=clean\ntarget=test\njournal_schema=4\nupdate_protocol=1\nrelease_id={id}\nbinary_sha256={}\n",
+                "b".repeat(40),
+                "a".repeat(64)
+            );
+            fs::write(release.join("MANIFEST"), &manifest)?;
+            symlink(&id, root.join("current"))?;
+            let launcher = temp.path().join("agmi");
+            symlink(root.join("current/agmi"), &launcher)?;
+            let (_, label, first) = selected_metadata(temp.path(), &root, &launcher)?;
+            assert_eq!(label, manifest);
+            // Same pathname and bytes on another inode are a different object.
+            fs::rename(&binary, release.join("old"))?;
+            fs::copy(release.join("old"), &binary)?;
+            let (_, _, replacement) = selected_metadata(temp.path(), &root, &launcher)?;
+            assert_ne!(first, replacement);
+            // A path escape or contradictory identity never becomes standalone/match.
+            fs::remove_file(root.join("current"))?;
+            symlink("../outside", root.join("current"))?;
+            assert!(selected_metadata(temp.path(), &root, &launcher).is_err());
+            fs::remove_file(root.join("current"))?;
+            symlink(&id, root.join("current"))?;
+            fs::write(release.join("MANIFEST"), manifest.replace(&id, "r-invalid"))?;
+            assert!(selected_metadata(temp.path(), &root, &launcher).is_err());
+            Ok(())
+        }
+
+        #[test]
+        fn observed_arguments_are_exact_and_proc_inputs_are_bounded() -> Result<()> {
+            let binary = Path::new("/release/agmi");
+            let config = Path::new("/account/config.toml");
+            assert!(managed_argv(
+                b"/release/agmi\0--config\0/account/config.toml\0run\0",
+                binary,
+                config
+            ));
+            for argv in [
+                b"/release/agmi\0--config\0/other/config.toml\0run\0".as_slice(),
+                b"/release/agmi\0--config\0/account/config.toml\0run\0--once\0",
+                b"/release/agmi\0--config\0/account/config.toml\0run",
+            ] {
+                assert!(!managed_argv(argv, binary, config));
+            }
+            let file = tempfile::NamedTempFile::new()?;
+            fs::write(file.path(), vec![0; 16_385])?;
+            assert!(bounded_bytes(file.path()).is_err());
+            Ok(())
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn observed_start_ticks_handle_parentheses_and_pid_reuse() -> Result<()> {
+            let stat = |start| {
+                format!(
+                    "42 (name ) with spaces) S {} {start} 0",
+                    vec!["0"; 18].join(" ")
+                )
+            };
+            assert_eq!(process_start(stat(123).as_bytes())?, 123);
+            assert_ne!(
+                process_start(stat(123).as_bytes())?,
+                process_start(stat(124).as_bytes())?
+            );
+            assert!(process_start(b"42 (truncated) S").is_err());
+            assert!(super::super::current_start_ticks().is_some());
+            Ok(())
+        }
+
+        #[test]
+        fn process_snapshot_rollover_and_legacy_absence_are_not_matches() {
+            let tuple = json!({"runtime_instance":"instance-a","authority_epoch":3,
+                "generation":4,"revision":"revision",
+                "process":{"runtime_instance":"instance-a","authority_epoch":3,
+                    "account_generation":4,"pid":42}});
+            let status = json!({"generation":4,"effective_runtime":{
+                "revision":"revision","runtime_instance":"instance-a","authority_epoch":3,
+                "policy":{"process":tuple["process"]}}});
+            assert!(related_runtime_snapshot(&tuple, &status));
+            for (field, changed) in [
+                ("runtime_instance", json!("instance-b")),
+                ("authority_epoch", json!(4)),
+                ("generation", json!(5)),
+                ("revision", json!("revision-b")),
+            ] {
+                let mut rollover = tuple.clone();
+                rollover[field] = changed;
+                assert!(!related_runtime_snapshot(&rollover, &status), "{field}");
+            }
+            let mut legacy = status.clone();
+            legacy["effective_runtime"]["policy"]["process"] = json!({"pid":42});
+            assert!(!related_runtime_snapshot(&tuple, &legacy));
+            assert!(!related_runtime_snapshot(&json!({}), &json!({})));
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        #[test]
+        fn unsupported_process_observation_never_claims_a_match() {
+            let observed = super::super::observe_process(Path::new("/unread"), &json!({}));
+            assert_eq!(observed.state, "not_assessed");
+            assert_eq!(observed.reason, "unsupported_platform");
+            assert_eq!(super::super::current_start_ticks(), None);
+        }
 
         // Fixture writers belong to a dedicated process: unrelated libtest spawns
         // must not inherit writable descriptors for executables being staged.

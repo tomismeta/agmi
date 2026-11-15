@@ -1290,7 +1290,7 @@ fn once_model_admission_intersects_entry_counts_uncertainty_and_retry_deadlines(
         .answer
         .preparation
         .max_attempts_per_work = 2.into();
-    runtime.once = Some(OncePlan::capture(&runtime).unwrap());
+    runtime.once = Some(OncePlan::capture(&mut runtime).unwrap());
     runtime
         .config
         .capabilities

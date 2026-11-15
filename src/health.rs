@@ -4,6 +4,7 @@
 use crate::{capability::LaneId, config::Config, runtime, store::now};
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
+use std::path::Path;
 
 mod api;
 mod intervention;
@@ -126,6 +127,10 @@ pub fn enrich_status(status: &mut Value, options: Options, at: i64) {
         "thresholds",
         "expect_participation",
         "assessment_scope",
+        "operational_now",
+        "historical_uncertainty",
+        "operator_action_required",
+        "severity",
     ] {
         status[field] = report[field].take();
     }
@@ -194,15 +199,17 @@ pub(crate) fn qualify_doctor(report: &mut Value, repairs: &Value) {
     if !repairs["failure"].is_null() {
         intervention::qualify_repair_failure(report);
     }
+    operational_summary(report);
 }
 
 /// This command opens existing state read-only, never recovers it, and performs
 /// neither network nor model calls. Errors are deliberately replaced at this boundary.
-pub fn check(config: &Config, options: Options) -> Result<Value> {
-    let status = match runtime::status_evidence(config) {
+pub fn check(config_path: &Path, config: &Config, options: Options) -> Result<Value> {
+    let at = now();
+    let status = match local_status(config_path, config, at) {
         Ok(status) => status,
         Err(_) => {
-            return Ok(json!({
+            let mut report = json!({
                 "components":unknown_components(),
                 "work":unknown_work("local_evidence_unavailable"),
                 "intervention":unknown_intervention("local_evidence_unavailable"),
@@ -211,11 +218,15 @@ pub fn check(config: &Config, options: Options) -> Result<Value> {
                 "operational":{"status":"unknown","issues":["local_evidence_unavailable"]},
                 "risk":unknown_risk(),
                 "assessment_scope":{"evidence":"local_only","state_filesystem":"not_assessed"},
-                "evidence":"local_only","mutations":false
-            }));
+                "evidence":"local_only","mutations":false,"process_identity":"not_assessed",
+                "process_observation":{"state":"not_assessed","reason":"local_evidence_unavailable",
+                    "evidence_scope":"managed_invocation_and_stable_file_object_not_checksum_attestation"}
+            });
+            operational_summary(&mut report);
+            return Ok(report);
         }
     };
-    let mut result = evaluate(config, options, &status, now());
+    let mut result = evaluate(config, options, &status, at);
     if options.min_free_mib != 0 {
         let available = available_mib(&config.state_dir).ok();
         let issue = match available {
@@ -247,7 +258,47 @@ pub fn check(config: &Config, options: Options) -> Result<Value> {
                 .as_array()
                 .is_some_and(|warnings| !warnings.is_empty())
     );
+    operational_summary(&mut result);
+    qualify_refresh(&mut result, &status, options, at);
     Ok(result)
+}
+
+/// Journal facts plus bounded local observations and a read-only release cache.
+/// This path must not initialize installer state, read credentials or probe HTTP.
+pub fn local_status(config_path: &Path, config: &Config, at: i64) -> Result<Value> {
+    let mut status = runtime::status_evidence(config)?;
+    let process = serde_json::to_value(crate::installer::observe_process(config_path, &status))?;
+    let selected = serde_json::to_value(crate::installer::observe_selected(config_path))?;
+    status["process_identity"] = process["state"].clone();
+    status["release_advisory"] =
+        crate::update::advisory::diagnostic_view(config_path, &selected, &process, at);
+    let effective = &status["effective_runtime"];
+    let recorded = &effective["policy"]["process"];
+    let background = &effective["policy"]["update_background"];
+    let current = status["controller_stopped"] == false
+        && !matches!(process["state"].as_str(), Some("stopped" | "mismatch"))
+        && effective["runtime_instance"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+        && effective["authority_epoch"].as_u64().is_some()
+        && recorded["runtime_instance"] == effective["runtime_instance"]
+        && recorded["authority_epoch"] == effective["authority_epoch"]
+        && recorded["account_generation"] == status["generation"]
+        && controller_floor(&status).is_some_and(|floor| {
+            fresh(
+                effective["observed_at"].as_i64(),
+                at,
+                floor.max(Options::default().stale_seconds),
+            )
+        });
+    status["release_advisory"]["background"] = if current && background["enabled"].is_boolean() {
+        json!({"enabled":background["enabled"],"reason":background["reason"]})
+    } else {
+        json!({"enabled":null,"reason":"current_runtime_policy_unavailable"})
+    };
+    status["process_observation"] = process;
+    status["selected_image"] = selected;
+    Ok(status)
 }
 
 #[cfg(unix)]
@@ -466,6 +517,12 @@ fn evaluate_evidence(options: Options, status: &Value, at: i64) -> Value {
     if status["controller_stopped"] == true {
         issues.push("controller_stopped");
     }
+    if status["process_identity"] == "stopped" && !issues.contains(&"controller_stopped") {
+        issues.push("controller_stopped");
+    }
+    if status["process_identity"] == "mismatch" {
+        issues.push("process_identity_mismatch");
+    }
     match heartbeat_age {
         None => issues.push("controller_unobserved"),
         Some(seconds) if floor.is_some() && seconds > stale => issues.push("controller_stale"),
@@ -663,7 +720,14 @@ fn evaluate_evidence(options: Options, status: &Value, at: i64) -> Value {
     result["legacy_observation"] = status["legacy_observation"].clone();
     result["observations"] = status["observations"].clone();
     result["last_reported_build"] = status["last_reported_build"].clone();
-    result["process_identity"] = json!("unverified");
+    result["process_identity"] = json!(
+        status["process_identity"]
+            .as_str()
+            .unwrap_or("not_assessed")
+    );
+    result["process_observation"] = status["process_observation"].clone();
+    result["selected_image"] = status["selected_image"].clone();
+    result["release_advisory"] = status["release_advisory"].clone();
     result["evidence"] = json!("local_only");
     result["notifications"] = json!("local_exit_status_and_journal");
     result["assessment_scope"] = json!({"evidence":"local_only","state_filesystem":"not_assessed"});
@@ -701,7 +765,821 @@ fn evaluate_evidence(options: Options, status: &Value, at: i64) -> Value {
     finalize_readiness(&mut result);
     intervention::qualify_operational(&mut result, status);
     sync_work_components(&mut result);
+    operational_summary(&mut result);
+    qualify_refresh(&mut result, status, options, at);
     result
+}
+
+fn operational_summary(report: &mut Value) {
+    report["operational_now"] = report["operational"]["status"].clone();
+    let historical = report["risk"]["historical_eligible_answers"].as_u64();
+    let unresolved = report["risk"]["unresolved_effects"].as_u64();
+    report["historical_uncertainty"] = json!({
+        "status":if historical.is_some_and(|count| count > 0) {"retained"}
+            else if unresolved == Some(0) && report["risk"]["unresolved_model_attempts"] == 0 {
+                "none"
+            } else {"not_assessed"},
+        "historical_eligible_answers":historical,
+        "other_unresolved_scope":"not_assessed"
+    });
+    report["operator_action_required"] = json!(matches!(
+        report["intervention"]["status"].as_str(),
+        Some("operator_required" | "undetermined")
+    ));
+    if report["healthy"] != true || report["operator_action_required"] == true {
+        for lane in LANES {
+            if matches!(
+                report["work"][lane]["refresh"]["state"].as_str(),
+                Some("transient" | "refreshing")
+            ) {
+                report["work"][lane]["refresh"]["state"] = json!("blocked");
+                report["work"][lane]["refresh"]["reason"] =
+                    json!("required_evidence_or_action_outstanding");
+            }
+        }
+    }
+    report["severity"] = json!(match report["operational"]["status"].as_str() {
+        Some("clear")
+            if report["attention_required"] == true
+                || report["operator_action_required"] == true =>
+            "warning",
+        Some("clear") => "clear",
+        Some("blocked") => "blocked",
+        Some("degraded") => "degraded",
+        _ => "unknown",
+    });
+}
+
+/// Presentation only: the original completion and readiness predicates decide
+/// safety, and every deadline comes from the same lane's original evidence.
+fn qualify_refresh(report: &mut Value, status: &Value, options: Options, at: i64) {
+    for lane in LANES {
+        let stale = cycle_floor(status, lane).map(|floor| options.stale_seconds.max(floor));
+        let observed = if lane == "judge" {
+            status["work"][lane]["assessment"]["observed_at"].as_i64()
+        } else {
+            observation(status, lane)["observed_at"].as_i64()
+        };
+        let mut original_deadline = None::<i64>;
+        let mut retain_deadline = |value: i64| {
+            original_deadline =
+                Some(original_deadline.map_or(value, |previous| previous.min(value)));
+        };
+        if let Some((observed, stale)) = observed.zip(stale) {
+            retain_deadline(
+                observed
+                    .saturating_add(i64::try_from(stale).unwrap_or(i64::MAX))
+                    .saturating_add(1),
+            );
+            if lane != "judge"
+                && let Some(maximum) =
+                    lane_policy(status, lane)["schedule"]["observation_max_age_seconds"].as_u64()
+            {
+                retain_deadline(
+                    observed.saturating_add(i64::try_from(maximum).unwrap_or(i64::MAX)),
+                );
+            }
+        }
+        for assessment in [
+            &status["work"][lane]["assessment"],
+            &status["lane_participation"][lane]["assessment"],
+        ] {
+            if assessment["observed_at"].as_i64() == observed
+                && let Some(deadline) = assessment["valid_until"].as_i64()
+            {
+                retain_deadline(deadline);
+            }
+        }
+        if lane == "mine"
+            && lane_policy(status, lane)["schedule"]["each_epoch"] != true
+            && let Some(deadline) = status["work"][lane]["completion_valid_until"].as_i64()
+        {
+            retain_deadline(deadline);
+        }
+        let row = api::discovery(status, lane);
+        let failed = row.is_some_and(intervention::read_failed);
+        let in_flight =
+            row.is_some_and(|row| row["in_flight"] == true || row["state"] == "in_flight");
+        let safe = report["healthy"] == true
+            && lane_mode(status, lane) == Some("active")
+            && report["components"][lane]["state"] == "ok"
+            && report["work"][lane]["intervention"]["status"] == "none_required"
+            && stale.is_some_and(|stale| work_complete(status, lane, at, stale));
+        let (state, reason) = if (failed || in_flight) && safe {
+            if in_flight {
+                ("refreshing", "completed_work_discovery_in_flight")
+            } else {
+                ("transient", "completed_work_discovery_failed")
+            }
+        } else if failed || in_flight {
+            ("blocked", "required_evidence_or_action_outstanding")
+        } else if row.is_none() {
+            ("unknown", "discovery_evidence_unavailable")
+        } else {
+            ("idle", "no_refresh_outstanding")
+        };
+        report["work"][lane]["refresh"] = json!({
+            "state":state,"reason":reason,"observed_at":observed,
+            "valid_until":original_deadline,
+            "evidence":"same_lane_original_completion_not_retry_authority"
+        });
+    }
+}
+
+/// Explicit public presentation allowlist. Classification always precedes this
+/// projection; omitted witnesses must never be used to infer safe admission.
+pub fn compact_diagnostics(data: &mut Value) {
+    operational_summary(data);
+    fn within_budget(value: &Value) -> bool {
+        struct ByteCount(usize);
+        impl std::io::Write for ByteCount {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0 = self.0.saturating_add(bytes.len());
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut count = ByteCount(0);
+        serde_json::to_writer(&mut count, value).is_ok() && count.0 <= 15 * 1024
+    }
+    fn fields(value: &Value, names: &[&str], truncated: &mut bool) -> Value {
+        let mut out = serde_json::Map::new();
+        for &name in names {
+            let Some(value) = value.get(name) else {
+                continue;
+            };
+            let projected = match value {
+                Value::String(text) if text.len() > 160 => {
+                    *truncated = true;
+                    let mut end = 160;
+                    while !text.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    json!(format!("{}…", &text[..end]))
+                }
+                Value::Array(rows) => {
+                    if rows.len() > 8 {
+                        *truncated = true;
+                    }
+                    Value::Array(
+                        rows.iter()
+                            .take(8)
+                            .filter_map(|row| {
+                                if row.is_object() || row.is_array() {
+                                    *truncated = true;
+                                    None
+                                } else if row.as_str().is_some_and(|text| text.len() > 160) {
+                                    *truncated = true;
+                                    Some(json!("presentation_value_truncated"))
+                                } else {
+                                    Some(row.clone())
+                                }
+                            })
+                            .collect(),
+                    )
+                }
+                Value::Object(_) => continue,
+                _ => value.clone(),
+            };
+            out.insert(name.to_owned(), projected);
+        }
+        Value::Object(out)
+    }
+    fn admission(value: &Value, truncated: &mut bool) -> Value {
+        let mut out = fields(value, ADMISSION, truncated);
+        if let Some(blocker) = value.get("pre_intent_blocker") {
+            out["pre_intent_blocker"] = if blocker.is_null() {
+                Value::Null
+            } else {
+                fields(blocker, &["reason", "not_before"], truncated)
+            };
+        }
+        out
+    }
+    fn actions(value: &Value, truncated: &mut bool) -> Value {
+        let Some(rows) = value.as_array() else {
+            return json!([]);
+        };
+        if rows.len() > 4 {
+            *truncated = true;
+        }
+        json!(
+            rows.iter()
+                .take(4)
+                .map(|row| fields(
+                    row,
+                    &["kind", "authorization_required", "message", "argv",],
+                    truncated
+                ))
+                .collect::<Vec<_>>()
+        )
+    }
+    let source = &*data;
+    let mut truncated = false;
+    let mut out = fields(
+        source,
+        &[
+            "healthy",
+            "checked_at",
+            "issues",
+            "warnings",
+            "attention_required",
+            "initialized",
+            "paused",
+            "controller_stopped",
+            "hosted_identity_verified",
+            "heartbeat_age_seconds",
+            "observation_age_seconds",
+            "heartbeat_recent",
+            "observing",
+            "preparing",
+            "pending_age_seconds",
+            "epoch_observed_age_seconds",
+            "admission_blocked",
+            "unresolved_model_attempts",
+            "oldest_unresolved_operation",
+            "oldest_unresolved_since",
+            "oldest_unresolved_age_seconds",
+            "affected_capabilities",
+            "progress_age_seconds",
+            "last_safety_observation_at",
+            "process_identity",
+            "evidence",
+            "notifications",
+            "mutations",
+            "expect_participation",
+            "state_free_mib",
+            "operational_now",
+            "operator_action_required",
+            "severity",
+            "repair_requested",
+            "repair_outcome",
+            "next_before",
+            "reads_truncated",
+        ],
+        &mut truncated,
+    );
+    const FINDING: &[&str] = &[
+        "status",
+        "state",
+        "reason",
+        "reasons",
+        "observed_at",
+        "age_seconds",
+        "progress",
+        "next_action",
+        "next_at",
+        "unattended",
+        "evidence_fresh",
+        "observation_fresh",
+        "requires_fresh_eligibility",
+        "ready",
+        "mode",
+        "process_identity",
+        "last_http_status",
+        "last_http_status_observed_at",
+        "last_success_at",
+        "last_failure_at",
+        "failure_category",
+        "retry_at",
+        "evidence",
+        "valid_until",
+        "count",
+        "bound_count",
+        "unbound_count",
+        "required_for_participation",
+        "completeness",
+        "locally_judgeable",
+        "observed_opportunities",
+    ];
+    const ADMISSION: &[&str] = &[
+        "allowed",
+        "reason",
+        "scope",
+        "own_count",
+        "own_limit",
+        "own_remaining",
+        "account_unresolved",
+        "required_release",
+        "not_before",
+        "retained_uncertainty_nonblocking",
+        "historical_eligible_count",
+        "capacity_exempt_count",
+        "unresolved_count",
+    ];
+    for name in [
+        "operational",
+        "risk",
+        "historical_uncertainty",
+        "assessment_scope",
+        "current_epoch",
+        "last_reported_build",
+        "hosted_identity",
+        "writer_authority",
+        "desired_capabilities",
+        "migration",
+        "legacy_observation",
+        "effects",
+    ] {
+        if source.get(name).is_some() {
+            out[name] = fields(
+                &source[name],
+                &[
+                    "status",
+                    "issues",
+                    "evidence",
+                    "evidence_fresh",
+                    "attention_required",
+                    "unresolved_effects",
+                    "historical_eligible_answers",
+                    "capacity_exempt_answers",
+                    "unresolved_model_attempts",
+                    "background_remote_work",
+                    "retained_uncertainty_nonblocking_lanes",
+                    "other_unresolved_scope",
+                    "state_filesystem",
+                    "epoch",
+                    "answered",
+                    "source",
+                    "version",
+                    "commit",
+                    "target",
+                    "dirty",
+                    "build_profile",
+                    "build_timestamp",
+                    "observed_at",
+                    "last_verified_at",
+                    "rejection",
+                    "legacy_failure",
+                    "answer",
+                    "judge",
+                    "mine",
+                    "pending",
+                    "required",
+                    "format",
+                    "reason",
+                    "direct_network_requests",
+                    "direct_model_calls",
+                    "unknown_submissions_replayed",
+                    "model_attempts_abandoned",
+                    "configuration_changed",
+                    "pause_state_changed",
+                    "identity_verified",
+                    "read_deadlines_reset",
+                    "restored_runtime_may_participate",
+                ],
+                &mut truncated,
+            );
+        }
+    }
+    for name in [
+        "pending_work",
+        "captured_work",
+        "reads",
+        "request_restrictions",
+    ] {
+        if let Some(value) = source.get(name) {
+            out[format!("{name}_count")] = json!(value.as_array().map(Vec::len));
+        }
+    }
+    out["process_observation"] = fields(
+        &source["process_observation"],
+        &[
+            "state",
+            "reason",
+            "inspected_at",
+            "pid",
+            "start_ticks",
+            "image_relation",
+            "evidence_scope",
+        ],
+        &mut truncated,
+    );
+    out["selected_image"] = fields(
+        &source["selected_image"],
+        &[
+            "ownership",
+            "state",
+            "reason",
+            "inspected_at",
+            "release",
+            "digest",
+        ],
+        &mut truncated,
+    );
+    out["release_advisory"] = fields(
+        &source["release_advisory"],
+        &[
+            "availability",
+            "freshness",
+            "checked_at",
+            "latest_version",
+            "reason",
+            "owner",
+            "selected_running_relation",
+            "installability",
+            "next_action",
+        ],
+        &mut truncated,
+    );
+    for name in ["background", "last_good", "next_action"] {
+        if source["release_advisory"][name].is_object() {
+            out["release_advisory"][name] = fields(
+                &source["release_advisory"][name],
+                &[
+                    "enabled",
+                    "reason",
+                    "availability",
+                    "checked_at",
+                    "latest_version",
+                    "kind",
+                    "instruction",
+                    "argv",
+                    "authorization_required",
+                ],
+                &mut truncated,
+            );
+        }
+    }
+    out["thresholds"] = fields(
+        &source["thresholds"],
+        &[
+            "stale_seconds",
+            "answer_grace_seconds",
+            "cycle_floor_seconds",
+            "timing_source",
+            "min_free_mib",
+            "warn_free_mib",
+        ],
+        &mut truncated,
+    );
+    out["intervention"] = fields(&source["intervention"], FINDING, &mut truncated);
+    for name in ["controller", "lanes"] {
+        out["intervention"][name] = fields(
+            &source["intervention"][name],
+            &[
+                "ready",
+                "reason",
+                "observed_at",
+                "evidence_fresh",
+                "process_identity",
+                "answer",
+                "judge",
+                "mine",
+            ],
+            &mut truncated,
+        );
+    }
+    out["participation"] = fields(
+        &source["participation"],
+        &[
+            "unresolved_count",
+            "risk_admissions",
+            "allowed",
+            "reason",
+            "scope",
+        ],
+        &mut truncated,
+    );
+    out["observations"] = if source["observations"].is_null() {
+        Value::Null
+    } else {
+        json!({})
+    };
+    for lane in LANES {
+        if let Some(observed) = source["observations"].get(lane) {
+            out["observations"][lane] = if observed.is_null() {
+                Value::Null
+            } else {
+                fields(
+                    observed,
+                    &["observed_at", "first_observed_at", "epoch", "answered"],
+                    &mut truncated,
+                )
+            };
+        }
+        out["work"][lane] = fields(
+            &source["work"][lane],
+            &[
+                "phase",
+                "reason",
+                "next_action",
+                "next_at",
+                "progress",
+                "operation_epoch",
+                "completion_valid_until",
+                "binding_revision",
+            ],
+            &mut truncated,
+        );
+        for name in [
+            "intervention",
+            "operational",
+            "refresh",
+            "background_recovery",
+            "assessment",
+        ] {
+            out["work"][lane][name] = fields(&source["work"][lane][name], FINDING, &mut truncated);
+        }
+        out["work"][lane]["model"] = fields(
+            &source["work"][lane]["model"],
+            &[
+                "operation_id",
+                "failure_category",
+                "current_route",
+                "budget_used",
+                "unresolved_attempts",
+                "attempts",
+                "max_attempts",
+                "execution",
+                "state",
+                "pending_execution_deadline",
+            ],
+            &mut truncated,
+        );
+        out["work"][lane]["retry"] = fields(
+            &source["work"][lane]["retry"],
+            &[
+                "policy_eligible",
+                "requires_fresh_eligibility",
+                "reason",
+                "next_at",
+                "eligible",
+            ],
+            &mut truncated,
+        );
+        out["work"][lane]["next_actions"] =
+            actions(&source["work"][lane]["next_actions"], &mut truncated);
+        out["work"][lane]["background_recovery"]["next_actions"] = actions(
+            &source["work"][lane]["background_recovery"]["next_actions"],
+            &mut truncated,
+        );
+        out["work"][lane]["admission"] =
+            admission(&source["work"][lane]["admission"], &mut truncated);
+        out["participation"]["lanes"][lane] =
+            admission(&source["participation"]["lanes"][lane], &mut truncated);
+        out["thresholds"]["lanes"][lane] = fields(
+            &source["thresholds"]["lanes"][lane],
+            &[
+                "stale_seconds",
+                "work_seconds",
+                "model_seconds",
+                "read_http_seconds",
+                "write_http_seconds",
+                "model_attempt_limit",
+                "max_uncertain_replacements_per_work",
+                "timing_source",
+            ],
+            &mut truncated,
+        );
+        out["lane_participation"][lane] = fields(
+            &source["lane_participation"][lane],
+            &["freshness", "state", "reason", "epoch"],
+            &mut truncated,
+        );
+        out["lane_controls"][lane] = fields(
+            &source["lane_controls"][lane],
+            &["paused", "reason"],
+            &mut truncated,
+        );
+        out["lane_controls"][lane]["authoritative_closure"] = fields(
+            &source["lane_controls"][lane]["authoritative_closure"],
+            FINDING,
+            &mut truncated,
+        );
+        out["components"][lane] = fields(&source["components"][lane], FINDING, &mut truncated);
+        out["components"][lane]["admission"] = out["work"][lane]["admission"].clone();
+        let policy = source
+            .get("effective_capabilities")
+            .unwrap_or(&source["effective_runtime"]["policy"]["capabilities"]);
+        out["effective_capabilities"][lane] = fields(&policy[lane], &["mode"], &mut truncated);
+        for section in ["timeouts", "schedule", "preparation", "participation"] {
+            out["effective_capabilities"][lane][section] = fields(
+                &policy[lane][section],
+                &[
+                    "read_http_seconds",
+                    "http_seconds",
+                    "model_seconds",
+                    "poll_seconds",
+                    "retry_seconds",
+                    "backoff_max_seconds",
+                    "jitter_seconds",
+                    "observation_max_age_seconds",
+                    "each_epoch",
+                    "max_attempts_per_work",
+                    "max_uncertain_replacements_per_work",
+                    "while_blocked",
+                    "retry_uncertain",
+                    "mode",
+                    "max_unresolved_operations",
+                    "uncertainty_grace_seconds",
+                    "retry_uncertain_answers",
+                    "uncertain_answer_retry_seconds",
+                    "max_answer_attempts_per_epoch",
+                    "max_historical_unknown_answers",
+                    "historical_unknown_answer_capacity",
+                    "interval_seconds",
+                    "discovery_retry_seconds",
+                    "discovery_backoff_max_seconds",
+                ],
+                &mut truncated,
+            );
+        }
+    }
+    if source.get("effective_runtime").is_some() {
+        out["effective_runtime"] = fields(
+            &source["effective_runtime"],
+            &[
+                "revision",
+                "reload_blocked",
+                "observed_at",
+                "authority_epoch",
+            ],
+            &mut truncated,
+        );
+    }
+    out["components"]["controller"] =
+        fields(&source["components"]["controller"], FINDING, &mut truncated);
+    out["components"]["api"]["identity"] = fields(
+        &source["components"]["api"]["identity"],
+        FINDING,
+        &mut truncated,
+    );
+    for lane in LANES {
+        out["components"]["api"]["lanes"][lane] = fields(
+            &source["components"]["api"]["lanes"][lane],
+            FINDING,
+            &mut truncated,
+        );
+    }
+    let resources = source["components"]["api"]["resources"].as_array();
+    out["components"]["api"]["resources"] = json!([]);
+    out["components"]["api"]["resources_count"] = json!(resources.map(Vec::len));
+    out["components"]["api"]["resources_truncated"] =
+        source["components"]["api"]["resources_truncated"].clone();
+    let mut background = json!({"count":0,"degraded":0,"unknown":0});
+    for row in resources.into_iter().flatten() {
+        if row["dependency"] == "background_remote_work" {
+            background["count"] = json!(background["count"].as_u64().unwrap_or(0) + 1);
+            if let Some(state @ ("degraded" | "unknown")) = row["health"]["state"].as_str() {
+                background[state] = json!(background[state].as_u64().unwrap_or(0) + 1);
+            }
+        }
+    }
+    out["components"]["api"]["background_resources"] = background;
+    if source["repairs"].is_object() {
+        out["repairs"] = fields(&source["repairs"], &["failure"], &mut truncated);
+        out["repairs"]["counts"] = fields(
+            &source["repairs"]["counts"],
+            &["eligible", "ineligible", "applied", "skipped"],
+            &mut truncated,
+        );
+        for name in ["eligible", "ineligible", "applied", "skipped"] {
+            if let Some(rows) = source["repairs"][name].as_array() {
+                truncated |= rows.len() > 4;
+                out["repairs"][name] = Value::Array(
+                    rows.iter()
+                        .take(4)
+                        .map(|row| {
+                            fields(
+                                row,
+                                &[
+                                    "operation_id",
+                                    "kind",
+                                    "classification",
+                                    "eligible",
+                                    "reason",
+                                    "applied",
+                                ],
+                                &mut truncated,
+                            )
+                        })
+                        .collect(),
+                );
+            }
+        }
+        out["repairs"]["restoration"] = fields(
+            &source["repairs"]["restoration"],
+            &["manager_action", "runtime", "verified"],
+            &mut truncated,
+        );
+    }
+    if let Some(rows) = source["diagnostics"].as_array() {
+        if rows.len() > 4 {
+            truncated = true;
+        }
+        out["diagnostics"] = json!(
+            rows.iter()
+                .take(4)
+                .map(|row| {
+                    let mut diagnostic = fields(
+                        row,
+                        &["code", "severity", "message", "scope"],
+                        &mut truncated,
+                    );
+                    diagnostic["next_actions"] = actions(&row["next_actions"], &mut truncated);
+                    diagnostic
+                })
+                .collect::<Vec<_>>()
+        );
+    }
+    // Reserve room for the cli.v1 envelope. If optional presentation grows, keep
+    // classification, counts and issue lists rather than copying larger witnesses.
+    let mut omitted = Vec::new();
+    let mut fits = within_budget(&out);
+    for name in [
+        "effective_runtime",
+        "effective_capabilities",
+        "lane_controls",
+        "lane_participation",
+        "observations",
+        "thresholds",
+        "selected_image",
+        "last_reported_build",
+        "hosted_identity",
+        "writer_authority",
+    ] {
+        if fits {
+            break;
+        }
+        if out[name].is_object() {
+            out[name] = json!({});
+            omitted.push(name);
+            truncated = true;
+            fits = within_budget(&out);
+        }
+    }
+    if !fits {
+        for lane in LANES {
+            for name in ["assessment", "retry", "admission", "background_recovery"] {
+                out["work"][lane][name] = json!({});
+            }
+            out["components"][lane] = fields(
+                &out["components"][lane],
+                &["state", "reasons", "mode", "observed_at", "age_seconds"],
+                &mut truncated,
+            );
+        }
+        out["components"]["api"] = json!({
+            "resources":[],"resources_count":resources.map(Vec::len),
+            "resources_truncated":source["components"]["api"]["resources_truncated"],
+            "details_omitted":true,
+        });
+        omitted.push("work_detail_and_api");
+        truncated = true;
+        fits = within_budget(&out);
+    }
+    if !fits {
+        // Worst-case strings/lists still cannot turn routine output into an
+        // unbounded log. Keep the canonical top-level decisions and their types.
+        for (name, value) in out.as_object_mut().expect("compact object") {
+            if value.is_object()
+                && !matches!(
+                    name.as_str(),
+                    "operational" | "risk" | "historical_uncertainty" | "intervention"
+                )
+            {
+                *value = json!({});
+            }
+        }
+        omitted.push("extended_details");
+        truncated = true;
+        fits = within_budget(&out);
+    }
+    if !fits {
+        fn bound(value: &mut Value) {
+            match value {
+                Value::String(text) if text.len() > 64 => {
+                    let mut end = 64;
+                    while !text.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    text.truncate(end);
+                }
+                Value::Array(rows) => {
+                    rows.truncate(2);
+                    for row in rows {
+                        bound(row);
+                    }
+                }
+                Value::Object(object) => {
+                    for child in object.values_mut() {
+                        bound(child);
+                    }
+                }
+                _ => {}
+            }
+        }
+        bound(&mut out);
+        omitted.push("long_strings_and_lists");
+        truncated = true;
+    }
+    out["presentation"] = json!({"truncated":truncated,"omitted_sections":omitted,
+        "scope":"allowlisted_summary_not_admission_evidence",
+        "resource_details_omitted":resources.is_some_and(|rows| !rows.is_empty())});
+    *data = out;
 }
 
 fn sync_work_components(report: &mut Value) {
@@ -954,6 +1832,7 @@ fn issue_state(result: &Value, code: &str) -> &'static str {
         | "identity_mismatch"
         | "api_routing_mismatch"
         | "controller_stopped"
+        | "process_identity_mismatch"
         | "participation_paused"
         | "reload_blocked"
         | "state_disk_space_low"
@@ -1127,7 +2006,12 @@ fn components(status: &Value, health: &Value, at: i64, stale: u64, options: Opti
             "api_routing_mismatch",
         ),
         (
-            status["controller_stopped"] == true,
+            status["process_identity"] == "mismatch",
+            "blocked",
+            "process_identity_mismatch",
+        ),
+        (
+            status["controller_stopped"] == true || status["process_identity"] == "stopped",
             "blocked",
             "controller_stopped",
         ),
@@ -1410,11 +2294,14 @@ fn components(status: &Value, health: &Value, at: i64, stale: u64, options: Opti
                     // Current completion or timely work supersedes older discovery
                     // failures; unrelated recorded history is not a dependency.
                     if !read_only
-                        && (complete || (!bound_read && finding.1 == "work_in_progress"))
-                        && dependency["last_failure_at"]
-                            .as_i64()
-                            .zip(finding.2)
-                            .is_none_or(|(failure, observed)| failure <= observed)
+                        && ((!bound_read
+                            && complete
+                            && !matches!(dependency["status"].as_u64(), Some(401 | 403)))
+                            || ((complete || (!bound_read && finding.1 == "work_in_progress"))
+                                && dependency["last_failure_at"]
+                                    .as_i64()
+                                    .zip(finding.2)
+                                    .is_none_or(|(failure, observed)| failure <= observed)))
                     {
                         continue;
                     }
@@ -2754,5 +3641,165 @@ mod tests {
                 "start_controller"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+
+    #[test]
+    fn completed_same_lane_refresh_keeps_only_original_evidence_window() {
+        for (index, lane) in LANES.into_iter().enumerate() {
+            let (config, options, mut status) = super::tests::fixture();
+            status["reads"][index]["last_failure_at"] = json!(10001);
+            status["reads"][index]["failures"] = json!(1);
+            status["reads"][index]["failure_category"] = json!("transport");
+            status["reads"][index]["status"] = json!(503);
+            status["lane_participation"][lane]["assessment"] =
+                json!({"observed_at":10000,"valid_until":10002});
+            if lane == "judge" {
+                status["work"][lane]["assessment"]["valid_until"] = json!(10002);
+            }
+            let transient = evaluate(&config, options, &status, 10001);
+            assert_eq!(transient["healthy"], true, "{lane}: {transient}");
+            assert_eq!(transient["work"][lane]["refresh"]["state"], "transient");
+            assert_eq!(transient["work"][lane]["refresh"]["observed_at"], 10000);
+            assert_eq!(transient["work"][lane]["refresh"]["valid_until"], 10002);
+            // The raw failure is never relabelled as a successful API read.
+            assert_eq!(
+                transient["components"]["api"]["lanes"][lane]["state"],
+                "degraded"
+            );
+            status["reads"][index]["in_flight"] = json!(true);
+            let refreshing = evaluate(&config, options, &status, 10001);
+            assert_eq!(refreshing["work"][lane]["refresh"]["state"], "refreshing");
+            assert_eq!(refreshing["work"][lane]["refresh"]["valid_until"], 10002);
+            let expired = evaluate(&config, options, &status, 10002);
+            assert_eq!(expired["healthy"], false, "{lane}: {expired}");
+            assert_eq!(expired["work"][lane]["refresh"]["state"], "blocked");
+        }
+    }
+
+    #[test]
+    fn refreshing_never_borrows_completion_or_hides_auth_stamp_and_deadline_failures() {
+        for edge in ["missing", "auth", "stamp", "deadline", "admission"] {
+            let (config, options, mut status) = super::tests::fixture();
+            status["reads"][0]["last_failure_at"] = json!(10001);
+            status["reads"][0]["failures"] = json!(1);
+            status["reads"][0]["failure_category"] = json!("transport");
+            status["reads"][0]["status"] = json!(503);
+            match edge {
+                "missing" => status["observations"]["answer"]["answered"] = json!(false),
+                "auth" => status["reads"][0]["status"] = json!(401),
+                "stamp" => status["lane_participation"]["answer"]["freshness"] = json!("stale"),
+                "deadline" => {
+                    status["pending_work"] = json!([{
+                        "kind":"answer","state":"dispatching","created_at":1,"updated_at":1,
+                        "http_deadline":1
+                    }])
+                }
+                "admission" => {
+                    status["work"]["answer"]["admission"] = json!({
+                        "allowed":false,"reason":"account_uncertainty","scope":"account"
+                    });
+                    status["participation"]["lanes"]["answer"] =
+                        status["work"]["answer"]["admission"].clone();
+                }
+                _ => unreachable!(),
+            }
+            let report = evaluate(&config, options, &status, 10001);
+            assert_eq!(report["healthy"], false, "{edge}: {report}");
+            assert_eq!(
+                report["work"]["answer"]["refresh"]["state"], "blocked",
+                "{edge}"
+            );
+            assert_ne!(report["components"]["answer"]["state"], "ok", "{edge}");
+        }
+    }
+
+    #[test]
+    fn observation_negatives_are_conclusive_but_release_notice_is_passive() {
+        for state in [
+            "not_assessed",
+            "unavailable",
+            "observed_match",
+            "mismatch",
+            "stopped",
+        ] {
+            let (config, options, mut status) = super::tests::fixture();
+            status["process_identity"] = json!(state);
+            let baseline = evaluate(&config, options, &status, 10000);
+            status["release_advisory"] =
+                json!({"availability":"available","latest_version":"9.9.9"});
+            let advisory = evaluate(&config, options, &status, 10000);
+            for key in [
+                "healthy",
+                "issues",
+                "warnings",
+                "intervention",
+                "severity",
+                "operator_action_required",
+            ] {
+                assert_eq!(baseline[key], advisory[key], "{state}/{key}");
+            }
+            assert_eq!(
+                advisory["healthy"],
+                !matches!(state, "mismatch" | "stopped")
+            );
+            assert_eq!(advisory["process_identity"], state);
+            if state == "mismatch" {
+                assert_eq!(
+                    advisory["intervention"]["next_action"],
+                    "inspect_managed_service"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compact_evidence_is_bounded_private_and_never_recalculates_risk() {
+        let (config, options, mut status) = super::tests::fixture();
+        status["participation"]["unresolved_count"] = json!(2500);
+        status["participation"]["lanes"]["answer"]["historical_eligible_count"] = json!(2000);
+        status["pending_work"] = json!(
+            (0..256)
+                .map(|id| json!({
+                    "kind":"answer","state":"unknown","nonblocking_for_fresh_work":true,
+                    "operation_id":id,"binding_revision":1,"private":"private-work-canary"
+                }))
+                .collect::<Vec<_>>()
+        );
+        status["reads"]
+            .as_array_mut()
+            .unwrap()
+            .extend((0..256).map(|id| {
+                json!({
+                    "owner":"answer","purpose":"job","resource":format!("private-job-canary-{id}"),
+                    "operation_id":id,"binding_revision":1,"last_failure_at":10000,"status":503,
+                    "failure_category":"transport"
+                })
+            }));
+        let full = evaluate(&config, options, &status, 10000);
+        let mut compact = full.clone();
+        compact_diagnostics(&mut compact);
+        let envelope = json!({"schema":"agmi.cli.v1","ok":false,"type":"health","data":compact});
+        let bytes = serde_json::to_vec(&envelope).unwrap();
+        assert!(bytes.len() <= 16 * 1024, "{}", bytes.len());
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(!text.contains("private-work-canary"));
+        assert!(!text.contains("private-job-canary"));
+        assert_eq!(envelope["data"]["risk"]["unresolved_effects"], 2500);
+        assert_eq!(
+            envelope["data"]["historical_uncertainty"]["historical_eligible_answers"],
+            2000
+        );
+        assert_eq!(envelope["data"]["pending_work_count"], 256);
+        assert_eq!(envelope["data"]["healthy"], full["healthy"]);
+        assert_eq!(
+            envelope["data"]["components"]["api"]["background_resources"]["count"],
+            256
+        );
+        assert_eq!(full["pending_work"].as_array().unwrap().len(), 256);
     }
 }

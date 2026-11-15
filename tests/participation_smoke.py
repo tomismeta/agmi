@@ -111,7 +111,11 @@ print(json.dumps({'provider': 'openai-codex', 'model': payload['model'],
                 model='openai/test', reasoning='high', core_guidance_file=str(self.core))
         self.database = root / 'state/state.sqlite3'
         self.command = [self.binary, '--config', str(self.config), '--json']
-        self.env = dict(os.environ, NO_PROXY='127.0.0.1,localhost', no_proxy='127.0.0.1,localhost')
+        self.env = dict(os.environ, HOME=str(root / 'home'),
+                        XDG_CONFIG_HOME=str(root / 'home/.config'),
+                        XDG_DATA_HOME=str(root / 'home/.local/share'),
+                        XDG_CACHE_HOME=str(root / 'cache'), AGMI_UPDATE_CHECKS='0',
+                        NO_PROXY='127.0.0.1,localhost', no_proxy='127.0.0.1,localhost')
         self.configure()
 
     def handler(self):

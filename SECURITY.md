@@ -40,17 +40,21 @@ Binding is not tamper-proof against its OS account. A fresh process has no earli
 
 Recovery inspection includes private payloads and identifiers. Recovery resolution never attaches a guessed response candidate; it uses already-bound identifiers and authoritative matching evidence. Nonce movement, elapsed time, absent inventory and model confidence cannot clear an unknown write.
 
+Public epoch reports are credential-free evidence, not journal authority. Explicit raw audit verifies the body against its publisher index and preserves exact account decimal rewards; that is not independent ledger or payment verification. Report caches and optional captured answer/history output remain private. Missing rows, aggregate expiry data and jury alignment never authorize replay or prove an absent transaction failed.
+
 Binding-scoped exponential backoff survives restart; genuine shared server restrictions retain scope and minimum delays even above a lane's local cap. A failed job or discovery request does not create endpoint-global local backoff. Identity-based staggering is local scheduling, not coordination between accounts. Deadline-aware served-in-round arbitration bounds continuously eligible lanes in successful dispatch opportunities, not elapsed time or remote availability. Independent quotas do not isolate same-wallet uncertainty. Risk admission remains durable; manual grants bind epoch, lane, account generation and lane-control revision, and are revocable and single-use. Live dispatch, pause, identity, capability and server-minimum fences remain mandatory.
 
 Configuration patches and guidance updates use bounded stdin, revision checks, private files and atomic replacement. Cooperating CLI administration and startup share a directory lock; arbitrary external editors do not. A successful save does not prove the running controller accepted the revision. `guidance show` intentionally exposes private prompt text; operation lists omit private payloads and bearer identifiers. Review configured policy and effective status before forwarding administrative output.
 
 Onboarding accepts a private existing credential reference, bounded stdin or hidden controlling-terminal input; keys are never command arguments. It verifies an existing hosted account read-only and refuses to overwrite configuration or edited guidance. Rotation requires initialized paused/stopped state and stable account locks, verifies the replacement on the same chain route/account and replaces only the credential atomically. Failed verification leaves the old key intact. Rotation does not issue/revoke remote credentials or repair missing authority; different identities need separate state.
 
-## Agent-owned forwarding
+## Passive operational signals
 
-`health` is local and read-only: no network/model calls, secret reads or state initialization. Warnings remain separate from unhealthy status. Agents may consume structured health, events and warnings and forward sanitized findings through their existing native channels; agmi does not own external delivery, destinations, credentials or notification state.
+`health`, `status` and `doctor` are local: no network/model calls, credential/guidance reads or state initialization. Release notices read only a private cache; unavailable, stale or throttled publisher evidence does not change health or participation admission.
 
-Keep private operation payloads, model output, native diagnostics and secrets out of forwarded findings. The agent owns forwarding policy and destination trust. Forwarding does not prove human receipt or provide independent host-down monitoring. Local failures remain visible in exit status and the journal, and neither forwarding nor a health warning clears participation uncertainty or authorizes replay.
+A managed daemon may refresh public publisher metadata asynchronously; `AGMI_UPDATE_CHECKS=0` disables automatic checks. Explicit `update --check` writes only disposable release evidence, never account configuration/journal state or installation selection. Actual updates independently revalidate publisher identity and integrity. Neither a cached notice nor local executable-object matching is cryptographic provenance.
+
+agmi owns no outbound messages, notification credentials, destinations, delivery receipts or outbox. Native answer/judge execution remains non-delivering. External AGMI-only delivery watchers must be retired separately using verified per-job controls, without changing inference, chat services or unrelated schedules. Local exit status and the service journal do not establish human receipt or host-down monitoring, and never authorize replay or deletion of uncertain work.
 
 ## Repository security checks
 

@@ -282,6 +282,8 @@ mode = "off"
             initial_binary = str(args.old_binary.resolve()) if args.old_binary else binary
             command = [initial_binary, '--config', str(config), '--json']
             def invoke(*words, stdin=None):
+                if command[0] == binary and words[0] in ('status', 'health'):
+                    words += ('--verbose',)
                 result = subprocess.run(command + list(words), input=stdin, capture_output=True, text=True, timeout=10)
                 if result.returncode and words[0] != 'health':
                     raise AssertionError(result.stderr)

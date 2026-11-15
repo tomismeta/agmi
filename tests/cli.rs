@@ -1,7 +1,11 @@
 use std::{fs, process::Command};
 
 fn binary() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_agmi"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agmi"));
+    command
+        .env("AGMI_UPDATE_CHECKS", "0")
+        .env("XDG_CACHE_HOME", env!("CARGO_TARGET_TMPDIR"));
+    command
 }
 
 #[test]
@@ -533,7 +537,7 @@ fn control_commands_preserve_live_writer_visibility() {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             assert!(writer.try_wait().unwrap().is_none(), "writer exited");
-            let status = agmi::runtime::status(config);
+            let status = agmi::runtime::status(&path, config);
             if status
                 .as_ref()
                 .is_ok_and(|s| s["effective_runtime"]["revision"].as_str() == Some(expected))

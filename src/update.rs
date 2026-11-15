@@ -17,6 +17,8 @@ use std::{
 };
 use tokio::io::AsyncReadExt;
 
+pub mod advisory;
+
 const API: &str = "https://api.github.com/repos/tomismeta/agmi";
 const DOWNLOAD: &str = "https://github.com/tomismeta/agmi/releases/download";
 const METADATA_LIMIT: usize = 2 * 1024 * 1024;
@@ -275,6 +277,7 @@ async fn response(client: &Client, initial: &str, asset: bool) -> Result<reqwest
         );
     }
     for redirects in 0..=3 {
+        advisory::request_guard()?;
         let response = client
             .get(url.clone())
             .header(
@@ -302,6 +305,15 @@ async fn response(client: &Client, initial: &str, asset: bool) -> Result<reqwest
             url = next;
             continue;
         }
+        if let Some(failure) = advisory::source_failure(
+            response.status().as_u16(),
+            response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+        ) {
+            return Err(failure.into());
+        }
         ensure!(
             response.status() == reqwest::StatusCode::OK,
             failure("update_network_unavailable")
@@ -318,6 +330,25 @@ async fn fetch(
     limit: usize,
     expected_size: Option<u64>,
 ) -> Result<Vec<u8>> {
+    advisory::request_guard()?;
+    #[cfg(test)]
+    if let Some(result) = advisory::test_request().await {
+        return result;
+    }
+    #[cfg(test)]
+    if let Ok(result) = advisory::TEST_TRANSPORT.try_with(|responses| {
+        responses
+            .get(url)
+            .cloned()
+            .ok_or_else(|| failure("unexpected_test_request"))
+    }) {
+        let bytes = result?;
+        ensure!(
+            bytes.len() <= limit && expected_size.is_none_or(|n| n == bytes.len() as u64),
+            failure("update_download_size_invalid")
+        );
+        return Ok(bytes);
+    }
     let mut response = response(client, url, asset).await?;
     ensure!(
         response
@@ -1158,9 +1189,12 @@ pub async fn run(config_path: &Path, options: Options<'_>) -> Result<Value> {
         }),
         failure("update_invalid_expected_release")
     );
+    if options.check {
+        return advisory::standalone_check(config_path).await;
+    }
     // Recovery routing is deliberately before release discovery, no-op handling,
     // or any interpretation of configuration/journal data by this executable.
-    let pending = if options.check || options.dry_run {
+    let pending = if options.dry_run {
         None
     } else {
         installer::pending_update_target(config_path)?
@@ -1242,45 +1276,13 @@ pub async fn run(config_path: &Path, options: Options<'_>) -> Result<Value> {
         report["update"]["current"]["release"] = json!(selected.release);
     }
     let client = client()?;
-    let metadata = fetch(
-        &client,
-        &format!("{API}/releases/latest"),
-        false,
-        METADATA_LIMIT,
-        None,
-    )
-    .await?;
-    let release: Release =
-        serde_json::from_slice(&metadata).map_err(|_| failure("update_metadata_invalid"))?;
-    let version = release
-        .version()
-        .map_err(|_| failure("update_metadata_invalid"))?;
-    let sums = asset_text(
-        &client,
-        release
-            .asset("SHA256SUMS", TEXT_LIMIT)
-            .map_err(|_| failure("update_metadata_invalid"))?,
-    )
-    .await?;
-    let build_info = asset_text(
-        &client,
-        release
-            .asset("BUILD-INFO.txt", TEXT_LIMIT)
-            .map_err(|_| failure("update_metadata_invalid"))?,
-    )
-    .await?;
-    verify(
-        build_info.as_bytes(),
-        &checksum(&sums, "BUILD-INFO.txt").map_err(|_| failure("update_metadata_invalid"))?,
-    )?;
-    let published =
-        Identity::parse(&build_info, true).map_err(|_| failure("update_manifest_invalid"))?;
-    ensure!(
-        published.version == version,
-        failure("update_manifest_invalid")
-    );
+    let Publication {
+        release,
+        published,
+        build_info,
+        sums,
+    } = discover_publication(&client, false).await?;
     complete_discovery(
-        config_path,
         options,
         report,
         current,
@@ -1295,8 +1297,50 @@ pub async fn run(config_path: &Path, options: Options<'_>) -> Result<Value> {
     .await
 }
 
+// Installation and advisory share all publisher/manifest/checksum validation.
+async fn discover_publication(client: &Client, bounded: bool) -> Result<Publication> {
+    let metadata = advisory::request_budget(
+        bounded,
+        fetch(
+            client,
+            &format!("{API}/releases/latest"),
+            false,
+            METADATA_LIMIT,
+            None,
+        ),
+    )
+    .await?;
+    let release: Release =
+        serde_json::from_slice(&metadata).map_err(|_| failure("update_metadata_invalid"))?;
+    let version = release
+        .version()
+        .map_err(|_| failure("update_metadata_invalid"))?;
+    let sums = advisory::request_budget(
+        bounded,
+        asset_text(client, release.asset("SHA256SUMS", TEXT_LIMIT)?),
+    )
+    .await?;
+    let build_info = advisory::request_budget(
+        bounded,
+        asset_text(client, release.asset("BUILD-INFO.txt", TEXT_LIMIT)?),
+    )
+    .await?;
+    verify(build_info.as_bytes(), &checksum(&sums, "BUILD-INFO.txt")?)?;
+    let published =
+        Identity::parse(&build_info, true).map_err(|_| failure("update_manifest_invalid"))?;
+    ensure!(
+        published.version == version,
+        failure("update_manifest_invalid")
+    );
+    Ok(Publication {
+        release,
+        published,
+        build_info,
+        sums,
+    })
+}
+
 async fn complete_discovery(
-    _config_path: &Path,
     options: Options<'_>,
     mut report: Value,
     current: Result<(installer::InstalledIdentity, Identity)>,
@@ -1327,7 +1371,7 @@ async fn complete_discovery(
     if !compatible {
         outcome(
             &mut report,
-            options.check || options.dry_run,
+            options.dry_run,
             "unavailable",
             "published_target_incompatible",
         );
@@ -1341,7 +1385,7 @@ async fn complete_discovery(
         Err(_) => {
             outcome(
                 &mut report,
-                options.check || options.dry_run,
+                options.dry_run,
                 "refused",
                 "managed_installation_unverified",
             );
@@ -1357,7 +1401,7 @@ async fn complete_discovery(
     match order {
         Ordering::Current(reason) => {
             outcome(&mut report, true, "current", reason);
-            if !options.check && !options.dry_run {
+            if !options.dry_run {
                 let mut arguments = vec!["activate".into(), selected.release.clone()];
                 arguments.extend(["--expected-release".into(), selected.release.clone()]);
                 if options.stopped {
@@ -1378,12 +1422,7 @@ async fn complete_discovery(
             return Ok(report);
         }
         Ordering::Refused(reason) => {
-            outcome(
-                &mut report,
-                options.check || options.dry_run,
-                "refused",
-                reason,
-            );
+            outcome(&mut report, options.dry_run, "refused", reason);
             return Ok(report);
         }
         Ordering::Available => {}
@@ -1395,7 +1434,7 @@ async fn complete_discovery(
         "available",
         "published_release_descends_installed",
     );
-    if options.check || options.dry_run {
+    if options.dry_run {
         return Ok(report);
     }
     // Temporary download storage is separate from configuration, releases and the
@@ -2000,66 +2039,6 @@ mod tests {
             assert_eq!(report["repair"]["applied_count"], 1);
             assert_eq!(report["repair"]["status"], "applied");
         }
-    }
-
-    #[tokio::test]
-    async fn published_check_never_executes_or_writes_user_state() {
-        let root = tempfile::tempdir().unwrap();
-        let published = identity("0.1.0", 'a', false);
-        let name = format!("agmi-v{}-{}.tar.gz", published.version, published.target);
-        let publication = Publication {
-            release: Release {
-                tag_name: "v0.1.0".into(),
-                draft: false,
-                prerelease: false,
-                published_at: Some("published".into()),
-                assets: vec![Asset {
-                    name: name.clone(),
-                    size: 1,
-                    browser_download_url: format!("{DOWNLOAD}/v0.1.0/{name}"),
-                    state: "uploaded".into(),
-                }],
-            },
-            sums: format!("{}  {name}\n", "b".repeat(64)),
-            build_info: String::new(),
-            published: published.clone(),
-        };
-        let current = installer::InstalledIdentity {
-            manifest: String::new(),
-            binary: root.path().join("must-not-be-executed"),
-            release: format!("r-{}", published.digest),
-            digest: published.digest.clone(),
-        };
-        let options = Options {
-            release: None,
-            binary: None,
-            sha256: None,
-            check: true,
-            dry_run: false,
-            repair: false,
-            stopped: false,
-            migration_only: false,
-            migrate: false,
-            proposal: None,
-            expected_token: None,
-            accept_risk_change: None,
-            expected_release: None,
-        };
-        let initial = report(&options, "github_latest_stable");
-        let result = complete_discovery(
-            &root.path().join("config.toml"),
-            options,
-            initial,
-            Ok((current, published)),
-            &client().unwrap(),
-            publication,
-        )
-        .await
-        .unwrap();
-        assert_eq!(result["success"], true);
-        assert!(result["readiness"].is_null());
-        assert!(result.get("installation").is_none());
-        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
     }
 
     #[test]

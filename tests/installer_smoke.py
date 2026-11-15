@@ -71,6 +71,7 @@ with tempfile.TemporaryDirectory(prefix='agmi-installer-boundaries-') as directo
     releases = home / '.local/share/agmi/releases'
     marker = root / 'untrusted-executed'
     env = dict(os.environ, HOME=str(home), PATH=str(tools), TMPDIR=str(temporary),
+               AGMI_UPDATE_CHECKS='0', XDG_CACHE_HOME=str(root / 'cache'),
                AGMI_FIXTURE_ROOT=str(root), AGMI_ATTACK_MARKER=str(marker))
     for variable in ('XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'SYSTEMD_UNIT_PATH', 'SYSTEMD_BUS_ADDRESS',
                      'DBUS_SESSION_BUS_ADDRESS', 'XDG_RUNTIME_DIR'):
@@ -300,6 +301,33 @@ else:
     cli('service', 'status', environment=dict(env, PATH=str(status_tools)))
     assert calls()[before:] and all(call[0] == 'systemctl' for call in calls()[before:])
     print(json.dumps({'scenario': 'status_without_systemd_analyze', 'status_succeeded': True}))
+
+    # Passive status uses stable selected-object metadata, not installer status
+    # hashing or any activation/manager command. A broken managed selection is
+    # unknown ownership, never silently treated as a standalone executable.
+    before = len(calls())
+    state_existed = state.exists()
+    observed = cli('status')
+    assert observed['selected_image']['ownership'] == 'managed', observed
+    assert observed['selected_image']['state'] == 'observed', observed
+    assert observed['selected_image']['release'] == first_id, observed
+    assert observed['process_observation']['state'] in ('unavailable', 'stopped'), observed
+    assert all(call[2] == 'show' for call in calls()[before:]), calls()[before:]
+    assert state.exists() == state_existed, 'Passive observation initialized account state'
+    selected_link = releases / 'current'
+    selected_link.unlink()
+    selected_link.symlink_to('r-' + '0' * 64)
+    try:
+        broken = cli('status')
+        assert broken['selected_image']['ownership'] == 'unknown', broken
+        assert broken['selected_image']['state'] == 'unavailable', broken
+        assert broken['process_observation']['state'] == 'unavailable', broken
+        assert state.exists() == state_existed
+        assert config.read_bytes() == original_config
+        assert credential.read_bytes() == b'private-input-must-not-change'
+    finally:
+        selected_link.unlink()
+        selected_link.symlink_to(first_id)
     (root / 'state-query-failed').touch()
     before = len(calls())
     error = cli('update', '--release', second_id, '--stopped', success=False)

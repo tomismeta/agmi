@@ -2,6 +2,11 @@ use super::*;
 use crate::endpoints::Endpoint;
 use crate::solver::contract::{NativeAttemptCompletion, NativeOutcome};
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static REMOTE_CONTEXT_CONSTRUCTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Participation relevance, not permission to retry or settle a remote effect.
 /// Admission owns capacity/uncertainty gates; current work owns deduplication.
 #[derive(Clone, Copy, Default)]
@@ -20,6 +25,7 @@ impl RemoteWorkScope {
         epoch: Option<u64>,
         judge: Option<&Value>,
         key: &str,
+        at: i64,
     ) -> Option<bool> {
         if !self.admission_open
             || !matches!(
@@ -35,7 +41,7 @@ impl RemoteWorkScope {
             return Some(true);
         }
         if let Some(assessment) = judge {
-            return judging_work_current(assessment, key).map(|current| !current);
+            return judging_work_current_at(assessment, key, at).map(|current| !current);
         }
         Some(
             self.independent
@@ -52,7 +58,7 @@ impl RemoteWorkScope {
 
 /// Aggregate exclusions cannot identify a retained operation. A positive
 /// witness remains useful when truncated; absence requires complete witnesses.
-fn judging_work_current(assessment: &Value, key: &str) -> Option<bool> {
+fn judging_work_current_at(assessment: &Value, key: &str, at: i64) -> Option<bool> {
     if assessment["locally_judgeable"] == true {
         return Some(false);
     }
@@ -70,10 +76,10 @@ fn judging_work_current(assessment: &Value, key: &str) -> Option<bool> {
     if assessment["completeness"] != "complete"
         || assessment["valid_until"]
             .as_i64()
-            .is_none_or(|until| until <= now())
+            .is_none_or(|until| until <= at)
         || assessment["observed_at"]
             .as_i64()
-            .is_none_or(|at| at > now())
+            .is_none_or(|observed| observed < 0 || observed > at)
     {
         return None;
     }
@@ -95,7 +101,367 @@ fn judging_work_current(assessment: &Value, key: &str) -> Option<bool> {
     (assessment["excluded_work_truncated"] == false && covered >= count).then_some(false)
 }
 
+/// One lane's bounded, validated participation-relevance snapshot.
+pub(super) struct RemoteWorkContext {
+    kind: LaneId,
+    scope: RemoteWorkScope,
+    observation: Option<Value>,
+    assessment: Value,
+    original: Option<Operation>,
+    retry_blocker: Option<(&'static str, Option<i64>)>,
+    completion_valid_until: Option<i64>,
+    completed_mine: Option<i64>,
+    fresh: bool,
+    decay_provenance: bool,
+    at: i64,
+}
+
+impl RemoteWorkContext {
+    pub(super) fn epoch(&self) -> Option<u64> {
+        self.scope.epoch
+    }
+    pub(super) fn has_decay_provenance(&self) -> bool {
+        self.decay_provenance
+    }
+    pub(super) fn set_admission_open(&mut self, open: bool) {
+        self.scope.admission_open = open;
+    }
+    pub(super) fn decay_current_at(&self, config: &Config, at: i64) -> bool {
+        if !self.fresh || !self.decay_provenance || at < self.at {
+            return false;
+        }
+        let until = if self.kind == LaneId::Judge {
+            self.assessment["valid_until"].as_i64()
+        } else {
+            self.observation
+                .as_ref()
+                .and_then(|observation| observation["observed_at"].as_i64())
+                .map(|observed| {
+                    observed.saturating_add(
+                        config
+                            .schedule(self.kind)
+                            .observation_max_age_seconds
+                            .min(i64::MAX as u64) as i64,
+                    )
+                })
+        };
+        until.is_some_and(|until| at < until)
+    }
+    pub(super) fn nonblocking(&self, state: &str, epoch: Option<u64>, key: &str) -> Option<bool> {
+        self.scope.background(
+            state,
+            epoch,
+            (self.kind == LaneId::Judge).then_some(&self.assessment),
+            key,
+            self.at,
+        )
+    }
+
+    pub(super) fn historical(&self, epoch: Option<u64>, key: &str) -> bool {
+        let inventory_absent = self.assessment["completeness"] == "complete"
+            && self.assessment["excluded_work_truncated"] == false
+            && self.assessment["eligible_candidates"].as_u64() == Some(0)
+            && self.assessment["excluded_work"]
+                .as_array()
+                .is_some_and(|rows| {
+                    self.assessment["observed_opportunities"].as_u64() == Some(rows.len() as u64)
+                        && rows.iter().all(|row| {
+                            row["work_key"]
+                                .as_str()
+                                .is_some_and(|current| !current.eq_ignore_ascii_case(key))
+                        })
+                });
+        self.fresh
+            && (epoch
+                .zip(self.scope.epoch)
+                .is_some_and(|(work, current)| work < current)
+                || inventory_absent)
+    }
+}
+
+struct AdmissionIntent {
+    pre_intent_blocker: Option<(&'static str, Option<i64>)>,
+    blocker: Option<(&'static str, Option<i64>)>,
+}
+
 impl Store {
+    fn admission_intent(
+        &self,
+        config: &Config,
+        kind: LaneId,
+        mut blocker: Option<(&'static str, Option<i64>)>,
+    ) -> Result<AdmissionIntent> {
+        let control = self.control()?;
+        let reload: bool = self.db.query_row(
+            "SELECT COALESCE((SELECT reload_blocked FROM runtime_state WHERE singleton=1),0)",
+            [],
+            |r| r.get(0),
+        )?;
+        let identity_rejected: bool = self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM hosted_identity_evidence WHERE rejection IS NOT NULL)",
+            [],
+            |r| r.get(0),
+        )?;
+        if identity_rejected {
+            blocker = Some(("identity_rejected", None));
+        }
+        // Preserve eligibility before control/mode/reload intent overlays. This
+        // remains diagnostic evidence, never an independent admission permit.
+        let pre_intent_blocker = blocker;
+        if reload {
+            blocker = Some(("config_reload_rejected", None));
+        }
+        if config.mode(kind) != Mode::Active {
+            blocker = Some(("capability_not_active", None));
+        }
+        let lane_paused: bool = self.db.query_row(
+            "SELECT paused FROM lane_control WHERE lane=?1",
+            [kind.as_str()],
+            |r| r.get(0),
+        )?;
+        if lane_paused {
+            blocker = Some(("lane_paused", None));
+        }
+        if control.paused {
+            blocker = Some(("admission_paused", None));
+        }
+        Ok(AdmissionIntent {
+            pre_intent_blocker,
+            blocker,
+        })
+    }
+
+    pub(super) fn fresh_lane_admission_open(
+        &self,
+        config: &Config,
+        kind: LaneId,
+        epoch: Option<u64>,
+        at: i64,
+        totals: &mut UncertaintyAccounting,
+    ) -> Result<bool> {
+        accounting::apply_floor(&self.db, config, kind, totals)?;
+        let mut cutoff = AdmissionCutoff::current();
+        cutoff.at = at;
+        let blocker = self.uncertainty_blocker_with_at(config, kind, epoch, totals, cutoff)?;
+        Ok(self
+            .admission_intent(config, kind, blocker)?
+            .blocker
+            .is_none())
+    }
+
+    pub(super) fn remote_observation_context(
+        &self,
+        config: &Config,
+        kind: LaneId,
+        at: i64,
+        admission_open: bool,
+    ) -> Result<RemoteWorkContext> {
+        #[cfg(test)]
+        REMOTE_CONTEXT_CONSTRUCTIONS.with(|count| count.set(count.get() + 1));
+        let observation = self.lane_observation(kind)?;
+        let epoch = observation.as_ref().and_then(|o| o["epoch"].as_u64());
+        let assessment = if kind == LaneId::Judge {
+            let raw: Option<String> = self.db.query_row(
+                    "SELECT json_extract(lane_participation,'$.judge') FROM runtime_state WHERE singleton=1",
+                    [], |r| r.get(0)).optional()?.flatten();
+            let record = raw
+                .map(|raw| serde_json::from_str::<Value>(&raw))
+                .transpose()?;
+            if let Some(record) = record {
+                let stamp: AdmissionStampSnapshot =
+                    serde_json::from_value(record["stamp"].clone())?;
+                if Self::observation_stamp_matches(&self.db, kind, &stamp)? {
+                    record["assessment"].clone()
+                } else {
+                    Value::Null
+                }
+            } else {
+                Value::Null
+            }
+        } else {
+            Value::Null
+        };
+        let config_current: bool = self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM runtime_policy WHERE singleton=1
+             AND json_extract(policy,'$.lane_revisions.'||?1)=?2)",
+            params![kind.as_str(), config.lane_revision(kind).ok()],
+            |r| r.get(0),
+        )?;
+        let mut decay_provenance = kind == LaneId::Judge && config_current;
+        let fresh = if kind == LaneId::Judge {
+            assessment["observed_at"]
+                .as_i64()
+                .is_some_and(|observed| observed >= 0 && observed <= at)
+                && assessment["valid_until"]
+                    .as_i64()
+                    .is_some_and(|until| until > at)
+        } else if let Some(observed) = &observation {
+            let matches: bool = self.db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM control c,runtime_authority a
+                 WHERE c.singleton=1 AND a.singleton=1 AND c.generation=?1 AND a.authority_epoch=?2)",
+                params![observed["generation"].as_i64(), observed["authority_epoch"].as_u64()], |r| r.get(0))?;
+            let provenance: Option<String> = self
+                .db
+                .query_row(
+                    "SELECT json_extract(lane_participation,'$.challenge_provenance.'||?1)
+                 FROM runtime_state WHERE singleton=1",
+                    [kind.as_str()],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .flatten();
+            let provenance = provenance.and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+            let stamped = if let Some(provenance) = provenance {
+                if let Ok(stamp) =
+                    serde_json::from_value::<AdmissionStampSnapshot>(provenance["stamp"].clone())
+                {
+                    provenance["request_sequence"] == observed["request_sequence"]
+                        && stamp.authority_epoch
+                            == observed["authority_epoch"].as_u64().unwrap_or(u64::MAX)
+                        && stamp.account_generation
+                            == observed["generation"].as_i64().unwrap_or(i64::MIN)
+                        && Self::observation_stamp_matches(&self.db, kind, &stamp)?
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            decay_provenance = stamped && config_current;
+            matches
+                && observed["observed_at"].as_i64().is_some_and(|observed| {
+                    observed >= 0
+                        && observed <= at
+                        && at
+                            < observed.saturating_add(
+                                config
+                                    .schedule(kind)
+                                    .observation_max_age_seconds
+                                    .min(i64::MAX as u64) as i64,
+                            )
+                })
+        } else {
+            false
+        };
+        Ok(RemoteWorkContext {
+            kind,
+            scope: RemoteWorkScope {
+                admission_open,
+                epoch,
+                ..RemoteWorkScope::default()
+            },
+            observation,
+            assessment,
+            fresh,
+            decay_provenance,
+            at,
+            original: None,
+            retry_blocker: None,
+            completion_valid_until: None,
+            completed_mine: None,
+        })
+    }
+
+    pub(super) fn remote_work_context(
+        &self,
+        config: &Config,
+        kind: LaneId,
+        at: i64,
+        accounting: &accounting::AccountingReadSnapshot,
+    ) -> Result<RemoteWorkContext> {
+        let base = self.remote_observation_context(config, kind, at, false)?;
+        let RemoteWorkContext {
+            observation,
+            assessment,
+            fresh,
+            decay_provenance,
+            ..
+        } = base;
+        let epoch = observation.as_ref().and_then(|o| o["epoch"].as_u64());
+        let lane_admission = self
+            .admission_projection_with(config, kind, epoch, None, accounting)?
+            .value;
+        let original = if kind == LaneId::Answer {
+            epoch
+                .map(|epoch| self.uncertain_answer(epoch))
+                .transpose()?
+                .flatten()
+        } else {
+            None
+        };
+        let retry_blocker = if let Some(original) = &original {
+            let retry_epoch = original.request["solver"]["epoch"]
+                .as_u64()
+                .context("answer epoch missing")?;
+            if let Some(reason) =
+                Self::answer_retry_policy_blocker(&self.db, config, retry_epoch, None)?
+            {
+                Some((reason, None))
+            } else {
+                let totals =
+                    accounting.accounting(&self.db, config, kind, None, Some(original.id))?;
+                self.uncertainty_blocker_with(config, kind, Some(retry_epoch), &totals)?
+            }
+        } else {
+            None
+        };
+        let completion_valid_until = (kind == LaneId::Mine
+            && config.mode(kind) == Mode::Active
+            && !config.capabilities.mine.schedule.each_epoch)
+            .then(|| self.participation_next_at(kind))
+            .transpose()?;
+        // Only the latest current-epoch mine establishes completion; a newer
+        // failed or uncertain attempt must not be hidden by earlier success.
+        let completed_mine = if kind == LaneId::Mine
+            && config.mode(kind) == Mode::Active
+            && (config.capabilities.mine.schedule.each_epoch
+                || completion_valid_until.is_some_and(|deadline| deadline > at))
+            && let Some(epoch) = epoch
+        {
+            self.db.query_row(
+                    "SELECT CASE WHEN state IN ('completed','confirmed','final') THEN id END FROM operations
+                     WHERE kind='mine' AND work_key>=?1 AND work_key<?2 ORDER BY id DESC LIMIT 1",
+                    params![format!("{epoch}:"), format!("{epoch};")], |row| row.get::<_, Option<i64>>(0))
+                    .optional()?.flatten()
+        } else {
+            None
+        };
+        let scope = RemoteWorkScope {
+            admission_open: lane_admission["allowed"] == true,
+            epoch,
+            independent: match kind {
+                LaneId::Judge => false,
+                LaneId::Mine => {
+                    !config.capabilities.mine.schedule.each_epoch
+                        && completion_valid_until.is_some_and(|deadline| deadline <= at)
+                }
+                LaneId::Answer => false,
+            },
+            completed: completed_mine.is_some()
+                || (kind == LaneId::Answer
+                    && observation
+                        .as_ref()
+                        .is_some_and(|row| row["answered"] == true)),
+            retry_epoch: original
+                .as_ref()
+                .filter(|_| retry_blocker.is_none())
+                .and_then(|original| original.request["solver"]["epoch"].as_u64()),
+        };
+        Ok(RemoteWorkContext {
+            kind,
+            scope,
+            observation,
+            assessment,
+            original,
+            retry_blocker,
+            completion_valid_until,
+            completed_mine,
+            fresh,
+            decay_provenance,
+            at,
+        })
+    }
+
     fn lane_participation_projection(
         &self,
         stopped: bool,
@@ -244,39 +610,10 @@ impl Store {
                 blocker = Some(("generation_changed", None));
             }
         }
-        let reload: bool = self.db.query_row(
-            "SELECT COALESCE((SELECT reload_blocked FROM runtime_state WHERE singleton=1),0)",
-            [],
-            |r| r.get(0),
-        )?;
-        let identity_rejected: bool = self.db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM hosted_identity_evidence WHERE rejection IS NOT NULL)",
-            [],
-            |r| r.get(0),
-        )?;
-        if identity_rejected {
-            blocker = Some(("identity_rejected", None));
-        }
-        // Preserve eligibility before control/mode/reload intent overlays. This
-        // remains diagnostic evidence, never an independent admission permit.
-        let pre_intent_blocker = blocker;
-        if reload {
-            blocker = Some(("config_reload_rejected", None));
-        }
-        if config.mode(kind) != Mode::Active {
-            blocker = Some(("capability_not_active", None));
-        }
-        let lane_paused: bool = self.db.query_row(
-            "SELECT paused FROM lane_control WHERE lane=?1",
-            [kind.as_str()],
-            |r| r.get(0),
-        )?;
-        if lane_paused {
-            blocker = Some(("lane_paused", None));
-        }
-        if control.paused {
-            blocker = Some(("admission_paused", None));
-        }
+        let AdmissionIntent {
+            pre_intent_blocker,
+            blocker,
+        } = self.admission_intent(config, kind, blocker)?;
         let reason = blocker.map(|b| b.0);
         let lane = reason == Some("lane_unresolved_capacity");
         let required_release =
@@ -399,105 +736,24 @@ impl Store {
         stopped: bool,
         reload: bool,
         accounting: &accounting::AccountingReadSnapshot,
-    ) -> Result<(Value, [RemoteWorkScope; LaneId::COUNT])> {
+    ) -> Result<(Value, Vec<RemoteWorkContext>)> {
         let control = self.control()?;
         let waits = self.wait_evidence()?;
         let mut work = json!({});
-        let mut scopes = [RemoteWorkScope::default(); LaneId::COUNT];
-        for (index, kind) in LaneId::ALL.into_iter().enumerate() {
-            let observation = self.lane_observation(kind)?;
-            let epoch = observation.as_ref().and_then(|o| o["epoch"].as_u64());
-            let lane_admission = self
-                .admission_projection_with(config, kind, epoch, None, accounting)?
-                .value;
-            let assessment = if kind == LaneId::Judge {
-                let raw: Option<String> = self.db.query_row(
-                    "SELECT json_extract(lane_participation,'$.judge') FROM runtime_state WHERE singleton=1",
-                    [], |r| r.get(0)).optional()?.flatten();
-                let record = raw
-                    .map(|raw| serde_json::from_str::<Value>(&raw))
-                    .transpose()?;
-                if let Some(record) = record {
-                    let stamp: AdmissionStampSnapshot =
-                        serde_json::from_value(record["stamp"].clone())?;
-                    if Self::observation_stamp_matches(&self.db, kind, &stamp)? {
-                        record["assessment"].clone()
-                    } else {
-                        Value::Null
-                    }
-                } else {
-                    Value::Null
-                }
-            } else {
-                Value::Null
-            };
-            let original = if kind == LaneId::Answer {
-                epoch
-                    .map(|epoch| self.uncertain_answer(epoch))
-                    .transpose()?
-                    .flatten()
-            } else {
-                None
-            };
-            let retry_blocker = if let Some(original) = &original {
-                let retry_epoch = original.request["solver"]["epoch"]
-                    .as_u64()
-                    .context("answer epoch missing")?;
-                if let Some(reason) =
-                    Self::answer_retry_policy_blocker(&self.db, config, retry_epoch, None)?
-                {
-                    Some((reason, None))
-                } else {
-                    let totals =
-                        accounting.accounting(&self.db, config, kind, None, Some(original.id))?;
-                    self.uncertainty_blocker_with(config, kind, Some(retry_epoch), &totals)?
-                }
-            } else {
-                None
-            };
-            let completion_valid_until = (kind == LaneId::Mine
-                && config.mode(kind) == Mode::Active
-                && !config.capabilities.mine.schedule.each_epoch)
-                .then(|| self.participation_next_at(kind))
-                .transpose()?;
-            // Only the latest current-epoch mine establishes completion; a newer
-            // failed or uncertain attempt must not be hidden by earlier success.
-            let completed_mine = if kind == LaneId::Mine
-                && config.mode(kind) == Mode::Active
-                && (config.capabilities.mine.schedule.each_epoch
-                    || completion_valid_until.is_some_and(|deadline| deadline > now()))
-                && let Some(epoch) = epoch
-            {
-                self.db.query_row(
-                    "SELECT CASE WHEN state IN ('completed','confirmed','final') THEN id END FROM operations
-                     WHERE kind='mine' AND work_key>=?1 AND work_key<?2 ORDER BY id DESC LIMIT 1",
-                    params![format!("{epoch}:"), format!("{epoch};")], |row| row.get::<_, Option<i64>>(0))
-                    .optional()?.flatten()
-            } else {
-                None
-            };
-            let scope = RemoteWorkScope {
-                admission_open: lane_admission["allowed"] == true,
-                epoch,
-                independent: match kind {
-                    LaneId::Judge => false,
-                    LaneId::Mine => {
-                        !config.capabilities.mine.schedule.each_epoch
-                            && completion_valid_until.is_some_and(|deadline| deadline <= now())
-                    }
-                    LaneId::Answer => false,
-                },
-                completed: completed_mine.is_some()
-                    || (kind == LaneId::Answer
-                        && observation
-                            .as_ref()
-                            .is_some_and(|row| row["answered"] == true)),
-                retry_epoch: original
-                    .as_ref()
-                    .filter(|_| retry_blocker.is_none())
-                    .and_then(|original| original.request["solver"]["epoch"].as_u64()),
-            };
-            scopes[index] = scope;
+        let mut scopes = Vec::with_capacity(LaneId::COUNT);
+        for kind in LaneId::ALL {
+            let context = self.remote_work_context(config, kind, now(), accounting)?;
+            let RemoteWorkContext {
+                scope,
+                ref observation,
+                ref assessment,
+                ref original,
+                retry_blocker,
+                completion_valid_until,
+                completed_mine,
+                ..
+            } = context;
+            let epoch = scope.epoch;
             let mut candidates = self.db.prepare("SELECT id,state,request ->> '$.solver.epoch',work_key FROM operations WHERE kind=?1
                 AND state IN ('generating','generated','prepared','retry','dispatching','queued','unknown','included_pending','confirmed','model_unknown')
                 ORDER BY CASE WHEN state IN ('generating','generated','prepared','retry','dispatching') THEN 0 ELSE 1 END,id DESC")?;
@@ -505,12 +761,8 @@ impl Store {
             let mut id = None;
             while let Some(candidate) = candidates.next()? {
                 let state = candidate.get_ref(1)?.as_str()?;
-                if scope.background(
-                    state,
-                    candidate.get(2)?,
-                    (kind == LaneId::Judge).then_some(&assessment),
-                    candidate.get_ref(3)?.as_str()?,
-                ) == Some(false)
+                if context.nonblocking(state, candidate.get(2)?, candidate.get_ref(3)?.as_str()?)
+                    == Some(false)
                 {
                     id = Some(candidate.get::<_, i64>(0)?);
                     break;
@@ -870,7 +1122,7 @@ impl Store {
                         "requires_fresh_eligibility":true,"manual_authorized":self.manual_authorized(kind,epoch)?});
             }
             if kind == LaneId::Judge {
-                lane["assessment"] = assessment;
+                lane["assessment"] = assessment.clone();
                 if op.is_none()
                     && lane["assessment"]["locally_judgeable"] == false
                     && lane["assessment"]["exclusions"]["assignment_read_backoff"]
@@ -889,6 +1141,7 @@ impl Store {
                 }
             }
             work[kind.as_str()] = lane;
+            scopes.push(context);
         }
         Ok((work, scopes))
     }
@@ -919,6 +1172,23 @@ impl Store {
             .map(|p| serde_json::from_str::<Value>(&p))
             .transpose()?;
         let mut effective_config = None;
+        let runtime_instance: Option<String> = self
+            .db
+            .query_row(
+                "SELECT runtime_instance FROM runtime_state WHERE singleton=1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        let authority_epoch: Option<u64> = self
+            .db
+            .query_row(
+                "SELECT authority_epoch FROM runtime_authority WHERE singleton=1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
         let effective=runtime.as_ref().map(|(revision,reload,capabilities,at)| -> Result<Value>{
             if let Some(policy)=&policy
                 && let (Ok(capabilities), Ok(identity), Ok(runtime)) = (
@@ -946,7 +1216,8 @@ impl Store {
                 captured.runtime=runtime;
                 effective_config=Some(captured);
             }
-            Ok(json!({"revision":revision,"reload_blocked":reload,"capabilities":serde_json::from_str::<Value>(capabilities)?,"observed_at":at,"policy":policy}))
+            Ok(json!({"revision":revision,"runtime_instance":runtime_instance,"authority_epoch":authority_epoch,
+                "reload_blocked":reload,"capabilities":serde_json::from_str::<Value>(capabilities)?,"observed_at":at,"policy":policy}))
         }).transpose()?;
         let stopped: bool = self.db.query_row(
             "SELECT COALESCE((SELECT controller_stopped FROM runtime_state WHERE singleton=1),0)",
@@ -994,7 +1265,7 @@ impl Store {
                     .context("effective accounting missing")?,
             )?
         } else {
-            (json!({}), [RemoteWorkScope::default(); LaneId::COUNT])
+            (json!({}), Vec::new())
         };
         let mut lanes = json!({});
         let mut affected = Vec::new();
@@ -1091,16 +1362,12 @@ impl Store {
                     "queued" | "included_pending" | "confirmed" => "pending_remote",
                     _ => "active_local",
                 });
-                let scope = work_scopes[LaneId::ALL
+                let context = &work_scopes[LaneId::ALL
                     .iter()
                     .position(|lane| *lane == kind)
                     .expect("known lane")];
-                entry["nonblocking_for_fresh_work"] = json!(scope.background(
-                    &state,
-                    epoch,
-                    (kind == LaneId::Judge).then_some(&work["judge"]["assessment"]),
-                    row.get_ref(19)?.as_str()?
-                ));
+                entry["nonblocking_for_fresh_work"] =
+                    json!(context.nonblocking(&state, epoch, row.get_ref(19)?.as_str()?));
                 entry["admission"] = self
                     .admission_projection_with(policy, kind, epoch, candidate.as_ref(), accounting)?
                     .value;
@@ -1214,7 +1481,7 @@ impl Store {
         status["last_progress_at"] = json!(last_progress);
         status["last_safety_observation_at"] = json!(safety);
         status["last_reported_build"] = json!(policy.as_ref().map(|p| &p["build"]));
-        status["process_identity"] = json!("unverified");
+        status["process_identity"] = json!("not_assessed");
         status["evidence"] = json!("authenticated_hosted_response");
         status["finality"] = json!("node_reported_only");
         status["paid"] = json!("not_verified");

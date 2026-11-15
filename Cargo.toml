@@ -1,6 +1,6 @@
 [package]
 name = "agmi"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.96"
 description = "Reliable, configurable MinePOA participation for autonomous agents"

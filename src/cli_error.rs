@@ -120,6 +120,17 @@ pub(crate) fn parser(error: &clap::Error, config: Option<&Path>) -> Value {
 }
 
 pub(crate) fn execution(error: &Error, config: Option<&Path>) -> Value {
+    if let Some(reason) = error.downcast_ref::<agmi::protocol::reports::FailureReason>() {
+        return json!({
+            "code":"epoch_report_unavailable",
+            "message":"Public report evidence is unavailable for this authority; no journal outcomes were changed.",
+            "details":{"reason":reason.code()},
+            "next_actions":[
+                action(config, &["epoch", "--help"], false),
+                action(config, &["config", "check"], false)
+            ]
+        });
+    }
     if let Some(error) = error.downcast_ref::<agmi::store::LaneControlError>() {
         return json!({
             "code":error.code(),"message":error.message(),"details":{},
@@ -700,6 +711,27 @@ pub(crate) fn onboarding(data: &mut Value, config: Option<&Path>) {
     ]);
 }
 
+pub(crate) fn release_actions(data: &Value) -> Value {
+    let next = &data["release_advisory"]["next_action"];
+    match next["kind"].as_str() {
+        Some("update") => json!([action(None, &["update"], true)]),
+        Some("check") => json!([action(None, &["update", "--check"], false)]),
+        Some("inspect_service") => json!([action(None, &["service", "status"], false)]),
+        Some("use_install_owner") => json!([{
+            "kind":"instruction","authorization_required":false,
+            "message":"Use the installation owner to update this unmanaged build; agmi update is not authorized."
+        }]),
+        Some("unavailable") if next["reason"] == "previous_attempt_incomplete" => json!([{
+            "kind":"instruction","authorization_required":false,
+            "message":"An unfinished release check may have lost a source retry floor. Inspect local update cache and storage before any further check; no installation is authorized."
+        }]),
+        _ => json!([{
+            "kind":"instruction","authorization_required":false,
+            "message":"Release action unavailable; inspect the reported release evidence and installation ownership. No installation is authorized."
+        }]),
+    }
+}
+
 pub(crate) fn human(kind: &str, data: &Value) {
     match kind {
         "health" | "doctor" => {
@@ -710,6 +742,7 @@ pub(crate) fn human(kind: &str, data: &Value) {
             }
             print_unrepresented_issues(data);
             print_risk_caveat(data);
+            print_release_notice(data);
             if kind == "doctor" {
                 print_doctor_repairs(data);
             }
@@ -739,9 +772,18 @@ pub(crate) fn human(kind: &str, data: &Value) {
             }
             print_unrepresented_issues(data);
             print_risk_caveat(data);
+            print_release_notice(data);
             print_next(data);
         }
         "update" => {
+            if data["release_advisory"].is_object() {
+                print_release_notice(data);
+                println!(
+                    "No activation or repair performed. Installability and readiness: not assessed."
+                );
+                print_actions(&data["next_actions"]);
+                return;
+            }
             println!(
                 "Update: {} ({})",
                 data["update"]["status"].as_str().unwrap_or("unknown"),
@@ -798,6 +840,47 @@ pub(crate) fn human(kind: &str, data: &Value) {
                 "Update success is separate from readiness; retained uncertainty and upstream waits are not erased."
             );
         }
+        "epoch" => {
+            println!(
+                "Epoch evidence: work={} close={} (selected local page)",
+                fmt_json(&data["work_epoch"]),
+                fmt_json(&data["close_epoch"])
+            );
+            let summary = &data["summary"];
+            println!(
+                "Answers: graded={} passed={} failed={} expired={} pending_as_of_close={} unknown={}",
+                fmt_json(&summary["graded"]),
+                fmt_json(&summary["passed"]),
+                fmt_json(&summary["failed"]),
+                fmt_json(&summary["expired"]),
+                fmt_json(&summary["pending_as_of_close"]),
+                fmt_json(&summary["unknown_answer_outcomes"])
+            );
+            let reward = &data["account_close_reward"];
+            print!(
+                "Account close reward: {}",
+                reward["status"].as_str().unwrap_or("unknown")
+            );
+            if let Some(amount) = reward["amount"].as_str() {
+                print!(" {amount} (node-reported; ledger not independently verified)");
+            }
+            println!();
+            if let Some(complete) = data["refresh_ok"].as_bool() {
+                println!(
+                    "Refresh: {}",
+                    if complete {
+                        "complete"
+                    } else {
+                        "incomplete; inspect --json source errors"
+                    }
+                );
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&data["rows"]).expect("epoch rows serialize")
+            );
+            println!("Absence remains unknown; reports never authorize replay.");
+        }
         "install" | "service" => {
             let evidence = data.get("installation").unwrap_or(data);
             println!(
@@ -830,6 +913,40 @@ pub(crate) fn human(kind: &str, data: &Value) {
         print_actions(&data["next_actions"]);
     }
 }
+
+fn print_release_notice(data: &Value) {
+    let notice = &data["release_advisory"];
+    if !notice.is_object() {
+        return;
+    }
+    let availability = notice["availability"].as_str().unwrap_or("unknown");
+    let freshness = notice["freshness"].as_str().unwrap_or("unavailable");
+    print!("Release: {availability}; evidence={freshness}");
+    if let Some(reason) = notice["reason"].as_str() {
+        print!("; reason={reason}");
+    }
+    if let Some(version) = notice["latest_version"].as_str() {
+        print!("; latest_recorded={version}");
+    }
+    if let Some(checked_at) = notice["checked_at"].as_i64() {
+        print!("; checked_at={checked_at}");
+    }
+    match notice["next_action"]["kind"].as_str() {
+        Some("update") if availability == "available" && freshness == "fresh" => {
+            print!("; agmi update");
+        }
+        Some("inspect_service") => print!("; inspect service with agmi service status"),
+        Some("use_install_owner") => print!("; use installation owner"),
+        Some("check") => print!("; agmi update --check"),
+        Some("unavailable") => print!("; release action unavailable"),
+        _ => {}
+    }
+    if notice["background"]["enabled"] == false {
+        print!("; automatic checks disabled");
+    }
+    println!();
+}
+
 fn fmt_json(value: &Value) -> Cow<'_, str> {
     match value {
         Value::Bool(true) => Cow::Borrowed("true"),
