@@ -449,12 +449,16 @@ fn adopt_locked(path: &Path, source: &Path, canonical_source: &Path) -> Result<(
     } else {
         None
     };
+    let snapshot = source_snapshot(source)?;
+    ensure!(
+        snapshot.is_some() || !source_footprint || present(path)?,
+        "legacy_source_unavailable"
+    );
     let durable_existed = present(path.parent().context("record parent")?)?;
     let _durable = acquire(path)?.context("advisory_adoption_deferred")?;
     if let Some(legacy) = &_legacy {
         verify_lease(source, legacy)?;
     }
-    let snapshot = source_snapshot(source)?;
     #[cfg(unix)]
     let source_metadata = if snapshot.is_some() {
         Some(fs::symlink_metadata(source)?)
@@ -910,7 +914,12 @@ fn read_view_record(home: &Path, legacy: Result<PathBuf>) -> Result<Option<Recor
             "legacy_source_conflict"
         );
     }
-    Ok(source_snapshot(&source)?.map(|(record, _)| record))
+    let snapshot = source_snapshot(&source)?;
+    ensure!(
+        snapshot.is_some() || !present(&source.with_file_name("update.lock"))?,
+        "legacy_source_unavailable"
+    );
+    Ok(snapshot.map(|(record, _)| record))
 }
 
 pub(crate) fn view(context: &LocalUpdateContext, at: i64) -> AdvisoryView {
@@ -1588,6 +1597,20 @@ mod tests {
         persist(&source, &record).unwrap();
         drop(lease);
         (source, record)
+    }
+
+    #[test]
+    fn missing_legacy_record_with_surviving_lease_is_not_pristine() {
+        let home = tempfile::tempdir().unwrap();
+        let (source, _) = legacy_fixture(home.path(), true);
+        let lock = source.with_file_name("update.lock");
+        let before = fs::read(&lock).unwrap();
+        fs::remove_file(&source).unwrap();
+        let path = durable_path(home.path());
+        assert!(read_view_record(home.path(), Ok(source.clone())).is_err());
+        assert!(adopt_locked(&path, &source, &source).is_err());
+        assert!(!path.parent().unwrap().exists());
+        assert_eq!(fs::read(&lock).unwrap(), before);
     }
 
     #[tokio::test]
