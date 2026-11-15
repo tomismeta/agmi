@@ -71,7 +71,7 @@ def startup_race(binary, root, environment, chain, address, account_keys, lock_r
             result = edit.result(timeout=15)
             assert result.returncode != 0
             assert json.loads(result.stderr)['error']['code'] == 'admin_identity_immutable', result.stderr
-        status = json.loads(call('status').stdout)['data']
+        status = json.loads(call('status', '--verbose').stdout)['data']
         assert status['initialized'] and status['identity_matches_config']
         assert json.loads(call('config', 'show').stdout)['data']['config']['network']['address'] == address
     finally:
