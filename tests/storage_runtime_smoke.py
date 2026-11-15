@@ -4,11 +4,12 @@
 Root invocation (no host home/bus/cgroup mounts; --network none, private cgroup
 namespace, --tmpfs /run, --tmpfs /tmp:exec,mode=1777):
   python3 /src/tests/storage_runtime_smoke.py /input/agmi
-Root starts user@17321 and invokes its unprivileged helper with a clean account
-environment. Do NOT invoke the helper directly. All model/API work is deterministic
-fixture work; no provider SDK, provider credentials, or external network is used.
-ENOSPC is exercised with a one-inode tmpfs in the service's private mount
-namespace. EDQUOT/EROFS mapping is covered by the typed errno regression.
+Root establishes inherited private /tmp for user@17321 before its first start,
+then invokes the normal unprivileged helper. Do NOT invoke the helper directly.
+All model/API work is deterministic fixture work; no provider SDK, credentials
+or external network is used. No host namespace policy or AGMI privileges change.
+ENOSPC is exercised with a one-inode tmpfs in the service's inherited/private
+mount namespace. EDQUOT/EROFS mapping has typed errno coverage.
 """
 import argparse
 import fcntl
@@ -82,10 +83,34 @@ def account_environment():
                 no_proxy='127.0.0.1,localhost', LANG='C.UTF-8')
 
 
+def process_identity(pid):
+    process = pathlib.Path(f'/proc/{pid}')
+    fields = (process / 'stat').read_text().rsplit(')', 1)[1].split()
+    return (process.stat().st_uid, fields[19], identity(process / 'exe'),
+            os.readlink(process / 'ns/mnt'))
+
+
 def root_orchestrator(binary):
     require(os.geteuid() == 0, 'invoke this acceptance as container root')
     container_guard()
-    run(['systemctl', 'start', 'user@17321.service'])
+    wait(lambda: subprocess.run(['systemctl', 'show', '--property=Version', '--value'],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0,
+         'system manager did not become ready', seconds=60)
+    manager_unit = f'user@{UID}.service'
+    require(run(['systemctl', 'show', manager_unit, '--property=MainPID', '--value']).stdout.strip() == '0',
+            'fixture manager must not start before namespace setup')
+    dropin = pathlib.Path(f'/etc/systemd/system/{manager_unit}.d/agmi-storage-fixture.conf')
+    require(not dropin.exists() and not dropin.is_symlink(), 'fresh fixture manager definition required')
+    dropin.parent.mkdir(mode=0o755, parents=True)
+    dropin.write_text('[Service]\nPrivateTmp=yes\n')
+    dropin.chmod(0o644)
+    run(['systemctl', 'daemon-reload'])
+    run(['systemctl', 'start', manager_unit])
+    manager_pid = int(run(['systemctl', 'show', manager_unit, '--property=MainPID', '--value']).stdout)
+    manager_identity = process_identity(manager_pid)
+    manager_tmp = pathlib.Path(f'/proc/{manager_pid}/root/tmp')
+    require(manager_identity[0] == UID and identity(manager_tmp) != identity(pathlib.Path('/tmp')),
+            'root-managed inherited private tmp was not established')
     require(RUNTIME.stat().st_uid == UID, 'wrong runtime owner')
     require(not CONTROL.exists() and not CONTROL.is_symlink(), 'fresh fixture control required')
     CONTROL.mkdir(mode=0o700)
@@ -115,6 +140,10 @@ def root_orchestrator(binary):
                 require(observed.returncode == 0 and observed.stdout.strip() == str(pid),
                         'requested PID is not actual managed service')
                 require(pathlib.Path(f'/proc/{pid}').stat().st_uid == UID, 'wrong service uid')
+                service_identity = process_identity(pid)
+                capabilities = dict(line.split(':', 1) for line in pathlib.Path(f'/proc/{pid}/status').read_text().splitlines() if ':' in line)
+                require(all(int(capabilities[name].strip(), 16) == 0
+                            for name in ('CapEff', 'CapPrm', 'CapAmb')), 'AGMI gained capabilities')
                 require(os.readlink(f'/proc/{pid}/ns/mnt') != os.readlink('/proc/self/ns/mnt'),
                         'service has no private mount namespace')
                 private_tmp = pathlib.Path(f'/proc/{pid}/root/tmp')
@@ -123,23 +152,34 @@ def root_orchestrator(binary):
                 require(scratch_identity == identity(pathlib.Path(f'/proc/{pid}/root') / str(SCRATCH)[1:]),
                         'runtime scratch not shared with service')
                 boot = pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip().replace('-', '')
-                matches = []
-                # Enumerate only immediate children of the proven private tmpfs.
-                # Never delete a glob, guessed tree, or a symlink target.
-                for tree in pathlib.Path('/tmp').iterdir():
-                    if not tree.name.startswith('systemd-private-' + boot + '-agmi.service-'):
-                        continue
-                    outer = tree.lstat()
-                    require(stat.S_ISDIR(outer.st_mode) and outer.st_uid in (0, UID)
-                            and stat.S_IMODE(outer.st_mode) & 0o077 == 0, 'unsafe private tree')
-                    backing = tree / 'tmp'
-                    if backing.is_symlink():
-                        raise AssertionError('symlink private backing refused')
-                    if backing.is_dir() and identity(backing) == identity(private_tmp):
-                        matches.append(backing)
-                require(len(matches) == 1, 'cannot uniquely attest live private tmp backing')
-                backing = matches[0]
-                require(identity(backing) == identity(private_tmp), 'backing identity changed')
+                matches = {}
+                # Root supplies an inherited namespace when user namespaces are
+                # unavailable. Nested AGMI isolation, when supported, stays intact.
+                roots = [(pathlib.Path('/tmp'), (manager_unit, 'agmi.service')),
+                         (manager_tmp, ('agmi.service',))]
+                for parent, names in roots:
+                    for tree in parent.iterdir():
+                        if not any(tree.name.startswith('systemd-private-' + boot + '-' + name + '-')
+                                   for name in names):
+                            continue
+                        outer = tree.lstat()
+                        require(stat.S_ISDIR(outer.st_mode) and outer.st_uid in (0, UID)
+                                and stat.S_IMODE(outer.st_mode) & 0o077 == 0, 'unsafe private tree')
+                        backing = tree / 'tmp'
+                        require(not backing.is_symlink(), 'symlink private backing refused')
+                        if backing.is_dir() and identity(backing) == identity(private_tmp):
+                            matches.setdefault(identity(backing), (backing, identity(tree)))
+                require(len(matches) == 1, 'cannot uniquely attest live inherited/private tmp backing')
+                backing, parent_identity = next(iter(matches.values()))
+                require(process_identity(pid) == service_identity
+                        and process_identity(manager_pid) == manager_identity,
+                        'service or manager changed before deletion')
+                outer = backing.parent.lstat()
+                require(stat.S_ISDIR(outer.st_mode) and outer.st_uid in (0, UID)
+                        and stat.S_IMODE(outer.st_mode) & 0o077 == 0
+                        and identity(backing.parent) == parent_identity
+                        and not backing.is_symlink() and identity(backing) == identity(private_tmp),
+                        'backing ownership or identity changed')
                 shutil.rmtree(backing)
                 require(private_tmp.stat().st_nlink == 0, 'private tmp backing was not deleted')
                 require(identity(SCRATCH) == scratch_identity, 'managed runtime root was disturbed')
@@ -332,6 +372,102 @@ print(json.dumps(dict(provider='openai-codex', model=payload['model'],
         return [json.loads(row['model_attempt']) for row in fixture.rows(
             'SELECT model_attempt FROM operation_evidence WHERE model_attempt IS NOT NULL ORDER BY operation_id')]
 
+    def judge_record(key):
+        rows = fixture.rows(
+            'SELECT o.id,o.revision,o.state,e.model_attempt FROM operations o '
+            'LEFT JOIN operation_evidence e ON e.operation_id=o.id '
+            'WHERE o.kind=? AND o.work_key=? ORDER BY o.id LIMIT 1', ('judge', key))
+        if not rows or rows[0]['model_attempt'] is None:
+            return None
+        row = rows[0]
+        row['native'] = json.loads(row.pop('model_attempt'))
+        return row
+
+    def workspace_diagnosis(key, pinned, category, revision, deadline):
+        last = {}
+
+        def diagnostic(command):
+            remaining = deadline - time.monotonic()
+            require(remaining > 0, 'diagnostic publication deadline: ' + json.dumps(last)[:16000])
+            result = subprocess.run([str(binary), '--json', command, '--verbose'],
+                                    capture_output=True, text=True, timeout=min(5, remaining),
+                                    env=fixture.env)
+            require(result.returncode in ((0,) if command == 'status' else (0, 1)),
+                    'diagnostic command failed')
+            return json.loads(result.stdout)['data']
+
+        def witness(status):
+            runtime = status['effective_runtime']
+            lane = status['work']['judge']
+            model, assessment = lane.get('model', {}), lane.get('assessment', {})
+            at = int(time.time())
+            exclusions = assessment.get('exclusions', {})
+            relevant = lambda reason: reason == 'already_attempted' or reason.startswith('model_')
+            positive = any(row.get('work_key', '').lower() == key
+                           and relevant(row.get('reason', ''))
+                           for row in assessment.get('excluded_work', []))
+            ready = (runtime.get('revision') == revision and not runtime.get('reload_blocked')
+                     and runtime.get('authority_epoch') ==
+                         pinned['native']['producer']['preflight_admission']['authority_epoch']
+                     and status.get('controller_stopped') is False
+                     and model.get('operation_id') == pinned['id']
+                     and model.get('current_route') is True and model.get('current_runtime') is True
+                     and model.get('state') == 'prelaunch_failed'
+                     and model.get('failure_category') == category
+                     and assessment.get('completeness') == 'complete'
+                     and assessment.get('locally_judgeable') is False
+                     and 0 <= assessment.get('observed_at', -1) <= at
+                     and assessment.get('valid_until', -1) > at
+                     and sum(count for reason, count in exclusions.items() if relevant(reason)) > 0
+                     and positive)
+            stamp = (runtime.get('revision'), runtime.get('runtime_instance'),
+                     runtime.get('authority_epoch'), assessment.get('observed_at'),
+                     assessment.get('valid_until'), model.get('operation_id'))
+            return ready, stamp
+
+        while time.monotonic() < deadline:
+            row = judge_record(key)
+            require(row is not None and row['id'] == pinned['id']
+                    and row['revision'] == pinned['revision']
+                    and row['native']['producer'] == pinned['native']['producer'],
+                    'a later attempt substituted for the selected failure')
+            before = diagnostic('status')
+            last = dict(key=key, operation_id=pinned['id'], model=before['work']['judge'].get('model'),
+                        assessment=before['work']['judge'].get('assessment'))
+            ready, stamp = witness(before)
+            if ready:
+                require(before['work']['judge']['model'].get('scope') == 'current_work',
+                        'positive current-work evidence has wrong scope: ' + json.dumps(last)[:16000])
+                doctor = diagnostic('doctor')
+                after = diagnostic('status')
+                current = judge_record(key)
+                require(current is not None and current['id'] == pinned['id']
+                        and current['revision'] == pinned['revision']
+                        and current['native']['producer'] == pinned['native']['producer'],
+                        'attempt identity changed during diagnosis')
+                after_ready, after_stamp = witness(after)
+                if after_ready:
+                    require(after['work']['judge']['model'].get('scope') == 'current_work',
+                            'post-diagnosis current-work evidence has wrong scope: ' + json.dumps(last)[:16000])
+                stale = doctor['thresholds']['stale_seconds']
+                at = int(time.time())
+                live = all(0 <= at - status['effective_runtime']['observed_at'] <= stale
+                           for status in (before, after))
+                if after_ready and after_stamp == stamp and live:
+                    lane = doctor['work']['judge']
+                    model = lane['model']
+                    last['doctor'] = lane
+                    require(model['operation_id'] == pinned['id']
+                            and model['failure_category'] == category
+                            and model['current_route'] is True and model['current_runtime'] is True
+                            and model['state'] == 'prelaunch_failed'
+                            and lane['intervention']['status'] == 'operator_required'
+                            and lane['intervention']['next_action'] == 'inspect_model_workspace',
+                            'current judge failure lacks safe recovery guidance: ' + json.dumps(last)[:16000])
+                    return json.dumps(doctor)
+            time.sleep(0.05)
+        raise AssertionError('exact diagnostic evidence did not converge: ' + json.dumps(last)[:16000])
+
     def assert_process(expected):
         wait(lambda: cli('status', '--verbose')['process_observation']['state'] == 'observed_match',
              'actual canonical process never reached observed_match')
@@ -465,7 +601,7 @@ print(json.dumps(dict(provider='openai-codex', model=payload['model'],
         wait(lambda: not list(SCRATCH.glob('agmi-model-*')), 'completed workspaces not cleaned')
         require(any((record.get('completion') or {}).get('outcome') == 'captured' for record in model_records()),
                 'submission lacks actual captured native completion')
-        print('PASS deleted live service-private /tmp backing; new native capture/submission without restart; private workspace cleanup', flush=True)
+        print('PASS live inherited/private /tmp backing deleted; new managed capture/submission without restart; private workspace cleanup', flush=True)
 
         # Hold a genuine answer process, then break allocation for the other
         # lane. Its completion and already accepted effect must still survive.
@@ -479,7 +615,11 @@ print(json.dumps(dict(provider='openai-codex', model=payload['model'],
 
         for index, fault in enumerate(('missing', 'not-directory', 'permission', 'capacity')):
             require(not displaced.exists(), 'unexpected displaced root')
-            before = len(model_records())
+            key = f'{20 + index:064x}'
+            require(not fixture.rows('SELECT id FROM operations WHERE kind=? AND work_key=?',
+                                     ('judge', key)), 'fresh assignment required')
+            deadline = time.monotonic() + 25
+            pinned = {}
             before_launches, before_calls = launches(), len(calls())
             if fault in ('missing', 'not-directory'):
                 SCRATCH.rename(displaced)
@@ -497,29 +637,31 @@ print(json.dumps(dict(provider='openai-codex', model=payload['model'],
             category = {'permission': 'native_workspace_permission',
                         'capacity': 'native_workspace_capacity'}.get(fault, 'native_workspace_unavailable')
             def failed():
-                return any((record.get('completion') or {}).get('reason_code') == category
-                           for record in model_records()[before:])
-            wait(failed, 'real ' + fault + ' allocation did not produce typed failure')
-            failures = [record for record in model_records()[before:]
-                        if (record.get('completion') or {}).get('reason_code') == category]
-            for record in failures:
-                completion = record['completion']
-                require(completion['execution'] == 'not_started'
-                        and completion['outcome'] == 'not_started'
+                row = judge_record(key)
+                if row is None:
+                    return False
+                if not pinned:
+                    pinned.update(row)
+                require(row['id'] == pinned['id'] and row['revision'] == pinned['revision']
+                        and row['native']['producer'] == pinned['native']['producer'],
+                        'failed-work witness changed attempt identity')
+                completion = row['native'].get('completion') or {}
+                if not completion:
+                    return False
+                require(completion.get('reason_code') == category
+                        and completion.get('execution') == 'not_started'
+                        and completion.get('outcome') == 'not_started'
                         and completion.get('inference_spawned_at') is None
-                        and record.get('launch') is None, 'storage failure gained launch/paid authority')
+                        and row['native'].get('launch') is None
+                        and row['state'] == 'prelaunch_failed',
+                        'exact storage failure gained launch/paid authority or wrong classification')
+                return True
+            wait(failed, 'real ' + fault + ' exact allocation did not fail',
+                 seconds=max(0, deadline - time.monotonic()))
             require(launches() == before_launches and len(calls()) == before_calls,
                     'allocation failure launched native child')
-            status = cli('status', '--verbose')
-            require(status['work']['judge']['model']['failure_category'] == category,
-                    'consumer model diagnostics lost storage category')
-            diagnosis = subprocess.run([str(binary), '--json', 'doctor', '--verbose'],
-                                       capture_output=True, text=True, timeout=15, env=fixture.env)
-            require(diagnosis.returncode in (0, 1), 'doctor invocation failed')
-            doctor = json.loads(diagnosis.stdout)['data']
-            serialized = json.dumps(doctor)
-            require(category in serialized and 'inspect_model_workspace' in serialized,
-                    'doctor lacks bounded safe storage recovery instruction')
+            revision = fixture.invoke('config', 'check')['revision']
+            serialized = workspace_diagnosis(key, pinned, category, revision, deadline)
             require(str(SCRATCH) not in serialized and 'pk_test_fixture' not in serialized,
                     'doctor leaked private path or credential')
             fixture.cycles(2)

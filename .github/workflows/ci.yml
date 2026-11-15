@@ -115,6 +115,4 @@ jobs:
             --network=none --tmpfs /run --tmpfs /run/lock --tmpfs /tmp:exec,mode=1777 \
             -v "$PWD:/src:ro" -v "$PWD/target/release/agmi:/input/agmi:ro" \
             agmi-systemd-fixture
-          timeout 60 docker exec "$name" sh -c \
-            'until systemctl start user@17321.service; do sleep 1; done'
           docker exec "$name" python3 -u /src/tests/storage_runtime_smoke.py /input/agmi
