@@ -3311,7 +3311,8 @@ impl Store {
 
     pub(crate) fn runtime_state(&self, config: &Config, reload_blocked: bool) -> Result<()> {
         self.continuity()?;
-        let tx = self.db.unchecked_transaction()?;
+        // Reserve the writer before reading metadata that concurrent lane controls can change.
+        let tx = rusqlite::Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
         let mut policy = json!({"capabilities":config.capabilities,
             "identity":config.identity,"runtime":config.runtime,"build":crate::runtime::build_info()});
         let (authority_epoch, runtime_instance, account_generation): (
