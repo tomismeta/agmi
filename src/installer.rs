@@ -105,6 +105,25 @@ pub(crate) fn current_start_ticks() -> Option<u64> {
     *START
 }
 
+/// Runs local advisory adoption while installation ownership is synchronously held.
+/// This does not fence standalone checkers from retired releases.
+pub(crate) fn with_advisory_owner<T>(work: impl FnOnce() -> Result<T>) -> Result<T> {
+    #[cfg(target_os = "linux")]
+    {
+        native::with_advisory_owner(work)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let home = crate::store::account_home()?;
+        let selected = observe_selected(&home.join(".config/agmi/config.toml"));
+        ensure!(
+            selected.ownership == "unmanaged",
+            "advisory_adoption_deferred"
+        );
+        work()
+    }
+}
+
 pub(crate) fn pending_update_target(config_path: &Path) -> Result<Option<String>> {
     #[cfg(unix)]
     {
@@ -584,6 +603,68 @@ mod native {
         Ok((id.to_owned(), manifest, before))
     }
 
+    #[cfg(any(target_os = "linux", test))]
+    fn observed_unit(
+        home: &Path,
+        root: &Path,
+        release: &str,
+        fragment: &Path,
+    ) -> Result<(File, ImageObservation, ImageObservation)> {
+        ensure!(valid_id(release), "invalid selected release");
+        let unit = home.join(".config/systemd/user/agmi.service");
+        let directory = root.join(release);
+        // Only the two installer-owned links may be followed. In particular,
+        // neither an ancestor nor the release artifact may introduce a link.
+        for parent in [unit.parent().context("missing unit parent")?, &directory] {
+            account_owned_ancestors(parent, home)?;
+            for ancestor in parent.ancestors() {
+                ensure!(
+                    fs::symlink_metadata(ancestor)?.is_dir(),
+                    "linked unit ancestor"
+                );
+                if ancestor == home {
+                    break;
+                }
+            }
+        }
+        let current = root.join("current");
+        let unit_link = fs::symlink_metadata(&unit)?;
+        let current_link = fs::symlink_metadata(&current)?;
+        for link in [&unit_link, &current_link] {
+            ensure!(
+                link.file_type().is_symlink() && link.uid() == unsafe { libc::geteuid() },
+                "foreign managed link"
+            );
+        }
+        ensure!(
+            fs::read_link(&unit)? == root.join("current/agmi.service")
+                && fs::read_link(&current)? == Path::new(release),
+            "foreign managed unit selection"
+        );
+        let target = directory.join("agmi.service");
+        ensure!(
+            fragment == unit || fragment == target || fragment == root.join("current/agmi.service"),
+            "foreign loaded unit path"
+        );
+        let file = regular(&target)?;
+        account_owned(&target)?;
+        let image = image_metadata(&file.metadata()?);
+        ensure!(
+            image == image_metadata(&regular(&target)?.metadata()?)
+                && image_metadata(&unit_link) == image_metadata(&fs::symlink_metadata(&unit)?)
+                && image_metadata(&current_link)
+                    == image_metadata(&fs::symlink_metadata(&current)?)
+                && fs::read_link(&unit)? == root.join("current/agmi.service")
+                && fs::read_link(&current)? == Path::new(release),
+            "managed unit changed"
+        );
+        Ok((
+            file,
+            image_metadata(&unit_link),
+            image_metadata(&current_link),
+        ))
+    }
+
     #[cfg(target_os = "linux")]
     fn process_start(bytes: &[u8]) -> Result<u64> {
         let text = std::str::from_utf8(bytes)?;
@@ -785,26 +866,30 @@ mod native {
             let root = selected.root.as_ref().context("missing root")?;
             let mut remaining = 65_536;
             let before = observation_properties(deadline, &mut remaining)?;
-            let unit = home.join(".config/systemd/user/agmi.service");
-            account_owned_ancestors(unit.parent().context("missing unit parent")?, &home)?;
-            account_owned(&unit)?;
-            regular(&unit)?;
+            let release = selected.release.as_deref().context("missing release")?;
             ensure!(
-                before["LoadState"] == "loaded"
-                    && before["DropInPaths"].is_empty()
-                    && fs::canonicalize(&before["FragmentPath"])? == fs::canonicalize(&unit)?,
+                before["LoadState"] == "loaded" && before["DropInPaths"].is_empty(),
                 "foreign managed unit"
             );
+            let (unit_file, unit_link, current_link) =
+                observed_unit(&home, root, release, Path::new(&before["FragmentPath"]))?;
+            let unit_image = image_metadata(&unit_file.metadata()?);
             let pid: u32 = before["MainPID"].parse()?;
             result.pid = Some(pid);
             if pid == 0 {
                 let after = observation_properties(deadline, &mut remaining)?;
                 let final_selected = super::observe_selected(path);
+                let (final_unit, final_link, final_current) =
+                    observed_unit(&home, root, release, Path::new(&after["FragmentPath"]))?;
                 ensure!(
                     before == after
                         && final_selected.state == "observed"
                         && selected.release == final_selected.release
                         && selected.image == final_selected.image
+                        && unit_image == image_metadata(&unit_file.metadata()?)
+                        && unit_image == image_metadata(&final_unit.metadata()?)
+                        && unit_link == final_link
+                        && current_link == final_current
                         && std::time::Instant::now() < deadline,
                     "snapshot rollover"
                 );
@@ -860,10 +945,16 @@ mod native {
                 "snapshot rollover"
             );
             let final_selected = super::observe_selected(path);
+            let (final_unit, final_link, final_current) =
+                observed_unit(&home, root, release, Path::new(&after["FragmentPath"]))?;
             ensure!(
                 selected.release == final_selected.release
                     && selected.image == final_selected.image
                     && final_selected.state == "observed"
+                    && unit_image == image_metadata(&unit_file.metadata()?)
+                    && unit_image == image_metadata(&final_unit.metadata()?)
+                    && unit_link == final_link
+                    && current_link == final_current
                     && std::time::Instant::now() < deadline,
                 "selected rollover or deadline"
             );
@@ -3444,6 +3535,107 @@ mod native {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    pub(super) fn with_advisory_owner<T>(work: impl FnOnce() -> Result<T>) -> Result<T> {
+        let home = crate::store::account_home()?;
+        let config = home.join(".config/agmi/config.toml");
+        let selected = super::observe_selected(&config);
+        if selected.ownership == "unmanaged" {
+            return work();
+        }
+        let _owner = (|| -> Result<InstallLock> {
+            ensure!(
+                selected.ownership == "managed",
+                "advisory_adoption_deferred"
+            );
+            ensure!(
+                std::env::var_os("AGMI_UPDATE_LEASE_FD").is_none(),
+                "advisory_adoption_deferred"
+            );
+            let root = selected
+                .root
+                .as_ref()
+                .context("missing installation root")?;
+            let lease = InstallLock::acquire(root)?;
+            ensure!(
+                !lease.inherited && update_state::read(root)?.is_none(),
+                "advisory_adoption_deferred"
+            );
+            let current = super::observe_selected(&config);
+            ensure!(
+                current.release == selected.release && current.image == selected.image,
+                "advisory_adoption_deferred"
+            );
+            let invoking = regular(&std::env::current_exe()?)?;
+            ensure!(
+                Some(image_metadata(&invoking.metadata()?)) == selected.image,
+                "advisory_adoption_deferred"
+            );
+            let deadline = std::time::Instant::now() + Duration::from_millis(500);
+            let mut remaining = 65_536;
+            let before = observation_properties(deadline, &mut remaining)?;
+            ensure!(
+                before["LoadState"] == "loaded" && before["DropInPaths"].is_empty(),
+                "advisory_adoption_deferred"
+            );
+            let release = selected
+                .release
+                .as_deref()
+                .context("missing selected release")?;
+            let (unit, link, selection) =
+                observed_unit(&home, root, release, Path::new(&before["FragmentPath"]))?;
+            let unit_image = image_metadata(&unit.metadata()?);
+            let pid: u32 = before["MainPID"].parse()?;
+            if pid == 0 {
+                ensure!(
+                    matches!(before["ActiveState"].as_str(), "inactive" | "failed"),
+                    "advisory_adoption_deferred"
+                );
+            } else {
+                ensure!(
+                    before["ActiveState"] == "active",
+                    "advisory_adoption_deferred"
+                );
+                let process = PathBuf::from(format!("/proc/{pid}"));
+                ensure!(
+                    fs::metadata(&process)?.uid() == unsafe { libc::geteuid() },
+                    "advisory_adoption_deferred"
+                );
+                ensure!(
+                    Some(image_metadata(
+                        &File::open(process.join("exe"))?.metadata()?
+                    )) == selected.image,
+                    "advisory_adoption_deferred"
+                );
+                ensure!(
+                    managed_argv(
+                        &fs::read(process.join("cmdline"))?,
+                        &root.join(release).join("agmi"),
+                        &config
+                    ),
+                    "advisory_adoption_deferred"
+                );
+            }
+            let after = observation_properties(deadline, &mut remaining)?;
+            let (final_unit, final_link, final_selection) =
+                observed_unit(&home, root, release, Path::new(&after["FragmentPath"]))?;
+            let final_selected = super::observe_selected(&config);
+            ensure!(
+                before == after
+                    && link == final_link
+                    && selection == final_selection
+                    && unit_image == image_metadata(&final_unit.metadata()?)
+                    && selected.image == final_selected.image
+                    && selected.release == final_selected.release
+                    && std::time::Instant::now() < deadline,
+                "advisory_adoption_deferred"
+            );
+            Ok(lease)
+        })()
+        .map_err(|_| anyhow::anyhow!("advisory_adoption_deferred"))?;
+        work()
+    }
+
     pub(super) fn managed_root(config_path: &Path) -> Result<Option<PathBuf>> {
         let home = crate::store::account_home()?;
         let selected = if config_path.is_absolute() {
@@ -4264,6 +4456,141 @@ mod native {
         use super::*;
 
         static TEST_SERIAL: Mutex<()> = Mutex::new(());
+
+        fn observed_unit_fixture() -> Result<(tempfile::TempDir, PathBuf, String, PathBuf)> {
+            let home = tempfile::tempdir()?;
+            fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700))?;
+            let root = home.path().join(".local/share/agmi/releases");
+            let id = format!("r-{}", "a".repeat(64));
+            fs::create_dir_all(root.join(&id))?;
+            let unit = home.path().join(".config/systemd/user/agmi.service");
+            fs::create_dir_all(unit.parent().unwrap())?;
+            for parent in [root.join(&id), unit.parent().unwrap().to_path_buf()] {
+                for ancestor in parent.ancestors() {
+                    fs::set_permissions(ancestor, fs::Permissions::from_mode(0o700))?;
+                    if ancestor == home.path() {
+                        break;
+                    }
+                }
+            }
+            let target = root.join(&id).join("agmi.service");
+            fs::write(&target, b"owned unit")?;
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o600))?;
+            symlink(&id, root.join("current"))?;
+            symlink(root.join("current/agmi.service"), &unit)?;
+            Ok((home, root, id, unit))
+        }
+
+        #[test]
+        fn observed_unit_accepts_only_the_installer_chain_without_writing() -> Result<()> {
+            let (home, root, id, unit) = observed_unit_fixture()?;
+            let target = root.join(&id).join("agmi.service");
+            let before = fs::read(&target)?;
+            // The generic helper must still refuse even this authorized symlink.
+            assert!(regular(&unit).is_err());
+            let (mut file, link, current) = observed_unit(home.path(), &root, &id, &unit)?;
+            let image = image_metadata(&file.metadata()?);
+            let mut contents = Vec::new();
+            file.read_to_end(&mut contents)?;
+            assert_eq!(contents, before);
+            let (again, next_link, next_current) = observed_unit(home.path(), &root, &id, &target)?;
+            assert_eq!(image, image_metadata(&again.metadata()?));
+            assert_eq!(link, next_link);
+            assert_eq!(current, next_current);
+            observed_unit(home.path(), &root, &id, &root.join("current/agmi.service"))?;
+            assert_eq!(fs::read(&target)?, before);
+            assert_eq!(fs::read_link(&unit)?, root.join("current/agmi.service"));
+            assert_eq!(fs::read_link(root.join("current"))?, Path::new(&id));
+            Ok(())
+        }
+
+        #[test]
+        fn observed_unit_rejects_foreign_dangling_and_escaped_chains() -> Result<()> {
+            let (home, root, id, unit) = observed_unit_fixture()?;
+            let target = root.join(&id).join("agmi.service");
+            let foreign = home.path().join("foreign.service");
+            symlink(&target, &foreign)?;
+            assert!(observed_unit(home.path(), &root, &id, &foreign).is_err());
+            for link in [
+                target.clone(),
+                foreign.clone(),
+                PathBuf::from("../../../../.local/share/agmi/releases/current/agmi.service"),
+                home.path().join("missing.service"),
+            ] {
+                fs::remove_file(&unit)?;
+                symlink(link, &unit)?;
+                assert!(observed_unit(home.path(), &root, &id, &unit).is_err());
+            }
+            fs::remove_file(&unit)?;
+            symlink(root.join("current/agmi.service"), &unit)?;
+            for selection in [
+                PathBuf::from("../outside"),
+                root.join(&id),
+                PathBuf::from(format!("r-{}", "b".repeat(64))),
+            ] {
+                fs::remove_file(root.join("current"))?;
+                symlink(selection, root.join("current"))?;
+                assert!(observed_unit(home.path(), &root, &id, &unit).is_err());
+            }
+            fs::remove_file(root.join("current"))?;
+            symlink(&id, root.join("current"))?;
+            fs::rename(&target, root.join(&id).join("saved.service"))?;
+            assert!(observed_unit(home.path(), &root, &id, &unit).is_err());
+            symlink("saved.service", &target)?;
+            assert!(observed_unit(home.path(), &root, &id, &unit).is_err());
+            fs::remove_file(&target)?;
+            fs::rename(root.join(&id).join("saved.service"), &target)?;
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o622))?;
+            assert!(observed_unit(home.path(), &root, &id, &unit).is_err());
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o600))?;
+            let parent = unit.parent().unwrap();
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o722))?;
+            assert!(observed_unit(home.path(), &root, &id, &unit).is_err());
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+            // An exclusively owned directory alias still is not the owned chain.
+            let moved = home.path().join("outside-units");
+            fs::rename(parent, &moved)?;
+            symlink(&moved, parent)?;
+            assert!(observed_unit(home.path(), &root, &id, &unit).is_err());
+            fs::remove_file(parent)?;
+            fs::rename(moved, parent)?;
+            let directory = root.join(&id);
+            let moved = home.path().join("outside-release");
+            fs::rename(&directory, &moved)?;
+            symlink(&moved, &directory)?;
+            assert!(observed_unit(home.path(), &root, &id, &unit).is_err());
+            Ok(())
+        }
+
+        #[test]
+        fn observed_unit_pins_artifact_and_detects_link_replacement() -> Result<()> {
+            let (home, root, id, unit) = observed_unit_fixture()?;
+            let target = root.join(&id).join("agmi.service");
+            let (file, link, current) = observed_unit(home.path(), &root, &id, &unit)?;
+            let image = image_metadata(&file.metadata()?);
+            // Preserve the old objects so inode reuse cannot make the test flaky.
+            fs::rename(&target, root.join(&id).join("old.service"))?;
+            fs::write(&target, b"owned unit")?;
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o600))?;
+            let (replacement, _, _) = observed_unit(home.path(), &root, &id, &unit)?;
+            assert_ne!(image, image_metadata(&replacement.metadata()?));
+            assert_eq!(image.inode, file.metadata()?.ino());
+            fs::rename(&unit, unit.with_extension("old"))?;
+            symlink(root.join("current/agmi.service"), &unit)?;
+            let (_, replacement_link, _) = observed_unit(home.path(), &root, &id, &unit)?;
+            assert_ne!(link, replacement_link);
+            fs::rename(root.join("current"), root.join("old-current"))?;
+            symlink(&id, root.join("current"))?;
+            let (_, _, replacement_current) = observed_unit(home.path(), &root, &id, &unit)?;
+            assert_ne!(current, replacement_current);
+            let next_id = format!("r-{}", "b".repeat(64));
+            fs::create_dir(root.join(&next_id))?;
+            fs::write(root.join(&next_id).join("agmi.service"), b"next unit")?;
+            fs::remove_file(root.join("current"))?;
+            symlink(next_id, root.join("current"))?;
+            assert!(observed_unit(home.path(), &root, &id, &unit).is_err());
+            Ok(())
+        }
 
         #[test]
         fn observed_selection_is_metadata_not_checksum_attestation() -> Result<()> {

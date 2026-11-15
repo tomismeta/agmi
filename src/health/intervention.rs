@@ -490,6 +490,25 @@ fn lane<'a>(
     let model = &work["model"];
     if !read_only && model.is_object() {
         if model["current_route"] == true
+            && model["current_runtime"] == true
+            && model["scope"] == "current_work"
+            && model["state"] == "prelaunch_failed"
+            && status["controller_stopped"] == false
+            && fresh(
+                status["effective_runtime"]["observed_at"].as_i64(),
+                at,
+                stale,
+            )
+            && let Some(
+                code @ ("native_workspace_unavailable"
+                | "native_workspace_capacity"
+                | "native_workspace_permission"
+                | "native_workspace_failure"),
+            ) = model["failure_category"].as_str()
+        {
+            return Finding::blocked(code, "inspect_model_workspace");
+        }
+        if model["current_route"] == true
             && matches!(
                 model["failure_category"].as_str(),
                 Some("native_auth_unavailable")
@@ -1481,6 +1500,52 @@ mod tests {
             projection(&status).0["judge"]["intervention"]["status"],
             "operator_required"
         );
+    }
+
+    #[test]
+    fn local_workspace_failures_require_host_inspection_not_model_recovery() {
+        for code in [
+            "native_workspace_unavailable",
+            "native_workspace_capacity",
+            "native_workspace_permission",
+            "native_workspace_failure",
+        ] {
+            let mut status = fixture();
+            status["work"]["answer"]["model"] = json!({
+                "state":"prelaunch_failed","retry_eligible":true,
+                "scope":"current_work","current_route":true,"current_runtime":true,
+                "failure_category":code
+            });
+            let (work, _) = projection(&status);
+            assert_eq!(work["answer"]["intervention"]["reason"], code);
+            assert_eq!(
+                work["answer"]["intervention"]["status"],
+                "operator_required"
+            );
+            assert_eq!(
+                work["answer"]["intervention"]["next_action"],
+                "inspect_model_workspace"
+            );
+            assert!(work["answer"]["intervention"]["next_at"].is_null());
+            status["work"]["answer"]["model"]["current_route"] = json!(false);
+            assert_eq!(
+                projection(&status).0["answer"]["intervention"]["reason"],
+                "model_retry_eligible"
+            );
+            status["work"]["answer"]["model"]["current_route"] = json!(true);
+            for (field, value) in [
+                ("current_runtime", json!(false)),
+                ("scope", json!("historical_assignment")),
+                ("state", json!("confirmed")),
+            ] {
+                let mut changed = status.clone();
+                changed["work"]["answer"]["model"][field] = value;
+                assert_ne!(
+                    projection(&changed).0["answer"]["intervention"]["next_action"],
+                    "inspect_model_workspace"
+                );
+            }
+        }
     }
 
     #[test]

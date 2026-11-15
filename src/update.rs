@@ -656,6 +656,8 @@ fn safe_intervention(value: &Value) -> Value {
             "hosted_identity_authentication_failed", "hosted_identity_mismatch",
             "hosted_identity_unavailable", "hosted_identity_invalid_response", "hosted_identity_legacy_unknown",
             "model_authentication_failed", "model_configuration_failed", "model_attempt_budget_exhausted",
+            "native_workspace_unavailable", "native_workspace_capacity",
+            "native_workspace_permission", "native_workspace_failure",
             "admission_recovery_unproven", "model_retry_eligible", "model_uncertain", "model_retry_unavailable",
             "model_retry_evidence_unavailable", "unbound_outcome_requires_evidence", "admission_evidence_unavailable",
             "read_outcome_overdue", "read_in_flight", "read_backoff", "completion_evidence_stale",
@@ -672,6 +674,7 @@ fn safe_intervention(value: &Value) -> Value {
             "retry_model", "recover_model", "await_assignments", "await_challenge", "observe_assignments",
             "observe_challenge", "await_answer_retry", "inspect_answer_retry", "inspect_repair_failure",
             "inspect_state_filesystem", "await_identity",
+            "inspect_model_workspace",
         ], "inspect_local_evidence"),
         "evidence":"local_only"
     });

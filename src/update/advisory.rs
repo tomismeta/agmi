@@ -1,4 +1,4 @@
-//! Disposable, passive publisher evidence. Never an installation authority.
+//! Durable, passive publisher restriction evidence. Never installation authority.
 use super::*;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -136,7 +136,7 @@ pub(crate) type CheckReport = Value;
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Cache {
+struct Record {
     format: u8,
     source: String,
     context: String,
@@ -148,7 +148,17 @@ struct Cache {
     next_due_at: i64,
     retry_not_before: Option<i64>,
     good: Option<Good>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    adoption: Option<Adoption>,
 }
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Adoption {
+    phase: String,
+    legacy_path: PathBuf,
+    source_sha256: Option<String>,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Good {
@@ -169,12 +179,39 @@ pub(crate) fn background_policy() -> Value {
         _ => json!({"enabled":false,"reason":"invalid_environment"}),
     }
 }
-fn cache_path() -> Option<PathBuf> {
-    let root = std::env::var_os("XDG_CACHE_HOME")
+fn record_path() -> Option<PathBuf> {
+    crate::store::account_home()
+        .ok()
+        .map(|home| durable_path(&home))
+}
+
+fn durable_path(home: &Path) -> PathBuf {
+    home.join(".local/share/agmi/update-advisory/update.json")
+}
+
+fn legacy_path() -> Result<PathBuf> {
+    resolve_legacy_path(std::env::var_os("XDG_CACHE_HOME"), std::env::var_os("HOME"))
+}
+
+fn resolve_legacy_path(
+    xdg: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Result<PathBuf> {
+    let root = xdg
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
-    root.is_absolute().then(|| root.join("agmi/update.json"))
+        .or_else(|| home.map(|h| PathBuf::from(h).join(".cache")))
+        .context("legacy_source_unavailable")?;
+    ensure!(root.is_absolute(), "legacy_source_unavailable");
+    Ok(root.join("agmi/update.json"))
+}
+
+fn present(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e.into()),
+    }
 }
 fn safe_metadata(path: &Path, directory: bool) -> Result<()> {
     let metadata = fs::symlink_metadata(path)?;
@@ -184,23 +221,32 @@ fn safe_metadata(path: &Path, directory: bool) -> Result<()> {
         } else {
             metadata.is_file()
         },
-        "unsafe cache type"
+        "unsafe record type"
     );
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
         ensure!(
-            metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & 0o077 == 0,
-            "unsafe cache ownership"
+            metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.mode() & 0o777 == if directory { 0o700 } else { 0o600 },
+            "unsafe record ownership"
         );
         if !directory {
-            ensure!(metadata.nlink() == 1, "unsafe cache links");
+            ensure!(metadata.nlink() == 1, "unsafe record links");
         }
     }
     Ok(())
 }
-fn read_cache(path: &Path) -> Result<Cache> {
+fn read_record(path: &Path) -> Result<Record> {
+    let bytes = read_bytes(path)?;
+    let cache: Record = serde_json::from_slice(&bytes)?;
+    validate_record(&cache)?;
+    Ok(cache)
+}
+
+fn read_bytes(path: &Path) -> Result<Vec<u8>> {
     safe_metadata(path.parent().context("cache parent")?, true)?;
+    safe_base(path.parent().context("record parent")?)?;
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -228,8 +274,64 @@ fn read_cache(path: &Path) -> Result<Cache> {
     let mut bytes = Vec::new();
     file.take(LIMIT + 1).read_to_end(&mut bytes)?;
     ensure!(bytes.len() as u64 <= LIMIT, "cache too large");
-    let cache: Cache = serde_json::from_slice(&bytes)?;
-    ensure!(cache.format == 1 && cache.source == API, "foreign cache");
+    Ok(bytes)
+}
+
+fn validate_record(cache: &Record) -> Result<()> {
+    ensure!(cache.source == API, "foreign record");
+    ensure!(
+        matches!(
+            cache.outcome.as_str(),
+            "" | "in_progress" | "success" | "failure"
+        ),
+        "invalid outcome"
+    );
+    ensure!(
+        (cache.outcome == "in_progress")
+            == (cache.finished_at.is_none() && !cache.outcome.is_empty()),
+        "invalid completion"
+    );
+    if cache.outcome.is_empty() {
+        ensure!(
+            cache.format == 2
+                && cache.started_at == 0
+                && cache.finished_at.is_none()
+                && cache.attempt_id.is_empty()
+                && cache.reason.is_empty()
+                && cache.context.is_empty()
+                && cache.next_due_at == 0
+                && cache.retry_not_before.is_none()
+                && cache.good.is_none()
+                && cache
+                    .adoption
+                    .as_ref()
+                    .is_some_and(|a| a.source_sha256.is_none()),
+            "invalid empty record"
+        );
+    }
+    ensure!(
+        cache.started_at >= 0
+            && cache.next_due_at >= 0
+            && cache.finished_at.is_none_or(|finished| {
+                finished >= 0
+                    && (finished >= cache.started_at
+                        || (cache.outcome == "failure" && cache.reason == "clock_regressed"))
+            })
+            && cache.retry_not_before.is_none_or(|floor| floor >= 0),
+        "invalid record time"
+    );
+    match (cache.format, &cache.adoption) {
+        (1, None) => (),
+        (2, Some(adoption)) => {
+            ensure!(
+                matches!(adoption.phase.as_str(), "adopting" | "ready")
+                    && adoption.legacy_path.is_absolute()
+                    && adoption.source_sha256.as_ref().is_none_or(|v| hex(v, 64)),
+                "invalid adoption"
+            );
+        }
+        _ => anyhow::bail!("unsupported record"),
+    }
     if let Some(good) = &cache.good {
         let identity = Identity::parse(&good.manifest, true)?;
         ensure!(
@@ -251,43 +353,241 @@ fn read_cache(path: &Path) -> Result<Cache> {
             "incomplete success proof"
         );
     }
-    Ok(cache)
+    Ok(())
 }
-fn initialize(path: &Path) -> Result<()> {
-    let parent = path.parent().context("cache parent")?;
-    // Only the standard cache base may be created; never follow an existing agmi symlink.
-    let base = parent.parent().context("cache base")?;
-    if !base.exists() {
-        fs::create_dir_all(base)?;
-    }
+fn safe_base(parent: &Path) -> Result<()> {
+    let base = parent.parent().context("record base")?;
     let metadata = fs::symlink_metadata(base)?;
-    ensure!(metadata.is_dir(), "unsafe cache base");
+    ensure!(metadata.is_dir(), "unsafe record base");
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
         ensure!(
             metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & 0o022 == 0,
-            "unsafe cache base"
+            "unsafe record base"
         );
     }
-    if !parent.exists() {
+    Ok(())
+}
+
+fn initialize(path: &Path) -> Result<()> {
+    let parent = path.parent().context("record parent")?;
+    let mut missing = Vec::new();
+    let mut ancestor = parent;
+    while !present(ancestor)? {
+        missing.push(ancestor.to_path_buf());
+        ancestor = ancestor.parent().context("record ancestor")?;
+    }
+    for directory in missing.iter().rev() {
         let mut builder = fs::DirBuilder::new();
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;
             builder.mode(0o700);
         }
-        match builder.create(parent) {
-            Ok(()) => (),
+        match builder.create(directory) {
+            Ok(()) => File::open(directory.parent().context("record ancestor")?)?.sync_all()?,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (),
             Err(e) => return Err(e.into()),
         }
     }
+    safe_base(parent)?;
     safe_metadata(parent, true)
+}
+
+fn account_ancestors(path: &Path, home: &Path) -> Result<()> {
+    ensure!(path.starts_with(home), "record outside account home");
+    let mut current = home.to_path_buf();
+    for component in path.strip_prefix(home)?.components() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if present(&current)? {
+                let metadata = fs::symlink_metadata(&current)?;
+                ensure!(
+                    metadata.is_dir()
+                        && metadata.uid() == unsafe { libc::geteuid() }
+                        && metadata.mode() & 0o022 == 0,
+                    "unsafe record ancestor"
+                );
+            }
+        }
+        current.push(component);
+    }
+    Ok(())
+}
+
+fn source_snapshot(path: &Path) -> Result<Option<(Record, String)>> {
+    if let Some(parent) = path.parent()
+        && present(parent)?
+    {
+        safe_metadata(parent, true)?;
+        safe_base(parent)?;
+    }
+    if !present(path)? {
+        return Ok(None);
+    }
+    let bytes = read_bytes(path)?;
+    let record: Record = serde_json::from_slice(&bytes)?;
+    validate_record(&record)?;
+    ensure!(record.format == 1, "legacy_source_conflict");
+    Ok(Some((record, format!("{:x}", Sha256::digest(&bytes)))))
+}
+
+// Lock order is install -> legacy -> durable; all work finishes before release.
+fn adopt_locked(path: &Path, source: &Path, canonical_source: &Path) -> Result<()> {
+    if source != canonical_source {
+        ensure!(
+            !present(canonical_source)?
+                && !present(&canonical_source.with_file_name("update.lock"))?,
+            "legacy_source_conflict"
+        );
+    }
+    let source_footprint = present(source)? || present(&source.with_file_name("update.lock"))?;
+    let _legacy = if source_footprint {
+        Some(acquire(source)?.context("advisory_adoption_deferred")?)
+    } else {
+        None
+    };
+    let durable_existed = present(path.parent().context("record parent")?)?;
+    let _durable = acquire(path)?.context("advisory_adoption_deferred")?;
+    if let Some(legacy) = &_legacy {
+        verify_lease(source, legacy)?;
+    }
+    let snapshot = source_snapshot(source)?;
+    #[cfg(unix)]
+    let source_metadata = if snapshot.is_some() {
+        Some(fs::symlink_metadata(source)?)
+    } else {
+        None
+    };
+    let source_parent = source.parent().context("legacy parent")?;
+    let source_directory = if present(source_parent)? {
+        Some(open_directory(source_parent)?)
+    } else {
+        None
+    };
+    let mut record = if present(path)? {
+        let record = read_record(path)?;
+        ensure!(record.format == 2, "advisory_record_invalid");
+        let adoption = record
+            .adoption
+            .as_ref()
+            .context("advisory_record_invalid")?;
+        ensure!(adoption.legacy_path == source, "legacy_source_conflict");
+        if adoption.phase == "ready" {
+            ensure!(snapshot.is_none(), "legacy_source_conflict");
+            return Ok(());
+        }
+        ensure!(
+            snapshot
+                .as_ref()
+                .is_none_or(|(_, digest)| Some(digest) == adoption.source_sha256.as_ref()),
+            "legacy_source_conflict"
+        );
+        record
+    } else {
+        ensure!(!durable_existed, "advisory_record_missing");
+        let digest = snapshot.as_ref().map(|(_, digest)| digest.clone());
+        let mut record = snapshot
+            .as_ref()
+            .map(|(record, _)| record.clone())
+            .unwrap_or_else(|| Record {
+                source: API.into(),
+                ..Record::default()
+            });
+        record.format = 2;
+        record.adoption = Some(Adoption {
+            phase: "adopting".into(),
+            legacy_path: source.into(),
+            source_sha256: digest,
+        });
+        persist(path, &record)?;
+        record
+    };
+    verify_lease(path, &_durable)?;
+    if let Some(legacy) = &_legacy {
+        verify_lease(source, legacy)?;
+    }
+    if let Some((_, digest)) = snapshot {
+        ensure!(
+            source_snapshot(source)?.is_some_and(|(_, current)| current == digest),
+            "legacy_source_conflict"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let original = source_metadata.as_ref().context("legacy_source_conflict")?;
+            let current = fs::symlink_metadata(source)?;
+            ensure!(
+                original.dev() == current.dev() && original.ino() == current.ino(),
+                "legacy_source_conflict"
+            );
+        }
+        #[cfg(test)]
+        filesystem_boundary()?;
+        verify_directory(
+            source_parent,
+            source_directory
+                .as_ref()
+                .context("legacy_source_conflict")?,
+        )?;
+        fs::remove_file(source)?;
+        #[cfg(test)]
+        filesystem_boundary()?;
+    }
+    if let Some(directory) = source_directory {
+        #[cfg(test)]
+        filesystem_boundary()?;
+        verify_directory(source_parent, &directory)?;
+        directory.sync_all()?;
+        #[cfg(test)]
+        filesystem_boundary()?;
+    }
+    verify_lease(path, &_durable)?;
+    if let Some(legacy) = &_legacy {
+        verify_lease(source, legacy)?;
+    }
+    record
+        .adoption
+        .as_mut()
+        .context("advisory_record_invalid")?
+        .phase = "ready".into();
+    persist(path, &record)
+}
+
+fn prepare_record(path: &Path) -> Result<()> {
+    let home = crate::store::account_home()?;
+    account_ancestors(path, &home)?;
+    let canonical_source = home.join(".cache/agmi/update.json");
+    if present(path)? {
+        let record = read_record(path)?;
+        ensure!(record.format == 2, "advisory_record_invalid");
+        if record.adoption.as_ref().is_some_and(|a| a.phase == "ready") {
+            ensure!(
+                !present(
+                    &record
+                        .adoption
+                        .as_ref()
+                        .context("advisory_record_invalid")?
+                        .legacy_path
+                )?,
+                "legacy_source_conflict"
+            );
+            ensure!(!present(&canonical_source)?, "legacy_source_conflict");
+            return Ok(());
+        }
+    }
+    let source = legacy_path()?;
+    installer::with_advisory_owner(|| adopt_locked(path, &source, &canonical_source))
 }
 fn acquire(path: &Path) -> Result<Option<File>> {
     initialize(path)?;
     let lock_path = path.with_file_name("update.lock");
+    ensure!(
+        !present(path)? || present(&lock_path)?,
+        "advisory_record_missing"
+    );
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true);
     #[cfg(unix)]
@@ -307,16 +607,180 @@ fn acquire(path: &Path) -> Result<Option<File>> {
         ensure!(a.dev() == b.dev() && a.ino() == b.ino(), "lock changed");
     }
     match file.try_lock() {
-        Ok(()) => Ok(Some(file)),
+        Ok(()) => {
+            verify_lease(path, &file)?;
+            file.sync_all()?;
+            open_directory(path.parent().context("record parent")?)?.sync_all()?;
+            Ok(Some(file))
+        }
         Err(std::fs::TryLockError::WouldBlock) => Ok(None),
         Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
     }
 }
-fn persist(path: &Path, cache: &Cache) -> Result<()> {
-    safe_metadata(path.parent().context("cache parent")?, true)?;
+fn verify_directory(path: &Path, file: &File) -> Result<()> {
+    safe_metadata(path, true)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let opened = file.metadata()?;
+        let named = fs::symlink_metadata(path)?;
+        ensure!(
+            opened.dev() == named.dev() && opened.ino() == named.ino(),
+            "advisory directory changed"
+        );
+    }
+    Ok(())
+}
+
+fn open_directory(path: &Path) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let directory = options.open(path)?;
+    verify_directory(path, &directory)?;
+    Ok(directory)
+}
+
+fn verify_lease(path: &Path, file: &File) -> Result<()> {
+    let lock = path.with_file_name("update.lock");
+    safe_metadata(&lock, false)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let opened = file.metadata()?;
+        let named = fs::symlink_metadata(lock)?;
+        ensure!(
+            opened.dev() == named.dev() && opened.ino() == named.ino() && opened.nlink() == 1,
+            "advisory lease changed"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static FILESYSTEM_FAULT: std::cell::Cell<Option<(usize, usize)>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn filesystem_boundary() -> Result<()> {
+    FILESYSTEM_FAULT.with(|fault| {
+        if let Some((target, seen)) = fault.get() {
+            fault.set(Some((target, seen + 1)));
+            ensure!(target != seen + 1, "injected_filesystem_failure");
+        }
+        Ok(())
+    })
+}
+
+fn persist(path: &Path, cache: &Record) -> Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SERIAL: AtomicU64 = AtomicU64::new(0);
+    validate_record(cache)?;
+    let parent = path.parent().context("record parent")?;
+    safe_metadata(parent, true)?;
+    safe_base(parent)?;
+    let previous_target = if present(path)? {
+        safe_metadata(path, false)?;
+        Some(fs::symlink_metadata(path)?)
+    } else {
+        None
+    };
     let bytes = serde_json::to_vec(cache)?;
-    ensure!(bytes.len() as u64 <= LIMIT, "cache too large");
-    crate::admin::persist(path, &bytes)
+    ensure!(bytes.len() as u64 <= LIMIT, "record too large");
+    let directory = open_directory(parent)?;
+    let (temporary, mut file) = loop {
+        let temporary = parent.join(format!(
+            ".update-{}-{}.tmp",
+            std::process::id(),
+            SERIAL.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        match options.open(&temporary) {
+            Ok(file) => break (temporary, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    };
+    let result = (|| -> Result<()> {
+        file.write_all(&bytes)?;
+        #[cfg(test)]
+        filesystem_boundary()?;
+        file.sync_all()?;
+        #[cfg(test)]
+        filesystem_boundary()?;
+        safe_metadata(parent, true)?;
+        safe_metadata(&temporary, false)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let opened = directory.metadata()?;
+            let named = fs::symlink_metadata(parent)?;
+            let opened_file = file.metadata()?;
+            let named_file = fs::symlink_metadata(&temporary)?;
+            ensure!(
+                opened.dev() == named.dev()
+                    && opened.ino() == named.ino()
+                    && opened_file.dev() == named_file.dev()
+                    && opened_file.ino() == named_file.ino()
+                    && opened_file.nlink() == 1,
+                "record publication changed"
+            );
+        }
+        match (&previous_target, present(path)?) {
+            (None, false) => (),
+            (Some(previous), true) => {
+                safe_metadata(path, false)?;
+                let current = fs::symlink_metadata(path)?;
+                ensure!(
+                    previous.len() == current.len()
+                        && previous.modified()? == current.modified()?,
+                    "record target changed"
+                );
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    ensure!(
+                        previous.dev() == current.dev()
+                            && previous.ino() == current.ino()
+                            && previous.ctime() == current.ctime()
+                            && previous.ctime_nsec() == current.ctime_nsec(),
+                        "record target changed"
+                    );
+                }
+            }
+            _ => anyhow::bail!("record target changed"),
+        }
+        #[cfg(test)]
+        filesystem_boundary()?;
+        verify_directory(parent, &directory)?;
+        fs::rename(&temporary, path)?;
+        #[cfg(test)]
+        filesystem_boundary()?;
+        #[cfg(test)]
+        filesystem_boundary()?;
+        verify_directory(parent, &directory)?;
+        directory.sync_all()?;
+        #[cfg(test)]
+        filesystem_boundary()?;
+        Ok(())
+    })();
+    // Only this operation's create-new temporary is disposable.
+    let _ = fs::remove_file(temporary);
+    result
 }
 fn offset(context: &LocalUpdateContext) -> i64 {
     let hash = Sha256::digest(
@@ -327,8 +791,10 @@ fn offset(context: &LocalUpdateContext) -> i64 {
     );
     i64::from(u16::from_be_bytes([hash[0], hash[1]])) % 301
 }
-fn cache_view(context: &LocalUpdateContext, cache: Option<&Cache>, at: i64) -> Value {
+fn record_view(context: &LocalUpdateContext, cache: Option<&Record>, at: i64) -> Value {
     let mut result = json!({"availability":"unknown","freshness":"missing","reason":"no_compatible_evidence","checked_at":null,"latest_version":null,"background":background_policy(),"owner":context.selected["ownership"],"selected_running_relation":"not_assessed","next_action":{"kind":"use_install_owner"},"installability":"not_assessed","last_good":null});
+    result["storage"] = json!("unknown");
+    result["adoption_required"] = json!(false);
     if context.managed() {
         result["next_action"] = json!({"kind":"check","argv":["agmi","update","--check"]});
     }
@@ -336,8 +802,43 @@ fn cache_view(context: &LocalUpdateContext, cache: Option<&Cache>, at: i64) -> V
         result["next_action"] = json!({"kind":"unavailable"});
     }
     let Some(cache) = cache else { return result };
+    result["storage"] = json!(if cache.format == 1 {
+        "legacy"
+    } else {
+        "durable"
+    });
     result["next_due_at"] = json!(cache.next_due_at.max(cache.retry_not_before.unwrap_or(0)));
+    result["retry_not_before"] = json!(cache.retry_not_before);
+    result["adoption_required"] = json!(
+        cache.format == 1
+            || cache
+                .adoption
+                .as_ref()
+                .is_some_and(|a| a.phase == "adopting")
+    );
+    if cache
+        .adoption
+        .as_ref()
+        .is_some_and(|a| a.phase == "adopting")
+    {
+        result["freshness"] = json!("unavailable");
+        result["reason"] = json!("advisory_adoption_in_progress");
+        result["next_action"] =
+            json!({"kind":"unavailable","reason":"advisory_adoption_in_progress"});
+        return result;
+    }
+    // Keep source floors and unfinished-attempt evidence visible during adoption.
+    let incomplete = cache.outcome == "in_progress" && cache.finished_at.is_none();
     result["reason"] = json!(cache.reason);
+    if cache.retry_not_before.is_some_and(|floor| floor > at) {
+        result["reason"] = json!("source_retry_not_before");
+    } else if incomplete {
+        result["reason"] = json!("previous_attempt_incomplete");
+    }
+    if incomplete {
+        result["next_action"] =
+            json!({"kind":"unavailable","reason":"previous_attempt_incomplete"});
+    }
     result["freshness"] = json!("unavailable");
     if let Some(good) = &cache.good {
         let publication = Identity::parse(&good.manifest, true).ok();
@@ -382,26 +883,60 @@ fn cache_view(context: &LocalUpdateContext, cache: Option<&Cache>, at: i64) -> V
     }
     result
 }
+fn read_view_record(home: &Path, legacy: Result<PathBuf>) -> Result<Option<Record>> {
+    let path = durable_path(home);
+    account_ancestors(&path, home)?;
+    let canonical = home.join(".cache/agmi/update.json");
+    if present(&path)? {
+        let record = read_record(&path)?;
+        ensure!(record.format == 2, "advisory_record_invalid");
+        if let Some(adoption) = &record.adoption {
+            ensure!(
+                adoption.phase == "adopting"
+                    || (!present(&adoption.legacy_path)? && !present(&canonical)?),
+                "legacy_source_conflict"
+            );
+        }
+        return Ok(Some(record));
+    }
+    ensure!(
+        !present(path.parent().context("record parent")?)?,
+        "advisory_record_missing"
+    );
+    let source = legacy?;
+    if source != canonical {
+        ensure!(
+            !present(&canonical)? && !present(&canonical.with_file_name("update.lock"))?,
+            "legacy_source_conflict"
+        );
+    }
+    Ok(source_snapshot(&source)?.map(|(record, _)| record))
+}
+
 pub(crate) fn view(context: &LocalUpdateContext, at: i64) -> AdvisoryView {
-    let Some(path) = cache_path() else {
-        let mut value = cache_view(context, None, at);
-        value["freshness"] = json!("unavailable");
-        value["reason"] = json!("cache_unavailable");
-        return value;
-    };
-    match read_cache(&path) {
-        Ok(cache) => cache_view(context, Some(&cache), at),
+    let observed =
+        crate::store::account_home().and_then(|home| read_view_record(&home, legacy_path()));
+    match observed {
+        Ok(Some(record)) => record_view(context, Some(&record), at),
+        Ok(None) => record_view(context, None, at),
         Err(error) => {
-            let mut value = cache_view(context, None, at);
-            if error
-                .downcast_ref::<std::io::Error>()
-                .is_none_or(|e| e.kind() != std::io::ErrorKind::NotFound)
-            {
-                value["freshness"] = json!("unavailable");
-                value["reason"] = json!("cache_invalid");
-            }
+            let mut value = record_view(context, None, at);
+            value["freshness"] = json!("unavailable");
+            let reason = storage_reason(&error);
+            value["reason"] = json!(reason);
+            value["next_action"] = json!({"kind":"unavailable","reason":reason});
             value
         }
+    }
+}
+
+fn storage_reason(error: &anyhow::Error) -> &'static str {
+    match error.to_string().as_str() {
+        "legacy_source_conflict" => "legacy_source_conflict",
+        "legacy_source_unavailable" => "legacy_source_unavailable",
+        "advisory_record_missing" => "advisory_record_missing",
+        "advisory_adoption_deferred" => "advisory_adoption_deferred",
+        _ => "advisory_record_invalid",
     }
 }
 pub(crate) fn diagnostic_view(
@@ -496,27 +1031,37 @@ fn reason(error: &anyhow::Error) -> &'static str {
         "update_discovery_unverified"
     })
 }
-fn report(context: &LocalUpdateContext, cache: Option<&Cache>, success: bool, why: &str) -> Value {
-    let mut advisory = cache_view(context, cache, now());
+fn report(context: &LocalUpdateContext, cache: Option<&Record>, success: bool, why: &str) -> Value {
+    let mut advisory = record_view(context, cache, now());
     if !success {
         advisory["availability"] = json!("unknown");
         advisory["reason"] = json!(why);
         if advisory["freshness"] == "fresh" {
             advisory["freshness"] = json!("stale");
         }
-        advisory["next_action"] = if context.managed() {
-            json!({"kind":"check","argv":["agmi","update","--check"]})
-        } else if context.selected["ownership"] == "unmanaged" {
-            json!({"kind":"use_install_owner"})
-        } else {
-            json!({"kind":"unavailable"})
-        };
-        if why == "previous_attempt_incomplete" {
-            advisory["next_action"] =
-                json!({"kind":"unavailable","reason":"previous_attempt_incomplete"});
+        if why == "check_in_progress" || advisory["next_action"]["kind"] != "unavailable" {
+            advisory["next_action"] = if context.managed() {
+                json!({"kind":"check","argv":["agmi","update","--check"]})
+            } else if context.selected["ownership"] == "unmanaged" {
+                json!({"kind":"use_install_owner"})
+            } else {
+                json!({"kind":"unavailable"})
+            };
+        }
+        if matches!(
+            why,
+            "previous_attempt_incomplete"
+                | "advisory_record_missing"
+                | "advisory_record_invalid"
+                | "advisory_storage_unavailable"
+                | "advisory_persistence_failed"
+                | "legacy_source_unavailable"
+                | "legacy_source_conflict"
+        ) {
+            advisory["next_action"] = json!({"kind":"unavailable","reason":why});
         }
     }
-    json!({"success":success,"discovery_success":cache.is_some_and(|c|c.outcome=="success") && (success || why=="cache_persistence_failed"),"update":{"check":true,"status":if success { advisory["availability"].as_str().unwrap_or("unknown") } else { "unknown" },"reason":why,"source":"github_latest_stable","current_source":if context.managed() {"managed_selected_release"} else if context.selected["ownership"] == "unmanaged" {"unmanaged_invoker"} else {"unavailable"}},"release_advisory":advisory})
+    json!({"success":success,"discovery_success":cache.is_some_and(|c|c.outcome=="success") && (success || why=="advisory_persistence_failed"),"update":{"check":true,"status":if success { advisory["availability"].as_str().unwrap_or("unknown") } else { "unknown" },"reason":why,"source":"github_latest_stable","current_source":if context.managed() {"managed_selected_release"} else if context.selected["ownership"] == "unmanaged" {"unmanaged_invoker"} else {"unavailable"}},"release_advisory":advisory})
 }
 pub(crate) async fn check(context: LocalUpdateContext, trigger: CheckTrigger) -> CheckReport {
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -533,11 +1078,37 @@ async fn check_until(
     if Instant::now() >= deadline {
         return report(&context, None, false, "update_overall_timeout");
     }
-    let Some(path) = cache_path() else {
-        return report(&context, None, false, "cache_unavailable");
+    let Some(path) = record_path() else {
+        return report(&context, None, false, "advisory_storage_unavailable");
     };
+    let adoption_path = path.clone();
+    let prepared = tokio::time::timeout_at(
+        tokio::time::Instant::from_std(deadline),
+        tokio::task::spawn_blocking(move || prepare_record(&adoption_path)),
+    )
+    .await;
+    match prepared {
+        Ok(Ok(Ok(()))) => (),
+        Ok(Ok(Err(error))) => return report(&context, None, false, storage_reason(&error)),
+        _ => return report(&context, None, false, "advisory_adoption_deferred"),
+    }
     check_path(context, trigger, deadline, path).await
 }
+fn finish_attempt(cache: &mut Record, good: Option<Good>, at: i64) {
+    if at < cache.started_at
+        || good
+            .as_ref()
+            .is_some_and(|good| good.checked_at < cache.started_at || good.checked_at > at)
+    {
+        cache.outcome = "failure".into();
+        cache.reason = "clock_regressed".into();
+    } else if cache.outcome == "success" {
+        cache.good = good;
+    }
+    // Preserve the observed wall time, not a fabricated ordered timestamp.
+    cache.finished_at = Some(at);
+}
+
 async fn check_path(
     context: LocalUpdateContext,
     trigger: CheckTrigger,
@@ -545,7 +1116,13 @@ async fn check_path(
     path: PathBuf,
 ) -> Value {
     let invoked_at = now();
-    let previous = read_cache(&path).ok();
+    let previous = match read_record(&path) {
+        Ok(record) => Some(record),
+        Err(_) if present(&path).unwrap_or(true) => {
+            return report(&context, None, false, "advisory_record_invalid");
+        }
+        Err(_) => None,
+    };
     let previous_attempt = previous.as_ref().map(|c| c.attempt_id.clone());
     let previous_finished = previous.as_ref().and_then(|c| c.finished_at);
     let lease = loop {
@@ -555,7 +1132,7 @@ async fn check_path(
         match acquire(&path) {
             Ok(Some(lease)) => break lease,
             Ok(None) if matches!(trigger, CheckTrigger::Explicit) => {
-                let cache = read_cache(&path).ok();
+                let cache = read_record(&path).ok();
                 if let Some(cache) = &cache
                     && (Some(&cache.attempt_id) != previous_attempt.as_ref()
                         || previous_finished.is_none())
@@ -570,11 +1147,26 @@ async fn check_path(
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             Ok(None) => return report(&context, previous.as_ref(), false, "check_in_progress"),
-            Err(_) => return report(&context, previous.as_ref(), false, "cache_unavailable"),
+            Err(_) => {
+                return report(
+                    &context,
+                    previous.as_ref(),
+                    false,
+                    "advisory_storage_unavailable",
+                );
+            }
         }
     };
     let lease = std::sync::Arc::new(lease);
-    let mut cache = read_cache(&path).unwrap_or_default();
+    let mut cache = match read_record(&path) {
+        Ok(record)
+            if record.format == 2
+                && record.adoption.as_ref().is_some_and(|a| a.phase == "ready") =>
+        {
+            record
+        }
+        _ => return report(&context, None, false, "advisory_record_invalid"),
+    };
     if matches!(trigger, CheckTrigger::Explicit)
         && (Some(&cache.attempt_id) != previous_attempt.as_ref() || previous_finished.is_none())
         && cache.finished_at.is_some_and(|t| t >= invoked_at)
@@ -587,7 +1179,7 @@ async fn check_path(
         return report(&context, Some(&cache), false, "source_retry_not_before");
     }
     // An interrupted commit may have lost a source floor. Never spend another
-    // request on that uncertainty; the disposable cache needs operator inspection.
+    // request on that uncertainty; the durable record needs operator inspection.
     if cache.outcome == "in_progress" && cache.finished_at.is_none() {
         return report(&context, Some(&cache), false, "previous_attempt_incomplete");
     }
@@ -601,7 +1193,7 @@ async fn check_path(
     if request_guard().is_err() {
         return report(&context, Some(&cache), false, "check_cancelled");
     }
-    cache.format = 1;
+    cache.format = 2;
     cache.source = API.into();
     cache.context = context.key();
     cache.started_at = at;
@@ -612,7 +1204,7 @@ async fn check_path(
     cache.next_due_at = at.saturating_add(INTERVAL + offset(&context));
     let initial_saved = bounded_persist(&path, &cache, lease.clone(), deadline).await;
     if !initial_saved {
-        return report(&context, Some(&cache), false, "cache_persistence_failed");
+        return report(&context, Some(&cache), false, "advisory_persistence_failed");
     }
     let discovery = tokio::time::timeout_at(
         tokio::time::Instant::from_std(deadline),
@@ -640,6 +1232,7 @@ async fn check_path(
         Ok(result) => result,
         Err(_) => Err(failure("update_overall_timeout")),
     };
+    let mut replacement_good = None;
     match result {
         Ok(good) => {
             let observed = LocalUpdateContext::observe(&context.config_path);
@@ -649,7 +1242,7 @@ async fn check_path(
                 cache.reason = "context_changed".into();
             } else {
                 cache.reason = good.reason.clone();
-                cache.good = Some(good);
+                replacement_good = Some(good);
                 cache.outcome = "success".into();
             }
         }
@@ -665,7 +1258,7 @@ async fn check_path(
         cache.outcome = "failure".into();
         cache.reason = "check_cancelled".into();
     }
-    cache.finished_at = Some(now());
+    finish_attempt(&mut cache, replacement_good, now());
     let saved = bounded_persist(&path, &cache, lease.clone(), deadline).await && initial_saved;
     drop(lease);
     report(
@@ -675,7 +1268,7 @@ async fn check_path(
         if saved {
             &cache.reason
         } else {
-            "cache_persistence_failed"
+            "advisory_persistence_failed"
         },
     )
 }
@@ -683,6 +1276,17 @@ async fn check_path(
 pub async fn standalone_check(config_path: &Path) -> Result<Value> {
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut context = LocalUpdateContext::observe(config_path);
+    let canonical = crate::store::account_home()?.join(".config/agmi/config.toml");
+    let canonical_owner = installer::observe_selected(&canonical);
+    let canonical_owner = serde_json::to_value(canonical_owner)?;
+    if context.selected["ownership"] == "unmanaged" && canonical_owner["ownership"] != "unmanaged" {
+        return Ok(report(
+            &context,
+            None,
+            false,
+            "managed_installation_unverified",
+        ));
+    }
     if context.selected["ownership"] != "managed" && context.selected["ownership"] != "unmanaged" {
         return Ok(report(
             &context,
@@ -795,8 +1399,8 @@ pub(crate) async fn run(config_path: PathBuf, mut stop: watch::Receiver<bool>) {
             return;
         }
         let at = now();
-        let due = cache_path()
-            .and_then(|p| read_cache(&p).ok())
+        let due = record_path()
+            .and_then(|p| read_record(&p).ok())
             .map(|c| {
                 c.next_due_at
                     .min(at.saturating_add(INTERVAL + 300))
@@ -845,8 +1449,296 @@ pub(super) async fn test_request() -> Option<Result<Vec<u8>>> {
 }
 
 #[cfg(test)]
+fn test_adoption() -> Adoption {
+    Adoption {
+        phase: "ready".into(),
+        legacy_path: PathBuf::from("/isolated-unused-legacy/update.json"),
+        source_sha256: None,
+    }
+}
+
+#[cfg(test)]
+fn test_record_path(home: &Path) -> PathBuf {
+    let path = durable_path(home);
+    let source = home.join(".cache/agmi/update.json");
+    adopt_locked(&path, &source, &source).unwrap();
+    path
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cutover_fault_boundaries_recover_or_preserve_a_closed_history() {
+        for boundary in 1..=16 {
+            let home = tempfile::tempdir().unwrap();
+            let (source, original) = legacy_fixture(home.path(), true);
+            let path = durable_path(home.path());
+            FILESYSTEM_FAULT.with(|fault| fault.set(Some((boundary, 0))));
+            let result = adopt_locked(&path, &source, &source);
+            let visited = FILESYSTEM_FAULT.with(|fault| fault.replace(None).unwrap().1);
+            assert!(result.is_err(), "boundary {boundary} visited {visited}");
+            if path.exists() {
+                adopt_locked(&path, &source, &source).unwrap();
+                let recovered = read_record(&path).unwrap();
+                assert_eq!(recovered.retry_not_before, original.retry_not_before);
+                assert_eq!(recovered.attempt_id, original.attempt_id);
+                assert_eq!(recovered.outcome, "in_progress");
+                assert_eq!(recovered.finished_at, None);
+                assert_eq!(recovered.adoption.unwrap().phase, "ready");
+                assert!(!source.exists());
+            } else {
+                assert_eq!(
+                    read_record(&source).unwrap().attempt_id,
+                    original.attempt_id
+                );
+                assert!(adopt_locked(&path, &source, &source).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_resolution_preserves_override_and_rejects_relative_roots() {
+        assert_eq!(
+            resolve_legacy_path(Some("/custom/cache".into()), Some("/ignored".into())).unwrap(),
+            PathBuf::from("/custom/cache/agmi/update.json")
+        );
+        assert_eq!(
+            resolve_legacy_path(Some("".into()), Some("/account".into())).unwrap(),
+            PathBuf::from("/account/.cache/agmi/update.json")
+        );
+        assert!(resolve_legacy_path(Some("relative".into()), Some("/account".into())).is_err());
+        assert!(resolve_legacy_path(None, None).is_err());
+    }
+
+    #[test]
+    fn readonly_legacy_view_preserves_bytes_mtimes_and_restrictions() {
+        let home = tempfile::tempdir().unwrap();
+        let (source, original) = legacy_fixture(home.path(), true);
+        let lock = source.with_file_name("update.lock");
+        let before = (
+            fs::read(&source).unwrap(),
+            fs::metadata(&source).unwrap().modified().unwrap(),
+            fs::metadata(&lock).unwrap().modified().unwrap(),
+            fs::metadata(source.parent().unwrap())
+                .unwrap()
+                .modified()
+                .unwrap(),
+        );
+        for _ in 0..2 {
+            let observed = read_view_record(home.path(), Ok(source.clone()))
+                .unwrap()
+                .unwrap();
+            let view = record_view(&unmanaged_context(), Some(&observed), now());
+            assert_eq!(view["storage"], "legacy");
+            assert_eq!(view["adoption_required"], true);
+            assert_eq!(view["availability"], "unknown");
+            assert_eq!(view["retry_not_before"], json!(original.retry_not_before));
+        }
+        assert_eq!(
+            (
+                fs::read(&source).unwrap(),
+                fs::metadata(&source).unwrap().modified().unwrap(),
+                fs::metadata(&lock).unwrap().modified().unwrap(),
+                fs::metadata(source.parent().unwrap())
+                    .unwrap()
+                    .modified()
+                    .unwrap()
+            ),
+            before
+        );
+        assert!(!home.path().join(".local").exists());
+        let path = durable_path(home.path());
+        drop(acquire(&path).unwrap().unwrap());
+        assert!(read_view_record(home.path(), Ok(source.clone())).is_err());
+        crate::admin::persist(&path, b"unsupported durable evidence").unwrap();
+        assert!(read_view_record(home.path(), Ok(source)).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_inode_replacement_is_detected_before_publication() {
+        let home = tempfile::tempdir().unwrap();
+        let path = test_record_path(home.path());
+        let lease = acquire(&path).unwrap().unwrap();
+        let lock = path.with_file_name("update.lock");
+        fs::rename(&lock, lock.with_file_name("retained-lock")).unwrap();
+        drop(acquire(&path).unwrap_err());
+        crate::admin::persist(&lock, b"").unwrap();
+        assert!(verify_lease(&path, &lease).is_err());
+        assert!(acquire(&path).unwrap().is_some());
+    }
+
+    fn legacy_fixture(home: &Path, incomplete: bool) -> (PathBuf, Record) {
+        let source = home.join(".cache/agmi/update.json");
+        let lease = acquire(&source).unwrap().unwrap();
+        let record = Record {
+            format: 1,
+            source: API.into(),
+            context: "original-context".into(),
+            started_at: 100,
+            finished_at: if incomplete { None } else { Some(101) },
+            attempt_id: "original-attempt".into(),
+            outcome: if incomplete { "in_progress" } else { "failure" }.into(),
+            reason: "update_source_throttled".into(),
+            next_due_at: 200,
+            retry_not_before: Some(now() + 3600),
+            ..Default::default()
+        };
+        persist(&source, &record).unwrap();
+        drop(lease);
+        (source, record)
+    }
+
+    #[tokio::test]
+    async fn adoption_preserves_floor_and_incomplete_evidence_without_http() {
+        for incomplete in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let (source, record) = legacy_fixture(home.path(), incomplete);
+            let original = fs::read(&source).unwrap();
+            let lock = fs::metadata(source.with_file_name("update.lock")).unwrap();
+            let path = durable_path(home.path());
+            adopt_locked(&path, &source, &source).unwrap();
+            let adopted = read_record(&path).unwrap();
+            let mut expected = serde_json::to_value(&record).unwrap();
+            expected["format"] = json!(2);
+            expected["adoption"] = serde_json::to_value(Adoption {
+                phase: "ready".into(),
+                legacy_path: source.clone(),
+                source_sha256: Some(format!("{:x}", Sha256::digest(&original))),
+            })
+            .unwrap();
+            assert_eq!(serde_json::to_value(&adopted).unwrap(), expected);
+            assert!(!source.exists());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                assert_eq!(
+                    lock.ino(),
+                    fs::metadata(source.with_file_name("update.lock"))
+                        .unwrap()
+                        .ino()
+                );
+            }
+            let request = pending_request();
+            let result = TEST_REQUEST
+                .scope(
+                    request.clone(),
+                    check_path(
+                        unmanaged_context(),
+                        CheckTrigger::Explicit,
+                        Instant::now() + Duration::from_secs(1),
+                        path.clone(),
+                    ),
+                )
+                .await;
+            assert_eq!(result["update"]["reason"], "source_retry_not_before");
+            if incomplete {
+                assert_eq!(
+                    result["release_advisory"]["next_action"]["kind"],
+                    "unavailable"
+                );
+            }
+            assert_eq!(request.starts.load(std::sync::atomic::Ordering::SeqCst), 0);
+            if incomplete {
+                let lease = acquire(&path).unwrap().unwrap();
+                let mut expired = adopted;
+                expired.retry_not_before = Some(1);
+                persist(&path, &expired).unwrap();
+                drop(lease);
+                let result = check_path(
+                    unmanaged_context(),
+                    CheckTrigger::Explicit,
+                    Instant::now() + Duration::from_secs(1),
+                    path,
+                )
+                .await;
+                assert_eq!(result["update"]["reason"], "previous_attempt_incomplete");
+            }
+        }
+    }
+
+    #[test]
+    fn adopting_resumes_before_or_after_source_unlink() {
+        for removed in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let (source, mut record) = legacy_fixture(home.path(), false);
+            let digest = format!("{:x}", Sha256::digest(fs::read(&source).unwrap()));
+            let path = durable_path(home.path());
+            let lease = acquire(&path).unwrap().unwrap();
+            record.format = 2;
+            record.adoption = Some(Adoption {
+                phase: "adopting".into(),
+                legacy_path: source.clone(),
+                source_sha256: Some(digest),
+            });
+            persist(&path, &record).unwrap();
+            drop(lease);
+            if removed {
+                fs::remove_file(&source).unwrap();
+            }
+            adopt_locked(&path, &source, &source).unwrap();
+            assert_eq!(read_record(&path).unwrap().adoption.unwrap().phase, "ready");
+            assert!(!source.exists());
+        }
+    }
+
+    #[test]
+    fn conflicting_or_reappearing_source_preserves_both_records() {
+        for phase in ["adopting", "ready"] {
+            let home = tempfile::tempdir().unwrap();
+            let (source, mut record) = legacy_fixture(home.path(), false);
+            let path = durable_path(home.path());
+            let lease = acquire(&path).unwrap().unwrap();
+            record.format = 2;
+            record.adoption = Some(Adoption {
+                phase: phase.into(),
+                legacy_path: source.clone(),
+                source_sha256: Some("a".repeat(64)),
+            });
+            persist(&path, &record).unwrap();
+            drop(lease);
+            let before = (fs::read(&path).unwrap(), fs::read(&source).unwrap());
+            assert!(adopt_locked(&path, &source, &source).is_err());
+            assert_eq!(
+                (fs::read(&path).unwrap(), fs::read(&source).unwrap()),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn durable_footprint_and_ambiguous_sources_are_not_pristine() {
+        let home = tempfile::tempdir().unwrap();
+        let path = durable_path(home.path());
+        let source = home.path().join(".cache/agmi/update.json");
+        drop(acquire(&path).unwrap().unwrap());
+        assert!(adopt_locked(&path, &source, &source).is_err());
+        assert!(!path.exists());
+        let second = tempfile::tempdir().unwrap();
+        let (canonical, _) = legacy_fixture(second.path(), false);
+        let alternate = second.path().join("custom-cache/agmi/update.json");
+        assert!(adopt_locked(&durable_path(second.path()), &alternate, &canonical).is_err());
+        assert!(canonical.exists());
+        assert!(!durable_path(second.path()).exists());
+    }
+
+    #[test]
+    fn invalid_source_never_defaults_and_destination_is_account_scoped() {
+        let home = tempfile::tempdir().unwrap();
+        let source = home.path().join(".cache/agmi/update.json");
+        drop(acquire(&source).unwrap().unwrap());
+        crate::admin::persist(&source, b"{malformed").unwrap();
+        let path = durable_path(home.path());
+        assert_eq!(
+            path,
+            home.path()
+                .join(".local/share/agmi/update-advisory/update.json")
+        );
+        assert!(adopt_locked(&path, &source, &source).is_err());
+        assert_eq!(fs::read(&source).unwrap(), b"{malformed");
+        assert!(!path.exists());
+    }
 
     fn unmanaged_context() -> LocalUpdateContext {
         LocalUpdateContext {
@@ -870,8 +1762,9 @@ mod tests {
         let path = dir.path().join("agmi/update.json");
         let context = unmanaged_context();
         let started = now() + 3600;
-        let cache = Cache {
-            format: 1,
+        let cache = Record {
+            format: 2,
+            adoption: Some(test_adoption()),
             source: API.into(),
             context: context.key(),
             started_at: started,
@@ -880,7 +1773,7 @@ mod tests {
             outcome: "failure".into(),
             reason: "release_query_failed".into(),
             attempt_id: "before-clock-rollback".into(),
-            ..Cache::default()
+            ..Record::default()
         };
         let lease = acquire(&path).unwrap().unwrap();
         persist(&path, &cache).unwrap();
@@ -899,13 +1792,13 @@ mod tests {
             .await;
         assert_eq!(result["update"]["reason"], "not_due");
         assert_eq!(request.starts.load(std::sync::atomic::Ordering::SeqCst), 0);
-        assert_eq!(read_cache(&path).unwrap().attempt_id, cache.attempt_id);
+        assert_eq!(read_record(&path).unwrap().attempt_id, cache.attempt_id);
     }
 
     #[tokio::test]
     async fn stop_cancels_pending_http_and_restart_is_not_incomplete() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("agmi/update.json");
+        let path = test_record_path(dir.path());
         let (sender, stop) = watch::channel(false);
         let request = pending_request();
         let task = tokio::spawn(CHECK_STOP.scope(
@@ -930,7 +1823,7 @@ mod tests {
             .unwrap();
         assert_eq!(result["update"]["reason"], "check_cancelled");
         assert_eq!(request.starts.load(std::sync::atomic::Ordering::SeqCst), 1);
-        let cache = read_cache(&path).unwrap();
+        let cache = read_record(&path).unwrap();
         assert_eq!(cache.outcome, "failure");
         assert_eq!(cache.reason, "check_cancelled");
         assert!(cache.finished_at.is_some());
@@ -965,7 +1858,7 @@ mod tests {
     async fn parsed_throttle_floor_survives_simultaneously_ready_stop() {
         for status in [429, 503] {
             let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("agmi/update.json");
+            let path = test_record_path(dir.path());
             let (sender, stop) = watch::channel(false);
             let request = std::sync::Arc::new(TestRequest {
                 starts: std::sync::atomic::AtomicUsize::new(0),
@@ -989,7 +1882,7 @@ mod tests {
                 .await;
             assert_eq!(result["update"]["reason"], "check_cancelled");
             assert_eq!(request.starts.load(std::sync::atomic::Ordering::SeqCst), 1);
-            let cache = read_cache(&path).unwrap();
+            let cache = read_record(&path).unwrap();
             assert_eq!(cache.reason, "check_cancelled");
             assert!(cache.finished_at.is_some());
             assert!(cache.retry_not_before.unwrap() >= before + 3600);
@@ -1011,7 +1904,7 @@ mod tests {
     #[tokio::test]
     async fn stop_during_initial_commit_serializes_cancelled_finalizer_without_http() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("agmi/update.json");
+        let path = test_record_path(dir.path());
         let (sender, stop) = watch::channel(false);
         let request = pending_request();
         let gate = std::sync::Arc::new(TestCommit {
@@ -1050,13 +1943,13 @@ mod tests {
         assert_eq!(result["update"]["reason"], "check_cancelled");
         assert_eq!(gate.writes.load(std::sync::atomic::Ordering::SeqCst), 2);
         assert_eq!(request.starts.load(std::sync::atomic::Ordering::SeqCst), 0);
-        let cache = read_cache(&path).unwrap();
+        let cache = read_record(&path).unwrap();
         assert_eq!(cache.reason, "check_cancelled");
         assert!(cache.finished_at.is_some());
     }
 
     #[tokio::test]
-    async fn prestart_stop_creates_no_cache_or_lease() {
+    async fn prestart_stop_creates_no_record_or_lease() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("agmi/update.json");
         let (_sender, stop) = watch::channel(true);
@@ -1082,8 +1975,9 @@ mod tests {
         let lease = acquire(&path).unwrap().unwrap();
         persist(
             &path,
-            &Cache {
-                format: 1,
+            &Record {
+                format: 2,
+                adoption: Some(test_adoption()),
                 source: API.into(),
                 outcome: "in_progress".into(),
                 ..Default::default()
@@ -1095,7 +1989,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), finish_background(task))
             .await
             .unwrap();
-        let cache = read_cache(&path).unwrap();
+        let cache = read_record(&path).unwrap();
         assert_eq!(cache.outcome, "in_progress");
         assert!(cache.finished_at.is_none());
     }
@@ -1110,33 +2004,34 @@ mod tests {
         assert!(acquire(&path).unwrap().is_some());
     }
     #[test]
-    fn cache_rejects_oversized_and_foreign_format() {
+    fn record_rejects_oversized_and_foreign_format() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("agmi/update.json");
         let _lease = acquire(&path).unwrap().unwrap();
-        let cache = Cache {
-            format: 2,
+        let cache = Record {
+            format: 99,
             source: API.into(),
             ..Default::default()
         };
-        persist(&path, &cache).unwrap();
-        assert!(read_cache(&path).is_err());
+        assert!(persist(&path, &cache).is_err());
+        crate::admin::persist(&path, &serde_json::to_vec(&cache).unwrap()).unwrap();
+        assert!(read_record(&path).is_err());
         crate::admin::persist(&path, &vec![b'x'; LIMIT as usize + 1]).unwrap();
-        assert!(read_cache(&path).is_err());
+        assert!(read_record(&path).is_err());
     }
     #[cfg(unix)]
     #[test]
-    fn cache_symlink_and_hardlink_are_refused() {
+    fn record_symlink_and_hardlink_are_refused() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("agmi/update.json");
         let _lease = acquire(&path).unwrap().unwrap();
         let target = dir.path().join("target");
         crate::admin::persist(&target, b"{}").unwrap();
         std::os::unix::fs::symlink(&target, &path).unwrap();
-        assert!(read_cache(&path).is_err());
+        assert!(read_record(&path).is_err());
         fs::remove_file(&path).unwrap();
         fs::hard_link(&target, &path).unwrap();
-        assert!(read_cache(&path).is_err());
+        assert!(read_record(&path).is_err());
     }
     #[tokio::test]
     async fn attempt_persistence_failure_refuses_explicit_and_automatic_http() {
@@ -1162,7 +2057,7 @@ mod tests {
                 )
                 .await;
             assert_eq!(result["success"], false);
-            assert_eq!(result["update"]["reason"], "cache_persistence_failed");
+            assert_eq!(result["update"]["reason"], "advisory_record_invalid");
             assert!(!dir.path().join("not-created").exists());
         }
     }
@@ -1173,8 +2068,9 @@ mod tests {
         let path = dir.path().join("agmi/update.json");
         let lease = std::sync::Arc::new(acquire(&path).unwrap().unwrap());
         let floor = now() + 3600;
-        let cache = Cache {
-            format: 1,
+        let cache = Record {
+            format: 2,
+            adoption: Some(test_adoption()),
             source: API.into(),
             outcome: "failure".into(),
             reason: "update_source_throttled".into(),
@@ -1188,7 +2084,7 @@ mod tests {
         let until = Instant::now() + Duration::from_secs(2);
         loop {
             if let Some(lease) = acquire(&path).unwrap() {
-                assert_eq!(read_cache(&path).unwrap().retry_not_before, Some(floor));
+                assert_eq!(read_record(&path).unwrap().retry_not_before, Some(floor));
                 drop(lease);
                 break;
             }
@@ -1220,8 +2116,9 @@ mod tests {
         let lease = acquire(&path).unwrap().unwrap();
         persist(
             &path,
-            &Cache {
-                format: 1,
+            &Record {
+                format: 2,
+                adoption: Some(test_adoption()),
                 source: API.into(),
                 outcome: "in_progress".into(),
                 started_at: now() - INTERVAL * 2,
@@ -1371,6 +2268,114 @@ mod discovery_tests {
             .await;
     }
     #[test]
+    fn fail_closed_advisory_actions_require_inspection_not_another_check() {
+        let (context, _) = fixture();
+        assert_eq!(
+            record_view(&context, None, 200)["next_action"]["kind"],
+            "check"
+        );
+        for floor in [None, Some(500)] {
+            let cache = Record {
+                format: 2,
+                adoption: Some(test_adoption()),
+                source: API.into(),
+                started_at: 100,
+                outcome: "in_progress".into(),
+                reason: "check_in_progress".into(),
+                retry_not_before: floor,
+                ..Default::default()
+            };
+            let view = record_view(&context, Some(&cache), 200);
+            assert_eq!(view["next_action"]["kind"], "unavailable");
+            assert_eq!(view["next_action"]["reason"], "previous_attempt_incomplete");
+        }
+        for reason in [
+            "previous_attempt_incomplete",
+            "advisory_record_missing",
+            "advisory_record_invalid",
+            "advisory_storage_unavailable",
+            "advisory_persistence_failed",
+            "legacy_source_unavailable",
+            "legacy_source_conflict",
+        ] {
+            let report = report(&context, None, false, reason);
+            assert_eq!(report["release_advisory"]["availability"], "unknown");
+            assert_eq!(
+                report["release_advisory"]["next_action"]["kind"],
+                "unavailable"
+            );
+            assert_eq!(report["release_advisory"]["next_action"]["reason"], reason);
+        }
+        let busy = report(&context, None, false, "check_in_progress");
+        assert_eq!(busy["release_advisory"]["next_action"]["kind"], "check");
+    }
+
+    #[test]
+    fn clock_regression_preserves_valid_failure_floors_and_last_good_then_recovers() {
+        let (context, responses) = fixture();
+        let manifest =
+            String::from_utf8(responses[&format!("{DOWNLOAD}/v0.5.0/BUILD-INFO.txt")].clone())
+                .unwrap();
+        let good = Good {
+            checked_at: 100,
+            context: context.key(),
+            availability: "available".into(),
+            reason: "verified".into(),
+            manifest,
+            tag: "v0.5.0".into(),
+            archive_sha256: "f".repeat(64),
+        };
+        for (finished, checked) in [(199, 199), (201, 199), (199, 201)] {
+            let home = tempfile::tempdir().unwrap();
+            let path = test_record_path(home.path());
+            let _lease = acquire(&path).unwrap().unwrap();
+            let mut record = read_record(&path).unwrap();
+            record.context = context.key();
+            record.started_at = 200;
+            record.outcome = "success".into();
+            record.reason = "verified".into();
+            record.attempt_id = "regressed".into();
+            record.next_due_at = 1000;
+            record.retry_not_before = Some(500);
+            record.good = Some(good.clone());
+            let mut observed = good.clone();
+            observed.checked_at = checked;
+            finish_attempt(&mut record, Some(observed), finished);
+            persist(&path, &record).unwrap();
+            let mut recovered = read_record(&path).unwrap();
+            assert_eq!(recovered.finished_at, Some(finished));
+            assert_eq!(recovered.reason, "clock_regressed");
+            assert_eq!(recovered.outcome, "failure");
+            assert_eq!(recovered.retry_not_before, Some(500));
+            assert_eq!(recovered.good.as_ref().unwrap().checked_at, 100);
+            assert_eq!(
+                record_view(&context, Some(&recovered), 300)["availability"],
+                "unknown"
+            );
+
+            let before = fs::read(&path).unwrap();
+            record.finished_at = Some(199);
+            record.reason = "release_query_failed".into();
+            assert!(persist(&path, &record).is_err());
+            assert_eq!(fs::read(&path).unwrap(), before);
+
+            recovered.started_at = 600;
+            recovered.outcome = "success".into();
+            recovered.reason = "verified".into();
+            let mut observed = good.clone();
+            observed.checked_at = 601;
+            finish_attempt(&mut recovered, Some(observed), 602);
+            persist(&path, &recovered).unwrap();
+            let recovered = read_record(&path).unwrap();
+            assert_eq!(recovered.retry_not_before, Some(500));
+            assert_eq!(
+                record_view(&context, Some(&recovered), 602)["availability"],
+                "available"
+            );
+        }
+    }
+
+    #[test]
     fn failed_attempt_future_clock_and_changed_base_do_not_offer_old_good() {
         let (context, responses) = fixture();
         let manifest =
@@ -1385,8 +2390,9 @@ mod discovery_tests {
             tag: "v0.5.0".into(),
             archive_sha256: "f".repeat(64),
         };
-        let mut cache = Cache {
-            format: 1,
+        let mut cache = Record {
+            format: 2,
+            adoption: Some(test_adoption()),
             source: API.into(),
             context: context.key(),
             started_at: 99,
@@ -1399,28 +2405,28 @@ mod discovery_tests {
             good: Some(good),
         };
         assert_eq!(
-            cache_view(&context, Some(&cache), 200)["availability"],
+            record_view(&context, Some(&cache), 200)["availability"],
             "available"
         );
         assert_eq!(
-            cache_view(&context, Some(&cache), 99)["availability"],
+            record_view(&context, Some(&cache), 99)["availability"],
             "unknown"
         );
         cache.outcome = "failure".into();
-        let view = cache_view(&context, Some(&cache), 200);
+        let view = record_view(&context, Some(&cache), 200);
         assert_eq!(view["availability"], "unknown");
         assert_eq!(view["last_good"]["checked_at"], 100);
         cache.outcome = "success".into();
         let mut other = context.clone();
         other.identity.as_mut().unwrap().commit = "1".repeat(40);
         assert_eq!(
-            cache_view(&other, Some(&cache), 200)["availability"],
+            record_view(&other, Some(&cache), 200)["availability"],
             "unknown"
         );
         other.identity =
             Some(Identity::parse(&cache.good.as_ref().unwrap().manifest, true).unwrap());
         assert_eq!(
-            cache_view(&other, Some(&cache), 200)["availability"],
+            record_view(&other, Some(&cache), 200)["availability"],
             "current"
         );
     }
@@ -1428,8 +2434,9 @@ mod discovery_tests {
     fn canonical_check_reports_preserve_owner_specific_actions() {
         let (mut context, responses) = fixture();
         let stamp = now();
-        let mut cache = Cache {
-            format: 1,
+        let mut cache = Record {
+            format: 2,
+            adoption: Some(test_adoption()),
             source: API.into(),
             context: context.key(),
             started_at: stamp,
@@ -1471,10 +2478,15 @@ mod discovery_tests {
             unmanaged["release_advisory"]["next_action"]["kind"],
             "use_install_owner"
         );
-        let failed = report(&context, Some(&cache), false, "cache_persistence_failed");
+        let failed = report(&context, Some(&cache), false, "advisory_persistence_failed");
         assert_eq!(failed["release_advisory"]["availability"], "unknown");
         assert_eq!(
             failed["release_advisory"]["next_action"]["kind"],
+            "unavailable"
+        );
+        let transient = report(&context, Some(&cache), false, "release_query_failed");
+        assert_eq!(
+            transient["release_advisory"]["next_action"]["kind"],
             "use_install_owner"
         );
         context.selected["ownership"] = json!("unavailable");
@@ -1501,8 +2513,9 @@ mod discovery_tests {
             tag: "v0.5.0".into(),
             archive_sha256: "f".repeat(64),
         };
-        let mut cache = Cache {
-            format: 1,
+        let mut cache = Record {
+            format: 2,
+            adoption: Some(test_adoption()),
             source: API.into(),
             context: context.key(),
             started_at: stamp,
@@ -1553,11 +2566,11 @@ mod discovery_tests {
 // Always initiate the commit, even when HTTP consumed the caller's deadline.
 // A cancelled/timed-out fsync retains the OS lease until it finishes. If disk
 // failure/crash prevents a floor commit, the durable unfinished attempt fails
-// closed on subsequent checks. This cannot survive cache deletion or disk loss.
+// closed even if the record disappears while its durable ownership remains.
 // No account, installer, credential, or model state enters this blocking task.
 async fn bounded_persist(
     path: &Path,
-    cache: &Cache,
+    cache: &Record,
     lease: std::sync::Arc<File>,
     deadline: Instant,
 ) -> bool {
@@ -1587,6 +2600,7 @@ async fn bounded_persist(
                             .unwrap(),
                     );
                 }
+                verify_lease(&path, &_lease)?;
                 persist(&path, &cache)
             })
         )
@@ -1595,7 +2609,7 @@ async fn bounded_persist(
     )
 }
 
-fn completed_report(context: &LocalUpdateContext, cache: &Cache) -> Value {
+fn completed_report(context: &LocalUpdateContext, cache: &Record) -> Value {
     if context.managed() && LocalUpdateContext::observe(&context.config_path).key() != context.key()
     {
         report(context, Some(cache), false, "context_changed")

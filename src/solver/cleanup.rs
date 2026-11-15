@@ -86,14 +86,51 @@ pub(crate) async fn drain_native_cleanup_until(deadline: tokio::time::Instant) -
     }
 }
 
+/// Only workspace path resolution/allocation may construct this marker. Keep
+/// the original OS error without exposing its path through the public code.
+#[derive(Debug)]
+pub(super) struct WorkspaceAllocationError(pub(super) std::io::Error);
+impl WorkspaceAllocationError {
+    pub(super) fn reason(&self) -> contract::NativeReasonCode {
+        use contract::NativeReasonCode::*;
+        match self.0.raw_os_error() {
+            Some(libc::ENOENT | libc::ENOTDIR) => NativeWorkspaceUnavailable,
+            Some(libc::ENOSPC | libc::EDQUOT) => NativeWorkspaceCapacity,
+            Some(libc::EACCES | libc::EPERM | libc::EROFS) => NativeWorkspacePermission,
+            _ => NativeWorkspaceFailure,
+        }
+    }
+}
+impl std::fmt::Display for WorkspaceAllocationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("cannot allocate isolated adapter workspace")
+    }
+}
+impl std::error::Error for WorkspaceAllocationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
 pub(super) struct Scratch(pub(super) PathBuf, &'static mpsc::Sender<Cleanup>);
 impl Scratch {
     pub(super) fn new() -> Result<Self> {
+        Self::in_root(&std::env::temp_dir())
+    }
+
+    fn in_root(root: &Path) -> Result<Self> {
         // Establish cleanup ownership before creating a private workspace.
         let worker = worker()?;
         static SERIAL: AtomicU64 = AtomicU64::new(0);
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        let path = std::env::temp_dir().join(format!(
+        // Resolve relative OS-temp overrides before changing the child's cwd;
+        // neither canonicalize nor recreate the operator-selected root.
+        let root = if root.is_absolute() {
+            std::borrow::Cow::Borrowed(root)
+        } else {
+            std::borrow::Cow::Owned(std::path::absolute(root).map_err(WorkspaceAllocationError)?)
+        };
+        let path = root.join(format!(
             "agmi-model-{}-{timestamp}-{}",
             std::process::id(),
             SERIAL.fetch_add(1, Ordering::Relaxed)
@@ -121,4 +158,138 @@ pub(crate) async fn pause_native_cleanup_for_test() -> mpsc::Sender<()> {
         .unwrap();
     observed.await.unwrap();
     release
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_errors_preserve_sources_and_only_classify_allocation() {
+        use contract::NativeReasonCode::*;
+        for (errno, expected) in [
+            (libc::ENOENT, NativeWorkspaceUnavailable),
+            (libc::ENOTDIR, NativeWorkspaceUnavailable),
+            (libc::ENOSPC, NativeWorkspaceCapacity),
+            (libc::EDQUOT, NativeWorkspaceCapacity),
+            (libc::EACCES, NativeWorkspacePermission),
+            (libc::EPERM, NativeWorkspacePermission),
+            (libc::EROFS, NativeWorkspacePermission),
+            (libc::EIO, NativeWorkspaceFailure),
+            (libc::EEXIST, NativeWorkspaceFailure),
+        ] {
+            let error = anyhow::Error::new(WorkspaceAllocationError(
+                std::io::Error::from_raw_os_error(errno),
+            ));
+            assert_eq!(contract::NativeReasonCode::from_error(&error), expected);
+            assert_eq!(failure_code(&error), expected.as_str());
+            assert!(!execution_may_have_started(&error));
+            assert_eq!(
+                error
+                    .chain()
+                    .last()
+                    .unwrap()
+                    .downcast_ref::<std::io::Error>()
+                    .unwrap()
+                    .raw_os_error(),
+                Some(errno)
+            );
+            assert_eq!(
+                serde_json::from_value::<contract::NativeReasonCode>(json!(expected.as_str()))
+                    .unwrap(),
+                expected
+            );
+            // The same OS error outside allocation (worker or SDK I/O) does
+            // not prove a prelaunch workspace fault.
+            let unrelated = anyhow::Error::new(std::io::Error::from_raw_os_error(errno));
+            assert_eq!(
+                contract::NativeReasonCode::from_error(&unrelated),
+                NativeFailure
+            );
+            assert!(execution_may_have_started(&unrelated));
+        }
+    }
+
+    #[test]
+    fn missing_and_non_directory_roots_are_not_recreated_or_replaced() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("missing");
+        let file = root.path().join("file");
+        std::fs::write(&file, b"preserve").unwrap();
+        for path in [&missing, &file] {
+            let error = Scratch::in_root(path).err().unwrap();
+            assert_eq!(
+                contract::NativeReasonCode::from_error(&error),
+                contract::NativeReasonCode::NativeWorkspaceUnavailable
+            );
+            assert!(!execution_may_have_started(&error));
+        }
+        assert!(!missing.exists());
+        assert_eq!(std::fs::read(file).unwrap(), b"preserve");
+    }
+
+    #[tokio::test]
+    async fn relative_temp_override_is_absolute_private_and_inherited_by_native_children() {
+        const ISOLATED: &str = "AGMI_TEST_RELATIVE_TEMP_ROOT";
+        if std::env::var_os(ISOLATED).is_none() {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::create_dir(root.path().join("relative")).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "solver::cleanup::tests::relative_temp_override_is_absolute_private_and_inherited_by_native_children",
+                    "--nocapture",
+                ])
+                .current_dir(root.path())
+                .env("TMPDIR", "relative")
+                .env(ISOLATED, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        }
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(std::env::temp_dir(), PathBuf::from("relative"));
+        let scratch = Scratch::new().unwrap();
+        let other = Scratch::new().unwrap();
+        assert!(scratch.0.is_absolute());
+        assert_eq!(scratch.0.parent().unwrap(), cwd.join("relative"));
+        assert_ne!(scratch.0, other.0);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&scratch.0).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        invoke(
+            &std::env::current_exe().unwrap(),
+            &[
+                "--exact".into(),
+                "solver::cleanup::tests::native_child_temp_probe".into(),
+                "--ignored".into(),
+                "--nocapture".into(),
+            ],
+            b"",
+            &scratch.0,
+            NativeProtocol::Hermes,
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::env::current_dir().unwrap(), cwd);
+    }
+
+    // Run only through spawn_native above to probe its env_clear allowlist.
+    #[test]
+    #[ignore]
+    fn native_child_temp_probe() {
+        let cwd = std::env::current_dir().unwrap();
+        assert!(cwd.is_absolute());
+        assert_eq!(std::env::temp_dir(), cwd);
+        assert!(std::env::var_os("HOME").is_some());
+        assert!(std::env::var_os("AGMI_TEST_RELATIVE_TEMP_ROOT").is_none());
+        let temporary = tempfile::NamedTempFile::new().unwrap();
+        assert_eq!(temporary.path().parent().unwrap(), cwd);
+    }
 }

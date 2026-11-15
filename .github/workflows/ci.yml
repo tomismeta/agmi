@@ -107,3 +107,14 @@ jobs:
             HOME=/home/agmi-systemd-fixture XDG_RUNTIME_DIR=/run/user/17321 \
             DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/17321/bus \
             python3 -u /src/tests/systemd_smoke.py /input/agmi
+      - name: Isolated model workspace recovery
+        run: |
+          name="agmi-storage-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          trap 'docker rm -f "$name" >/dev/null 2>&1 || true' EXIT
+          docker run -d --name "$name" --privileged --cgroupns=private \
+            --network=none --tmpfs /run --tmpfs /run/lock --tmpfs /tmp:exec,mode=1777 \
+            -v "$PWD:/src:ro" -v "$PWD/target/release/agmi:/input/agmi:ro" \
+            agmi-systemd-fixture
+          timeout 60 docker exec "$name" sh -c \
+            'until systemctl start user@17321.service; do sleep 1; done'
+          docker exec "$name" python3 -u /src/tests/storage_runtime_smoke.py /input/agmi

@@ -1031,25 +1031,30 @@ impl Store {
                     now(),
                 );
             if config.preparation(kind).is_some() {
-                let latest:Option<(i64,String,String,Option<String>,String)>=self.db.query_row(
-                    "SELECT o.id,o.work_key,o.state,json_extract(e.model_attempt,'$.completion'),o.revision FROM operations o LEFT JOIN operation_evidence e ON e.operation_id=o.id
+                type ModelAttemptRow = (i64, String, String, Option<String>, String, Option<bool>);
+                let latest:Option<ModelAttemptRow>=self.db.query_row(
+                    "SELECT o.id,o.work_key,o.state,json_extract(e.model_attempt,'$.completion'),o.revision,
+                     json_extract(e.model_attempt,'$.producer.preflight_admission.authority_epoch')=(SELECT authority_epoch FROM runtime_authority WHERE singleton=1)
+                     FROM operations o LEFT JOIN operation_evidence e ON e.operation_id=o.id
                      WHERE o.kind=?1 AND (?2 IS NULL OR o.request ->> '$.solver.epoch' = ?2)
                      AND (?3 IS NULL OR o.work_key=?3)
                      AND (e.model_attempt IS NOT NULL OR o.state IN ('model_unknown','superseded_model_unknown','retry_model','prelaunch_failed','rejected'))
                      ORDER BY o.id DESC LIMIT 1",
                     params![kind.as_str(),if kind==LaneId::Answer { epoch } else { None },if kind==LaneId::Judge { op.as_ref().map(|op|op.key.as_str()) } else { None }],
-                    |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
-                if let Some((id, key, state, completion, revision)) = latest {
-                    let assessment = self.model_retry_assessment(kind, &key, config, now())?;
+                    |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional()?;
+                if let Some((id, key, state, completion, revision, current_runtime)) = latest {
+                    let model_assessment =
+                        self.model_retry_assessment(kind, &key, config, now())?;
                     let completion = completion.and_then(|value| {
                         serde_json::from_str::<NativeAttemptCompletion>(&value).ok()
                     });
-                    lane["model"] = serde_json::to_value(&assessment)?;
+                    lane["model"] = serde_json::to_value(&model_assessment)?;
                     let model = &mut lane["model"];
                     model["operation_id"] = json!(id);
                     model["state"] = json!(state);
-                    model["budget_used"] = json!(assessment.total_attempts);
-                    model["budget_limit"] = json!(assessment.attempt_limit);
+                    model["current_runtime"] = json!(current_runtime == Some(true));
+                    model["budget_used"] = json!(model_assessment.total_attempts);
+                    model["budget_limit"] = json!(model_assessment.attempt_limit);
                     // Receipt/admission diagnostics can replace generic evidence
                     // after a successful model run; only immutable model
                     // completion can identify a model failure.
@@ -1065,6 +1070,12 @@ impl Store {
                     );
                     model["scope"] = json!(if kind == LaneId::Answer
                         || op.as_ref().is_some_and(|op| op.key == key)
+                        || (state == "prelaunch_failed"
+                            && current_runtime == Some(true)
+                            && model["failure_category"]
+                                .as_str()
+                                .is_some_and(|code| { code.starts_with("native_workspace_") })
+                            && judging_work_current_at(assessment, &key, now()) == Some(true))
                     {
                         "current_work"
                     } else {

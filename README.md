@@ -40,6 +40,8 @@ The prompt reads the hosted API key privately. For automation, use `--api-key-fi
 
 Init creates private configuration at `~/.config/agmi/config.toml` and leaves participation paused/read-only. For a new account, see [registration and recovery](docs/OPERATIONS.md#identity-onboarding-and-recovery); public registration has not yet been live-validated.
 
+`agmi config show` reports the actual credential and durable-state paths. Managed model scratch is private and service-owned; it is not account storage. [Storage ownership and safe recovery](docs/OPERATIONS.md#storage-ownership).
+
 ### 3. Configure your lanes
 
 ```sh
@@ -86,7 +88,7 @@ Add `--json` for agent-readable responses or `--verbose` for full diagnostic evi
 
 Managed updates preserve identity, configuration meaning, models, guidance, and history, restoring prior runtime/timer/boot/pause intent. Interrupted updates remain pinned: rerun `agmi update`. Policy, risk, and authority decisions still require approval. [Update guarantees and older-client bootstrap](docs/OPERATIONS.md#stable-release-updates).
 
-Health/status show cached release notices without networking. Managed daemons check in the background; `AGMI_UPDATE_CHECKS=0` disables those checks. No messages, automatic installs or notification channels. [Evidence and update checks](docs/OPERATIONS.md#passive-release-notices).
+Health/status show locally retained release notices without networking. Managed daemons check in the background; `AGMI_UPDATE_CHECKS=0` disables those checks. No messages, automatic installs or notification channels. [Evidence and update checks](docs/OPERATIONS.md#passive-release-notices).
 
 Health is a local operational assessment, not proof of remote availability, settlement, or rewards. Pause cannot recall transmitted requests. Preserve the journal and uncertainty; never reset state or restore an older database to regain availability. [Reliability boundaries](docs/OPERATIONS.md#reliability-boundaries).
 

@@ -653,6 +653,13 @@ fn intervention_actions(
                 actions.push(action(config, &["status"], false));
                 return json!(actions);
             }
+            if detail["next_action"] == "inspect_model_workspace" {
+                actions.push(json!({"kind":"instruction","authorization_required":false,
+                    "message":"Inspect the controller's model temporary directory, its parent filesystem capacity, quota and permissions. A local workspace failure is not a model-provider or account-credential rejection. Preserve the journal, WAL, credentials and unknown outcomes. Doctor --repair does not repair model workspaces. A service restart can recreate a deleted private temporary namespace, but stops active model calls; assess in-flight work before explicitly restarting. Do not delete active service directories or reset model attempts."}));
+                actions.push(action(config, &["operations", "list"], false));
+                actions.push(action(config, &["service", "status"], false));
+                return json!(actions);
+            }
             let command: &[&str] = match detail["next_action"].as_str() {
                 Some("resume") => &["resume"],
                 Some("initialize_controller") => &["run", "--once"],
@@ -721,9 +728,9 @@ pub(crate) fn release_actions(data: &Value) -> Value {
             "kind":"instruction","authorization_required":false,
             "message":"Use the installation owner to update this unmanaged build; agmi update is not authorized."
         }]),
-        Some("unavailable") if next["reason"] == "previous_attempt_incomplete" => json!([{
+        Some("unavailable") => json!([{
             "kind":"instruction","authorization_required":false,
-            "message":"An unfinished release check may have lost a source retry floor. Inspect local update cache and storage before any further check; no installation is authorized."
+            "message":"Release action unavailable. Inspect release evidence, storage and installation ownership; preserve retry floors and unfinished attempts. No retry or installation is authorized."
         }]),
         _ => json!([{
             "kind":"instruction","authorization_required":false,
@@ -1759,6 +1766,40 @@ mod tests {
                         && action["authorization_required"] == true)
             );
         }
+    }
+
+    #[test]
+    fn workspace_recovery_guidance_never_authorizes_restart_or_abandonment() {
+        let actions = intervention_actions(
+            &json!({"status":"operator_required","reason":"native_workspace_unavailable",
+                "next_action":"inspect_model_workspace"}),
+            &[],
+            None,
+            100,
+        );
+        let actions = actions.as_array().unwrap();
+        assert!(
+            actions
+                .iter()
+                .any(|step| step["argv"] == json!(["agmi", "operations", "list"]))
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|step| step["argv"] == json!(["agmi", "service", "status"]))
+        );
+        assert!(
+            actions
+                .iter()
+                .all(|step| step["authorization_required"] == false)
+        );
+        assert!(actions.iter().any(|step| {
+            step["message"].as_str().is_some_and(|message| {
+                message.contains("stops active model calls")
+                    && message.contains("Doctor --repair does not repair model workspaces")
+            })
+        }));
+        assert!(actions.iter().all(|step| step["kind"] != "wait"));
     }
 
     #[test]

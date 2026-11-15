@@ -36,7 +36,7 @@ def snapshot(root):
 class Fixture:
     def __init__(self, binary, root):
         self.binary = str(pathlib.Path(binary).resolve())
-        self.root = pathlib.Path(root)
+        self.root = pathlib.Path(root).resolve()
         self.directory = self.root / 'identity'
         self.config = self.directory / 'config.toml'
         self.mode = 'success'
@@ -58,6 +58,8 @@ class Fixture:
                     'XDG_CACHE_HOME': str(self.root / 'home/cache'), 'AGMI_UPDATE_CHECKS': '0',
                     'HTTP_PROXY': 'http://127.0.0.1:1', 'HTTPS_PROXY': 'http://127.0.0.1:1',
                     'ALL_PROXY': 'http://127.0.0.1:1', 'NO_PROXY': ''}
+        self.default_state = (self.root / 'home/Library/Application Support/agmi'
+                              if sys.platform == 'darwin' else self.root / 'home/data/agmi')
         fixture = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -153,7 +155,7 @@ class Fixture:
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=5)
-        if (self.directory / 'state/state.sqlite3').exists():
+        if any(self.root.rglob('state.sqlite3')):
             lock_key = hashlib.sha256(f'{CHAIN}\n{ADDRESS}'.encode()).hexdigest()
             lock_root = pathlib.Path(pwd.getpwuid(os.geteuid()).pw_dir) / '.agmi-account-locks'
             for entry in lock_root.glob(lock_key + '.*'):
@@ -217,7 +219,7 @@ def success(f):
     assert action['authorization_required'] and argv[:4] == ['agmi', '--config', str(f.config), 'init']
     for flag, value in [('--account', ADDRESS), ('--chain', CHAIN), ('--base-url', f.origin),
                         ('--api-key-file', str(f.directory / 'credential')),
-                        ('--state-dir', str(f.directory / 'state')),
+                        ('--state-dir', str(f.default_state)),
                         ('--network-config', str(f.directory / 'network.toml'))]:
         assert argv[argv.index(flag) + 1] == value
     before = snapshot(f.root)
@@ -417,12 +419,14 @@ def rejection(f):
 
 def preflight(f):
     f.directory.mkdir(mode=0o700)
-    path = f.directory / ('state' if f.scenario == 'existing-state' else 'credential')
+    path = f.directory / 'credential'
     if f.scenario == 'existing-config':
         path = f.config
         path.write_text('existing config')
     elif f.scenario == 'existing-state':
-        path.mkdir(mode=0o700)
+        path = f.default_state / 'state.sqlite3'
+        path.parent.mkdir(mode=0o700, parents=True)
+        path.write_bytes(b'existing journal authority')
     elif f.scenario == 'symlink':
         target = f.root / 'target'
         target.write_text('pk_other_fixture')
@@ -518,7 +522,7 @@ def concurrent_init(f):
     first = subprocess.Popen(f.command(words), env=f.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     assert f.seen_post.wait(5)
     init = ['init', '--account', ADDRESS, '--chain', CHAIN, '--base-url', f.origin,
-            '--state-dir', str(f.directory / 'state'), '--key-stdin']
+            '--state-dir', str(f.default_state), '--key-stdin']
     second = subprocess.Popen(f.command(init), env=f.env, stdin=subprocess.PIPE,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     second.stdin.write(KEY)
@@ -643,6 +647,150 @@ def custom_routes(f):
     separate_init(f)
 
 
+
+def retain_legacy_binding(f):
+    """Construct schema-1 evidence as emitted before default alignment."""
+    intent_path = f.directory / 'registration-000001.intent.json'
+    capture_path = f.directory / 'registration-000001.capture.json'
+    intent = json.loads(intent_path.read_bytes())
+    intent['binding']['state_dir'] = str(f.directory / 'state')
+    intent_bytes = json.dumps(intent, separators=(',', ':')).encode()
+    intent_path.write_bytes(intent_bytes)
+    capture = json.loads(capture_path.read_bytes())
+    capture['intent_sha256'] = hashlib.sha256(intent_bytes).hexdigest()
+    capture_path.write_text(json.dumps(capture, separators=(',', ':')))
+    for name in ['credential', 'registration.json', 'network.toml']:
+        (f.directory / name).unlink(missing_ok=True)
+    # Neither changed HOME nor XDG defaults may rebind retained authority.
+    f.env['HOME'] = str(f.root / 'changed-home')
+    f.env['XDG_DATA_HOME'] = str(f.root / 'changed-data')
+
+
+def legacy_success(f):
+    f.run()
+    retain_legacy_binding(f)
+    before = snapshot(f.root)
+    assert f.status()['stage'] == 'response_captured'
+    assert f.run(['identity', 'resume'])['status']['stage'] == 'response_captured'
+    assert snapshot(f.root) == before and len(f.requests) == 2
+    resumed = (f.run() if f.scenario == 'legacy-create-recovery'
+               else f.run(['identity', 'resume', '--confirm']))
+    argv = resumed['next_actions'][0]['argv']
+    assert argv[argv.index('--state-dir') + 1] == str(f.directory / 'state')
+    metadata = json.loads((f.directory / 'registration.json').read_bytes())
+    assert metadata['state_dir'] == str(f.directory / 'state')
+    for name in ['registration-000001.intent.json', 'registration-000001.capture.json']:
+        assert (f.directory / name).read_bytes() == before['identity/' + name][1]
+    before = snapshot(f.root)
+    assert f.run()['next_actions'] == resumed['next_actions']
+    assert snapshot(f.root) == before and len(f.requests) == 2 and len(f.posts) == 1
+    f.run(argv[3:])
+    requests = list(f.requests)
+    before = snapshot(f.root)
+    assert f.status()['stage'] == 'configured'
+    assert f.run()['stage'] == 'configured'
+    assert snapshot(f.root) == before and f.requests == requests and len(f.posts) == 1
+
+
+def legacy_pending(f):
+    f.mode = 'rate-limit'
+    f.run()
+    retain_legacy_binding(f)
+    capture = f.directory / 'registration-000001.capture.json'
+    capture.unlink()
+    before = snapshot(f.root)
+    assert f.status()['stage'] == 'outcome_unknown'
+    assert f.run(success=False)['code'] == 'registration_outcome_unknown'
+    assert f.run(['identity', 'resume', '--confirm'], success=False)['code'] == 'registration_outcome_unknown'
+    assert snapshot(f.root) == before and len(f.posts) == 1 and len(f.requests) == 2
+
+
+def legacy_retry(f):
+    f.mode = 'rate-limit'
+    rejected = f.run()
+    retain_legacy_binding(f)
+    before = snapshot(f.root)
+    assert f.status()['stage'] == 'rejected'
+    assert f.run(f.args(extra=['--retry-rejected']), success=False)['code'] == 'registration_retry_floor'
+    assert snapshot(f.root) == before and len(f.posts) == 1
+    time.sleep(max(0, rejected['retry_not_before'] - time.time()) + 0.1)
+    f.mode = 'success'
+    result = f.run(f.args(extra=['--retry-rejected']))
+    assert result['attempt'] == 2 and len(f.posts) == 2 and len(f.requests) == 4
+    first = json.loads((f.directory / 'registration-000001.intent.json').read_bytes())
+    second = json.loads((f.directory / 'registration-000002.intent.json').read_bytes())
+    assert first['binding'] == second['binding']
+    for name in ['registration-000001.intent.json', 'registration-000001.capture.json']:
+        assert (f.directory / name).read_bytes() == before['identity/' + name][1]
+    assert result['next_actions'][0]['argv'][-1] == str(f.directory / 'state')
+
+
+def populated_default(f):
+    for name in ['releases/fixture/agmi', 'update-advisory/update.json']:
+        path = f.default_state / name
+        path.parent.mkdir(parents=True, mode=0o700)
+        path.write_bytes(b'preserve installation data')
+    before = snapshot(f.default_state)
+    result = f.run()
+    assert result['stage'] == 'created' and len(f.posts) == 1
+    assert snapshot(f.default_state) == before
+
+
+def journal_refusal(f):
+    f.default_state.mkdir(parents=True, mode=0o700)
+    name = f.scenario.removeprefix('journal-')
+    path = f.default_state / ('state.sqlite3' + {'db': '', 'wal': '-wal', 'shm': '-shm', 'symlink': ''}[name])
+    if name == 'symlink':
+        path.symlink_to(f.root / 'missing')
+    else:
+        path.write_bytes(b'journal authority')
+    before = snapshot(f.root)
+    f.run(success=False)
+    assert snapshot(f.root) == before and not f.requests
+    assert path.is_symlink() if name == 'symlink' else path.read_bytes() == b'journal authority'
+
+
+def unsafe_state_root(f):
+    f.default_state.parent.mkdir(parents=True, mode=0o700)
+    if f.scenario == 'state-root-symlink':
+        target = f.root / 'retained-install'
+        target.mkdir(mode=0o700)
+        f.default_state.symlink_to(target)
+    else:
+        f.default_state.mkdir(mode=0o700)
+        f.default_state.chmod(0o000)
+    try:
+        f.run(success=False)
+        assert not f.requests
+        if f.scenario == 'state-root-symlink':
+            assert f.default_state.is_symlink() and f.default_state.resolve() == target
+        else:
+            assert stat.S_IMODE(f.default_state.stat().st_mode) == 0
+    finally:
+        if not f.default_state.is_symlink():
+            f.default_state.chmod(0o700)
+
+
+def init_default(f):
+    data = f.run()
+    argv = data['next_actions'][0]['argv'][3:]
+    index = argv.index('--state-dir')
+    bound = argv[index + 1]
+    del argv[index:index + 2]
+    f.run(argv)
+    assert f.run(['config', 'show'])['config']['state_dir'] == bound
+    assert f.status()['stage'] == 'configured' and len(f.posts) == 1
+
+
+def explicit_init_relative(f):
+    data = f.run()
+    argv = data['next_actions'][0]['argv'][3:]
+    argv[argv.index('--state-dir') + 1] = 'explicit-state'
+    cwd = f.root / 'elsewhere'
+    cwd.mkdir()
+    f.run(argv, cwd=cwd)
+    assert f.run(['config', 'show'])['config']['state_dir'] == str(cwd / 'explicit-state')
+
 SCENARIOS = {'success': success, 'capture-resume': capture_resume, 'loss-boundaries': loss_boundaries,
              'partial-capture': partial_capture, 'mismatched-capture': mismatched_capture,
              'incomplete-capture': partial_capture,
@@ -655,6 +803,12 @@ SCENARIOS.update({name: rejection for name in ['rate-limit', 'header-floor', 'pr
 SCENARIOS.update({name: preflight for name in ['existing-config', 'existing-key', 'existing-state', 'symlink']})
 SCENARIOS.update({name: unsafe_evidence for name in ['hardlink', 'public-file', 'public-directory']})
 SCENARIOS.update({name: proof_limits for name in ['expired', 'algorithm', 'unbound-algorithm', 'secret-algorithm', 'invalid-algorithm', 'difficulty', 'hash-budget', 'time-budget', 'challenge-unavailable']})
+SCENARIOS.update({'legacy-success': legacy_success, 'legacy-pending': legacy_pending,
+                  'legacy-retry': legacy_retry, 'populated-default': populated_default,
+                  'legacy-create-recovery': legacy_success,
+                  'init-default': init_default, 'explicit-init-relative': explicit_init_relative})
+SCENARIOS.update({name: journal_refusal for name in ['journal-db', 'journal-wal', 'journal-shm', 'journal-symlink']})
+SCENARIOS.update({name: unsafe_state_root for name in ['state-root-symlink', 'state-root-unreadable']})
 
 
 def main():

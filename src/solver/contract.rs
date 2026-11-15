@@ -215,6 +215,10 @@ codes!(NativeReasonCode {
     CoreGuidanceMissing,
     ExecutableUnavailable,
     UnsupportedHarnessVersion,
+    NativeWorkspaceUnavailable,
+    NativeWorkspaceCapacity,
+    NativeWorkspacePermission,
+    NativeWorkspaceFailure,
     ModelDeadlineExceeded,
     NativeEnvelopeInvalid,
     NativeProvenanceMismatch,
@@ -249,6 +253,10 @@ codes!(NativeReasonCode {
 impl NativeReasonCode {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::NativeWorkspaceUnavailable => "native_workspace_unavailable",
+            Self::NativeWorkspaceCapacity => "native_workspace_capacity",
+            Self::NativeWorkspacePermission => "native_workspace_permission",
+            Self::NativeWorkspaceFailure => "native_workspace_failure",
             Self::NativeExecutionEvidenceMismatch => "native_execution_evidence_mismatch",
             Self::NativeOutputLimit => "native_output_limit",
             Self::CoreGuidanceMissing => "core_guidance_missing",
@@ -288,6 +296,10 @@ impl NativeReasonCode {
     }
     pub(super) fn from_error(error: &anyhow::Error) -> Self {
         match failure_code(error) {
+            "native_workspace_unavailable" => Self::NativeWorkspaceUnavailable,
+            "native_workspace_capacity" => Self::NativeWorkspaceCapacity,
+            "native_workspace_permission" => Self::NativeWorkspacePermission,
+            "native_workspace_failure" => Self::NativeWorkspaceFailure,
             "native_execution_evidence_mismatch" => Self::NativeExecutionEvidenceMismatch,
             "native_output_limit" => Self::NativeOutputLimit,
             "core_guidance_missing" => Self::CoreGuidanceMissing,

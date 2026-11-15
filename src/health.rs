@@ -1177,6 +1177,10 @@ pub fn compact_diagnostics(data: &mut Value) {
             "checked_at",
             "latest_version",
             "reason",
+            "storage",
+            "adoption_required",
+            "retry_not_before",
+            "next_due_at",
             "owner",
             "selected_running_relation",
             "installability",
@@ -1289,6 +1293,7 @@ pub fn compact_diagnostics(data: &mut Value) {
                 "operation_id",
                 "failure_category",
                 "current_route",
+                "current_runtime",
                 "budget_used",
                 "unresolved_attempts",
                 "attempts",
@@ -2358,6 +2363,10 @@ fn components(status: &Value, health: &Value, at: i64, stale: u64, options: Opti
                 Some(
                     "model_authentication_failed"
                         | "model_configuration_failed"
+                        | "native_workspace_unavailable"
+                        | "native_workspace_capacity"
+                        | "native_workspace_permission"
+                        | "native_workspace_failure"
                         | "model_attempt_budget_exhausted"
                         | "model_uncertain"
                         | "model_uncertain_retry_disabled"

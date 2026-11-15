@@ -10,6 +10,9 @@ Docker's default noexec tmpfs is unsuitable for its TMPDIR. Inside the container
     XDG_RUNTIME_DIR=/run/user/17321 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/17321/bus \
     python3 /src/tests/systemd_smoke.py /input/agmi
 No host user manager is contacted. A HOME override alone is NOT isolation.
+The current suite observes actual managed process identity and private runtime
+scratch creation/removal across native updates. Its explicit reset-failed calls
+separate manual-start journeys without changing production start-limit policy.
 The default current suite's second ELF has an inert appended label and exercises
 release selection only. Compatibility instead REQUIRES an authentic pre-change
 Linux format3 ELF and its externally recorded SHA256. A build from a hash-verified
@@ -33,6 +36,7 @@ import json
 import os
 import pathlib
 import signal
+import stat
 import sqlite3
 from contextlib import closing
 import pwd
@@ -970,6 +974,7 @@ def main():
     releases = home / '.local/share/agmi/releases'
     unit_dir = home / '.config/systemd/user'
     runtime_override = pathlib.Path('/run/user/17321/systemd/user/agmi.service.d')
+    scratch = pathlib.Path(os.environ['XDG_RUNTIME_DIR']) / 'agmi'
     candidates = home / 'fixture-releases'
     candidates.mkdir(mode=0o700)
     first = candidates / 'agmi-a'
@@ -1005,20 +1010,44 @@ def main():
         assert property_value('agmi.service', 'TimeoutStopUSec') == 'infinity'
         assert active('agmi.service') == runtime
         assert active('agmi-health.timer') == timer
+        assert property_value('agmi.service', 'RuntimeDirectory') == 'agmi'
+        assert property_value('agmi.service', 'RuntimeDirectoryMode') == '0700'
+        assert property_value('agmi.service', 'PrivateTmp') == 'yes'
         if runtime:
+            pid = int(property_value('agmi.service', 'MainPID'))
+            assert pid > 0 and digest(pathlib.Path(f'/proc/{pid}/exe')) == hashes[candidate]
             deadline = time.monotonic() + 15
             while time.monotonic() < deadline:
-                status = fixture.status()
-                if status.get('effective_runtime'):
+                # Use the real CLI/account environment, not Fixture.status()'s
+                # synthetic HOME/XDG roots. The incoming CLI may differ from
+                # current; observation must still attest the selected process.
+                status = cli('status', '--verbose')
+                observation = status['process_observation']
+                if observation['state'] == 'observed_match':
                     break
                 time.sleep(0.05)
             else:
-                raise AssertionError('systemd runtime did not publish loaded configuration')
-            pid = int(property_value('agmi.service', 'MainPID'))
-            assert pid > 0 and digest(pathlib.Path(f'/proc/{pid}/exe')) == hashes[candidate]
+                raise AssertionError(('systemd process was not observed matching', status))
+            assert observation['pid'] == pid
+            assert observation['image_relation'] == 'same_object'
+            assert status['selected_image']['release'] == release_id
+            assert status['effective_runtime']['policy']['process']['pid'] == pid
+            assert int(property_value('agmi.service', 'MainPID')) == pid
+            assert not property_value('agmi.service', 'DropInPaths')
+            metadata = scratch.lstat()
+            assert stat.S_ISDIR(metadata.st_mode) and stat.S_IMODE(metadata.st_mode) == 0o700
+            assert metadata.st_uid == os.getuid() and metadata.st_gid == os.getgid()
+            environment = pathlib.Path(f'/proc/{pid}/environ').read_bytes().split(b'\0')
+            assert f'TMPDIR={scratch}'.encode() in environment
+            assert f'RUNTIME_DIRECTORY={scratch}'.encode() in environment
         else:
             assert property_value('agmi.service', 'MainPID') == '0'
-        assert fixture.status()['paused'] is True
+            status = cli('status', '--verbose')
+            assert status['process_observation']['state'] == 'stopped', status
+            assert status['process_observation']['pid'] == 0
+            assert not scratch.exists() and not scratch.is_symlink()
+        assert status['paused'] is True
+        assert all(path.read_bytes() == value for path, value in private_inputs.items())
         assert fixture.key.read_text() == 'pk_test_fixture'
         assert not fixture.writes and not fixture.model_calls('answer')
 
@@ -1039,7 +1068,7 @@ def main():
         # Public staging replaces direct installer entrypoints. Both the current
         # binary and a distinct incoming image must stage without selecting a
         # release, creating state, installing bindings or contacting live units.
-        private_inputs = {path: path.read_bytes() for path in (fixture.config, fixture.key)}
+        private_inputs = {path: path.read_bytes() for path in (fixture.config, fixture.key, fixture.core)}
         assert not fixture.database.exists()
         for candidate in (first, second):
             data = cli('install', '--stage-only', '--binary', str(candidate), '--sha256', hashes[candidate])
@@ -1094,20 +1123,32 @@ def main():
         assert digest(fixture.database) == journal
         print('PASS service disable preserves definitions and permits re-enable without starting work', flush=True)
 
+        # Independent fixture journeys deliberately exceed the production
+        # three-start burst inside five minutes. Reset only their accounting;
+        # do not alter the installed unit's restart/start-limit policy.
+        systemctl('reset-failed', 'agmi.service')
         cli('service', 'start')
         selected(first, runtime=True, timer=True)
+        scratch_marker = scratch / 'fixture-before-native-update'
+        scratch_marker.write_text('must disappear with the old invocation')
         install('update', second)
         selected(second, runtime=True, timer=True)
+        assert not scratch_marker.exists(), 'native update retained the old runtime root'
+        scratch_marker.write_text('must survive a no-op activation')
         runtime_pid = property_value('agmi.service', 'MainPID')
         no_op = cli('update', '--release', ids[second], '--expected-release', ids[second])
         assert no_op['installation']['activation'] == 'loaded_verified'
         selected(second, runtime=True, timer=True)
         assert property_value('agmi.service', 'MainPID') == runtime_pid
+        assert scratch_marker.read_text() == 'must survive a no-op activation'
         activate(first)
         selected(first, runtime=True, timer=True)
+        assert not scratch_marker.exists(), 'retained activation retained the old runtime root'
         print('PASS running forward update and retained activation with real process identity', flush=True)
 
         systemctl('stop', 'agmi.service')
+        assert not scratch.exists()
+        systemctl('reset-failed', 'agmi.service')
         install('update', second)
         selected(second, timer=True)
         systemctl('stop', 'agmi-health.timer', 'agmi-health.service')
@@ -1132,6 +1173,10 @@ def main():
         assert os.readlink(releases / 'current') == ids[first], 'failed activation silently reverted pointer'
         assert all(not active(unit) for unit in UNITS)
         assert property_value('agmi.service', 'MainPID') == '0'
+        refused = cli('status', '--verbose')['process_observation']
+        assert refused['state'] == 'unavailable', refused
+        assert property_value('agmi.service', 'DropInPaths')
+        assert not scratch.exists()
         assert digest(fixture.database) == journal, 'failed activation changed or rewound journal'
         assert all((releases / ids[candidate]).is_dir() for candidate in (first, second))
         assert fixture.key.read_text() == 'pk_test_fixture' and not fixture.writes
