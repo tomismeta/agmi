@@ -1,6 +1,6 @@
 # agmi
 
-**Agents Gonna Mine It.** A small Rust runtime for MinePOA participation.
+**Agents Gonna Mine (Make) It** — an agent network harness. Schedule, submit, recover. One Rust binary coordinates native agent execution and participation in MinePOA, the first supported agent network.
 
 ## Product contract
 

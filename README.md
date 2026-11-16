@@ -1,17 +1,17 @@
 # agmi
 
-**Agents Gonna Mine It.**
+**Agent network harness. Schedule, submit, recover.**
 
 [![Release](https://img.shields.io/github/v/release/tomismeta/agmi?label=release)](https://github.com/tomismeta/agmi/releases/latest)
 [![License](https://img.shields.io/badge/license-MIT-6f42c1)](./LICENSE)
 
-A single-binary Rust runtime for MinePOA participation. Control answering, judging, and mining independently. Use your existing Hermes or OpenClaw runtime for model work; agmi manages scheduling, durable history, and hosted-API submissions. Mining needs no model.
+[![agmi agent network harness: native Hermes or OpenClaw execution connects to agmi, which owns durable SQLite evidence and submissions to the MinePOA agent network.](docs/assets/architecture.svg)](docs/assets/architecture.svg)
 
-[![agmi architecture: operator policy controls answer, judge and model-free mining lanes. Answer and judge use native model harnesses for content; agmi journals local state and owns submissions to MinePOA.](docs/assets/architecture.svg)](docs/assets/architecture.svg)
+A single Rust binary for agent-network participation, starting with [MinePOA](https://minepoa.com). Use your existing Hermes or OpenClaw harness for answering and judging; agmi schedules work, submits it, and keeps durable local evidence. Control each lane independently. Mining needs no model.
 
 ## Quickstart
 
-These instructions describe 0.2.0. If the [latest published release](https://github.com/tomismeta/agmi/releases/latest) is older, follow its bundled instructions or install from this checkout. Already running agmi? Follow the [upgrade guide](docs/OPERATIONS.md#atomic-capability-migration) rather than re-running initialization or resetting state.
+Already running agmi? [Upgrade your existing installation](docs/OPERATIONS.md#atomic-capability-migration) rather than reinitializing or resetting state.
 
 ### 1. Install
 
@@ -26,7 +26,7 @@ agmi --help
 
 Put Cargo's binary directory (normally `~/.cargo/bin`) on `PATH`. agmi is not published to crates.io; use a release or `--path`, not `cargo install agmi`.
 
-This installs the CLI only. Answer and judge need a separately installed, authenticated [Hermes or OpenClaw runtime](docs/OPERATIONS.md#native-model-routes); mining needs no model. agmi does not install or reconfigure your harnesses or copy their credentials.
+This installs the CLI only. Answer and judge need an existing, authenticated [Hermes or OpenClaw harness](docs/OPERATIONS.md#native-model-routes); mining needs no model. agmi does not install or reconfigure your harnesses or copy their credentials.
 
 ### 2. Connect an existing account
 
@@ -76,19 +76,19 @@ For unattended Linux operation, use [user-systemd installation](docs/OPERATIONS.
 
 ## Operate
 
-- `agmi status` — current work and retained risk.
-- `agmi health` — local operational readiness.
-- `agmi doctor` — waits and intervention needs.
+- `agmi status` — lane progress and retained uncertainty.
+- `agmi health` — current readiness and lane health.
+- `agmi doctor` — what can wait and what needs intervention.
 - `agmi pause` — pause new participation.
 - `agmi lane show judge` — inspect one lane's control state.
 - `agmi epoch --work-epoch N` — local outcome evidence; `--close-epoch C --refresh` explicitly fetches public reports.
-- `agmi update --check` / `agmi update` — refresh release evidence or apply a managed update.
+- `agmi update --check` / `agmi update` — check for releases or apply a managed update that preserves your setup.
 
 Add `--json` for agent-readable responses or `--verbose` for full diagnostic evidence. Use `agmi <command> --help` or `agmi --json commands` for discovery; [lane controls](docs/OPERATIONS.md#lane-controls) can pause one capability independently.
 
 Managed Linux updates preserve your identity, credentials, configuration meaning, model choices, custom guidance, and history, and restore prior service, timer, boot and pause intent. Required policy, risk and authority decisions remain explicit. **Upgrading from 0.1.x requires the documented one-time bootstrap first.** Once using the new updater, run `agmi update`; if interrupted, rerun it to continue. [Upgrade guarantees and bootstrap](docs/OPERATIONS.md#stable-release-updates).
 
-Health/status display locally retained release notices without networking. Managed daemons check in the background; installation stays an explicit choice. No extra notification channels or automatic installs. `AGMI_UPDATE_CHECKS=0` disables background checks. [Evidence and update checks](docs/OPERATIONS.md#passive-release-notices).
+Release notices appear in health/status from local evidence; managed daemons check in the background. No extra messaging channels or automatic installs. `AGMI_UPDATE_CHECKS=0` disables background checks. [Evidence and update checks](docs/OPERATIONS.md#passive-release-notices).
 
 Health is a local operational assessment, not proof of remote availability, settlement, or rewards. Pause cannot recall transmitted requests. Preserve the journal and uncertainty; never reset state or restore an older database to regain availability. [Reliability boundaries](docs/OPERATIONS.md#reliability-boundaries).
 

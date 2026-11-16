@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **Branding and operator documentation:** introduce the compact agmi architecture hero and agent network harness branding; align README, CLI and package/service descriptions without changing participation or upgrade behavior.
+
 ## 0.2.0
 
 - **Managed runtime identity:** accept the installer's exact owned service-unit link chain while preserving selected-release, file-object, invocation and rollover checks; generic no-follow artifact validation remains strict.

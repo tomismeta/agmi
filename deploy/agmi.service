@@ -1,5 +1,5 @@
 [Unit]
-Description=agmi — Agents Gonna Mine It [release=@AGMI_RELEASE_ID@]
+Description=agmi — Agent network harness [release=@AGMI_RELEASE_ID@]
 After=network-online.target
 Wants=network-online.target
 # Applies to manual starts as well as automatic failure restarts.
