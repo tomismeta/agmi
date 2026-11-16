@@ -1509,16 +1509,22 @@ fn sanitized_step(step: &Value) -> Value {
     step.clone()
 }
 
+fn render_wait(until: &Value) -> String {
+    match until.as_i64() {
+        Some(deadline) => {
+            format!("Wait until Unix timestamp {deadline} (reported deadline)")
+        }
+        None => "Retry time unknown; inspect local evidence.".to_owned(),
+    }
+}
+
 fn print_actions(actions: &Value) {
     let mut seen: Vec<String> = Vec::new();
     let mut index = 0;
     for step in actions.as_array().into_iter().flatten() {
         let description = match step["kind"].as_str() {
             Some("command") => render_argv(&step["argv"]),
-            Some("wait") => format!(
-                "Wait until Unix timestamp {} (reported deadline)",
-                step["until"]
-            ),
+            Some("wait") => render_wait(&step["until"]),
             _ => step["message"]
                 .as_str()
                 .unwrap_or("Inspect local evidence")
@@ -1867,6 +1873,19 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn missing_retry_deadline_does_not_present_a_timed_wait() {
+        let unknown = render_wait(&Value::Null);
+        assert!(unknown.contains("unknown"));
+        assert!(!unknown.contains("null"));
+        assert!(!unknown.contains("timestamp"));
+        assert!(render_wait(&json!(1_700_000_000)).contains("1700000000"));
+        print_actions(&json!([
+            {"kind":"wait","until":null},
+            {"kind":"wait","until":1_700_000_000}
+        ]));
+    }
+
     #[test]
     fn argv_rendering_quotes_boundaries_without_new_quoting_rules() {
         assert_eq!(shell_quote("health"), "health");

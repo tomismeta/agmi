@@ -5,13 +5,13 @@
 [![Release](https://img.shields.io/github/v/release/tomismeta/agmi?label=release)](https://github.com/tomismeta/agmi/releases/latest)
 [![License](https://img.shields.io/badge/license-MIT-6f42c1)](./LICENSE)
 
-A single-binary Rust runtime for MinePOA: answer challenges, judge assigned answers, and mine through the hosted API. Your models produce content; agmi owns scheduling, durable state, and submissions. Each instance keeps its own identity, credentials, and history.
+A single-binary Rust runtime for MinePOA participation. Control answering, judging, and mining independently. Use your existing Hermes or OpenClaw runtime for model work; agmi manages scheduling, durable history, and hosted-API submissions. Mining needs no model.
 
 [![agmi architecture: operator policy controls answer, judge and model-free mining lanes. Answer and judge use native model harnesses for content; agmi journals local state and owns submissions to MinePOA.](docs/assets/architecture.svg)](docs/assets/architecture.svg)
 
 ## Quickstart
 
-**Unreleased 0.2.0 candidate:** these steps describe this checkout's capability-owned configuration and journal format 4. Published v0.1.0/v0.1.1 use an older format; follow their release instructions or the [upgrade guide](docs/OPERATIONS.md#atomic-capability-migration). Existing installations should upgrade, not repeat initialization.
+These instructions describe 0.2.0. If the [latest published release](https://github.com/tomismeta/agmi/releases/latest) is older, follow its bundled instructions or install from this checkout. Already running agmi? Follow the [upgrade guide](docs/OPERATIONS.md#atomic-capability-migration) rather than re-running initialization or resetting state.
 
 ### 1. Install
 
@@ -86,9 +86,9 @@ For unattended Linux operation, use [user-systemd installation](docs/OPERATIONS.
 
 Add `--json` for agent-readable responses or `--verbose` for full diagnostic evidence. Use `agmi <command> --help` or `agmi --json commands` for discovery; [lane controls](docs/OPERATIONS.md#lane-controls) can pause one capability independently.
 
-Managed updates preserve identity, configuration meaning, models, guidance, and history, restoring prior runtime/timer/boot/pause intent. Interrupted updates remain pinned: rerun `agmi update`. Policy, risk, and authority decisions still require approval. [Update guarantees and older-client bootstrap](docs/OPERATIONS.md#stable-release-updates).
+Managed Linux updates preserve your identity, credentials, configuration meaning, model choices, custom guidance, and history, and restore prior service, timer, boot and pause intent. Required policy, risk and authority decisions remain explicit. **Upgrading from 0.1.x requires the documented one-time bootstrap first.** Once using the new updater, run `agmi update`; if interrupted, rerun it to continue. [Upgrade guarantees and bootstrap](docs/OPERATIONS.md#stable-release-updates).
 
-Health/status show locally retained release notices without networking. Managed daemons check in the background; `AGMI_UPDATE_CHECKS=0` disables those checks. No messages, automatic installs or notification channels. [Evidence and update checks](docs/OPERATIONS.md#passive-release-notices).
+Health/status display locally retained release notices without networking. Managed daemons check in the background; installation stays an explicit choice. No extra notification channels or automatic installs. `AGMI_UPDATE_CHECKS=0` disables background checks. [Evidence and update checks](docs/OPERATIONS.md#passive-release-notices).
 
 Health is a local operational assessment, not proof of remote availability, settlement, or rewards. Pause cannot recall transmitted requests. Preserve the journal and uncertainty; never reset state or restore an older database to regain availability. [Reliability boundaries](docs/OPERATIONS.md#reliability-boundaries).
 

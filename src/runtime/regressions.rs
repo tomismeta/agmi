@@ -665,6 +665,80 @@ async fn shutdown_cancels_discovery_before_draining_sent_effect() {
 }
 
 #[tokio::test]
+async fn failed_submissions_keep_typed_categories_without_resolving_uncertainty() {
+    use crate::protocol::ReadFailure;
+    for failure in [
+        Some(ReadFailure::Timeout),
+        Some(ReadFailure::Connect),
+        Some(ReadFailure::Request),
+        None,
+    ] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = Config::default();
+        config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
+        config.capabilities.answer.mode = Mode::ReadOnly;
+        config.capabilities.judge.mode = Mode::Off;
+        config.capabilities.mine.mode = Mode::Active;
+        let (_temp, mut runtime, _stop) = fixture_with(config);
+        no_discovery(&runtime);
+        identity_fixture(&mut runtime, &listener).await;
+        let op = runtime
+            .store
+            .seed_operation_for_test(
+                LaneId::Mine,
+                "8:mine",
+                "prepared",
+                &json!({"solver":request(LaneId::Mine)}),
+                runtime.store.control().unwrap(),
+                &runtime.config.lane_revision(LaneId::Mine).unwrap(),
+            )
+            .unwrap();
+        offer_mine(&mut runtime, op.clone());
+        runtime.arbitrate().unwrap();
+        let (_stream, _) = accept(&listener).await;
+        let error = match failure {
+            Some(failure) => anyhow::Error::new(failure),
+            None => anyhow::anyhow!("effect task ended"),
+        }
+        .context("private request https://private.invalid/?token=never-retain");
+        let effect = runtime.effect.take().unwrap();
+        runtime.finish_effect(effect, Err(error)).unwrap();
+        let current = runtime.store.operation(op.id).unwrap().unwrap();
+        assert_eq!(current.state, "unknown");
+        assert!(current.job_id.is_none() && current.txid.is_none());
+        let db =
+            rusqlite::Connection::open(runtime.config.state_dir.join("state.sqlite3")).unwrap();
+        let encoded: String = db
+            .query_row(
+                "SELECT evidence FROM operation_evidence WHERE operation_id=?1",
+                [op.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let evidence: Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(evidence["reason"], "transport_unknown");
+        assert!(evidence["status"].is_null());
+        assert_eq!(
+            evidence["error_category"],
+            failure.map_or(Value::Null, |failure| json!(failure.as_str()))
+        );
+        assert!(!encoded.contains("private.invalid") && !encoded.contains("never-retain"));
+        let intents: i64 = db
+            .query_row(
+                "SELECT count(*) FROM events WHERE operation_id=?1 AND code='dispatch_intent'",
+                [op.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(intents, 1);
+        assert!(AccountAdmissionGuard::try_acquire(&runtime.config).is_ok());
+        assert!(
+            crate::store::LaneAdmissionGuard::try_acquire(&runtime.config, LaneId::Mine).is_ok()
+        );
+    }
+}
+
+#[tokio::test]
 async fn lane_only_reload_preserves_identity_permit_but_shared_policy_and_credentials_fence_it() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut config = Config::default();
