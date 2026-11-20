@@ -29,7 +29,8 @@ OLD = 'pk_test_fixture'
 NEW = 'pk_lifecycle_replacement_fixture'
 WRONG = 'pk_lifecycle_wrong_identity_fixture'
 ECHO = 'pk_lifecycle_echo_fixture'
-SECRETS = (OLD, NEW, WRONG, ECHO)
+REJECTED = 'pk_lifecycle_unrecognized_fixture'
+SECRETS = (OLD, NEW, WRONG, ECHO, REJECTED)
 
 
 def safe(text):
@@ -41,6 +42,9 @@ def safe(text):
 class LifecycleFixture(Fixture):
     def __init__(self, binary, root):
         self.identity_reads = []
+        self.identity_backoff_once = False
+        self.identity_retry_at = None
+        self.identity_backoff_at = None
         super().__init__(binary, root)
 
     def handler(self):
@@ -53,13 +57,20 @@ class LifecycleFixture(Fixture):
                     key = self.headers.get('X-Api-Key')
                     with fixture.lock:
                         fixture.identity_reads.append(key)
-                    if key not in SECRETS:
+                        if fixture.identity_backoff_once:
+                            fixture.identity_backoff_once = False
+                            fixture.identity_backoff_at = time.monotonic()
+                            self.reply(503, {'ok': False}, retry_after=1)
+                            return
+                        if fixture.identity_backoff_at is not None:
+                            fixture.identity_retry_at = time.monotonic()
+                    if key not in SECRETS or key == REJECTED:
                         self.reply(401, {'ok': False})
                         return
                     body = {'address': fixture.address, 'chain_id': fixture.chain,
                             'next_nonce': fixture.nonce}
                     if key == WRONG:
-                        body['address'] = 'poa1' + '2' * 32
+                        body['address'] = 'poa1' + '1' * 31 + '2'
                     if key == ECHO:
                         body['untrusted'] = {'nested': [key]}
                     self.reply(200, body)
@@ -129,13 +140,11 @@ def init(f):
         result = f.cli(config, args + key_args, OLD if mode == 'stdin' else None)
         assert result['identity_verified'] and result['paused'] and not result['journal_initialized']
         assert result['ready_for_participation'] is False and result['service_state'] == 'not_inspected'
-        actions = result['next_actions']
-        commands = [action for action in actions if action['kind'] == 'command']
-        assert all(action['argv'][:3] == ['agmi', '--config', str(config)] for action in commands)
-        tails = [action['argv'][3:] for action in commands]
-        assert tails.index(['config', 'check']) < tails.index(['run', '--once']) < tails.index(['resume']) < tails.index(['health'])
-        assert all(action['authorization_required'] for action in commands if action['argv'][3:] in (['run', '--once'], ['resume']))
-        assert all(not action['authorization_required'] for action in commands if action['argv'][3:] in (['config', 'check'], ['health']))
+        assert result['account'] == f.address
+        assert result['next_actions'] == [{
+            'kind': 'command', 'authorization_required': False,
+            'argv': ['agmi', '--config', str(config), 'config', 'check'],
+        }]
         assert not (target / 'state/state.sqlite3').exists()
         text = config.read_text()
         assert not any(secret in text for secret in SECRETS)
@@ -181,11 +190,24 @@ def init(f):
             assert after == before, 'resumed init changed existing private files'
         else:
             assert snapshot(target) == before, 'different credential overwrote interrupted init'
-    for token, name in ((WRONG, 'wrong'), (ECHO, 'echo')):
-        target = f.root / name
+    for token, code, reason in (
+        (WRONG, 'credential_identity_unverified', 'account_or_chain_mismatch'),
+        (ECHO, 'identity_verification_unavailable', 'credential_echo_redacted'),
+        (REJECTED, 'credential_rejected', 'authentication_refused'),
+    ):
+        target = f.root / reason
         before = snapshot(f.root)
-        f.cli(target / 'config.toml', f.init_args(target) + ['--key-stdin'], token, succeeds=False)
+        output = f.cli(target / 'config.toml', f.init_args(target) + ['--key-stdin'], token, succeeds=False)
+        failure = json.loads(output)['error']
+        assert failure['code'] == code and failure['details']['reason'] == reason, output
         assert snapshot(f.root) == before and not target.exists()
+    f.identity_backoff_once = True
+    target = f.root / 'rate-limited'
+    output = f.cli(target / 'config.toml', f.init_args(target) + ['--key-stdin'], OLD, succeeds=False)
+    failure = json.loads(output)['error']
+    assert failure['code'] == 'identity_verification_backoff'
+    assert failure['details']['http_status'] == 503 and failure['details']['retry_after_seconds'] == 1
+    assert not target.exists()
     f.key.chmod(0o644)
     try:
         target = f.root / 'public-key'
@@ -233,9 +255,13 @@ def invalid_init(f):
         assert not any(secret in process.stdout + process.stderr for secret in SECRETS)
         assert snapshot(f.root) == before and not target.exists()
         assert not f.identity_reads and not f.reads and not f.writes
+        # No controlling terminal is present. Invalid inputs must win over key entry.
+        terminal_words = [word if word != '--key-stdin' else '--key-prompt' for word in words]
+        output = f.cli(config, terminal_words, succeeds=False)
+        assert json.loads(output)['error']['code'] == 'initialization_invalid'
 
 
-def terminal(f, target, interrupt=None):
+def terminal(f, target, interrupt=None, discover=False, retry=False, accept=True):
     master, slave = pty.openpty()
     original = termios.tcgetattr(slave)
     output = bytearray()
@@ -245,21 +271,38 @@ def terminal(f, target, interrupt=None):
         os.setsid()
         fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
 
-    try:
-        controlling_terminal()
-        child = subprocess.Popen([f.binary, '--json', '--config', str(target / 'config.toml'),
-                                  *f.init_args(target), '--key-prompt'],
-                                 stdin=slave, stdout=slave, stderr=slave, env=f.env)
-        deadline = time.monotonic() + 10
-        while b'(hidden): ' not in output:
+    def await_prompt(marker):
+        while marker not in output:
             assert time.monotonic() < deadline and child.poll() is None, safe(output.decode())
             if select.select([master], [], [], 0.1)[0]:
                 output.extend(os.read(master, 65536))
+
+    try:
+        controlling_terminal()
+        args = f.init_args(target)
+        if discover:
+            i = args.index('--account')
+            del args[i:i + 2]
+        else:
+            args += ['--key-prompt']
+        child = subprocess.Popen([f.binary, '--json', '--config', str(target / 'config.toml'), *args],
+                                 stdin=slave, stdout=slave, stderr=slave, env=f.env)
+        deadline = time.monotonic() + 10
+        await_prompt(b'(nothing will echo): ')
         prompt_flags = termios.tcgetattr(slave)[3]
         hidden = not (prompt_flags & termios.ECHO)
         os.write(master, OLD.encode() + (b'\n' if interrupt is None else b''))
         if interrupt is not None:
             child.send_signal(interrupt)
+        elif retry:
+            await_prompt(b'Retry verification without re-entering the key?')
+            os.write(master, b'y\n')
+        if interrupt is None and discover:
+            await_prompt(b'Save paused configuration for this account?')
+            assert b'Verifying the key with MinePOA' in output
+            assert b'Verified public account: poa1' in output
+            assert not target.exists(), 'configuration published before confirmation'
+            os.write(master, b'y\n' if accept else b'\n')
         while child.poll() is None:
             assert time.monotonic() < deadline, 'hidden prompt did not finish'
             if select.select([master], [], [], 0.1)[0]:
@@ -275,14 +318,14 @@ def terminal(f, target, interrupt=None):
             f'hidden input leaked; echo_disabled={hidden}; terminal_restored=True; '
             f'original_lflag={original[3]}; prompt_lflag={prompt_flags}; '
             f'exit={child.returncode}; transcript={safe(text)!r}')
-        assert (child.returncode == 0) == (interrupt is None), safe(text)
+        assert (child.returncode == 0) == (interrupt is None and accept), safe(text)
         assert hidden, 'prompt left echo enabled'
-        if interrupt is None:
+        if interrupt is None and accept:
             assert (target / 'credential').read_text() == OLD
             assert '"identity_verified":true' in text.replace(' ', '')
             private_tree(target)
         else:
-            assert not target.exists(), 'interrupted input created onboarding files'
+            assert not target.exists(), 'cancelled input created onboarding files'
     finally:
         signal.signal(signal.SIGHUP, signal.SIG_IGN)
         os.close(master)
@@ -292,10 +335,10 @@ def terminal(f, target, interrupt=None):
             child.wait(timeout=5)
 
 
-def isolated_terminal(f, target, interrupt=None):
+def isolated_terminal(f, target, interrupt=None, **options):
     # Controlling-terminal fork must not run in the threaded HTTP process.
     payload = dict(binary=f.binary, target=str(target), args=f.init_args(target),
-                   interrupt=interrupt)
+                   interrupt=interrupt, options=options)
     result = subprocess.run([sys.executable, __file__, '--terminal-worker'],
                             input=json.dumps(payload), text=True, capture_output=True,
                             timeout=20, env=f.env)
@@ -304,6 +347,14 @@ def isolated_terminal(f, target, interrupt=None):
 
 def prompt(f):
     isolated_terminal(f, f.root / 'prompt')
+    before = len(f.identity_reads)
+    f.identity_backoff_once = True
+    isolated_terminal(f, f.root / 'discover', discover=True, retry=True)
+    assert f.identity_reads[before:] == [OLD, OLD], 'retry did not reuse the original key exactly once'
+    assert f.identity_retry_at - f.identity_backoff_at >= 1, 'retry ignored the server floor'
+    discovered = f.cli(f.root / 'discover/config.toml', ['config', 'show'])['config']
+    assert discovered['network']['address'] == f.address
+    isolated_terminal(f, f.root / 'decline', discover=True, accept=False)
 
 
 def signals(f):
@@ -471,6 +522,6 @@ if __name__ == '__main__':
         payload = json.load(sys.stdin)
         worker = types.SimpleNamespace(binary=payload['binary'], env=os.environ,
                                        init_args=lambda _: payload['args'])
-        terminal(worker, pathlib.Path(payload['target']), payload['interrupt'])
+        terminal(worker, pathlib.Path(payload['target']), payload['interrupt'], **payload['options'])
     else:
         main()

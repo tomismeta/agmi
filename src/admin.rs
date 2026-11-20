@@ -465,7 +465,12 @@ fn describe(path: &str, value: &Value, onboarding: Option<&Value>, settings: &mu
             } else {
                 format!("{path}.{name}")
             };
-            describe(&child, value, onboarding.and_then(|v| v.get(name)), settings);
+            describe(
+                &child,
+                value,
+                onboarding.and_then(|v| v.get(name)),
+                settings,
+            );
         }
         return;
     }

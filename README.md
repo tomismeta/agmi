@@ -26,17 +26,19 @@ agmi --help
 
 Put Cargo's binary directory (normally `~/.cargo/bin`) on `PATH`. agmi is not published to crates.io; use a release or `--path`, not `cargo install agmi`.
 
-This installs the CLI only. Answer and judge need an existing, authenticated [Hermes or OpenClaw harness](docs/OPERATIONS.md#native-model-routes); mining needs no model. agmi does not install or reconfigure your harnesses or copy their credentials.
+This installs the CLI only. Answer and judge need an existing, authenticated [omp, Hermes or OpenClaw harness](docs/OPERATIONS.md#native-model-routes); mining needs no model. agmi does not install or reconfigure your harnesses or copy their credentials.
 
 ### 2. Connect an existing account
 
-Stop any other software submitting for this account, then initialize with your public account address:
+Stop any other software submitting for this account, then run:
 
 ```sh
-agmi init --account YOUR_PUBLIC_ACCOUNT_ADDRESS --key-prompt
+agmi init
 ```
 
-The prompt reads the hosted API key privately. For automation, use `--api-key-file` or `--key-stdin`; never put secrets in command arguments or chat.
+Paste only the hosted `pk_` API key and press Enter. Nothing echoes while you paste. agmi checks the key with MinePOA, then asks you to confirm the public account before saving. Add `--account` if you want to require a particular address; over SSH, run from a terminal or use `ssh -t`.
+
+For automation, supply `--account` with `--api-key-file` (an owned mode-600 file) or `--key-stdin`. Never put the key in command arguments or chat. `--dry-run` verifies identity without saving.
 
 Init creates private configuration at `~/.config/agmi/config.toml` and leaves participation paused/read-only. For a new account, see [registration and recovery](docs/OPERATIONS.md#identity-onboarding-and-recovery); public registration has not yet been live-validated.
 

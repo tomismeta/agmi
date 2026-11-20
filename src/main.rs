@@ -71,8 +71,9 @@ enum Command {
     },
     /// Verify an existing hosted credential and create read-only, paused configuration.
     Init {
+        /// Expected public address. Required for noninteractive input; otherwise discovered from MinePOA.
         #[arg(long)]
-        account: String,
+        account: Option<String>,
         #[arg(long)]
         chain: Option<String>,
         #[arg(long)]
@@ -81,12 +82,12 @@ enum Command {
         #[arg(long)]
         network_config: Option<PathBuf>,
         /// Reference an existing private credential; never copy or replace it.
-        #[arg(long, conflicts_with_all = ["key_stdin", "key_prompt"], required_unless_present_any = ["key_stdin", "key_prompt"])]
+        #[arg(long, conflicts_with_all = ["key_stdin", "key_prompt"], requires = "account")]
         api_key_file: Option<PathBuf>,
         /// Read a key from stdin, never from a command argument.
-        #[arg(long)]
+        #[arg(long, requires = "account")]
         key_stdin: bool,
-        /// Prompt on the controlling terminal with echo disabled.
+        /// Prompt on the controlling terminal with echo disabled (the default).
         #[arg(long, conflicts_with = "key_stdin")]
         key_prompt: bool,
         #[arg(long)]
@@ -897,7 +898,7 @@ fn discovery() -> Value {
         {"name":"identity create","network_reads":"only with --confirm","network_writes":"only with --confirm; at most one registration POST per durable attempt","model_calls":false,"local_writes":"only with --confirm","confirmation_flag":"--confirm","purpose":"without --confirm: nonmutating plan; explicit bounded hosted identity creation; never starts, initializes or resumes participation"},
         {"name":"identity status","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":false,"purpose":"local sanitized registration evidence and safe next actions; never retries registration"},
         {"name":"identity resume","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":"only with --confirm","confirmation_flag":"--confirm","purpose":"nonmutating plan or explicit local-only publication from retained successful registration evidence; never repeats proof work or registration"},
-        {"name":"init","network_reads":true,"network_writes":false,"local_writes":"unless --dry-run","purpose":"existing identity only; --account and --api-key-file, --key-stdin or --key-prompt; never registers or resumes"},
+        {"name":"init","network_reads":true,"network_writes":false,"local_writes":"unless --dry-run","purpose":"existing hosted identity only; hidden prompt by default, or --account with --api-key-file or --key-stdin; never registers or resumes"},
         {"name":"credentials rotate","network_reads":true,"network_writes":false,"local_writes":"credential only unless --dry-run","purpose":"requires initialized, paused, stopped account; verifies replacement identity; file/stdin/hidden prompt"},
         {"name":"install","network_reads":false,"network_writes":false,"local_writes":"unless --dry-run","purpose":"--binary local-path --sha256 trusted-digest; fresh install selects stopped; --stage-only only publishes; --migration-only permits supported older journal formats to current, disables boot activation, stays stopped and never converts state"},
         {"name":"update","network_reads":"latest stable metadata/assets unless explicit local source","network_writes":false,"model_calls":false,"local_writes":"unless --dry-run; --check writes only passive user-cache evidence","confirmation_flag":"--repair for guarded recovery; --migrate for stopped migration maintenance","private_output":"canonical preview only for explicitly requested migration preparation","purpose":"ordinary compatible update preserves configuration, guidance, credentials, pause/generation and runtime intent, then doctor; --check works without configuration/journal and never activates; --migrate disables boot activation, stops and may pause, prepares private conversion approval or completes exact marker-only conversion, never resumes participation; --expected-token requires --release; --proposal FILE|- is private JSON, never argv JSON; --migration-only is stopped bootstrap without conversion"},
@@ -1117,19 +1118,18 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
                 chain.as_deref(),
                 base_url.as_deref(),
             )?;
-            let bytes = lifecycle::credential_input(api_key_file.as_deref(), *key_stdin)?;
             return Ok((
                 "init",
                 lifecycle::init(
                     &path,
                     lifecycle::InitOptions {
-                        account,
+                        account: account.as_deref(),
                         network,
                         credential_file: api_key_file.as_deref(),
+                        key_stdin: *key_stdin,
                         state_dir: state_dir.as_deref(),
                         dry_run: *dry_run,
                     },
-                    &bytes,
                 )
                 .await?,
             ));

@@ -3,7 +3,7 @@
 use crate::{
     admin,
     config::Config,
-    protocol::Protocol,
+    protocol::{Protocol, ReadFailure, transport_failure},
     store::{AccountAdmissionGuard, AccountLock, Store, admin_identity_initialized},
 };
 use anyhow::{Context, Result, ensure};
@@ -76,8 +76,12 @@ fn credential_input_inner(path: Option<&Path>, stdin: bool) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-#[cfg(unix)]
 fn prompt_credential() -> Result<Vec<u8>> {
+    hidden_line("Hosted API key: paste only the pk_… token and press Enter (nothing will echo): ")
+}
+
+#[cfg(unix)]
+fn hidden_line(prompt: &str) -> Result<Vec<u8>> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -149,9 +153,7 @@ fn prompt_credential() -> Result<Vec<u8>> {
         unsafe { libc::tcsetattr(terminal.file.as_raw_fd(), libc::TCSAFLUSH, &hidden) } == 0,
         "cannot disable credential echo"
     );
-    terminal
-        .file
-        .write_all(b"Existing hosted API key (hidden): ")?;
+    terminal.file.write_all(prompt.as_bytes())?;
     terminal.file.flush()?;
     let mut bytes = Vec::new();
     loop {
@@ -219,27 +221,50 @@ fn prompt_credential() -> Result<Vec<u8>> {
 }
 
 #[cfg(not(unix))]
-fn prompt_credential() -> Result<Vec<u8>> {
+fn hidden_line(_prompt: &str) -> Result<Vec<u8>> {
     anyhow::bail!("hidden input requires Unix; use --key-stdin")
 }
 
-async fn verify(config: &Config, bytes: &[u8]) -> Result<()> {
-    let protocol = Protocol::with_credential(config, bytes).map_err(|error| {
-        if error
-            .downcast_ref::<crate::protocol::CredentialFormatError>()
-            .is_some()
-        {
-            LifecycleError {
-                code: "credential_format_invalid",
-                message: crate::protocol::CredentialFormatError::MESSAGE,
-            }
-        } else {
-            LifecycleError {
-                code: "identity_verification_prerequisite",
-                message: "Cannot prepare identity verification; inspect the network configuration and private credential input.",
-            }
-        }
-    })?;
+fn terminal_notice(message: &str) -> Result<()> {
+    writeln!(
+        fs::OpenOptions::new().write(true).open("/dev/tty")?,
+        "{message}"
+    )?;
+    Ok(())
+}
+
+#[derive(Debug)]
+struct VerificationEvidence {
+    http_status: Option<u16>,
+    reason: &'static str,
+    retry_after_seconds: Option<u64>,
+    transient: bool,
+}
+
+impl std::fmt::Display for VerificationEvidence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.reason)
+    }
+}
+impl std::error::Error for VerificationEvidence {}
+
+pub fn verification_details(error: &anyhow::Error) -> Option<Value> {
+    let evidence = error.downcast_ref::<VerificationEvidence>()?;
+    Some(json!({
+        "reason":evidence.reason,"http_status":evidence.http_status,
+        "retry_after_seconds":evidence.retry_after_seconds,"transient":evidence.transient,
+    }))
+}
+
+fn verification_error(
+    code: &'static str,
+    message: &'static str,
+    evidence: VerificationEvidence,
+) -> anyhow::Error {
+    anyhow::Error::new(evidence).context(LifecycleError { code, message })
+}
+
+async fn verify_once(protocol: &Protocol, config: &Config) -> Result<String> {
     let response = protocol
         .get(
             crate::endpoints::Endpoint::Identity,
@@ -262,49 +287,158 @@ async fn verify(config: &Config, bytes: &[u8]) -> Result<()> {
             },
         )
         .await
-        .map_err(|_| LifecycleError {
-            code: "identity_verification_unavailable",
-            message: "Identity verification is unavailable; no credential was changed.",
+        .map_err(|error| {
+            verification_error(
+                "identity_verification_unavailable",
+                "Could not complete the MinePOA identity check; no credential was saved.",
+                VerificationEvidence {
+                    http_status: None,
+                    reason: transport_failure(&error).as_str(),
+                    retry_after_seconds: None,
+                    transient: true,
+                },
+            )
         })?
         .response;
-    if !((200..300).contains(&response.status)
-        && response.read_failure.is_none()
-        && ["ok", "success"].iter().all(|field| {
-            response
+    let evidence = |reason, transient| VerificationEvidence {
+        http_status: Some(response.status),
+        reason,
+        retry_after_seconds: response.retry_after_seconds,
+        transient,
+    };
+    let (code, message, facts) = match response.status {
+        401 | 403 => (
+            "credential_rejected",
+            "MinePOA refused authentication. Check that this is the hosted API key for this network.",
+            evidence("authentication_refused", false),
+        ),
+        429 | 503 => (
+            "identity_verification_backoff",
+            "MinePOA is rate-limiting or temporarily unavailable; no credential was saved.",
+            evidence("upstream_backoff", true),
+        ),
+        500..=599 => (
+            "identity_verification_unavailable",
+            "MinePOA returned a server error during verification; no credential was saved.",
+            evidence("upstream_error", true),
+        ),
+        200..=299 => {
+            if let Some(failure) = response.read_failure {
+                return Err(verification_error(
+                    "identity_verification_unavailable",
+                    "MinePOA did not return a usable identity response; no credential was saved.",
+                    evidence(
+                        failure.as_str(),
+                        matches!(failure, ReadFailure::Timeout | ReadFailure::BodyInterrupted),
+                    ),
+                ));
+            }
+            if ["ok", "success"].iter().all(|field| {
+                response
+                    .body
+                    .get(field)
+                    .is_none_or(|v| v.as_bool() == Some(true))
+            }) && let Some(address) = response
                 .body
-                .get(field)
-                .is_none_or(|v| v.as_bool() == Some(true))
-        })
-        && response.body.get("address").and_then(Value::as_str)
-            == Some(config.network.address.as_str())
-        && response
-            .body
-            .get("chain_id")
-            .is_none_or(|v| v.as_str() == Some(config.network.chain.as_str())))
-    {
-        return Err(LifecycleError {
-            code: "credential_identity_unverified",
-            message: "Credential did not verify the configured chain/account; no credential was changed.",
-        }.into());
+                .get("address")
+                .and_then(Value::as_str)
+                .filter(|address| crate::config::valid_address(address))
+            {
+                if (config.network.address.is_empty() || config.network.address == address)
+                    && response
+                        .body
+                        .get("chain_id")
+                        .is_none_or(|v| v.as_str() == Some(config.network.chain.as_str()))
+                {
+                    return Ok(address.to_owned());
+                }
+                return Err(verification_error(
+                    "credential_identity_unverified",
+                    "The key belongs to a different account or chain. No credential was saved.",
+                    evidence("account_or_chain_mismatch", false),
+                ));
+            }
+            (
+                "identity_verification_unavailable",
+                "MinePOA did not return a usable identity response; no credential was saved.",
+                evidence("identity_response_invalid", false),
+            )
+        }
+        _ => (
+            "identity_verification_unavailable",
+            "MinePOA returned an unexpected response during identity verification; no credential was saved.",
+            evidence("unexpected_status", false),
+        ),
+    };
+    Err(verification_error(code, message, facts))
+}
+
+async fn verify(config: &Config, bytes: &[u8], interactive: bool) -> Result<String> {
+    let protocol = Protocol::with_credential(config, bytes).map_err(|error| {
+        if error.downcast_ref::<crate::protocol::CredentialFormatError>().is_some() {
+            LifecycleError {
+                code: "credential_format_invalid",
+                message: crate::protocol::CredentialFormatError::MESSAGE,
+            }
+        } else {
+            LifecycleError {
+                code: "identity_verification_prerequisite",
+                message: "Cannot prepare identity verification; inspect the network configuration and private credential input.",
+            }
+        }
+    })?;
+    if interactive {
+        terminal_notice(&format!(
+            "Verifying the key with MinePOA (up to {} seconds)…",
+            config.identity.read_http_seconds
+        ))?;
     }
-    Ok(())
+    let first = verify_once(&protocol, config).await;
+    if let Err(error) = &first
+        && interactive
+        && let Some(facts) = error.downcast_ref::<VerificationEvidence>()
+        && facts.transient
+    {
+        // Keep the key in this process only. Never shorten a server minimum or
+        // let an unbounded upstream wait tie up an interactive terminal.
+        let wait = facts.retry_after_seconds.unwrap_or(0);
+        if wait <= config.identity.read_http_seconds {
+            let message = error
+                .downcast_ref::<LifecycleError>()
+                .expect("typed verification error");
+            terminal_notice(message.message)?;
+            let reply = hidden_line(
+                "Retry verification without re-entering the key? Type y and press Enter [y/N]: ",
+            )?;
+            if reply.eq_ignore_ascii_case(b"y") {
+                if wait > 0 {
+                    terminal_notice(&format!("Waiting {wait} seconds before retrying…"))?;
+                    tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                }
+                terminal_notice("Retrying MinePOA identity verification…")?;
+                return verify_once(&protocol, config).await;
+            }
+        }
+    }
+    first
 }
 
 pub struct InitOptions<'a> {
-    pub account: &'a str,
+    pub account: Option<&'a str>,
     pub network: crate::config::NetworkConfig,
     pub credential_file: Option<&'a Path>,
+    pub key_stdin: bool,
     pub state_dir: Option<&'a Path>,
     pub dry_run: bool,
 }
 
 /// Creates private configuration/guidance only; never registers or initializes a journal.
-pub async fn init(path: &Path, options: InitOptions<'_>, bytes: &[u8]) -> Result<Value> {
-    init_inner(path, options, bytes).await.map_err(|error| safe_lifecycle_error(error,
+pub async fn init(path: &Path, options: InitOptions<'_>) -> Result<Value> {
+    init_inner(path, options).await.map_err(|error| safe_lifecycle_error(error,
         "initialization_failed", "Initialization did not complete. Private files may already exist; inspect configuration before retrying."))
 }
 
-async fn init_inner(path: &Path, options: InitOptions<'_>, bytes: &[u8]) -> Result<Value> {
+async fn init_inner(path: &Path, options: InitOptions<'_>) -> Result<Value> {
     let path = absolute(path)?;
     if !fs::symlink_metadata(&path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
         return Err(LifecycleError {
@@ -317,7 +451,7 @@ async fn init_inner(path: &Path, options: InitOptions<'_>, bytes: &[u8]) -> Resu
         network: options.network,
         ..Config::for_onboarding()
     };
-    config.network.address = options.account.into();
+    config.network.address = options.account.unwrap_or_default().into();
     config.network.credential_file = match options.credential_file {
         Some(file) => absolute(file)?,
         None => parent.join("credential"),
@@ -367,15 +501,50 @@ async fn init_inner(path: &Path, options: InitOptions<'_>, bytes: &[u8]) -> Resu
             );
         }
     }
-    config.validate().context(LifecycleError {
+    let interactive = options.credential_file.is_none() && !options.key_stdin;
+    ensure!(
+        interactive || options.account.is_some(),
+        "noninteractive input requires an account"
+    );
+    (if options.account == Some("") {
+        Err(crate::config::ConfigDiagnostic::field("network.address", "Invalid account address.").into())
+    } else {
+        config.validate()
+    })
+    .context(LifecycleError {
         code: "initialization_invalid",
         message: "Initialization inputs are invalid; no identity verification was requested and no onboarding files were written.",
     })?;
     ensure!(
-        !admin_identity_initialized(&config)?,
+        config.network.address.is_empty() || !admin_identity_initialized(&config)?,
         "existing account state requires its existing configuration; onboarding never replaces identity/history"
     );
-    verify(&config, bytes).await?;
+    let bytes = credential_input(options.credential_file, options.key_stdin)?;
+    let verified_address = verify(&config, &bytes, interactive).await?;
+    config.network.address = verified_address;
+    // Check the discovered account's writer marker before offering to save.
+    if options.account.is_none() {
+        ensure!(
+            !admin_identity_initialized(&config)?,
+            "existing account state requires its existing configuration; onboarding never replaces identity/history"
+        );
+    }
+    if interactive && options.account.is_none() && !options.dry_run {
+        terminal_notice(&format!(
+            "Verified public account: {} on {}.",
+            config.network.address, config.network.chain
+        ))?;
+        let reply = hidden_line(
+            "Save paused configuration for this account? Type y and press Enter [y/N]: ",
+        )?;
+        if !reply.eq_ignore_ascii_case(b"y") {
+            return Err(LifecycleError {
+                code: "initialization_cancelled",
+                message: "Setup cancelled; no credential or configuration was saved.",
+            }
+            .into());
+        }
+    }
     if !options.dry_run {
         let mut builder = fs::DirBuilder::new();
         builder.recursive(true);
@@ -433,12 +602,12 @@ async fn init_inner(path: &Path, options: InitOptions<'_>, bytes: &[u8]) -> Resu
             ensure!(
                 existing_credential
                     .as_deref()
-                    .is_none_or(|existing| existing == bytes),
+                    .is_none_or(|existing| existing == bytes.as_slice()),
                 "managed credential differs from verified input; existing credentials are never overwritten"
             );
         } else {
             ensure!(
-                existing_credential.as_deref() == Some(bytes),
+                existing_credential.as_deref() == Some(bytes.as_slice()),
                 "credential changed during verification; retry"
             );
         }
@@ -448,12 +617,12 @@ async fn init_inner(path: &Path, options: InitOptions<'_>, bytes: &[u8]) -> Resu
             }
         }
         if options.credential_file.is_none() && existing_credential.is_none() {
-            admin::persist(&config.network.credential_file, bytes)?;
+            admin::persist(&config.network.credential_file, &bytes)?;
         }
         admin::persist(&path, toml::to_string_pretty(&config)?.as_bytes())?;
     }
     Ok(
-        json!({"path":path,"dry_run":options.dry_run,"identity_verified":true,"paused":true,
+        json!({"path":path,"dry_run":options.dry_run,"identity_verified":true,"account":config.network.address,"paused":true,
         "journal_initialized":false,"credential_referenced":options.credential_file.is_some(),
         "ready_for_participation":false,"capabilities":config.capabilities,"service_state":"not_inspected",
         "note":"No account was registered. Configuration alone does not initialize the journal, configure native model authentication, start a controller or authorize participation."}),
@@ -470,6 +639,10 @@ async fn rotate_inner(path: &Path, bytes: &[u8], dry_run: bool) -> Result<Value>
     // stopped() fails fast if a writer still holds its permanent inode.
     let _directory = admin::lock_config_directory(path)?;
     let config = Config::load_metadata(path)?;
+    ensure!(
+        !config.network.address.is_empty(),
+        "configuration has no account address"
+    );
     ensure!(
         !config.network.credential_file.as_os_str().is_empty(),
         "configuration has no credential reference"
@@ -520,7 +693,7 @@ async fn rotate_inner(path: &Path, bytes: &[u8], dry_run: bool) -> Result<Value>
             );
         }
     }
-    verify(&config, bytes).await?;
+    verify(&config, bytes, false).await?;
     ensure!(
         admin::read_optional(&target, true)?.as_deref() == Some(old.as_slice()),
         "credential changed during verification; retry with the current file"

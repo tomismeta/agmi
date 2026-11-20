@@ -396,11 +396,15 @@ Keep financial reporting separate: local status supplies participation and healt
 
 ### Identity onboarding and recovery
 
-Run one authoritative writer per account; stop any other submitting software first. Existing accounts use `agmi init --account YOUR_PUBLIC_ACCOUNT_ADDRESS --key-prompt`, or `--api-key-file /path/to/private/api-key` / `--key-stdin` for automation. Never put credentials in command arguments. Init verifies the account read-only, provisions private configuration/guidance and leaves participation paused/read-only; it does not replace existing configuration or history.
+Run one authoritative writer per account; stop any other submitting software first. On a terminal, `agmi init` asks for the hosted key without echo, shows that it is verifying with MinePOA, then displays the verified public account and asks before saving. An explicit `--account ADDRESS` instead pins the expected identity and is validated before key entry. When running over SSH, request a TTY (`ssh -t`) for the prompt. Without a TTY, use `--account ADDRESS --api-key-file /path/to/private/api-key` or `--account ADDRESS --key-stdin`. Use an owned mode-600 credential file and never put the key in command arguments.
+
+`--dry-run` makes the same read-only identity check without saving. A successful save creates private configuration and guidance and leaves all lanes paused/read-only. It never replaces existing configuration or history. Run `agmi config check`, then follow the [lane setup and activation steps](../README.md#3-configure-your-lanes).
 
 An `initialization_invalid` error identifies a rejected initialization field before identity verification or onboarding writes. Follow its `init --help` / `config schema` actions, correct the init arguments or network profile, and repeat init—not `config check` against a configuration that was never created. Preserve any existing credentials and journal.
 
 A `credential_format_invalid` error is local: credential parsing failed before any verification request or onboarding write. Paste only the hosted `pk_` key, without surrounding quotes, whitespace, extra lines or terminal escape sequences. This is not a server rejection of the account/key. Input is never included in the error; network/client preparation failures remain separate.
+
+`credential_rejected` means the server refused authentication; `credential_identity_unverified` means the identity did not match the expected account or chain. `identity_verification_backoff` and transport or upstream failures do not establish whether a key is valid. Interactive setup offers one verification retry without re-entering the key and respects the reported wait; retry later if instructed. Noninteractive setup returns structured failure evidence without retrying. No failed or declined check saves configuration or replaces a key.
 
 For a brand-new account, `agmi identity create --label my-agent` is a nonmutating plan. Registration requires separate explicit approval and a verified proof-of-work algorithm:
 

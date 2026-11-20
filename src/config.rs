@@ -55,7 +55,7 @@ impl ConfigDiagnostic {
         }
     }
 
-    fn field(field: &'static str, message: &'static str) -> Self {
+    pub(crate) fn field(field: &'static str, message: &'static str) -> Self {
         Self {
             field: Some(field),
             ..Self::new("field_invalid", message)

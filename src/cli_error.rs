@@ -273,12 +273,24 @@ pub(crate) fn execution(error: &Error, config: Option<&Path>) -> Value {
         | "credential_format_invalid"
         | "identity_verification_prerequisite"
         | "credential_identity_unverified"
+        | "credential_rejected"
+        | "initialization_cancelled"
+        | "identity_verification_backoff"
         | "identity_verification_unavailable" => &["init", "--help"],
         "invalid_release_digest" => &["install", "--help"],
         "invalid_release_identity" => &["update", "--help"],
         _ => &["health"],
     };
     let mut value = json!({"code":code,"message":message,"details":{},"next_actions":[action(config, command, false)]});
+    if let Some(details) = agmi::lifecycle::verification_details(error) {
+        value["details"] = details;
+        if value["details"]["transient"] == true {
+            value["next_actions"] = json!([{
+                "kind":"instruction","authorization_required":true,
+                "message":"Retry the command after any reported server wait. You can reuse the existing API key file; do not rotate a key because of a transport or server error."
+            }]);
+        }
+    }
     if code == "admin_routing_runtime_active" {
         value["next_actions"] = json!([
             action(config, &["status"], false),
@@ -703,20 +715,7 @@ pub(crate) fn onboarding(data: &mut Value, config: Option<&Path>) {
             "message":"Repeat the verified init command without --dry-run to create configuration. No onboarding files were written."}]);
         return;
     }
-    data["next_actions"] = json!([
-        action(config, &["config", "show"], false),
-        action(config, &["agents"], false),
-        {"kind":"instruction","authorization_required":true,
-            "message":"Review native model authentication, routes and guidance; explicitly configure desired active capability modes with config apply. Initialization leaves all capabilities read-only."},
-        action(config, &["config", "check"], false),
-        action(config, &["run", "--once"], true),
-        {"kind":"instruction","authorization_required":true,
-            "message":"Choose a controller: install and start the user service if desired, or run agmi in the foreground. Installation and running state have not been inspected. Do not run two controllers."},
-        action(config, &["resume"], true),
-        {"kind":"instruction","authorization_required":true,
-            "message":"Keep the chosen controller running after resume; a completed run --once is not a supervised controller."},
-        action(config, &["health"], false)
-    ]);
+    data["next_actions"] = json!([action(config, &["config", "check"], false)]);
 }
 
 pub(crate) fn release_actions(data: &Value) -> Value {
@@ -757,7 +756,8 @@ pub(crate) fn human(kind: &str, data: &Value) {
             print_next(data);
         }
         "init" => println!(
-            "Identity verified; configuration {}. Participation is not ready; capabilities remain read-only and the journal is not initialized.",
+            "Identity verified for {}. Configuration {}; all lanes remain read-only and the journal is not initialized.",
+            data["account"].as_str().unwrap_or("the requested account"),
             if data["dry_run"] == true {
                 "not written (dry run)"
             } else {
@@ -1337,6 +1337,12 @@ pub(crate) fn human_error(error: &Value) {
         if let Some(value) = error["details"][key].as_str() {
             eprintln!("{label}: {value}");
         }
+    }
+    if let Some(status) = error["details"]["http_status"].as_u64() {
+        eprintln!("HTTP status: {status}");
+    }
+    if let Some(seconds) = error["details"]["retry_after_seconds"].as_u64() {
+        eprintln!("Retry after: {seconds}s");
     }
     if let Some(recovery) = error["details"]["bootstrap_recovery"].as_object() {
         eprintln!(
