@@ -301,6 +301,9 @@ fn terminal_failure(terminal: &Value) -> NativeFailure {
         Some("native_auth_unavailable") => "native_auth_unavailable",
         Some("native_route_mismatch") => "native_route_mismatch",
         Some("native_process_failed") => "native_process_failed",
+        // A failed provider stream is not a failed local process: it leaves
+        // inference completion unknown rather than completed-invalid.
+        Some("native_stream_failed") => "native_stream_failed",
         Some("native_failure") => "native_failure",
         _ => "native_envelope_invalid",
     })
@@ -611,6 +614,23 @@ mod tests {
             EvidenceSource::AdapterContract
         );
         assert!(evidence.fallback_used.is_none() && evidence.tool_count.is_none());
+    }
+    #[test]
+    fn provider_stream_failures_stay_unknown_and_distinct_from_process_failures() {
+        let expected = expected();
+        for code in ["native_stream_failed", "native_process_failed"] {
+            let mut terminal = expected.clone();
+            terminal["ok"] = json!(false);
+            terminal["reason_code"] = json!(code);
+            let data = json!({"entries":[entry("dispatch",DISPATCH,expected.clone()),entry("terminal",TERMINAL,terminal)]});
+            let error = terminal_entry(&data, &expected, &mut Default::default()).unwrap_err();
+            assert_eq!(failure_code(&error), code);
+            // Neither failure proves inference finished; only an invalid
+            // artifact graduates to completed-invalid accounting.
+            assert!(!completed_artifact_invalid(&error));
+            assert!(execution_may_have_started(&error));
+            assert!(!format!("{error:?}").contains("secret"));
+        }
     }
     #[test]
     fn native_version_is_qualified_exactly() {

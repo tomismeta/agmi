@@ -43,6 +43,7 @@ class Endpoint(http.server.BaseHTTPRequestHandler):
             if self.server.behavior == "stall":
                 time.sleep(2)
             data = encoded({"output": ANSWER, "tool": self.server.behavior == "tool",
+                            "stream_error": self.server.behavior == "stream-error",
                             "overflow": self.server.behavior == "overflow",
                             "native_model": "fallback" if self.server.behavior == "identity" else None})
             self.send_response(200)
@@ -99,6 +100,7 @@ export default function(pi) {
               openrouterVariant:options.openrouterVariant,antigravityEndpointMode:options.antigravityEndpointMode,
               fallbacks:options.fallbacks,sessionId:options.sessionId},model:model.id})});
           const data=await response.json();
+          if (data.stream_error) throw new Error("fixture private provider error");
           const message={role:"assistant",api:model.api,provider:model.provider,model:data.native_model??model.id,
             content:data.tool?[{type:"toolCall",id:"bad",name:"profile_canary",arguments:{}}]:[{type:"text",text:data.output}],
             stopReason:data.tool?"toolUse":"stop",timestamp:Date.now(),
@@ -119,7 +121,7 @@ export default function(pi) {
         } catch (cause) {
           appendFileSync(__CANARY__+".transport-error",String(cause).slice(0,1024));
           const error={role:"assistant",api:model.api,provider:model.provider,model:model.id,content:[],
-            stopReason:"error",errorMessage:"fixture failure",timestamp:Date.now()};
+            stopReason:"error",errorMessage:String(cause),timestamp:Date.now()};
           stream.push({type:"error",reason:"error",error});stream.end(error);
         }
       })(); return stream;
@@ -312,6 +314,7 @@ def run_case(binary, bridge, root, server, name, provider="openrouter", effort="
         if expected:
             detail = Path(str(canary) + ".transport-error")
             assert not terminal["ok"] and terminal["reason_code"] == expected, (terminal, detail.read_text() if detail.exists() else None)
+            assert "fixture private provider error" not in json.dumps(terminal)
             if behavior == "identity":
                 assert terminal["native_model"] == "fallback" and terminal["native_provider"] == provider, terminal
         else:
@@ -391,6 +394,8 @@ def main():
                      expected="native_run_binding_mismatch", duplicate=True)
             run_case(binary, bridge, root, server, "output-overflow", behavior="overflow", expected="native_output_limit")
             run_case(binary, bridge, root, server, "deadline", behavior="stall", expected="model_deadline_exceeded")
+            run_case(binary, bridge, root, server, "upstream-stream-error",
+                     behavior="stream-error", expected="native_stream_failed")
         finally:
             server.shutdown()
             server.server_close()

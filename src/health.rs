@@ -945,6 +945,17 @@ pub fn compact_diagnostics(data: &mut Value) {
             };
             out.insert(name.to_owned(), projected);
         }
+        if let Some(flag) = names
+            .iter()
+            .copied()
+            .find(|name| matches!(*name, "release_truncated" | "blocker_ids_truncated"))
+            && matches!(
+                (value["blocker_ids"].as_array(), out.get("blocker_ids").and_then(Value::as_array)),
+                (Some(original), Some(compact)) if original.len() > compact.len()
+            )
+        {
+            out.insert(flag.to_owned(), Value::Bool(true));
+        }
         Value::Object(out)
     }
     fn admission(value: &Value, truncated: &mut bool) -> Value {
@@ -970,7 +981,15 @@ pub fn compact_diagnostics(data: &mut Value) {
                 .take(4)
                 .map(|row| fields(
                     row,
-                    &["kind", "authorization_required", "message", "argv",],
+                    &[
+                        "kind",
+                        "authorization_required",
+                        "message",
+                        "argv",
+                        "until",
+                        "clock",
+                        "evidence"
+                    ],
                     truncated
                 ))
                 .collect::<Vec<_>>()
@@ -1044,6 +1063,17 @@ pub fn compact_diagnostics(data: &mut Value) {
         "last_failure_at",
         "failure_category",
         "retry_at",
+        "server_floor_at",
+        "local_retry_at",
+        "blocker_ids",
+        "required_release",
+        "release_scope",
+        "release_truncated",
+        "bound_missing",
+        "bound_read_status",
+        "bound_read_category",
+        "resolution",
+        "retry_floor",
         "evidence",
         "valid_until",
         "count",
@@ -1063,6 +1093,8 @@ pub fn compact_diagnostics(data: &mut Value) {
         "own_remaining",
         "account_unresolved",
         "required_release",
+        "blocker_ids",
+        "blocker_ids_truncated",
         "not_before",
         "retained_uncertainty_nonblocking",
         "historical_eligible_count",

@@ -1100,6 +1100,47 @@ fn print_lane_row(data: &Value, lane: &str) {
     {
         print!("; next_at={at}");
     }
+    match intervention["retry_floor"].as_str() {
+        Some("server_restriction") => print!("; server retry restriction"),
+        Some("local_backoff") => print!("; local retry backoff"),
+        Some("retained_floor") => print!("; retained retry restriction"),
+        Some("operation_minimum") => print!("; operation retry minimum"),
+        Some("participation_grace") => print!("; participation grace period"),
+        _ => {}
+    }
+    if let Some(at) = intervention["server_floor_at"].as_i64() {
+        print!("; server floor={at}");
+    }
+    if let Some(at) = intervention["local_retry_at"].as_i64() {
+        print!("; local retry={at}");
+    }
+    if intervention["resolution"] == "polling_not_guaranteed" {
+        print!("; at least one bound read returned 404; polling continues, outcome unknown");
+    }
+    if let Some(ids) = intervention["blocker_ids"]
+        .as_array()
+        .filter(|ids| !ids.is_empty())
+    {
+        print!("; blocking local operations:");
+        for id in ids.iter().filter_map(Value::as_i64) {
+            print!(" #{id}");
+        }
+        if intervention["release_truncated"] == true {
+            print!(" (list incomplete)");
+        }
+    }
+    let model = &work["model"];
+    if model["current_route"] == true {
+        match model["failure_category"].as_str() {
+            Some("artifact_grade_invalid") => {
+                print!("; completed inference returned an invalid grade")
+            }
+            Some("native_stream_failed") => {
+                print!("; native stream failed, execution outcome unknown")
+            }
+            _ => {}
+        }
+    }
     println!();
 }
 

@@ -10,6 +10,7 @@ struct Finding<'a> {
     reason: &'a str,
     action: &'a str,
     next_at: Option<i64>,
+    detail: Value,
 }
 
 impl<'a> Finding<'a> {
@@ -20,6 +21,7 @@ impl<'a> Finding<'a> {
             reason,
             action: "inspect_local_evidence",
             next_at: None,
+            detail: json!({}),
         }
     }
 
@@ -30,6 +32,7 @@ impl<'a> Finding<'a> {
             reason,
             action,
             next_at: None,
+            detail: json!({}),
         }
     }
 
@@ -40,13 +43,40 @@ impl<'a> Finding<'a> {
             reason,
             action,
             next_at,
+            detail: json!({}),
         }
     }
 
+    /// Attach bounded typed witnesses without changing the classification.
+    /// Callers pass only canonical store evidence (blocker id lists, safe
+    /// read outcomes, retry-floor labels); nothing here re-decides admission.
+    fn with(mut self, key: &str, value: Value) -> Self {
+        if let Value::Object(fields) = &mut self.detail {
+            fields.insert(key.to_owned(), value);
+        }
+        self
+    }
+
+    /// Merge a prebuilt evidence object (flat scalar/array fields only).
+    fn with_all(mut self, evidence: Value) -> Self {
+        if let (Value::Object(fields), Value::Object(detail)) = (&mut self.detail, evidence) {
+            fields.extend(detail);
+        }
+        self
+    }
+
     fn value(&self, observed: Option<i64>, evidence_fresh: Option<bool>) -> Value {
-        json!({"status":self.status,"reason":self.reason,"next_action":self.action,
+        let mut result = json!({"status":self.status,"reason":self.reason,"next_action":self.action,
             "next_at":self.next_at,"observed_at":observed,"evidence_fresh":evidence_fresh,
-            "evidence":"local_only_not_a_success_guarantee"})
+            "evidence":"local_only_not_a_success_guarantee"});
+        if let Value::Object(target) = &mut result
+            && let Value::Object(detail) = &self.detail
+        {
+            for (key, value) in detail {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+        result
     }
 }
 
@@ -79,6 +109,58 @@ fn timestamp(value: &Value) -> Option<i64> {
     value.as_i64().filter(|time| *time >= 0)
 }
 
+/// A retained deadline schedules future work only while it stays ahead of
+/// now. Expired timestamps are stale evidence, never a revived promise.
+fn future(value: &Value, at: i64) -> Option<i64> {
+    timestamp(value).filter(|time| *time > at)
+}
+
+/// Which journal operations the store says must clear, carried verbatim from
+/// the canonical admission projection. Health never recomputes membership.
+fn blocker_evidence(detail: &Value) -> Value {
+    json!({
+        "blocker_ids": detail.get("blocker_ids").cloned().unwrap_or(Value::Null),
+        "required_release": detail.get("required_release").cloned().unwrap_or(Value::Null),
+        "release_scope": detail.get("scope").cloned().unwrap_or(Value::Null),
+        "release_truncated": detail.get("blocker_ids_truncated").cloned().unwrap_or(Value::Null),
+    })
+}
+
+/// Name the retained floor behind a store retry deadline. This labels the
+/// canonical reason; the deadline itself stays the store's `not_before`.
+fn floor_kind(reason: &str) -> Option<&'static str> {
+    match reason {
+        "operation_retry_minimum" => Some("operation_minimum"),
+        "operation_backoff" => Some("local_backoff"),
+        "shared_server_restriction" => Some("server_restriction"),
+        "retained_legacy_floor" => Some("retained_floor"),
+        "account_uncertainty_grace" | "uncertain_answer_retry_delay" => Some("participation_grace"),
+        _ => None,
+    }
+}
+
+/// Last recorded outcome of the bound read, if any. A missing row means no
+/// usable evidence was retained; a 404 means the remote side reports the
+/// bound job unknown or expired while local polling continues. Server floors
+/// (the remote restriction and its retained copy) are reported separately
+/// from local backoff so an active server restriction reads differently from
+/// a local wait. Only deadlines still ahead of now are shown; expired floors
+/// stay on their own rows, never revived here.
+fn bound_evidence(dependency: Option<&Value>, at: i64) -> Value {
+    let Some(row) = dependency else {
+        return json!({"bound_missing": true, "bound_read_status": null,
+            "bound_read_category": null, "server_floor_at": null,
+            "local_retry_at": null});
+    };
+    let ahead = |field: &str| future(&row[field], at);
+    json!({"bound_missing": false,
+        "bound_read_status": row.get("status").cloned().unwrap_or(Value::Null),
+        "bound_read_category": row.get("failure_category").and_then(Value::as_str)
+            .map_or(Value::Null, |category| json!(crate::store::safe_read_category(category))),
+        "server_floor_at": ahead("server_not_before").max(ahead("retained_conservative_floor")),
+        "local_retry_at": ahead("local_next_at")})
+}
+
 fn read<'a>(status: &'a Value, name: &str, work: &Value, purpose: &str) -> Option<&'a Value> {
     match purpose {
         "identity" => super::api::identity(status),
@@ -100,6 +182,10 @@ pub(super) fn read_failed(row: &Value) -> bool {
                         || row["failures"].as_u64().unwrap_or(0) > 0))
         })
     })
+}
+
+fn missing_remote_evidence(row: &Value) -> bool {
+    row["status"].as_u64() == Some(404) && read_failed(row)
 }
 
 fn read_auth_failed(row: &Value, at: i64, stale: u64) -> bool {
@@ -199,6 +285,7 @@ fn release_path<'a>(
     let mut uncertain = 0_u64;
     let mut authentication_blocked = false;
     let mut truncated_reads = false;
+    let mut polls_missing_evidence = false;
     let mut next: Option<i64> = None;
     for id in ids {
         let Some(row) = rows.iter().find(|row| row["operation_id"] == *id) else {
@@ -244,10 +331,16 @@ fn release_path<'a>(
                 .is_some_and(|deadline| at <= deadline.saturating_add(timing.shutdown as i64));
         if bound || dispatching {
             automatic += 1;
+            if bound && dependency.is_some_and(missing_remote_evidence) {
+                polls_missing_evidence = true;
+            }
+            // Only deadlines still ahead of now schedule another poll.
+            // Expired timestamps stay visible on their own rows, never as a
+            // revived promise here.
             let deadline = [
-                timestamp(&row["next_at"]),
-                timestamp(&row["retry_not_before"]),
-                dependency.and_then(|read| timestamp(&read["next_at"])),
+                future(&row["next_at"], at),
+                future(&row["retry_not_before"], at),
+                dependency.and_then(|read| future(&read["next_at"], at)),
             ]
             .into_iter()
             .flatten()
@@ -260,16 +353,27 @@ fn release_path<'a>(
             uncertain += 1;
         }
     }
+    // Every outcome carries the store's own blocker list so the operator can
+    // see which journal operations actually hold the lane.
     if automatic >= needed {
-        Finding::automatic("bound_reconciliation_pending", "await_reconciliation", next)
+        let finding =
+            Finding::automatic("bound_reconciliation_pending", "await_reconciliation", next)
+                .with_all(blocker_evidence(detail));
+        if polls_missing_evidence {
+            finding.with("resolution", json!("polling_not_guaranteed"))
+        } else {
+            finding
+        }
     } else if automatic + uncertain >= needed || detail["blocker_ids_truncated"] == true {
         Finding::unknown(if truncated_reads {
             "reconciliation_evidence_truncated"
         } else {
             "reconciliation_evidence_unavailable"
         })
+        .with_all(blocker_evidence(detail))
     } else if authentication_blocked {
         Finding::blocked("reconciliation_authentication_failed", "review_credentials")
+            .with_all(blocker_evidence(detail))
     } else {
         Finding::blocked(
             if detail["scope"] == "account" {
@@ -279,6 +383,7 @@ fn release_path<'a>(
             },
             "inspect_operations",
         )
+        .with_all(blocker_evidence(detail))
     }
 }
 
@@ -301,7 +406,7 @@ fn blocker<'a>(
             if recovery.status == "automatic_recovery" {
                 recovery
             } else {
-                Finding::blocked(reason, "authorize")
+                Finding::blocked(reason, "authorize").with_all(blocker_evidence(detail))
             }
         }
         "account_uncertainty_grace"
@@ -310,10 +415,17 @@ fn blocker<'a>(
         | "operation_retry_minimum"
         | "operation_backoff"
         | "uncertain_answer_retry_delay" => {
-            if let Some(next) = timestamp(&detail["not_before"]).or(timestamp(&detail["next_at"])) {
-                Finding::automatic(reason, "await_retry_eligibility", Some(next))
-            } else {
-                Finding::unknown("retry_deadline_unavailable")
+            // The deadline is the store's own floor; the label only names
+            // which one so server restrictions read differently from local
+            // backoff. An expired floor is stale evidence, not a new wait.
+            let next = future(&detail["not_before"], at).or(future(&detail["next_at"], at));
+            let finding = match next {
+                Some(next) => Finding::automatic(reason, "await_retry_eligibility", Some(next)),
+                None => Finding::unknown("retry_deadline_unavailable"),
+            };
+            match floor_kind(reason) {
+                Some(kind) => finding.with("retry_floor", json!(kind)),
+                None => finding,
             }
         }
         "uncertain_retry_disabled" | "answer_attempt_budget_exhausted" => {
@@ -321,7 +433,7 @@ fn blocker<'a>(
         }
         "generation_changed" => Finding::automatic(reason, "discard_unsent", None),
         "effect_in_flight" => {
-            Finding::automatic(reason, "await_effect", timestamp(&detail["not_before"]))
+            Finding::automatic(reason, "await_effect", future(&detail["not_before"], at))
         }
         _ => return None,
     })
@@ -426,6 +538,7 @@ fn lane<'a>(
             reason,
             action,
             next_at: next,
+            detail: json!({}),
         };
     }
     let observed = if name == "judge" {
@@ -452,6 +565,7 @@ fn lane<'a>(
             },
             action,
             next_at: next,
+            detail: json!({}),
         };
     }
     // Current admission blockers outrank background job/receipt maintenance.
@@ -479,13 +593,29 @@ fn lane<'a>(
         }
         let dependency = super::api::bound(status, work);
         if dependency.is_none() && status["reads_truncated"] == true {
-            return Finding::unknown("reconciliation_evidence_truncated");
+            return Finding::unknown("reconciliation_evidence_truncated")
+                .with_all(bound_evidence(None, at));
         }
-        let due = [next, dependency.and_then(|row| timestamp(&row["next_at"]))]
-            .into_iter()
-            .flatten()
-            .max();
-        return Finding::automatic("bound_reconciliation_pending", action, due);
+        // A valid binding with no retained read yet still has its first poll
+        // scheduled. Lack of an observed result is not lack of a path.
+        let due = [
+            next.filter(|time| *time > at),
+            dependency.and_then(|read| future(&read["next_at"], at)),
+        ]
+        .into_iter()
+        .flatten()
+        .max();
+        // A bound job the server reports as unknown or expired (404) keeps
+        // polling on the reconciliation schedule, but that polling is not a
+        // probable resolution: the remote side may never have the job again.
+        let missing = dependency.is_some_and(missing_remote_evidence);
+        let finding = Finding::automatic("bound_reconciliation_pending", action, due)
+            .with_all(bound_evidence(dependency, at));
+        return if missing {
+            finding.with("resolution", json!("polling_not_guaranteed"))
+        } else {
+            finding
+        };
     }
     let model = &work["model"];
     if !read_only && model.is_object() {
@@ -672,6 +802,7 @@ fn lane<'a>(
                         "await_challenge"
                     },
                     next_at: None,
+                    detail: json!({}),
                 };
             }
             if timestamp(&row["next_at"]).is_some_and(|time| time > at) && read_failed(row) {
@@ -697,6 +828,7 @@ fn lane<'a>(
             reason: "capability_read_only",
             action,
             next_at: next,
+            detail: json!({}),
         };
     }
     if matches!(phase, Some("observing" | "prepared" | "included")) {
@@ -796,6 +928,7 @@ pub(super) fn project(status: &Value, options: Options, at: i64) -> (Value, Valu
                 reason: "capability_off",
                 action: "none",
                 next_at: None,
+                detail: json!({}),
             }
         } else if ready != Some(true) && controller.reason != "controller_stopped" {
             Finding {
@@ -804,6 +937,7 @@ pub(super) fn project(status: &Value, options: Options, at: i64) -> (Value, Valu
                 reason: controller.reason,
                 action: controller.action,
                 next_at: None,
+                detail: json!({}),
             }
         } else if !matches!(mode(status, name), Some("active" | "read_only")) {
             Finding::unknown("effective_mode_unavailable")
@@ -836,6 +970,7 @@ pub(super) fn project(status: &Value, options: Options, at: i64) -> (Value, Valu
                 reason: identity.reason,
                 action: identity.action,
                 next_at: identity.next_at,
+                detail: finding.detail,
             };
         }
         if !work[name].is_object() {
@@ -916,6 +1051,7 @@ pub(super) fn qualify_operational(report: &mut Value, status: &Value) {
                 reason: "in_flight_outcome_overdue",
                 action: "inspect_operations",
                 next_at: None,
+                detail: json!({}),
             }),
             "pending_model_execution_expired" => Some(Finding::unknown(reason)),
             "pending_work_overdue" => Some(Finding {
@@ -924,6 +1060,7 @@ pub(super) fn qualify_operational(report: &mut Value, status: &Value) {
                 reason,
                 action: "inspect_operations",
                 next_at: None,
+                detail: json!({}),
             }),
             "model_attempt_budget_exhausted"
             | "model_uncertain_retry_disabled"
@@ -971,9 +1108,15 @@ pub(super) fn qualify_operational(report: &mut Value, status: &Value) {
             count += 1;
             if matches!(row["read_key"]["purpose"].as_str(), Some("job" | "receipt")) {
                 bound += 1;
-                let due = timestamp(&row["next_at"])
+                // Only deadlines still ahead of the report clock schedule
+                // another poll. `observed` is the report's own checked_at.
+                let ahead = |value: &Value| match observed {
+                    Some(now) => future(value, now),
+                    None => timestamp(value),
+                };
+                let due = ahead(&row["next_at"])
                     .into_iter()
-                    .chain(timestamp(&row["retry_not_before"]))
+                    .chain(ahead(&row["retry_not_before"]))
                     .chain(
                         row["read_key"]["owner"]
                             .as_str()
@@ -987,7 +1130,7 @@ pub(super) fn qualify_operational(report: &mut Value, status: &Value) {
                                 row["binding_revision"].as_i64().is_some()
                                     && row["binding_revision"] == read["binding_revision"]
                             })
-                            .and_then(|read| timestamp(&read["next_at"])),
+                            .and_then(|read| ahead(&read["next_at"])),
                     )
                     .max();
                 if let Some(at) = due {
@@ -1072,6 +1215,7 @@ fn core_reason(reason: &str) -> Finding<'_> {
             reason,
             action: "none",
             next_at: None,
+            detail: json!({}),
         },
         "not_initialized" => Finding::blocked(reason, "initialize_controller"),
         "migration_pending" => Finding::blocked(reason, "complete_migration"),
@@ -1142,6 +1286,7 @@ pub(super) fn qualify_restoration(report: &mut Value) {
                     reason: "capability_off",
                     action: "none",
                     next_at: None,
+                    detail: json!({}),
                 }
             } else if mode == Some("active") && report["paused"] == true {
                 Finding::blocked("admission_paused", "resume")
@@ -1637,5 +1782,88 @@ mod tests {
             status["effective_runtime"]["observed_at"] = observed;
             assert_eq!(projection(&status).1["unattended"], Value::Null);
         }
+    }
+
+    #[test]
+    fn valid_binding_without_a_read_keeps_its_first_poll() {
+        let mut status = fixture();
+        status["work"]["answer"]["phase"] = json!("queued");
+        status["work"]["answer"]["next_action"] = json!("read_job");
+        status["work"]["answer"]["read_key"] = queued(9, "answer")["read_key"].clone();
+        status["work"]["answer"]["binding_revision"] = json!(1);
+        status["reads"] = json!([]);
+        let intervention = projection(&status).0["answer"]["intervention"].clone();
+        assert_eq!(intervention["status"], "automatic_recovery");
+        assert_eq!(intervention["reason"], "bound_reconciliation_pending");
+        assert_eq!(intervention["bound_missing"], true);
+    }
+
+    #[test]
+    fn bound_job_404_polls_without_promising_resolution() {
+        let mut status = fixture();
+        status["work"]["answer"]["phase"] = json!("queued");
+        status["work"]["answer"]["next_action"] = json!("read_job");
+        status["work"]["answer"]["read_key"] = queued(1, "answer")["read_key"].clone();
+        status["work"]["answer"]["binding_revision"] = json!(1);
+        status["reads"] = json!([
+            {"owner":"answer","purpose":"job","resource":"1:1","binding_revision":1,
+                "last_failure_at":9999,"status":404,"failure_category":"not_found",
+                "next_at":10030,"local_next_at":10020,"server_not_before":10040,
+                "retained_conservative_floor":0}
+        ]);
+        let intervention = projection(&status).0["answer"]["intervention"].clone();
+        assert_eq!(intervention["status"], "automatic_recovery");
+        assert_eq!(intervention["reason"], "bound_reconciliation_pending");
+        assert_eq!(intervention["resolution"], "polling_not_guaranteed");
+        assert_eq!(intervention["bound_missing"], false);
+        assert_eq!(intervention["bound_read_status"], 404);
+        assert_eq!(intervention["bound_read_category"], "not_found");
+        assert_eq!(intervention["server_floor_at"], 10040);
+        assert_eq!(intervention["local_retry_at"], 10020);
+        assert_eq!(intervention["next_at"], 10030);
+    }
+
+    #[test]
+    fn expired_retry_floor_is_stale_evidence_not_a_wait() {
+        let mut status = fixture();
+        block(
+            &mut status,
+            "answer",
+            "shared_server_restriction",
+            "account",
+            &[],
+            0,
+        );
+        status["work"]["answer"]["admission"]["not_before"] = json!(9000);
+        let intervention = projection(&status).0["answer"]["intervention"].clone();
+        assert_eq!(intervention["status"], "undetermined");
+        assert_eq!(intervention["reason"], "retry_deadline_unavailable");
+        assert_eq!(intervention["retry_floor"], "server_restriction");
+        assert!(intervention["next_at"].is_null());
+    }
+
+    #[test]
+    fn release_path_names_the_store_blockers_it_counts() {
+        let mut status = fixture();
+        status["pending_work"] = json!([queued(1, "answer")]);
+        status["reads"] = json!([
+            {"owner":"answer","purpose":"job","resource":"1:1","binding_revision":1,
+                "last_failure_at":9999,"status":404,"next_at":10030}
+        ]);
+        block(
+            &mut status,
+            "answer",
+            "lane_unresolved_capacity",
+            "lane",
+            &[1],
+            1,
+        );
+        let intervention = projection(&status).0["answer"]["intervention"].clone();
+        assert_eq!(intervention["status"], "automatic_recovery");
+        assert_eq!(intervention["resolution"], "polling_not_guaranteed");
+        assert_eq!(intervention["blocker_ids"], json!([1]));
+        assert_eq!(intervention["required_release"], 1);
+        assert_eq!(intervention["release_scope"], "lane");
+        assert_eq!(intervention["release_truncated"], Value::Null);
     }
 }

@@ -266,12 +266,20 @@ codes!(NativeReasonCode {
     OpenclawException,
     OpenclawExecutionFailed,
     ArtifactJsonInvalid,
+    // Well-formed judge JSON that violates the grade schema (a non-null
+    // answer, a missing or out-of-range score, or missing or mistrimmed
+    // reasoning). One bounded code covers the fixed schema: operators
+    // regenerate the same way whichever field was wrong.
+    ArtifactGradeInvalid,
+    // The provider stream itself failed after dispatch. Unlike a local
+    // process failure this says nothing about whether inference ran.
+    NativeStreamFailed,
     ArtifactVersionMismatch,
     ArtifactRequestIdMismatch,
     ArtifactRequestDigestMismatch,
     ArtifactKindMismatch,
     NativeExecutionEvidenceMismatch,
-    NativeOutputLimit
+    NativeOutputLimit,
 });
 impl NativeReasonCode {
     pub fn as_str(self) -> &'static str {
@@ -293,6 +301,8 @@ impl NativeReasonCode {
             Self::OpenclawException => "openclaw_exception",
             Self::OpenclawExecutionFailed => "openclaw_execution_failed",
             Self::ArtifactJsonInvalid => "artifact_json_invalid",
+            Self::ArtifactGradeInvalid => "artifact_grade_invalid",
+            Self::NativeStreamFailed => "native_stream_failed",
             Self::ArtifactVersionMismatch => "artifact_version_mismatch",
             Self::ArtifactRequestIdMismatch => "artifact_request_id_mismatch",
             Self::ArtifactRequestDigestMismatch => "artifact_request_digest_mismatch",
@@ -337,6 +347,7 @@ impl NativeReasonCode {
             "openclaw_exception" => Self::OpenclawException,
             "openclaw_execution_failed" => Self::OpenclawExecutionFailed,
             "artifact_json_invalid" => Self::ArtifactJsonInvalid,
+            "artifact_grade_invalid" => Self::ArtifactGradeInvalid,
             "artifact_version_mismatch" => Self::ArtifactVersionMismatch,
             "artifact_request_id_mismatch" => Self::ArtifactRequestIdMismatch,
             "artifact_request_digest_mismatch" => Self::ArtifactRequestDigestMismatch,
@@ -354,6 +365,7 @@ impl NativeReasonCode {
             "native_route_mismatch" => Self::NativeRouteMismatch,
             "native_pipe_failed" => Self::NativePipeFailed,
             "native_process_failed" => Self::NativeProcessFailed,
+            "native_stream_failed" => Self::NativeStreamFailed,
             _ => Self::NativeFailure,
         }
     }
@@ -473,5 +485,39 @@ mod tests {
         let selection: ModelSelection = serde_json::from_str(recorded).unwrap();
         let reconstructed = ModelSelection::new(&selection.config()).unwrap();
         assert_eq!(serde_json::to_string(&reconstructed).unwrap(), recorded);
+    }
+
+    #[test]
+    fn grade_and_stream_failures_map_to_distinct_codes() {
+        for (code, expected) in [
+            (
+                "artifact_json_invalid",
+                NativeReasonCode::ArtifactJsonInvalid,
+            ),
+            (
+                "artifact_grade_invalid",
+                NativeReasonCode::ArtifactGradeInvalid,
+            ),
+            ("native_stream_failed", NativeReasonCode::NativeStreamFailed),
+            (
+                "native_process_failed",
+                NativeReasonCode::NativeProcessFailed,
+            ),
+            (
+                "native_envelope_invalid",
+                NativeReasonCode::NativeEnvelopeInvalid,
+            ),
+        ] {
+            let error = anyhow::Error::new(NativeFailure(code));
+            assert_eq!(NativeReasonCode::from_error(&error), expected);
+            assert_eq!(expected.as_str(), code);
+            assert_eq!(
+                serde_json::from_str::<NativeReasonCode>(
+                    &serde_json::to_string(&expected).unwrap()
+                )
+                .unwrap(),
+                expected
+            );
+        }
     }
 }

@@ -23,6 +23,17 @@ jobs:
         run: node --check adapters/openclaw.mjs
       - name: Native bridge contracts
         run: python3 tests/native_bridge_smoke.py
+      - name: Qualified standalone omp bridge
+        run: |
+          omp_dir="$RUNNER_TEMP/agmi-omp"
+          mkdir -p "$omp_dir"
+          curl --fail --silent --show-error --location \
+            https://github.com/can1357/oh-my-pi/releases/download/v19.0.1/omp-linux-x64 \
+            --output "$omp_dir/omp"
+          printf '%s  %s\n' 6ceef04430851bb1050c6fda3af467412eb44a11df0a6ff8121fe601013c5415 "$omp_dir/omp" \
+            | sha256sum --check
+          chmod 0700 "$omp_dir/omp"
+          python3 tests/omp_native_smoke.py --omp "$omp_dir/omp"
       - name: Behavior tests
         run: RUST_BACKTRACE=1 cargo +1.96.0 test --locked
       - name: Lints
@@ -88,6 +99,7 @@ jobs:
           cargo +1.96.0 install --path "$package_root/agmi-$version" --locked --root "$package_root/install"
           "$package_root/install/bin/agmi" build-info --manifest
           python3 tests/lifecycle_smoke.py "$package_root/install/bin/agmi" --scenario init
+          python3 tests/lifecycle_smoke.py "$package_root/install/bin/agmi" --scenario prompt
       - name: Isolated systemd release lifecycle
         run: |
           docker build -f tests/systemd_fixture.Dockerfile -t agmi-systemd-fixture tests

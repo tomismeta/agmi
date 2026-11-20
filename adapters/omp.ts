@@ -65,7 +65,7 @@ export default async function (pi: ExtensionAPI) {
         native_binding: "native_run_binding_mismatch", native_request: "native_run_binding_mismatch",
         native_not_ready: "native_run_binding_mismatch", native_identity: "native_provenance_mismatch",
         native_tool_call: "native_api_unsupported", native_completion: "native_api_unsupported",
-        native_output_limit: "native_output_limit", native_stream: "native_process_failed",
+        native_output_limit: "native_output_limit", native_stream: "native_stream_failed",
       };
       data.reason_code = reasons[data.reason_code] ?? "native_failure";
     }
