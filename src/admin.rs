@@ -457,7 +457,7 @@ fn patch_shape() -> Value {
     }
     shape
 }
-fn describe(path: &str, value: &Value, settings: &mut Vec<Value>) {
+fn describe(path: &str, value: &Value, onboarding: Option<&Value>, settings: &mut Vec<Value>) {
     if let Some(object) = value.as_object() {
         for (name, value) in object {
             let child = if path.is_empty() {
@@ -465,7 +465,7 @@ fn describe(path: &str, value: &Value, settings: &mut Vec<Value>) {
             } else {
                 format!("{path}.{name}")
             };
-            describe(&child, value, settings);
+            describe(&child, value, onboarding.and_then(|v| v.get(name)), settings);
         }
         return;
     }
@@ -505,6 +505,9 @@ fn describe(path: &str, value: &Value, settings: &mut Vec<Value>) {
             "immutable_when_initialized":matches!(path,
                 "network.base_url" | "network.chain" | "network.address"
                 | "network.credential_file" | "state_dir")});
+    if let Some(onboarding) = onboarding.filter(|default| *default != value) {
+        setting["onboarding_default"] = onboarding.clone();
+    }
     if path.ends_with(".max_unresolved_operations") || path.ends_with(".max_attempts_per_work") {
         setting["type"] = json!("integer|string");
         setting["one_of"] = json!([
@@ -568,7 +571,9 @@ fn describe(path: &str, value: &Value, settings: &mut Vec<Value>) {
 pub fn schema() -> Value {
     let defaults = defaults();
     let mut settings = Vec::new();
-    describe("", &defaults, &mut settings);
+    let onboarding =
+        serde_json::to_value(Config::for_onboarding()).expect("Config serialization is infallible");
+    describe("", &defaults, Some(&onboarding), &mut settings);
     json!({"schema":"agmi.config","settings":settings,"defaults":defaults,
         "capabilities":crate::capability::DESCRIPTORS,
         "control":{"configuration":"desired_saved_only","fence_acknowledged":false,
@@ -582,7 +587,7 @@ pub fn schema() -> Value {
             "reload":"Both files reload with configuration; each model attempt captures both layers privately."},
         "max_input_bytes":MAX_INPUT_BYTES,"patch":"nested JSON merge patch; null removes a field; the resulting TOML must pass Config validation",
         "persistence":"canonical TOML; comments and formatting are not preserved",
-        "runtime_applied":null,"runtime_application":"unverified","note":"Saved files are loaded by the runtime separately; status reports its effective revision."})
+        "runtime_applied":null,"runtime_application":"unverified","note":"Defaults describe omitted fields; onboarding_default shows differences saved into new files. Status reports the runtime's effective revision."})
 }
 fn validate_patch(patch: &Value, shape: &Value, depth: usize) -> Result<()> {
     if depth > MAX_DEPTH {

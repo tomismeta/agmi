@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Fleet-aligned onboarding:** new configurations save unbounded `participation_first`, bounded uncertain-model and answer retries, per-epoch mining, and fleet discovery, queued-job and timeout settings. Lanes still start read-only. Existing configurations and omitted-field defaults are unchanged.
 - **Private credential diagnostics:** distinguish locally rejected hosted-key formatting from network/client preparation failures before verification. Report bounded format guidance without echoing input, sending a verification request or creating onboarding files; accepted credential formats and identity checks are unchanged.
 - **Native inference deadline ownership:** retain one original deadline in pending launch state and reuse it during collection. Remove redundant flight storage flagged by Rust 1.96 Clippy without adding heap indirection or changing admission, timeout or cleanup semantics.
 - **Independent omp adapter:** support the separately installed standalone omp 19.0.1 binary through an invocation-only public SDK bridge. Preserve both guidance layers, native provider discovery/routing/auth ownership, original deadlines, host binding and conservative accounting; no omp fork, bundled executable, permanent plugin, cross-adapter dependency or automatic authentication/install.

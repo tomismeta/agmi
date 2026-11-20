@@ -52,6 +52,7 @@ agmi agents --json
 Edit the generated TOML or use [revision-checked configuration](docs/OPERATIONS.md#agent-administration):
 
 - Set `mode` under `capabilities.answer`, `.judge`, and `.mine` to `active`, `read_only`, or `off`. Enable only the lanes you intend to run.
+- New configs use the fleet's `participation_first` policy: distinct fresh work can proceed without a cap on unresolved submissions, and bounded retries are enabled. Review the [overlap and retry risks](docs/OPERATIONS.md#configurable-uncertainty-policy) before activating. Choose `strict` to wait for authoritative resolution.
 - For answer and judge, choose each lane's harness, executable, model, reasoning, timing, and retry policy. `agents` shows configuration, not proof of authentication.
 - Personalize the provisioned `answer/user-guidance.md` and `judge/user-guidance.md`. Keep core task instructions intact; guidance is sent to models and retained locally, so never include secrets.
 

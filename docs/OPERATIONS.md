@@ -81,7 +81,7 @@ Off and pause do not abandon already possibly-sent work: allowlisted identity, j
 
 This source tree accepts one current configuration shape, without `schema_version`. Released v0.1.1 configuration and earlier per-lane files carrying that marker are not accepted by the normal reader; use [explicit migration](#atomic-capability-migration). Each `capabilities.answer`, `.judge` and `.mine` table owns `mode`, `timeouts`, `schedule` and `participation`. Answer/judge additionally own `model` and `preparation`; mining is model-free. Only shared identity read policy (`identity`) and shutdown policy (`runtime.shutdown_seconds`) remain outside the lanes.
 
-Each lane's schedule defaults to 120-second polling, 180-second retry, a 900-second exponential-backoff cap and 30-second deterministic staggering. Mining additionally has `interval_seconds = 86400` and `each_epoch = false`. These are independent values, not references to a global schedule. Optional `discovery_retry_seconds` and `discovery_backoff_max_seconds` inherit that lane's retry/base-cap settings.
+Each lane's base schedule is 120-second polling, 180-second retry, a 900-second exponential-backoff cap and 30-second deterministic staggering. New configs explicitly set discovery retry/backoff to 30/120 seconds and queued-job polling to 15 seconds initially, capped at 120 seconds. Existing files that omit these overrides retain base retry/backoff. The mining interval is 86400 seconds when `each_epoch` is false; new configs set `each_epoch = true`.
 
 `schedule.observation_max_age_seconds` independently limits usable discovery evidence (default 120 seconds). It is not the HTTP request timeout. Successful discovery schedules its next refresh after the smaller of configured polling plus stagger and half this age (minimum one second). Server restrictions and failure backoff still take precedence; an outage can therefore leave evidence stale without silently extending its validity. Each page retains its original completion time and expiry.
 
@@ -131,7 +131,7 @@ max_seconds = 120
 Configure this separately for each lane. Both positive fields are required, with initial no greater than maximum. Intervals grow with queued-phase age; jitter stays within the local cap. Same-resource/server/legacy minima still win, and conversion to integer timestamps adds one conservative second. Missing phase evidence uses the cap. Omission preserves normal retry cadence. To disable answer's override, apply `{"capabilities":{"answer":{"schedule":{"queued_job_polling":null}}}}`. This affects bound-job reads, not write retries, receipt cadence or participation authorization.
 Already-due jobs continue through bounded reconciliation batches without the normal poll sleep. Polling intervals are scheduling targets, not upper bounds on upstream response latency.
 
-Each lane has independent `timeouts.http_seconds` and `read_http_seconds`, both defaulting to 90; neither inherits the other's value. Effectful mining GET uses the effect deadline. Answer/judge independently default `model_seconds` to 300. `capabilities.mine.schedule.each_epoch = true` replaces interval cadence with one explicit mining attempt per freshly observed epoch, whether answered or not. [MinePOA permits mining anytime](https://minepoa.com/go.md), but rewards require an answered epoch; local permission is not an earnings claim. Proven nonacceptance can retry captured work; uncertain mining is not repeatedly issued within that epoch.
+Each lane has independent `timeouts.http_seconds` and `read_http_seconds`; neither inherits the other's value. New configs set 120-second identity and lane reads, 90-second effect requests, and 600-second model attempts. Omitted fields still load as 90-second reads/effects and 300-second model attempts. Effectful mining GET uses the effect deadline. `capabilities.mine.schedule.each_epoch = true` replaces interval cadence with one explicit mining attempt per freshly observed epoch, whether answered or not. [MinePOA permits mining anytime](https://minepoa.com/go.md), but rewards require an answered epoch; local permission is not an earnings claim. Proven nonacceptance can retry captured work; uncertain mining is not repeatedly issued within that epoch.
 
 Startup, polling and retries use deterministic identity-based staggering without peer coordination. Ready effects use the [served-in-round fairness policy](#configurable-uncertainty-policy), not fixed answer priority or a reservation for future work. Its successful-opportunity bound is not a wall-clock or upstream-availability guarantee.
 
@@ -140,6 +140,8 @@ One runtime and journal owner collect results. Each lane has one discovery/fresh
 The selected effect retains account and lane admission guards through response bookkeeping. Gate-dependent preparation, abstention and native launch defer without inventing failures or another attempt; result collection and safety recovery remain live. Global pause can wait for an in-flight bounded effect; lane pause waits for its own lane, not a sibling's effect. After acknowledgement, new starts require current authorization. Neither acknowledgement nor local shutdown recalls transmitted requests.
 
 Answer/judge `preparation` defaults to `retry_uncertain = false`, `max_attempts_per_work = 2` (finite values 1–8), and `max_uncertain_replacements_per_work = 1` (0–8). `while_blocked` defaults true for answer and false for judge. Explicit `max_attempts_per_work = "unbounded"` authorizes paced recurring attempts after conclusively finished unusable output while work remains eligible; it is not a monetary budget. Possibly-running same-work inference remains separately limited to the original unresolved launch plus the configured replacement allowance, and requires `retry_uncertain`. Proven nonexecution does not consume an inference attempt; age, restart and manual abandonment do not refund possible execution. Existing retry schedules remain binding. Preparing behind uncertainty never authorizes submission. Preflight and pending admission/revalidation waits consume the same original execution deadline and cannot renew it.
+
+New configs explicitly enable `retry_uncertain` and `while_blocked` on Answer and Judge, with two attempts and at most one replacement for possibly-running inference per work item. An uncertain attempt may still incur a charge even when no usable result was captured.
 
 `run --once` takes a finite entry-time plan: at most two entry-due recovery reads per lane, one model attempt per model lane and one effect per lane, with bounded discovery/freshness. It drains owned handles but does not wait for future grace/cadence deadlines, discover later grants or replenish completed work indefinitely. Ordinary `run` continues scheduling.
 
@@ -172,17 +174,19 @@ Normal runtime and diagnostic readers require the current journal format. Before
 
 ### Configurable uncertainty policy
 
-Each lane has its own `capabilities.<lane>.participation` policy:
+Each lane has its own `capabilities.<lane>.participation` policy. `agmi init` and `agmi config init` save the fleet policy for new configurations and leave the lanes read-only: `participation_first` with `max_unresolved_operations = "unbounded"` on all three lanes. Existing files keep their policy; omitted modes load as `strict` and omitted caps load as four per lane. `agmi config schema` shows changed values as `onboarding_default` alongside the omitted-field `default`.
 
 | `mode` | New work behind account-wide unresolved effects |
 |---|---|
-| `strict` (default) | Wait for authoritative resolution |
+| `strict` | Wait for authoritative resolution |
 | `participation_first` | With a numeric exposure cap, permit overlap after applicable uncertainty grace; with explicit `"unbounded"`, admit distinct fresh work without a historical-count ceiling or blanket grace |
 | `manual` | Require a stopped-writer, epoch/lane/account-generation/lane-control-revision-bound one-dispatch grant; never bypass capacity, server minima or answer retry grace |
 
 `manual` governs overlap with unresolved effects, not approval of every submission: otherwise-safe first work can dispatch without a grant. It is not a model-only execution mode. Use lane controls to stop participation, and isolate protocol endpoints when testing real model execution.
 
 `max_unresolved_operations` defaults to 4 **per lane**, including the prospective dispatch. Another lane cannot consume or borrow a numeric allowance. There is no shared capacity pool, answer reserve or `allow_*` alias. `uncertainty_grace_seconds` defaults to 300 for bounded participation-first overlap. Strict/manual retain their independent account-uncertainty controls.
+
+New Answer configs also enable `retry_uncertain_answers` with at most two dispatch attempts per epoch and a 600-second retry delay, and select `accepted_linked` historical answer accounting. This is separate from admitting distinct fresh work: a same-epoch retry can duplicate an accepted answer, and a delayed older request can conflict with a newer dispatch. Neither path proves the old outcome or clears historical evidence.
 
 Explicit `mode = "participation_first"` plus `max_unresolved_operations = "unbounded"` accepts potentially growing remote exposure and retained history so missing old outcomes cannot indefinitely stop distinct fresh work. It removes neither same-work/epoch fences nor active local-effect, identity, pause, freshness or scoped server restrictions. The count ceiling and blanket uncertainty grace no longer govern that lane's new-work admission. Existing numeric files stay bounded; omission does not silently select unbounded behavior.
 

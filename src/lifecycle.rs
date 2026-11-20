@@ -315,7 +315,7 @@ async fn init_inner(path: &Path, options: InitOptions<'_>, bytes: &[u8]) -> Resu
     let parent = path.parent().context("configuration parent missing")?;
     let mut config = Config {
         network: options.network,
-        ..Config::default()
+        ..Config::for_onboarding()
     };
     config.network.address = options.account.into();
     config.network.credential_file = match options.credential_file {

@@ -140,8 +140,24 @@ def init(f):
         text = config.read_text()
         assert not any(secret in text for secret in SECRETS)
         initialized = f.cli(config, ['config', 'show'])['config']
-        assert all(initialized['capabilities'][lane]['mode'] == 'read_only'
-                   for lane in ('answer', 'judge', 'mine'))
+        lanes = initialized['capabilities']
+        assert initialized['identity']['read_http_seconds'] == 120
+        for lane in lanes.values():
+            assert lane['mode'] == 'read_only'
+            assert lane['participation']['mode'] == 'participation_first'
+            assert lane['participation']['max_unresolved_operations'] == 'unbounded'
+            assert lane['timeouts']['read_http_seconds'] == 120
+            assert lane['schedule']['discovery_retry_seconds'] == 30
+            assert lane['schedule']['discovery_backoff_max_seconds'] == 120
+            assert lane['schedule']['queued_job_polling'] == {'initial_seconds': 15, 'max_seconds': 120}
+        for lane in (lanes['answer'], lanes['judge']):
+            assert lane['preparation']['retry_uncertain'] and lane['preparation']['while_blocked']
+            assert lane['preparation']['max_attempts_per_work'] == 2
+            assert lane['timeouts']['model_seconds'] == 600
+        answer_policy = lanes['answer']['participation']
+        assert answer_policy['retry_uncertain_answers'] and answer_policy['max_answer_attempts_per_epoch'] == 2
+        assert answer_policy['historical_unknown_answer_capacity'] == 'accepted_linked'
+        assert lanes['mine']['schedule']['each_epoch'] is True
         private_tree(target)
         assert (f.key if mode == 'file' else target / 'credential').read_text() == OLD
         before = snapshot(f.root)

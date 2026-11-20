@@ -874,7 +874,7 @@ fn initialize(path: &Path) -> Result<Value> {
         std::fs::create_dir_all(parent).context("cannot create configuration directory")?;
     }
     let _configuration_guard = admin::lock_config_directory(path)?;
-    let text = toml::to_string_pretty(&Config::default())?;
+    let text = toml::to_string_pretty(&Config::for_onboarding())?;
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]

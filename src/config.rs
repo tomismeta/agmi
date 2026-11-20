@@ -732,6 +732,60 @@ impl Default for Config {
     }
 }
 impl Config {
+    /// Set policy explicitly for new configurations without changing how older files load.
+    pub fn for_onboarding() -> Self {
+        let mut config = Self::default();
+        let read_http_seconds = 120;
+        config.identity.read_http_seconds = read_http_seconds;
+        let lanes = &mut config.capabilities;
+        let participation = Participation {
+            mode: ParticipationMode::ParticipationFirst,
+            max_unresolved_operations: CountLimit::Unbounded,
+            ..Participation::default()
+        };
+        lanes.answer.participation = AnswerParticipation {
+            mode: participation.mode,
+            max_unresolved_operations: participation.max_unresolved_operations,
+            retry_uncertain_answers: true,
+            max_historical_unknown_answers: 2,
+            historical_unknown_answer_capacity: HistoricalAnswerCapacity::AcceptedLinked,
+            ..AnswerParticipation::default()
+        };
+        lanes.judge.participation = participation;
+        lanes.mine.participation = participation;
+
+        let schedule = Schedule {
+            discovery_retry_seconds: Some(30),
+            discovery_backoff_max_seconds: Some(120),
+            queued_job_polling: Some(QueuedJobPolling {
+                initial_seconds: 15,
+                max_seconds: 120,
+            }),
+            ..Schedule::default()
+        };
+        lanes.answer.schedule = schedule;
+        lanes.judge.schedule = schedule;
+        lanes.mine.schedule = MineSchedule {
+            discovery_retry_seconds: schedule.discovery_retry_seconds,
+            discovery_backoff_max_seconds: schedule.discovery_backoff_max_seconds,
+            queued_job_polling: schedule.queued_job_polling,
+            each_epoch: true,
+            ..lanes.mine.schedule
+        };
+
+        let model_timeouts = ModelTimeouts {
+            read_http_seconds,
+            model_seconds: 600,
+            ..ModelTimeouts::default()
+        };
+        lanes.answer.timeouts = model_timeouts;
+        lanes.judge.timeouts = model_timeouts;
+        lanes.mine.timeouts.read_http_seconds = read_http_seconds;
+        lanes.answer.preparation.retry_uncertain = true;
+        lanes.judge.preparation = lanes.answer.preparation;
+        config
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         Self::load_config(path, true)
     }
