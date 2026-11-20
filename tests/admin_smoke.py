@@ -71,7 +71,7 @@ def startup_race(binary, root, environment, chain, address, account_keys, lock_r
             result = edit.result(timeout=15)
             assert result.returncode != 0
             assert json.loads(result.stderr)['error']['code'] == 'admin_identity_immutable', result.stderr
-        status = json.loads(call('status').stdout)['data']
+        status = json.loads(call('status', '--verbose').stdout)['data']
         assert status['initialized'] and status['identity_matches_config']
         assert json.loads(call('config', 'show').stdout)['data']['config']['network']['address'] == address
     finally:
@@ -116,7 +116,8 @@ def main():
             base = [binary, '--json', '--config', str(config)]
             environment = dict(os.environ, HOME=str(root / 'home'),
                                XDG_CONFIG_HOME=str(root / 'xdg-config'),
-                               XDG_DATA_HOME=str(root / 'xdg-data'))
+                               XDG_DATA_HOME=str(root / 'xdg-data'),
+                               XDG_CACHE_HOME=str(root / 'cache'), AGMI_UPDATE_CHECKS='0')
 
             def invoke(*words, stdin=b'', expected=None):
                 result = subprocess.run(base + list(words), input=stdin, capture_output=True,

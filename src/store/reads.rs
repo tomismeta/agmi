@@ -73,6 +73,34 @@ pub(crate) enum ReconciliationService {
     Missing,
 }
 
+struct ReconciliationClaim {
+    at: i64,
+    service: Option<ReconciliationService>,
+    flight: Option<(u64, u64)>,
+}
+
+/// Synchronous scheduling-pass evidence only; reset after any coordinator work.
+/// Invalidated evidence drops the optional decay, never a preexisting floor.
+#[derive(Default)]
+pub(crate) struct ReconciliationPass {
+    finite_totals: Option<[UncertaintyAccounting; LaneId::COUNT]>,
+    lanes: [Option<ReconciliationLane>; LaneId::COUNT],
+    work_revision: Option<i64>,
+    policy: Option<(
+        [Participation; LaneId::COUNT],
+        crate::config::AnswerParticipation,
+    )>,
+    database_stamp: Option<(u64, i64)>,
+    invalidated: bool,
+}
+
+struct ReconciliationLane {
+    stamp: AdmissionStampSnapshot,
+    context: super::projection::RemoteWorkContext,
+    source: String,
+    totals: Option<UncertaintyAccounting>,
+}
+
 const RECONCILIATION_PAGE_SIZE: usize = 64;
 const RECONCILIATION_SELECT: &str = "WITH page AS MATERIALIZED (
     SELECT id,binding_revision,txid,job_id,next_at
@@ -115,7 +143,10 @@ impl Store {
         })
     }
 
-    fn read_parts(&self, key: &ReadKey) -> Result<(String, &'static str, String, Option<String>)> {
+    pub(super) fn read_parts(
+        &self,
+        key: &ReadKey,
+    ) -> Result<(String, &'static str, String, Option<String>)> {
         Ok(match key {
             ReadKey::Identity => ("account".into(), "identity", "identity".into(), None),
             ReadKey::Discovery { lane, source } => (
@@ -300,10 +331,188 @@ impl Store {
         Ok(local.max(self.request_not_before(config, endpoint, None)?))
     }
 
+    fn has_stamped_operation_read(&self, key: &ReadKey) -> Result<bool> {
+        if let ReadKey::Operation {
+            operation_id,
+            binding_revision,
+            ..
+        } = key
+        {
+            return Ok(self
+                .reconciliation_provenance(*operation_id, *binding_revision)?
+                .is_some_and(|p| p.active_request_sequence.is_some()));
+        }
+        Ok(false)
+    }
+
+    fn invalidate_untracked_flight(&self, key: &ReadKey) -> Result<()> {
+        if let ReadKey::Operation {
+            operation_id,
+            binding_revision,
+            phase,
+        } = key
+        {
+            let mut p = if *phase == ReadPhase::Job {
+                self.binding_provenance_at(*operation_id, *binding_revision, now())?
+            } else if let Some(p) =
+                self.reconciliation_provenance(*operation_id, *binding_revision)?
+            {
+                p
+            } else {
+                return Ok(());
+            };
+            p.consecutive_404 = 0;
+            p.observer_authority_epoch = None;
+            p.active_request_sequence = None;
+            self.save_reconciliation_provenance(*operation_id, &p)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish_reconciliation_read(
+        &self,
+        key: &ReadKey,
+        authority_epoch: u64,
+        sequence: u64,
+        status: Option<u16>,
+        category: Option<&str>,
+        complete: bool,
+    ) -> Result<bool> {
+        self.finish_reconciliation_read_inner(
+            key,
+            (authority_epoch, sequence),
+            status,
+            category,
+            complete,
+            false,
+        )
+    }
+
+    pub(crate) fn cancel_reconciliation_read(
+        &self,
+        key: &ReadKey,
+        authority_epoch: u64,
+        sequence: u64,
+    ) -> Result<bool> {
+        self.finish_reconciliation_read_inner(
+            key,
+            (authority_epoch, sequence),
+            None,
+            None,
+            false,
+            true,
+        )
+    }
+
+    fn finish_reconciliation_read_inner(
+        &self,
+        key: &ReadKey,
+        (epoch, sequence): (u64, u64),
+        status: Option<u16>,
+        category: Option<&str>,
+        complete: bool,
+        cancel: bool,
+    ) -> Result<bool> {
+        self.continuity()?;
+        let tx = rusqlite::Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
+        if !self.read_current(key)? {
+            return Ok(false);
+        }
+        let ReadKey::Operation {
+            operation_id,
+            binding_revision,
+            phase,
+        } = key
+        else {
+            return Ok(false);
+        };
+        let Some(mut p) = self.reconciliation_provenance(*operation_id, *binding_revision)? else {
+            return Ok(false);
+        };
+        let purpose = if *phase == ReadPhase::Receipt {
+            "receipt"
+        } else {
+            "job"
+        };
+        let active: bool = self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM read_state
+             WHERE operation_id=?1 AND binding_revision=?2 AND purpose=?3
+             AND retired=0 AND in_flight=1)",
+            params![operation_id, binding_revision, purpose],
+            |r| r.get(0),
+        )?;
+        if !active
+            || p.observer_authority_epoch != Some(epoch)
+            || p.active_request_sequence != Some(sequence)
+        {
+            return Ok(false);
+        }
+        let current: bool = self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM runtime_authority WHERE singleton=1 AND authority_epoch=?1)",
+            [epoch], |r| r.get(0),
+        )?;
+        if !current {
+            // Retire exactly the obsolete flight, without recording its response
+            // or refunding the attempt/service floors. A newer flight cannot
+            // reach this branch because its sequence/authority differs above.
+            p.active_request_sequence = None;
+            p.consecutive_404 = 0;
+            self.save_reconciliation_provenance(*operation_id, &p)?;
+            self.db.execute(
+                "UPDATE read_state SET in_flight=0 WHERE operation_id=?1
+                 AND binding_revision=?2 AND purpose=?3 AND retired=0 AND in_flight=1",
+                params![operation_id, binding_revision, purpose],
+            )?;
+            tx.commit()?;
+            return Ok(false);
+        }
+        // Receipt flights share only the attempt fence, never job-missing evidence.
+        if *phase == ReadPhase::Job {
+            p.consecutive_404 = if complete
+                && !cancel
+                && status == Some(404)
+                && matches!(category, None | Some("not_found"))
+            {
+                p.consecutive_404.saturating_add(1).min(2)
+            } else {
+                0
+            };
+            p.last_result_at = Some(now());
+            p.last_status = status;
+        }
+        p.active_request_sequence = None;
+        self.save_reconciliation_provenance(*operation_id, &p)?;
+        // The stamp was consumed above under this same transaction. The inner
+        // generic writer is intentionally transaction-aware (identity also uses it).
+        self.write_read_finished(key, status, category, cancel)?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    fn write_read_finished(
+        &self,
+        key: &ReadKey,
+        status: Option<u16>,
+        category: Option<&str>,
+        cancel: bool,
+    ) -> Result<()> {
+        let (owner, purpose, resource, _) = self.read_parts(key)?;
+        self.db.execute("UPDATE read_state SET in_flight=0,finished_at=?4,
+            status=CASE WHEN ?7 THEN status ELSE ?5 END,
+            failure_category=CASE WHEN ?6 IS NOT NULL THEN ?6 WHEN failures>0 THEN failure_category ELSE NULL END,
+            last_http_success_at=CASE WHEN NOT ?7 AND ?5>=200 AND ?5<300 THEN ?4 ELSE last_http_success_at END
+            WHERE owner=?1 AND purpose=?2 AND resource=?3 AND retired=0",
+            params![owner,purpose,resource,now(),status,category.map(safe_read_category),cancel])?;
+        Ok(())
+    }
+
     pub(crate) fn read_started(&self, key: &ReadKey) -> Result<bool> {
         self.continuity()?;
         let tx = self.db.unchecked_transaction()?;
         let started = self.start_read_in(key, now())?;
+        if started {
+            self.invalidate_untracked_flight(key)?;
+        }
         tx.commit()?;
         Ok(started)
     }
@@ -322,9 +531,13 @@ impl Store {
 
     pub(crate) fn cancel_read(&self, key: &ReadKey) -> Result<()> {
         self.continuity()?;
+        if self.has_stamped_operation_read(key)? {
+            return Ok(());
+        }
         if !self.read_current(key)? {
             return Ok(());
         }
+        self.invalidate_untracked_flight(key)?;
         let (owner, purpose, resource, _) = self.read_parts(key)?;
         self.db.execute(
             "UPDATE read_state SET in_flight=0,finished_at=?4
@@ -341,25 +554,14 @@ impl Store {
         category: Option<&str>,
     ) -> Result<()> {
         self.continuity()?;
+        if self.has_stamped_operation_read(key)? {
+            return Ok(());
+        }
         if !self.ensure_read_row(key)? {
             return Ok(());
         }
-        let (owner, purpose, resource, _) = self.read_parts(key)?;
-        self.db.execute(
-            "UPDATE read_state SET in_flight=0,finished_at=?4,status=?5,
-            failure_category=CASE WHEN ?6 IS NOT NULL THEN ?6
-                WHEN failures>0 THEN failure_category ELSE NULL END,
-            last_http_success_at=CASE WHEN ?5>=200 AND ?5<300 THEN ?4 ELSE last_http_success_at END
-            WHERE owner=?1 AND purpose=?2 AND resource=?3 AND retired=0",
-            params![
-                owner,
-                purpose,
-                resource,
-                now(),
-                status,
-                category.map(safe_read_category)
-            ],
-        )?;
+        self.invalidate_untracked_flight(key)?;
+        self.write_read_finished(key, status, category, false)?;
         Ok(())
     }
 
@@ -681,8 +883,13 @@ impl Store {
         Ok(Self::request_floor_in(&self.db, config, endpoint, resource)?.0)
     }
 
-    pub(crate) fn reconciliation_batch(&self, lane: LaneId) -> Result<Vec<Operation>> {
-        self.reconciliation_selection(lane, now())?
+    pub(crate) fn reconciliation_batch(
+        &self,
+        config: &Config,
+        lane: LaneId,
+        pass: &mut ReconciliationPass,
+    ) -> Result<Vec<Operation>> {
+        self.reconciliation_selection_in(config, lane, now(), pass)?
             .into_iter()
             .map(|(id, _)| {
                 self.operation(id)?
@@ -693,9 +900,11 @@ impl Store {
 
     pub(crate) fn reconciliation_plan(
         &self,
+        config: &Config,
         lane: LaneId,
+        pass: &mut ReconciliationPass,
     ) -> Result<Vec<(Operation, ReconciliationService)>> {
-        self.reconciliation_selection(lane, now())?
+        self.reconciliation_selection_in(config, lane, now(), pass)?
             .into_iter()
             .map(|(id, service)| {
                 Ok((
@@ -708,15 +917,20 @@ impl Store {
     }
 
     #[cfg(test)]
-    fn reconciliation_candidates(&self, lane: LaneId, at: i64) -> Result<Vec<i64>> {
+    fn reconciliation_candidates(
+        &self,
+        config: &Config,
+        lane: LaneId,
+        at: i64,
+    ) -> Result<Vec<i64>> {
         Ok(self
-            .reconciliation_selection(lane, at)?
+            .reconciliation_selection(config, lane, at)?
             .into_iter()
             .map(|(id, _)| id)
             .collect())
     }
 
-    fn reconciliation_schedule(&self, name: &str) -> Result<(i64, i64, bool)> {
+    pub(super) fn reconciliation_schedule(&self, name: &str) -> Result<(i64, i64, bool)> {
         Ok(self
             .db
             .query_row(
@@ -739,17 +953,202 @@ impl Store {
         Ok(())
     }
 
+    fn reconciliation_database_stamp(&self) -> Result<(u64, i64)> {
+        Ok((
+            self.db.total_changes(),
+            self.db.query_row("PRAGMA data_version", [], |r| r.get(0))?,
+        ))
+    }
+
+    fn recheck_reconciliation_database(&self, pass: &mut ReconciliationPass) -> Result<()> {
+        if pass.invalidated {
+            return Ok(());
+        }
+        let current = self.reconciliation_database_stamp()?;
+        if pass.database_stamp.is_some_and(|stamp| stamp != current) {
+            pass.invalidated = true;
+        } else {
+            pass.database_stamp = Some(current);
+        }
+        Ok(())
+    }
+    // Called only around our bounded cursor or read/service writes, while the
+    // caller still holds its IMMEDIATE transaction. Never renew data_version.
+    fn reconciliation_own_writes(&self, pass: &mut ReconciliationPass, before: u64) {
+        if let Some(stamp) = &mut pass.database_stamp {
+            if stamp.0 != before {
+                pass.invalidated = true;
+            } else {
+                stamp.0 = self.db.total_changes();
+            }
+        }
+    }
+
+    fn reconciliation_source_stamp(&self, lane: LaneId) -> Result<String> {
+        // Only source identity and original deadlines cross this boundary.
+        // Same-stamp/same-second assessment replacement is additionally fenced
+        // by SQLite's existing change counters, not a full witness comparison.
+        Ok(self.db.query_row(
+            "SELECT json_array(
+                (SELECT json_array(authority_epoch,generation,request_sequence,started_at,
+                    observed_at,epoch,answered,fingerprint) FROM lane_observations WHERE lane=?1),
+                (SELECT json_extract(policy,'$.lane_revisions.'||?1) FROM runtime_policy WHERE singleton=1),
+                (SELECT CASE WHEN ?1='judge' THEN json_array(
+                    json_extract(lane_participation,'$.judge.stamp'),
+                    json_extract(lane_participation,'$.judge.assessment.observed_at'),
+                    json_extract(lane_participation,'$.judge.assessment.valid_until'))
+                ELSE json_array(
+                    json_extract(lane_participation,'$.challenge_provenance.'||?1||'.stamp'),
+                    json_extract(lane_participation,'$.challenge_provenance.'||?1||'.request_sequence'))
+                END FROM runtime_state WHERE singleton=1))",
+            [lane.as_str()], |r| r.get(0),
+        )?)
+    }
+
+    fn reconciliation_delayed(
+        &self,
+        config: &Config,
+        lane: LaneId,
+        id: i64,
+        at: i64,
+        pass: &mut ReconciliationPass,
+    ) -> Result<bool> {
+        if pass.invalidated {
+            return Ok(false);
+        }
+        // The age/404 producer chain is a point read, evaluated only once.
+        let Some((due, _)) = self.reconciliation_decay_binding_at(id, at)? else {
+            return Ok(false);
+        };
+        if due <= at {
+            return Ok(false);
+        }
+        self.recheck_reconciliation_database(pass)?;
+        if pass.invalidated {
+            return Ok(false);
+        }
+        let Some(config_revision) = config.lane_revision(lane).ok() else {
+            pass.invalidated = true;
+            return Ok(false);
+        };
+        let stamp: Option<AdmissionStampSnapshot> = self.db.query_row(
+            "SELECT c.generation,l.control_revision,a.authority_epoch FROM control c,lane_control l,runtime_authority a
+             WHERE c.singleton=1 AND a.singleton=1 AND l.lane=?1",
+            [lane.as_str()], |r| Ok(AdmissionStampSnapshot {
+                account_generation: r.get(0)?, lane_control_revision: r.get(1)?, authority_epoch: r.get(2)?,
+                lane_config_revision: config_revision.clone(),
+            })).optional()?;
+        let Some(stamp) = stamp else {
+            pass.invalidated = true;
+            return Ok(false);
+        };
+        let work_revision = self.work_revision()?;
+        let policy = (
+            LaneId::ALL.map(|lane| config.participation(lane)),
+            config.capabilities.answer.participation,
+        );
+        if pass
+            .work_revision
+            .is_some_and(|revision| revision != work_revision)
+            || pass.policy.is_some_and(|captured| captured != policy)
+        {
+            pass.invalidated = true;
+            return Ok(false);
+        }
+        pass.work_revision = Some(work_revision);
+        pass.policy = Some(policy);
+        let index = LaneId::ALL
+            .iter()
+            .position(|candidate| *candidate == lane)
+            .expect("known lane");
+        let source = self.reconciliation_source_stamp(lane)?;
+        if let Some(cached) = &pass.lanes[index] {
+            if cached.stamp != stamp || cached.source != source {
+                pass.invalidated = true;
+                return Ok(false);
+            }
+        } else {
+            let context = self.remote_observation_context(config, lane, at, true)?;
+            if !context.decay_current_at(config, at) {
+                pass.invalidated = true;
+                return Ok(false);
+            }
+            pass.lanes[index] = Some(ReconciliationLane {
+                stamp,
+                source,
+                context,
+                totals: None,
+            });
+        }
+        let cached = pass.lanes[index].as_mut().expect("initialized lane");
+        if !cached.context.decay_current_at(config, at) {
+            pass.invalidated = true;
+            return Ok(false);
+        }
+        // Admission may reopen when a scalar floor expires; never reuse its
+        // previous answer as a source/relevance predicate.
+        cached.context.set_admission_open(true);
+        if !self.reconciliation_decay_relevant(id, &cached.context)? {
+            return Ok(false);
+        }
+        if cached.totals.is_none() {
+            let policy = config.participation(lane);
+            cached.totals = Some(
+                if policy.mode == ParticipationMode::ParticipationFirst
+                    && policy.max_unresolved_operations == CountLimit::Unbounded
+                {
+                    Self::uncertainty_accounting(&self.db, config, lane, None, None, false)?
+                } else {
+                    if pass.finite_totals.is_none() {
+                        pass.finite_totals =
+                            Some(accounting::reconciliation_totals(&self.db, config)?);
+                    }
+                    pass.finite_totals.as_ref().expect("initialized totals")[index].clone()
+                },
+            );
+        }
+        let open = self.fresh_lane_admission_open(
+            config,
+            lane,
+            cached.context.epoch(),
+            at,
+            cached.totals.as_mut().expect("initialized lane totals"),
+        )?;
+        cached.context.set_admission_open(open);
+        Ok(open)
+    }
+
+    #[cfg(test)]
     fn reconciliation_selection(
         &self,
+        config: &Config,
         lane: LaneId,
         at: i64,
+    ) -> Result<Vec<(i64, ReconciliationService)>> {
+        self.reconciliation_selection_in(config, lane, at, &mut ReconciliationPass::default())
+    }
+
+    fn reconciliation_selection_in(
+        &self,
+        config: &Config,
+        lane: LaneId,
+        at: i64,
+        pass: &mut ReconciliationPass,
     ) -> Result<Vec<(i64, ReconciliationService)>> {
         // Selection may advance past ineligible rows, but only a successful
         // claim may consume an eligible fair or missing candidate.
         let tx = rusqlite::Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
+        if pass.database_stamp.is_some() {
+            self.recheck_reconciliation_database(pass)?;
+        }
         let recent_name = format!("reconciliation:{}", lane.as_str());
         let fair_name = format!("reconciliation:fair:{}", lane.as_str());
         let missing_name = format!("reconciliation:missing:{}", lane.as_str());
+        let head_name = format!("reconciliation:head:{}", lane.as_str());
+        let mut recent_cursor = None;
+        let mut head_cursor = None;
+        let mut fair_cursor = None;
+        let mut missing_cursor = None;
         let recent = self.reconciliation_schedule(&recent_name)?;
         let fair = self.reconciliation_schedule(&fair_name)?;
         if recent.0 > at && fair.0 > at {
@@ -802,7 +1201,11 @@ impl Store {
                 for row in rows {
                     let (id, missing, eligible) = row?;
                     last = id;
-                    if id != exclude && missing == missing_only && eligible {
+                    if id != exclude
+                        && missing == missing_only
+                        && eligible
+                        && !self.reconciliation_delayed(config, lane, id, at, pass)?
+                    {
                         candidate = Some(id);
                         break;
                     }
@@ -819,7 +1222,6 @@ impl Store {
         };
         let mut candidates = Vec::with_capacity(2);
         if recent.0 <= at {
-            let head_name = format!("reconciliation:head:{}", lane.as_str());
             let head = self.reconciliation_schedule(&head_name)?.1;
             let newest = self
                 .db
@@ -839,12 +1241,9 @@ impl Store {
             let (candidate, last) = select(cursor, 0, false)?;
             // Keep ready recent work on its reserved cadence. Only an empty
             // eligible page advances this walk; ordinary history has its own.
-            self.set_reconciliation_cursor(
-                &recent_name,
-                candidate.map_or(last, |id| id.saturating_add(1)),
-            )?;
+            recent_cursor = Some(candidate.map_or(last, |id| id.saturating_add(1)));
             if newest > head {
-                self.set_reconciliation_cursor(&head_name, newest)?;
+                head_cursor = Some(newest);
             }
             if let Some(candidate) = candidate {
                 candidates.push((candidate, ReconciliationService::Recent));
@@ -857,18 +1256,12 @@ impl Store {
             // its sparse service floor are independent of traversal progress.
             let historical = if missing.0 <= at && (!fair.2 || ordinary.is_none()) {
                 let (candidate, last) = select(missing.1, exclude, true)?;
-                self.set_reconciliation_cursor(
-                    &missing_name,
-                    candidate.map_or(last, |id| id.saturating_add(1)),
-                )?;
+                missing_cursor = Some(candidate.map_or(last, |id| id.saturating_add(1)));
                 candidate
             } else {
                 None
             };
-            self.set_reconciliation_cursor(
-                &fair_name,
-                ordinary.map_or(ordinary_last, |id| id.saturating_add(1)),
-            )?;
+            fair_cursor = Some(ordinary.map_or(ordinary_last, |id| id.saturating_add(1)));
             if let Some(candidate) = historical.or(ordinary) {
                 candidates.push((
                     candidate,
@@ -887,6 +1280,19 @@ impl Store {
             candidates.swap(0, 1);
         }
         drop(stmt);
+        // Delay our cursor writes until all source reuse checks have finished.
+        let before_writes = self.db.total_changes();
+        for (name, cursor) in [
+            (&recent_name, recent_cursor),
+            (&head_name, head_cursor),
+            (&fair_name, fair_cursor),
+            (&missing_name, missing_cursor),
+        ] {
+            if let Some(cursor) = cursor {
+                self.set_reconciliation_cursor(name, cursor)?;
+            }
+        }
+        self.reconciliation_own_writes(pass, before_writes);
         tx.commit()?;
         Ok(candidates)
     }
@@ -898,8 +1304,21 @@ impl Store {
         config: &Config,
         lane: LaneId,
         key: &ReadKey,
+        authority_epoch: u64,
+        request_sequence: u64,
+        pass: &mut ReconciliationPass,
     ) -> Result<bool> {
-        self.reconciliation_read_started_at(config, lane, key, now())
+        self.reconciliation_claim_with_pass(
+            config,
+            lane,
+            key,
+            ReconciliationClaim {
+                at: now(),
+                service: None,
+                flight: Some((authority_epoch, request_sequence)),
+            },
+            pass,
+        )
     }
 
     pub(crate) fn reconciliation_read_claimed(
@@ -908,10 +1327,23 @@ impl Store {
         lane: LaneId,
         key: &ReadKey,
         service: ReconciliationService,
+        (authority_epoch, request_sequence): (u64, u64),
+        pass: &mut ReconciliationPass,
     ) -> Result<bool> {
-        self.reconciliation_claim_at(config, lane, key, now(), Some(service))
+        self.reconciliation_claim_with_pass(
+            config,
+            lane,
+            key,
+            ReconciliationClaim {
+                at: now(),
+                service: Some(service),
+                flight: Some((authority_epoch, request_sequence)),
+            },
+            pass,
+        )
     }
 
+    #[cfg(test)]
     fn reconciliation_read_started_at(
         &self,
         config: &Config,
@@ -922,6 +1354,7 @@ impl Store {
         self.reconciliation_claim_at(config, lane, key, at, None)
     }
 
+    #[cfg(test)]
     fn reconciliation_claim_at(
         &self,
         config: &Config,
@@ -930,13 +1363,61 @@ impl Store {
         at: i64,
         service: Option<ReconciliationService>,
     ) -> Result<bool> {
+        self.reconciliation_claim_at_stamped(config, lane, key, at, service, None)
+    }
+
+    #[cfg(test)]
+    fn reconciliation_claim_at_stamped(
+        &self,
+        config: &Config,
+        lane: LaneId,
+        key: &ReadKey,
+        at: i64,
+        service: Option<ReconciliationService>,
+        flight: Option<(u64, u64)>,
+    ) -> Result<bool> {
+        self.reconciliation_claim_with_pass(
+            config,
+            lane,
+            key,
+            ReconciliationClaim {
+                at,
+                service,
+                flight,
+            },
+            &mut ReconciliationPass::default(),
+        )
+    }
+
+    fn reconciliation_claim_with_pass(
+        &self,
+        config: &Config,
+        lane: LaneId,
+        key: &ReadKey,
+        claim: ReconciliationClaim,
+        pass: &mut ReconciliationPass,
+    ) -> Result<bool> {
+        let ReconciliationClaim {
+            at,
+            service,
+            flight,
+        } = claim;
         self.continuity()?;
         let ReadKey::Operation { operation_id, .. } = key else {
             bail!("reconciliation requires an operation binding");
         };
         let tx = rusqlite::Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
+        if pass.database_stamp.is_some() {
+            self.recheck_reconciliation_database(pass)?;
+        }
         if !self.read_current(key)? {
             return Ok(false);
+        }
+        if let Some((epoch, _)) = flight {
+            let current: bool = self.db.query_row("SELECT EXISTS(SELECT 1 FROM runtime_authority WHERE singleton=1 AND authority_epoch=?1)",[epoch],|r|r.get(0))?;
+            if !current {
+                return Ok(false);
+            }
         }
         let (next_at, missing): (i64, bool) = self.db.query_row(
             "SELECT o.next_at,COALESCE(o.txid IS NULL AND r.status=404 AND r.failures>=2,0)
@@ -976,8 +1457,40 @@ impl Store {
         if self.request_not_before(config, endpoint, remote.as_deref())? > at {
             return Ok(false);
         }
+        if self.read_backoff(key)?.next_at > at {
+            return Ok(false);
+        }
+        if self.reconciliation_delayed(config, lane, *operation_id, at, pass)? {
+            return Ok(false);
+        }
+        let before_writes = self.db.total_changes();
         if !self.start_read_in(key, at)? {
             return Ok(false);
+        }
+        if let ReadKey::Operation {
+            operation_id,
+            binding_revision,
+            phase,
+        } = key
+        {
+            let mut p = self.binding_provenance_at(*operation_id, *binding_revision, at)?;
+            if *phase == ReadPhase::Receipt {
+                // Receipt bookkeeping records only the actual first observation,
+                // never an inferred committed age or a job-missing producer.
+                p.bound_since = None;
+                p.last_result_at = None;
+                p.last_status = None;
+            }
+            if *phase != ReadPhase::Job
+                || flight.is_none()
+                || p.observer_authority_epoch != flight.map(|f| f.0)
+                || p.active_request_sequence.is_some()
+            {
+                p.consecutive_404 = 0;
+            }
+            p.observer_authority_epoch = flight.map(|f| f.0);
+            p.active_request_sequence = flight.map(|f| f.1);
+            self.save_reconciliation_provenance(*operation_id, &p)?;
         }
         let schedule = config.schedule(lane);
         let interval = schedule
@@ -1022,6 +1535,7 @@ impl Store {
                 ],
             )?;
         }
+        self.reconciliation_own_writes(pass, before_writes);
         tx.commit()?;
         Ok(true)
     }
@@ -1188,6 +1702,27 @@ impl Store {
             ],
         )?;
         if changed == 1 {
+            let path = format!("$.challenge_provenance.{}", lane.as_str());
+            if let Some(stamp) = admission {
+                tx.execute(
+                    "UPDATE runtime_state SET lane_participation=json_set(
+                    COALESCE(lane_participation,'{}'),?1,json(?2)) WHERE singleton=1",
+                    params![
+                        path,
+                        serde_json::to_string(
+                            &json!({"stamp":stamp,"request_sequence":request_sequence})
+                        )?
+                    ],
+                )?;
+            } else {
+                // An unstamped/manual observation cannot inherit an earlier
+                // observation's lane-configuration continuity.
+                tx.execute(
+                    "UPDATE runtime_state SET lane_participation=json_remove(
+                    COALESCE(lane_participation,'{}'),?1) WHERE singleton=1",
+                    [path],
+                )?;
+            }
             if previous.map(|p| p.0) != Some(epoch) {
                 tx.execute(
                     "INSERT INTO events(at,code,kind) VALUES(?1,'epoch_observed',?2)",

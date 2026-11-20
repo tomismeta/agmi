@@ -8,6 +8,143 @@ use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::path::Path;
 
+/// Local metadata evidence only; lifecycle checksum verification remains separate.
+#[derive(serde::Serialize)]
+pub(crate) struct SelectedObservation {
+    ownership: &'static str,
+    state: &'static str,
+    reason: &'static str,
+    inspected_at: i64,
+    root: Option<std::path::PathBuf>,
+    release: Option<String>,
+    digest: Option<String>,
+    manifest: Option<String>,
+    image: Option<ImageObservation>,
+    evidence_scope: &'static str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+struct ImageObservation {
+    device: u64,
+    inode: u64,
+    size: u64,
+    mtime: i64,
+    mtime_nsec: i64,
+    ctime: i64,
+    ctime_nsec: i64,
+}
+
+#[derive(serde::Serialize)]
+pub(crate) struct ProcessObservation {
+    state: &'static str,
+    reason: &'static str,
+    inspected_at: i64,
+    pid: Option<u32>,
+    start_ticks: Option<u64>,
+    invocation_id: Option<String>,
+    image_relation: &'static str,
+    evidence_scope: &'static str,
+}
+
+pub(crate) fn observe_selected(config_path: &Path) -> SelectedObservation {
+    let mut observation = SelectedObservation {
+        ownership: "unknown",
+        state: "unavailable",
+        reason: "inspection_unavailable",
+        inspected_at: crate::store::now(),
+        root: None,
+        release: None,
+        digest: None,
+        manifest: None,
+        image: None,
+        evidence_scope: "owned_manifest_and_stable_file_metadata_not_rehashed",
+    };
+    #[cfg(unix)]
+    native::observe_selected_into(config_path, &mut observation);
+    #[cfg(not(unix))]
+    {
+        let _ = config_path;
+        observation.reason = "unsupported_platform";
+    }
+    observation
+}
+
+pub(crate) fn observe_process(config_path: &Path, status: &Value) -> ProcessObservation {
+    let observation = ProcessObservation {
+        state: "not_assessed",
+        reason: "unsupported_platform",
+        inspected_at: crate::store::now(),
+        pid: None,
+        start_ticks: None,
+        invocation_id: None,
+        image_relation: "unknown",
+        evidence_scope: "managed_invocation_and_stable_file_object_not_checksum_attestation",
+    };
+    #[cfg(target_os = "linux")]
+    let observation = {
+        let mut observation = observation;
+        native::observe_process_into(config_path, status, &mut observation);
+        observation
+    };
+    #[cfg(not(target_os = "linux"))]
+    let _ = (config_path, status);
+    observation
+}
+
+pub(crate) fn current_start_ticks() -> Option<u64> {
+    static START: std::sync::LazyLock<Option<u64>> = std::sync::LazyLock::new(|| {
+        #[cfg(target_os = "linux")]
+        {
+            native::self_start_ticks()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+    });
+    *START
+}
+
+/// Runs local advisory adoption while installation ownership is synchronously held.
+/// This does not fence standalone checkers from retired releases.
+pub(crate) fn with_advisory_owner<T>(work: impl FnOnce() -> Result<T>) -> Result<T> {
+    #[cfg(target_os = "linux")]
+    {
+        native::with_advisory_owner(work)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let home = crate::store::account_home()?;
+        let selected = observe_selected(&home.join(".config/agmi/config.toml"));
+        ensure!(
+            selected.ownership == "unmanaged",
+            "advisory_adoption_deferred"
+        );
+        work()
+    }
+}
+
+pub(crate) fn pending_update_target(config_path: &Path) -> Result<Option<String>> {
+    #[cfg(unix)]
+    {
+        native::pending_update_target(config_path)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = config_path;
+        Ok(None)
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn managed_root(config_path: &Path) -> Result<Option<std::path::PathBuf>> {
+    native::managed_root(config_path)
+}
+#[cfg(unix)]
+pub(crate) fn guard_managed_run(config_path: &Path) -> Result<()> {
+    native::guard_managed_run(config_path)
+}
+
 /// Read-only identity of the selected release, not the possibly stale caller.
 pub(crate) struct InstalledIdentity {
     pub manifest: String,
@@ -96,7 +233,7 @@ pub(crate) fn with_repair_runtime(
 pub(crate) fn run(arguments: &[String], dry_run: bool) -> Result<Value> {
     let mut plan = json!({"arguments":arguments,"dry_run":dry_run,"network_downloads":false,
         "trust":"Local operator-trusted binary and expected SHA256 only; hashes/build labels are not signed publisher or source provenance.",
-        "pause_state":"unchanged","journal":"never copied, restored or migrated by installer","preview":"plan only; operational preconditions are checked on execution",
+        "pause_state":"preserve_original_intent","journal":"canonical_target_owned_conversion_only","preview":"plan only; operational preconditions are checked on execution",
         "stage":"preflight","staging":"not_started","activation":"not_started","service":"unknown","failure_code":"none"});
     if dry_run {
         plan["installation"] = installer_evidence(Some(&plan));
@@ -116,7 +253,9 @@ pub(crate) fn run(arguments: &[String], dry_run: bool) -> Result<Value> {
 #[cfg(unix)]
 mod native {
     use super::*;
+    use crate::lifecycle::update_state::{self, Header, Record};
     use crate::store::migration::{self, UpgradeKind};
+    type InstallLock = update_state::Lease;
     use sha2::{Digest, Sha256};
     #[cfg(target_os = "linux")]
     use std::os::fd::AsRawFd;
@@ -328,41 +467,6 @@ mod native {
             }
         }
     }
-    struct InstallLock(OwnedPath);
-    impl InstallLock {
-        fn acquire(root: &Path) -> Result<Self> {
-            let path = root.join(".install-lock");
-            fs::DirBuilder::new()
-                .mode(0o700)
-                .create(&path)
-                .map_err(|_| installer_preflight_error("installer_busy"))?;
-            let lock = Self(OwnedPath::record(path, true)?);
-            write_file(
-                &lock.0.path.join("owner"),
-                format!("{}\n", std::process::id()).as_bytes(),
-                0o600,
-            )?;
-            sync_directory(&lock.0.path)?;
-            sync_directory(root)?;
-            Ok(lock)
-        }
-    }
-    impl Drop for InstallLock {
-        fn drop(&mut self) {
-            // Never recursively remove a lock, reclaim a stale owner, or remove
-            // a replacement directory. Unknown contents require operator inspection.
-            self.0.armed = false;
-            if fs::symlink_metadata(&self.0.path)
-                .is_ok_and(|m| (m.dev(), m.ino()) == self.0.identity)
-            {
-                let _ = fs::remove_file(self.0.path.join("owner"));
-                let _ = fs::remove_dir(&self.0.path);
-                if let Some(parent) = self.0.path.parent() {
-                    let _ = sync_directory(parent);
-                }
-            }
-        }
-    }
 
     fn hex(value: &str, length: usize) -> bool {
         value.len() == length
@@ -380,6 +484,511 @@ mod native {
             .open(path)?;
         ensure!(file.metadata()?.is_file(), "artifact is not a regular file");
         Ok(file)
+    }
+
+    fn image_metadata(m: &fs::Metadata) -> ImageObservation {
+        ImageObservation {
+            device: m.dev(),
+            inode: m.ino(),
+            size: m.len(),
+            mtime: m.mtime(),
+            mtime_nsec: m.mtime_nsec(),
+            ctime: m.ctime(),
+            ctime_nsec: m.ctime_nsec(),
+        }
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    fn bounded_bytes(path: &Path) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        regular(path)?.take(16_385).read_to_end(&mut bytes)?;
+        ensure!(bytes.len() <= 16_384, "observation input exceeds bound");
+        Ok(bytes)
+    }
+
+    pub(super) fn observe_selected_into(path: &Path, result: &mut SelectedObservation) {
+        let inspected = (|| -> Result<()> {
+            let home = crate::store::account_home()?;
+            if resolve_missing(path)? != resolve_missing(&home.join(".config/agmi/config.toml"))? {
+                result.ownership = "unmanaged";
+                result.state = "not_assessed";
+                result.reason = "noncanonical_config";
+                return Ok(());
+            }
+            let root = home.join(".local/share/agmi/releases");
+            let launcher = home.join(".local/bin/agmi");
+            if !exists(&root)?
+                && !exists(&launcher)?
+                && !exists(&home.join(".config/systemd/user/agmi.service"))?
+            {
+                result.ownership = "unmanaged";
+                result.state = "not_assessed";
+                result.reason = "no_managed_installation";
+                return Ok(());
+            }
+            let (release, manifest, image) = selected_metadata(&home, &root, &launcher)?;
+            result.digest = Some(release[2..].to_owned());
+            result.release = Some(release);
+            result.manifest = Some(manifest);
+            result.image = Some(image);
+            result.root = Some(root);
+            result.ownership = "managed";
+            result.state = "observed";
+            result.reason = "stable_selected_object";
+            Ok(())
+        })();
+        if inspected.is_err() {
+            result.reason = "managed_identity_unavailable";
+        }
+    }
+
+    fn selected_metadata(
+        home: &Path,
+        root: &Path,
+        launcher: &Path,
+    ) -> Result<(String, String, ImageObservation)> {
+        account_owned_ancestors(root, home)?;
+        ensure!(fs::symlink_metadata(root)?.is_dir(), "invalid release root");
+        let selected = fs::read_link(root.join("current"))?;
+        let id = selected.to_str().context("invalid selection")?;
+        ensure!(valid_id(id), "invalid selected release");
+        let release = root.join(id);
+        account_owned_ancestors(&release, home)?;
+        ensure!(
+            fs::symlink_metadata(&release)?.is_dir(),
+            "invalid release directory"
+        );
+        account_owned_ancestors(launcher.parent().context("missing launcher parent")?, home)?;
+        ensure!(
+            fs::read_link(launcher)? == root.join("current/agmi"),
+            "foreign launcher"
+        );
+        let binary = regular(&release.join("agmi"))?;
+        let manifest_file = regular(&release.join("MANIFEST"))?;
+        account_owned(&release.join("agmi"))?;
+        account_owned(&release.join("MANIFEST"))?;
+        let before = image_metadata(&binary.metadata()?);
+        let manifest_before = image_metadata(&manifest_file.metadata()?);
+        ensure!(
+            binary.metadata()?.permissions().mode() & 0o111 != 0,
+            "not executable"
+        );
+        let mut manifest = String::new();
+        (&manifest_file)
+            .take(16_385)
+            .read_to_string(&mut manifest)?;
+        ensure!(manifest.len() <= 16_384, "manifest too large");
+        ensure!(
+            metadata(&manifest, "release_id")? == id
+                && metadata(&manifest, "binary_sha256")? == &id[2..]
+                && metadata(&manifest, "build_format")? == "1"
+                && metadata(&manifest, "update_protocol")? == "1"
+                && hex(metadata(&manifest, "commit")?, 40)
+                && matches!(metadata(&manifest, "source_dirty")?, "clean" | "dirty")
+                && metadata(&manifest, "journal_schema")?.parse::<u32>()? > 0
+                && !metadata(&manifest, "target")?.is_empty()
+                && !metadata(&manifest, "package_version")?.is_empty(),
+            "invalid manifest identity"
+        );
+        ensure!(
+            before == image_metadata(&binary.metadata()?)
+                && before == image_metadata(&regular(&release.join("agmi"))?.metadata()?)
+                && manifest_before == image_metadata(&manifest_file.metadata()?)
+                && manifest_before
+                    == image_metadata(&regular(&release.join("MANIFEST"))?.metadata()?)
+                && fs::read_link(root.join("current"))? == selected
+                && fs::read_link(launcher)? == root.join("current/agmi"),
+            "selected identity changed"
+        );
+        Ok((id.to_owned(), manifest, before))
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    fn observed_unit(
+        home: &Path,
+        root: &Path,
+        release: &str,
+        fragment: &Path,
+    ) -> Result<(File, ImageObservation, ImageObservation)> {
+        ensure!(valid_id(release), "invalid selected release");
+        let unit = home.join(".config/systemd/user/agmi.service");
+        let directory = root.join(release);
+        // Only the two installer-owned links may be followed. In particular,
+        // neither an ancestor nor the release artifact may introduce a link.
+        for parent in [unit.parent().context("missing unit parent")?, &directory] {
+            account_owned_ancestors(parent, home)?;
+            for ancestor in parent.ancestors() {
+                ensure!(
+                    fs::symlink_metadata(ancestor)?.is_dir(),
+                    "linked unit ancestor"
+                );
+                if ancestor == home {
+                    break;
+                }
+            }
+        }
+        let current = root.join("current");
+        let unit_link = fs::symlink_metadata(&unit)?;
+        let current_link = fs::symlink_metadata(&current)?;
+        for link in [&unit_link, &current_link] {
+            ensure!(
+                link.file_type().is_symlink() && link.uid() == unsafe { libc::geteuid() },
+                "foreign managed link"
+            );
+        }
+        ensure!(
+            fs::read_link(&unit)? == root.join("current/agmi.service")
+                && fs::read_link(&current)? == Path::new(release),
+            "foreign managed unit selection"
+        );
+        let target = directory.join("agmi.service");
+        ensure!(
+            fragment == unit || fragment == target || fragment == root.join("current/agmi.service"),
+            "foreign loaded unit path"
+        );
+        let file = regular(&target)?;
+        account_owned(&target)?;
+        let image = image_metadata(&file.metadata()?);
+        ensure!(
+            image == image_metadata(&regular(&target)?.metadata()?)
+                && image_metadata(&unit_link) == image_metadata(&fs::symlink_metadata(&unit)?)
+                && image_metadata(&current_link)
+                    == image_metadata(&fs::symlink_metadata(&current)?)
+                && fs::read_link(&unit)? == root.join("current/agmi.service")
+                && fs::read_link(&current)? == Path::new(release),
+            "managed unit changed"
+        );
+        Ok((
+            file,
+            image_metadata(&unit_link),
+            image_metadata(&current_link),
+        ))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn process_start(bytes: &[u8]) -> Result<u64> {
+        let text = std::str::from_utf8(bytes)?;
+        let (_, fields) = text.rsplit_once(") ").context("invalid process stat")?;
+        fields
+            .split_whitespace()
+            .nth(19)
+            .context("missing process start")?
+            .parse()
+            .map_err(Into::into)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn self_start_ticks() -> Option<u64> {
+        process_start(&bounded_bytes(Path::new("/proc/self/stat")).ok()?).ok()
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    fn managed_argv(command: &[u8], binary: &Path, config: &Path) -> bool {
+        command.split(|byte| *byte == 0).eq([
+            binary.as_os_str().as_bytes(),
+            b"--config",
+            config.as_os_str().as_bytes(),
+            b"run",
+            b"",
+        ])
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    fn related_runtime_snapshot(tuple: &Value, status: &Value) -> bool {
+        let policy = &status["effective_runtime"]["policy"]["process"];
+        tuple["process"] == *policy
+            && tuple["generation"] == status["generation"]
+            && tuple["revision"] == status["effective_runtime"]["revision"]
+            && tuple["runtime_instance"] == status["effective_runtime"]["runtime_instance"]
+            && tuple["authority_epoch"] == status["effective_runtime"]["authority_epoch"]
+            && tuple["runtime_instance"]
+                .as_str()
+                .is_some_and(|v| !v.is_empty())
+            && tuple["authority_epoch"].as_u64().is_some()
+            && tuple["generation"].as_i64().is_some()
+            && policy["runtime_instance"] == tuple["runtime_instance"]
+            && policy["authority_epoch"] == tuple["authority_epoch"]
+            && policy["account_generation"] == tuple["generation"]
+    }
+
+    #[cfg(target_os = "linux")]
+    fn observation_properties(
+        deadline: std::time::Instant,
+        remaining: &mut usize,
+    ) -> Result<std::collections::BTreeMap<String, String>> {
+        use std::os::unix::process::CommandExt;
+        let mut child = Command::new("systemctl")
+            .args(["--user", "show", "agmi.service", "--no-pager",
+                "--property=MainPID,InvocationID,ActiveState,SubState,LoadState,FragmentPath,DropInPaths,User"])
+            .env("SYSTEMD_PAGER", "").stdin(Stdio::null())
+            .stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0).spawn()?;
+        let result = (|| -> Result<Vec<u8>> {
+            let mut stdout = child.stdout.take().context("missing stdout")?;
+            let mut stderr = child.stderr.take().context("missing stderr")?;
+            for fd in [stdout.as_raw_fd(), stderr.as_raw_fd()] {
+                ensure!(
+                    unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) } >= 0,
+                    "cannot bound manager output"
+                );
+            }
+            let mut output = Vec::new();
+            let mut eof = [false; 2];
+            let mut buffer = [0u8; 4096];
+            loop {
+                ensure!(std::time::Instant::now() < deadline, "observation deadline");
+                for (index, pipe) in [&mut stdout as &mut dyn Read, &mut stderr as &mut dyn Read]
+                    .into_iter()
+                    .enumerate()
+                {
+                    match pipe.read(&mut buffer) {
+                        Ok(0) => eof[index] = true,
+                        Ok(n) => {
+                            ensure!(n <= *remaining, "manager output limit");
+                            *remaining -= n;
+                            if index == 0 {
+                                output.extend_from_slice(&buffer[..n]);
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+                if let Some(status) = child.try_wait()? {
+                    ensure!(status.success(), "manager unavailable");
+                    if eof == [true, true] {
+                        return Ok(output);
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        })();
+        // Also terminate descendants retaining pipe handles. Always reap our child.
+        if result.is_err() {
+            unsafe {
+                libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+            }
+            let _ = child.kill();
+        }
+        let _ = child.wait();
+        let text = String::from_utf8(result?)?;
+        let mut properties = std::collections::BTreeMap::new();
+        for line in text.lines() {
+            let (key, value) = line.split_once('=').context("invalid manager properties")?;
+            ensure!(
+                properties
+                    .insert(key.to_owned(), value.to_owned())
+                    .is_none(),
+                "duplicate manager property"
+            );
+        }
+        for key in [
+            "MainPID",
+            "InvocationID",
+            "ActiveState",
+            "SubState",
+            "LoadState",
+            "FragmentPath",
+            "DropInPaths",
+            "User",
+        ] {
+            ensure!(properties.contains_key(key), "missing manager property");
+        }
+        Ok(properties)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn runtime_tuple(config: &crate::config::Config) -> Result<Value> {
+        use rusqlite::{Connection, OpenFlags};
+        let path = config.state_dir.join("state.sqlite3");
+        account_owned_ancestors(&config.state_dir, &crate::store::account_home()?)?;
+        let file = regular(&path)?;
+        account_owned(&path)?;
+        ensure!(
+            file.metadata()?.mode() & 0o077 == 0 && file.metadata()?.nlink() == 1,
+            "journal is not a private single-link file"
+        );
+        let before = image_metadata(&file.metadata()?);
+        let db = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
+        db.busy_timeout(Duration::ZERO)?;
+        let tuple = db.query_row(
+            "SELECT s.runtime_instance,s.effective_revision,s.controller_stopped,
+             a.authority_epoch,c.generation,json_extract(p.policy,'$.process')
+             FROM runtime_state s,runtime_authority a,control c,runtime_policy p
+             WHERE s.singleton=1 AND a.singleton=1 AND c.singleton=1 AND p.singleton=1
+             AND length(p.policy)<=1048576",
+            [],
+            |r| {
+                Ok((
+                    r.get::<_, Option<String>>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, bool>(2)?,
+                    r.get::<_, u64>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, String>(5)?,
+                ))
+            },
+        )?;
+        ensure!(
+            tuple.5.len() <= 16_384
+                && before.device == file.metadata()?.dev()
+                && before.inode == fs::symlink_metadata(&path)?.ino(),
+            "journal changed"
+        );
+        Ok(
+            json!({"runtime_instance":tuple.0,"revision":tuple.1,"stopped":tuple.2,
+            "authority_epoch":tuple.3,"generation":tuple.4,
+            "process":serde_json::from_str::<Value>(&tuple.5)?}),
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn observe_process_into(
+        path: &Path,
+        status: &Value,
+        result: &mut ProcessObservation,
+    ) {
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        let selected = super::observe_selected(path);
+        if selected.ownership == "unmanaged" {
+            result.reason = "unmanaged_installation";
+            return;
+        }
+        result.state = "unavailable";
+        result.reason = "inspection_unavailable";
+        let inspected = (|| -> Result<()> {
+            ensure!(selected.state == "observed", "selected unavailable");
+            let home = crate::store::account_home()?;
+            let root = selected.root.as_ref().context("missing root")?;
+            let mut remaining = 65_536;
+            let before = observation_properties(deadline, &mut remaining)?;
+            let release = selected.release.as_deref().context("missing release")?;
+            ensure!(
+                before["LoadState"] == "loaded" && before["DropInPaths"].is_empty(),
+                "foreign managed unit"
+            );
+            let (unit_file, unit_link, current_link) =
+                observed_unit(&home, root, release, Path::new(&before["FragmentPath"]))?;
+            let unit_image = image_metadata(&unit_file.metadata()?);
+            let pid: u32 = before["MainPID"].parse()?;
+            result.pid = Some(pid);
+            if pid == 0 {
+                let after = observation_properties(deadline, &mut remaining)?;
+                let final_selected = super::observe_selected(path);
+                let (final_unit, final_link, final_current) =
+                    observed_unit(&home, root, release, Path::new(&after["FragmentPath"]))?;
+                ensure!(
+                    before == after
+                        && final_selected.state == "observed"
+                        && selected.release == final_selected.release
+                        && selected.image == final_selected.image
+                        && unit_image == image_metadata(&unit_file.metadata()?)
+                        && unit_image == image_metadata(&final_unit.metadata()?)
+                        && unit_link == final_link
+                        && current_link == final_current
+                        && std::time::Instant::now() < deadline,
+                    "snapshot rollover"
+                );
+                if matches!(before["ActiveState"].as_str(), "inactive" | "failed") {
+                    result.state = "stopped";
+                    result.reason = "managed_service_inactive";
+                }
+                return Ok(());
+            }
+            let config = crate::config::Config::load_metadata(path)?;
+            let tuple = runtime_tuple(&config)?;
+            ensure!(
+                before["ActiveState"] == "active" && hex(&before["InvocationID"], 32),
+                "transitional invocation"
+            );
+            result.invocation_id = Some(before["InvocationID"].clone());
+            let process = PathBuf::from(format!("/proc/{pid}"));
+            ensure!(
+                fs::metadata(&process)?.uid() == unsafe { libc::geteuid() },
+                "foreign process owner"
+            );
+            let start = process_start(&bounded_bytes(&process.join("stat"))?)?;
+            result.start_ticks = Some(start);
+            let executable = File::open(process.join("exe"))?;
+            let image = image_metadata(&executable.metadata()?);
+            ensure!(executable.metadata()?.is_file(), "nonregular executable");
+            let command = bounded_bytes(&process.join("cmdline"))?;
+            let binary = root
+                .join(selected.release.as_ref().context("missing release")?)
+                .join("agmi");
+            let canonical_config = home.join(".config/agmi/config.toml");
+            let argv_matches = managed_argv(&command, &binary, &canonical_config);
+            let policy = &status["effective_runtime"]["policy"]["process"];
+            ensure!(
+                related_runtime_snapshot(&tuple, status),
+                "unrelated runtime snapshot"
+            );
+            let identity_matches = policy["pid"].as_u64() == Some(u64::from(pid))
+                && policy["invocation_id"] == before["InvocationID"]
+                && policy["start_ticks"]
+                    .as_u64()
+                    .is_none_or(|ticks| ticks == start)
+                && tuple["stopped"] == false;
+            let after = observation_properties(deadline, &mut remaining)?;
+            ensure!(
+                before == after
+                    && start == process_start(&bounded_bytes(&process.join("stat"))?)?
+                    && image == image_metadata(&executable.metadata()?)
+                    && image == image_metadata(&File::open(process.join("exe"))?.metadata()?)
+                    && command == bounded_bytes(&process.join("cmdline"))?
+                    && fs::metadata(&process)?.uid() == unsafe { libc::geteuid() }
+                    && tuple == runtime_tuple(&config)?,
+                "snapshot rollover"
+            );
+            let final_selected = super::observe_selected(path);
+            let (final_unit, final_link, final_current) =
+                observed_unit(&home, root, release, Path::new(&after["FragmentPath"]))?;
+            ensure!(
+                selected.release == final_selected.release
+                    && selected.image == final_selected.image
+                    && final_selected.state == "observed"
+                    && unit_image == image_metadata(&unit_file.metadata()?)
+                    && unit_image == image_metadata(&final_unit.metadata()?)
+                    && unit_link == final_link
+                    && current_link == final_current
+                    && std::time::Instant::now() < deadline,
+                "selected rollover or deadline"
+            );
+            let same_image = selected.image.as_ref() == Some(&image);
+            result.image_relation = if same_image {
+                "same_object"
+            } else {
+                "different_object"
+            };
+            result.state = if same_image && argv_matches && identity_matches {
+                "observed_match"
+            } else {
+                "mismatch"
+            };
+            result.reason = if !same_image {
+                "running_selected_object_differs"
+            } else if !argv_matches {
+                "managed_arguments_differ"
+            } else if !identity_matches {
+                "recorded_invocation_differs"
+            } else {
+                "stable_managed_invocation"
+            };
+            Ok(())
+        })();
+        if inspected.is_err() {
+            result.state = "unavailable";
+            result.reason = if std::time::Instant::now() >= deadline {
+                "observation_budget_exceeded"
+            } else {
+                "identity_or_snapshot_unavailable"
+            };
+            result.image_relation = "unknown";
+        }
     }
     fn digest(file: File) -> Result<String> {
         digest_cancellable(file, true)
@@ -535,8 +1144,11 @@ mod native {
             "unknown source dirty marker"
         );
         ensure!(
-            metadata(&manifest, "journal_schema")?.parse::<i64>()? == CURRENT_JOURNAL_FORMAT
-                || (retained && matches!(metadata(&manifest, "journal_schema")?, "2" | "3")),
+            if retained {
+                metadata(&manifest, "journal_schema")?.parse::<u32>()? > 0
+            } else {
+                metadata(&manifest, "journal_schema")?.parse::<i64>()? == CURRENT_JOURNAL_FORMAT
+            },
             "incompatible journal schema"
         );
         ensure!(
@@ -688,10 +1300,6 @@ mod native {
             );
             ensure!(
                 (!request.migrate || !request.migration_only)
-                    && (request.migrate
-                        || (request.proposal.is_none()
-                            && request.expected_token.is_none()
-                            && request.accept_risk_change.is_none()))
                     && (request.expected_token.is_none() || action == "activate")
                     && request
                         .accept_risk_change
@@ -703,20 +1311,25 @@ mod native {
     }
 
     fn incoming(binary: &Path, request: &Request<'_>) -> Result<Value> {
-        let action = if request.action == "stage" {
-            "install"
-        } else {
-            request.action
+        let action = match request.action {
+            "stage" => "install",
+            "activate" => "update",
+            action => action,
         };
         let mut command = Command::new(binary);
-        command
-            .args(["--json", action, "--binary"])
-            .arg(binary)
-            .args(["--sha256", request.digest.context("missing digest")?]);
+        command.args(["--json", action]);
+        if request.action == "activate" {
+            command.args(["--release", request.target]);
+        } else {
+            command
+                .arg("--binary")
+                .arg(binary)
+                .args(["--sha256", request.digest.context("missing digest")?]);
+        }
         if request.action == "stage" {
             command.arg("--stage-only");
         }
-        if request.stopped && request.action == "update" {
+        if request.stopped && matches!(request.action, "update" | "activate") {
             command.arg("--stopped");
         }
         if request.migration_only {
@@ -760,6 +1373,9 @@ mod native {
                 && envelope["data"]["installation"].is_object()
             {
                 let evidence = installer_evidence(Some(&envelope["data"]["installation"]));
+                if evidence["failure_code"] == "decision_required" {
+                    return Ok(envelope["data"].clone());
+                }
                 if evidence["stage"] == "complete" && evidence["failure_code"] == "none" {
                     return Ok(envelope["data"].clone());
                 }
@@ -816,6 +1432,10 @@ mod native {
         stop_on_failure: bool,
         migration_only: bool,
         migrate: bool,
+        automatic: bool,
+        already_current: bool,
+        transaction: Option<Record>,
+        restoration: Value,
         proposal: Value,
         expected_token: Option<String>,
         inspection: Option<crate::store::migration::UpgradeInspection>,
@@ -848,6 +1468,10 @@ mod native {
                 stop_on_failure: false,
                 migration_only: false,
                 migrate: false,
+                automatic: false,
+                already_current: false,
+                transaction: None,
+                restoration: json!({"status":"not_needed","runtime":"unknown","timer":"unknown","pause_state":"unknown","verified":false}),
                 proposal: json!({}),
                 expected_token: None,
                 inspection: None,
@@ -866,7 +1490,10 @@ mod native {
                 &json!({"stage":self.phase,"staging":self.staging,"activation":self.activation,
                 "service":self.service,"failure_code":if success { "none" } else { self.failure },
                 "bootstrap_recovery":self.bootstrap_recovery,
-                "compatibility":self.compatibility,"migration":self.migration}),
+                "operation_mode":self.transaction.as_ref().map_or("unknown", |record| {
+                    if record.payload["explicit_maintenance"] == true { "maintenance" } else { "standard" }
+                }),
+                "compatibility":self.compatibility,"migration":self.migration,"restoration":self.restoration}),
             ))
         }
         fn record_migration_failure(&mut self, status: Option<Value>, expected: Option<&str>) {
@@ -886,7 +1513,8 @@ mod native {
             if let Some(status) = observed {
                 self.migration = json!({
                     "phase":if status["pending"] == true { "recovery_required" } else { "complete" },
-                    "participation_resumed":false,"release_id":self.migration["release_id"],
+                    "participation_resumed":self.migration["participation_resumed"].as_bool(),
+                    "release_id":self.migration["release_id"],
                     "token":status["token"],"target_journal_format":status["target_journal_format"],
                     "recovery_supported":status["recovery_supported"],
                     "further_migration_required":status["further_migration_required"],
@@ -928,9 +1556,29 @@ mod native {
                     "state location changed during upgrade"
                 );
             }
-            if required && !self.migrate {
-                self.failure = "migration_required";
-                anyhow::bail!("explicit stopped migration is required");
+            if required && !self.migrate && !self.migration_only {
+                self.migrate = true;
+            }
+            if required
+                && inspection.kind != UpgradeKind::Pending
+                && self.proposal == json!({})
+                && self.expected_token.is_none()
+                && self
+                    .transaction
+                    .as_ref()
+                    .is_none_or(|r| r.payload["authorization"] == "preserving")
+            {
+                match migration::automatic_upgrade(&self.config)? {
+                    migration::AutomaticUpgrade::Preserving => self.automatic = true,
+                    migration::AutomaticUpgrade::DecisionRequired(reason) => {
+                        self.failure = "decision_required";
+                        self.migration["phase"] = json!("decision_required");
+                        self.migration["decision_reason"] = json!(reason);
+                        anyhow::bail!(
+                            "canonical migration requires an explicit policy or authority decision"
+                        );
+                    }
+                }
             }
             if inspection.kind == UpgradeKind::Pending
                 || (inspection.kind == UpgradeKind::Compatible && self.expected_token.is_some())
@@ -998,143 +1646,6 @@ mod native {
             Ok(state)
         }
 
-        fn pause_for_upgrade(&mut self) -> Result<()> {
-            let inspection = self.inspection.as_ref().context("upgrade not inspected")?;
-            if inspection.kind == UpgradeKind::Pending
-                || inspection.journal_format.is_none_or(|version| version < 3)
-                || inspection.paused == Some(true)
-            {
-                return Ok(());
-            }
-            // No configuration/account/lane locks are held across the old CLI.
-            // Its own control path is the only authority to pause its source format.
-            self.failure = "migration_pause_failed";
-            let selected = fs::read_link(self.root.join("current"))?;
-            let id = selected.to_str().context("invalid retained release")?;
-            let release = self.root.join(id);
-            validate_release_metadata(&release, id, true)?;
-            let output = capture(
-                Command::new(release.join("agmi"))
-                    .arg("--config")
-                    .arg(&self.config)
-                    .args(["--json", "pause"]),
-                true,
-            )?;
-            ensure!(
-                output.status.success(),
-                "retained runtime could not persist pause"
-            );
-            self.verify_upgrade_stopped()?;
-            self.inspect_upgrade()?;
-            ensure!(
-                self.inspection
-                    .as_ref()
-                    .is_some_and(|value| value.paused == Some(true)),
-                "retained runtime did not persist pause"
-            );
-            Ok(())
-        }
-
-        fn continue_upgrade(&mut self, id: &str) -> Result<()> {
-            self.phase = "activation_preflight";
-            self.failure = "release_invalid";
-            let release = self.root.join(id);
-            validate_release(&release, id)?;
-            ensure!(
-                metadata(
-                    &fs::read_to_string(release.join("MANIFEST"))?,
-                    "journal_schema"
-                )? == CURRENT_JOURNAL_FORMAT.to_string(),
-                "continuation requires selected current-format executable"
-            );
-            self.space_checks(&release.join("agmi"), 0, true)?;
-            self.failure = "migration_conflict";
-            self.verify_units(&release)?;
-            self.loaded(id)?;
-            self.verify_upgrade_stopped()?;
-            self.verify_autostart_disabled()?;
-            self.activation = "loaded_verified";
-            self.service = "stopped";
-            self.stop_on_failure = true;
-            Ok(())
-        }
-
-        fn finish_upgrade(&mut self, id: &str, request: &Request<'_>) -> Result<()> {
-            if !self.maintenance() {
-                return Ok(());
-            }
-            self.phase = "migration";
-            self.failure = "migration_failed";
-            self.migration["release_id"] = json!(id);
-            self.verify_upgrade_stopped()?;
-            self.verify_autostart_disabled()?;
-            ensure!(
-                fs::read_link(self.root.join("current"))? == Path::new(id),
-                "selected release changed before migration"
-            );
-            let inspection = self.inspection.as_ref().context("upgrade not inspected")?;
-            let kind = inspection.kind;
-            let state = inspection.state_dir.clone();
-            if kind == UpgradeKind::Pending && request.expected_token.is_none() {
-                self.migration["release_id"] = json!(id);
-            } else if kind == UpgradeKind::Conversion && request.expected_token.is_none() {
-                let preview = migration::preview(&self.config, &self.proposal)?;
-                self.migration = json!({"phase":"prepared","participation_resumed":false,
-                    "release_id":id,"token":preview["token"],"approval_required":true,
-                    "risk_change_required":preview["risk_change_required"],
-                    "target_journal_format":CURRENT_JOURNAL_FORMAT});
-                self.preview = Some(preview);
-            } else {
-                let completed = if matches!(kind, UpgradeKind::Pending | UpgradeKind::Compatible) {
-                    migration::resume(
-                        &self.config,
-                        &state,
-                        request
-                            .expected_token
-                            .context("missing exact continuation")?,
-                    )?
-                } else if kind == UpgradeKind::MarkerOnly {
-                    let preview = migration::preview(&self.config, &self.proposal)?;
-                    self.migration["token"] = preview["token"].clone();
-                    migration::apply(
-                        &self.config,
-                        &preview["request"],
-                        preview["token"]
-                            .as_str()
-                            .context("missing canonical token")?,
-                        None,
-                    )?
-                } else {
-                    migration::apply(
-                        &self.config,
-                        &self.proposal,
-                        request.expected_token.context("missing exact approval")?,
-                        request.accept_risk_change,
-                    )?
-                };
-                let prerequisite = completed["recovery_prerequisite"].is_string()
-                    || completed["further_migration_required"] == true;
-                self.migration = json!({"phase":if prerequisite { "recovery_required" } else { "complete" },
-                    "participation_resumed":false,"release_id":id,"token":completed["token"],
-                    "target_journal_format":completed["target_journal_format"].as_i64()
-                        .or_else(|| (completed["branch"] == "config_only").then_some(CURRENT_JOURNAL_FORMAT)),
-                    "paused":completed["paused"],"generation":completed["generation"],
-                    "recovery_supported":completed["recovery_supported"],
-                    "further_migration_required":completed["further_migration_required"],
-                    "pending":false,"recovery_prerequisite":if completed["recovery_prerequisite"].is_string() {
-                        Some("authority_adoption")
-                    } else { None }});
-            }
-            ensure!(
-                fs::read_link(self.root.join("current"))? == Path::new(id),
-                "selected release changed during migration"
-            );
-            self.verify_upgrade_stopped()?;
-            self.verify_autostart_disabled()?;
-            self.phase = "complete";
-            self.output.push_str("Migration maintenance leaves services stopped and boot activation disabled; participation is not resumed.\n");
-            Ok(())
-        }
         fn systemctl(&self, arguments: &[&str], cancellable: bool) -> Result<Output> {
             capture(
                 Command::new(&self.systemctl).arg("--user").args(arguments),
@@ -1166,6 +1677,10 @@ mod native {
             Ok(())
         }
         fn manager_context(&self) -> Result<()> {
+            self.manager_search_context()?;
+            self.manager_loaded_context()
+        }
+        fn manager_search_context(&self) -> Result<()> {
             let output = self.systemctl(&["show", "--property=UnitPath", "--value"], true)?;
             ensure!(output.status.success(), "cannot inspect manager unit paths");
             let paths = String::from_utf8(output.stdout)?;
@@ -1176,6 +1691,9 @@ mod native {
                 }),
                 "manager does not load this installation's unit directory"
             );
+            Ok(())
+        }
+        fn manager_loaded_context(&self) -> Result<()> {
             for (unit, _, _) in UNITS {
                 if self.property(unit, "LoadState", true)? != "not-found" {
                     self.unit_path(unit)?;
@@ -1286,7 +1804,7 @@ mod native {
             }
             Ok(())
         }
-        fn disable_autostart(&mut self) -> Result<()> {
+        fn definition_targets(&self) -> Result<[Option<PathBuf>; UNITS.len()]> {
             let mut targets: [Option<PathBuf>; UNITS.len()] = Default::default();
             for ((unit, _, _), target) in UNITS.iter().zip(&mut targets) {
                 let definition = self.units.join(unit);
@@ -1299,7 +1817,20 @@ mod native {
                     Err(error) => return Err(error.into()),
                 };
             }
-            let disabled = self.control(&["disable", "agmi.service", "agmi-health.timer"]);
+            Ok(targets)
+        }
+        fn disable_autostart(&mut self) -> Result<()> {
+            let targets = self.definition_targets()?;
+            let runtime_enabled = self.property("agmi.service", "UnitFileState", true)?
+                == "enabled-runtime"
+                || self.property("agmi-health.timer", "UnitFileState", true)? == "enabled-runtime";
+            // Remove runtime links while persistent definitions still exist for lookup.
+            let disabled = (if runtime_enabled {
+                self.control(&["disable", "--runtime", "agmi.service", "agmi-health.timer"])
+            } else {
+                Ok(())
+            })
+            .and_then(|()| self.control(&["disable", "agmi.service", "agmi-health.timer"]));
             // systemd can remove definition links even when disable fails.
             // Restore their original targets before reporting failure or cancellation.
             let mut restored = Ok(());
@@ -1399,7 +1930,7 @@ mod native {
                 !fs::symlink_metadata(&self.root)?.file_type().is_symlink(),
                 "linked releases directory"
             );
-            InstallLock::acquire(&self.root)
+            InstallLock::acquire_or_reuse(&self.root)
         }
         fn fresh(&self) -> Result<()> {
             for path in [self.root.join("current"), self.bin.join("agmi")]
@@ -1453,57 +1984,58 @@ mod native {
         ) -> Result<()> {
             use std::fmt::Write;
             self.failure = "configuration_invalid";
-            let state = if self.migrate {
-                self.inspect_upgrade()?
-            } else {
-                // Only the retained binary interprets its legacy config, and only
-                // to report the state path. No runtime or journal command is run.
-                let retained_binary;
-                let binary = if self.migration_only {
-                    let selected = fs::read_link(self.root.join("current"))?;
-                    let id = selected.to_str().context("invalid retained release")?;
-                    let release = self.root.join(id);
-                    validate_release_metadata(&release, id, true)?;
-                    ensure!(
-                        matches!(
-                            metadata(
-                                &fs::read_to_string(release.join("MANIFEST"))?,
-                                "journal_schema"
-                            )?,
-                            "2" | "3"
-                        ),
-                        "migration-only requires a retained format2 or format3 release"
-                    );
-                    retained_binary = release.join("agmi");
-                    retained_binary.as_path()
+            let state =
+                if self.migrate || (!self.migration_only && exists(&self.root.join("current"))?) {
+                    self.inspect_upgrade()?
                 } else {
-                    binary
-                };
-                let result = capture(
-                    Command::new(binary)
-                        .arg("--config")
-                        .arg(&self.config)
-                        .args(["config", "state-path"]),
-                    true,
-                )
-                .map_err(|error| {
-                    if error
-                        .downcast_ref::<std::io::Error>()
-                        .is_some_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied)
-                    {
-                        installer_preflight_error("candidate_execution_unavailable")
+                    // Only the retained binary interprets its legacy config, and only
+                    // to report the state path. No runtime or journal command is run.
+                    let retained_binary;
+                    let binary = if self.migration_only {
+                        let selected = fs::read_link(self.root.join("current"))?;
+                        let id = selected.to_str().context("invalid retained release")?;
+                        let release = self.root.join(id);
+                        validate_release_metadata(&release, id, true)?;
+                        ensure!(
+                            matches!(
+                                metadata(
+                                    &fs::read_to_string(release.join("MANIFEST"))?,
+                                    "journal_schema"
+                                )?,
+                                "2" | "3"
+                            ),
+                            "migration-only requires a retained format2 or format3 release"
+                        );
+                        retained_binary = release.join("agmi");
+                        retained_binary.as_path()
                     } else {
-                        error
+                        binary
+                    };
+                    let result = capture(
+                        Command::new(binary)
+                            .arg("--config")
+                            .arg(&self.config)
+                            .args(["config", "state-path"]),
+                        true,
+                    )
+                    .map_err(|error| {
+                        if error
+                            .downcast_ref::<std::io::Error>()
+                            .is_some_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied)
+                        {
+                            installer_preflight_error("candidate_execution_unavailable")
+                        } else {
+                            error
+                        }
+                    })?;
+                    if !result.status.success() {
+                        // The ordinary parser stays strict. Recognized historical state
+                        // gets actionable refusal, never an implicit migration.
+                        let _ = self.inspect_upgrade();
+                        anyhow::bail!("cannot inspect configured state path");
                     }
-                })?;
-                if !result.status.success() {
-                    // The ordinary parser stays strict. Recognized historical state
-                    // gets actionable refusal, never an implicit migration.
-                    let _ = self.inspect_upgrade();
-                    anyhow::bail!("cannot inspect configured state path");
-                }
-                PathBuf::from(String::from_utf8(result.stdout)?.trim_end_matches('\n'))
-            };
+                    PathBuf::from(String::from_utf8(result.stdout)?.trim_end_matches('\n'))
+                };
             ensure!(state.is_absolute(), "state path must be absolute");
             let canonical_state = resolve_missing(&state)?;
             let canonical_root = fs::canonicalize(&self.root)?;
@@ -1701,6 +2233,8 @@ mod native {
             }
             Ok(())
         }
+        // Fresh installation and migration-only bootstrap stay stopped.
+        // Managed updates alone capture and restore independent lifecycle intent.
         fn activate(&mut self, id: &str, request: &Request<'_>) -> Result<()> {
             self.bootstrap_recovery = None;
             self.phase = "activation_preflight";
@@ -1731,12 +2265,12 @@ mod native {
                 validate_release_metadata(&self.root.join(previous), previous, true)?;
                 let old = fs::read_to_string(self.root.join(previous).join("MANIFEST"))?;
                 let new = fs::read_to_string(release.join("MANIFEST"))?;
-                if self.maintenance() {
+                if self.inspection.is_some() && !request.migration_only {
                     ensure!(
-                        matches!(metadata(&old, "journal_schema")?, "2" | "3" | "4")
+                        metadata(&old, "journal_schema")?.parse::<u32>()? > 0
                             && metadata(&new, "journal_schema")?
                                 == CURRENT_JOURNAL_FORMAT.to_string(),
-                        "unsupported stopped upgrade pair"
+                        "unsupported target identity"
                     );
                 } else {
                     activation_schema(
@@ -1762,36 +2296,21 @@ mod native {
                 );
             }
             self.failure = "service_state_unavailable";
-            let runtime_active = self.active("agmi.service")?;
-            let timer_active = self.active("agmi-health.timer")?;
+            self.active("agmi.service")?;
+            self.active("agmi-health.timer")?;
             checkpoint()?;
             self.phase = "stopping";
             self.failure = "stop_failed";
             self.activation = "in_progress";
             self.stop_on_failure = true;
-            if self.maintenance() {
-                // Preserve recoverable launcher/unit definitions before changing
-                // boot intent, then prevent reboot from racing a one-way change.
-                self.backup_legacy()?;
-                self.disable_autostart()?;
-            }
             self.stop_units(true)?;
-            if self.maintenance() {
-                self.verify_upgrade_stopped()?;
-            } else {
-                self.verify_stopped()?;
-            }
-            if self.maintenance() {
-                self.pause_for_upgrade()?;
-            }
+            self.verify_stopped()?;
             self.failure = "journal_incompatible";
             self.verify_journal_activation()?;
             self.service = "stopped";
             self.phase = "switching";
             self.failure = "switch_failed";
-            if !self.maintenance() {
-                self.backup_legacy()?;
-            }
+            self.backup_legacy()?;
             for (name, destination) in std::iter::once(("agmi", self.bin.join("agmi"))).chain(
                 UNITS
                     .iter()
@@ -1821,38 +2340,14 @@ mod native {
             self.control(&["daemon-reload"])?;
             self.loaded(id)?;
             self.activation = "loaded_verified";
-            if request.stopped || self.maintenance() {
-                if request.migration_only || self.maintenance() {
-                    self.failure = "stop_failed";
-                    self.verify_autostart_disabled()?;
-                    self.output.push_str("Migration bootstrap disabled boot activation. After local migration, explicitly enable/start services; participation still requires resume.\n");
-                } else if request.action == "install" {
-                    self.control(&["enable", "agmi.service", "agmi-health.timer"])?;
-                }
-                self.verify_stopped()?;
-            } else {
-                self.phase = "starting";
-                self.failure = "start_failed";
-                self.service = "unknown";
-                if runtime_active {
-                    self.control(&["start", "agmi.service"])?;
-                    self.control(&["is-active", "--quiet", "agmi.service"])?;
-                    let pid = self.property("agmi.service", "MainPID", true)?;
-                    ensure!(
-                        pid.parse::<u32>().is_ok_and(|pid| pid > 0),
-                        "no runtime process identity"
-                    );
-                    ensure!(
-                        digest(File::open(format!("/proc/{pid}/exe"))?)? == id[2..],
-                        "runtime binary identity mismatch"
-                    );
-                }
-                if timer_active {
-                    self.control(&["start", "agmi-health.timer"])?;
-                    self.control(&["is-active", "--quiet", "agmi-health.timer"])?;
-                }
-                self.service = "previous_intent_restored";
+            if request.migration_only {
+                self.failure = "stop_failed";
+                self.verify_autostart_disabled()?;
+                self.output.push_str("Migration bootstrap disabled boot activation. After local migration, explicitly enable/start services; participation still requires resume.\n");
+            } else if request.action == "install" {
+                self.control(&["enable", "agmi.service", "agmi-health.timer"])?;
             }
+            self.verify_stopped()?;
             self.status()?;
             checkpoint()?;
             self.phase = "complete";
@@ -1979,6 +2474,1275 @@ mod native {
             }
         }
         anyhow::bail!("installation path has no account home")
+    }
+
+    fn validate_update_payload(payload: &Value) -> Result<()> {
+        ensure!(payload.is_object(), "invalid target update payload");
+        ensure!(
+            matches!(
+                payload["phase"].as_str(),
+                Some(
+                    "prepared"
+                        | "quiescing"
+                        | "converting"
+                        | "runtime_ready"
+                        | "restoring"
+                        | "complete"
+                )
+            ),
+            "unsupported update phase"
+        );
+        for key in [
+            "runtime",
+            "timer",
+            "conversion",
+            "explicit_maintenance",
+            "decision",
+            "pause_pending",
+        ] {
+            ensure!(payload[key].is_boolean(), "missing update intent flag");
+        }
+        for key in ["paused", "original_pause"] {
+            ensure!(
+                payload
+                    .get(key)
+                    .is_some_and(|v| v.is_null() || v.is_boolean()),
+                "invalid update pause intent"
+            );
+        }
+        ensure!(
+            payload["generation"].is_null()
+                || payload["generation"].as_i64().is_some_and(|v| v >= 0),
+            "invalid update control generation"
+        );
+        ensure!(
+            payload["database_id"].is_null()
+                || payload["database_id"]
+                    .as_str()
+                    .is_some_and(|id| hex(id, 32)),
+            "invalid update database identity"
+        );
+        ensure!(
+            payload["inputs"].as_str().is_some_and(|hash| hex(hash, 64)),
+            "missing update input identity"
+        );
+        ensure!(
+            matches!(
+                payload["authorization"].as_str(),
+                Some("preserving" | "explicit")
+            ),
+            "unknown update authorization"
+        );
+        ensure!(
+            payload["enablement"]
+                .as_array()
+                .is_some_and(|values| values.len() == 3
+                    && values.iter().all(|v| matches!(
+                        v.as_str(),
+                        Some(
+                            "enabled"
+                                | "enabled-runtime"
+                                | "disabled"
+                                | "static"
+                                | "indirect"
+                                | "linked"
+                                | "linked-runtime"
+                        )
+                    ))),
+            "invalid boot intent"
+        );
+        ensure!(
+            payload["definitions"].as_array().is_some_and(|values| {
+                values.len() == UNITS.len()
+                    && values.iter().all(|v| {
+                        v.is_null() || v.as_str().is_some_and(|s| !s.is_empty() && s.len() <= 4096)
+                    })
+            }),
+            "invalid captured unit definitions"
+        );
+        ensure!(
+            payload["boot"].as_str().is_some_and(
+                |v| v.len() == 36 && v.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
+            ),
+            "invalid captured boot identity"
+        );
+        ensure!(
+            payload.get("resume").is_some_and(|v| v.is_null()
+                || (v["generation"].as_i64().is_some_and(|g| g >= 0)
+                    && v["paused"].is_boolean()
+                    && v["desired"].is_boolean())),
+            "invalid conditional resume transition"
+        );
+        ensure!(
+            payload["token"].is_null()
+                || payload["token"].as_str().is_some_and(|v| v
+                    .strip_prefix("agmi.atomic-migration.v1:")
+                    .is_some_and(|v| hex(v, 64))),
+            "invalid pinned migration token"
+        );
+        if matches!(
+            payload["phase"].as_str(),
+            Some("runtime_ready" | "restoring" | "complete")
+        ) {
+            ensure!(
+                payload["revision"].as_str().is_some_and(|v| hex(v, 64)),
+                "missing approved runtime revision"
+            );
+        }
+        Ok(())
+    }
+
+    fn boot_identity() -> Result<String> {
+        let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+        let boot = boot.trim();
+        ensure!(
+            boot.len() == 36 && boot.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-'),
+            "boot identity unavailable"
+        );
+        Ok(boot.to_owned())
+    }
+
+    // Hash only local inputs; never retain configuration or guidance bodies.
+    fn upgrade_inputs(config: &Path) -> Result<String> {
+        fn guidance(value: &toml::Value, base: &Path, hash: &mut Sha256) -> Result<()> {
+            if let Some(table) = value.as_table() {
+                for (key, value) in table {
+                    if matches!(key.as_str(), "guidance_file" | "core_guidance_file") {
+                        let path = value.as_str().context("invalid guidance path")?;
+                        let path = base.join(path);
+                        hash.update(path.as_os_str().as_bytes());
+                        hash.update(digest_cancellable(regular(&path)?, false)?.as_bytes());
+                    } else {
+                        guidance(value, base, hash)?;
+                    }
+                }
+            }
+            Ok(())
+        }
+        let bytes = fs::read(config)?;
+        ensure!(bytes.len() <= 65536, "configuration exceeds bound");
+        let value: toml::Value = toml::from_str(std::str::from_utf8(&bytes)?)?;
+        let mut hash = Sha256::new();
+        hash.update(&bytes);
+        guidance(
+            &value,
+            config.parent().context("missing config parent")?,
+            &mut hash,
+        )?;
+        Ok(format!("{:x}", hash.finalize()))
+    }
+
+    impl Installation {
+        fn persist_transaction(&self) -> Result<()> {
+            ensure!(
+                update_state::read(&self.root)?.is_some_and(|saved| self
+                    .transaction
+                    .as_ref()
+                    .is_some_and(|record| saved.header.nonce == record.header.nonce)),
+                "update record disappeared or was replaced"
+            );
+            update_state::save(
+                &self.root,
+                self.transaction
+                    .as_ref()
+                    .context("missing update transaction")?,
+            )
+        }
+        fn transaction_phase(&mut self, phase: &str) -> Result<()> {
+            self.transaction
+                .as_mut()
+                .context("missing update transaction")?
+                .payload["phase"] = json!(phase);
+            self.persist_transaction()
+        }
+        fn observed_restoration(&mut self, status: &str, verified: bool) {
+            let runtime = self.repair_runtime_state(false).ok();
+            let timer = self
+                .property("agmi-health.timer", "ActiveState", false)
+                .ok();
+            let pause = migration::inspect_upgrade(&self.config).ok();
+            self.restoration = json!({"status":status,
+                "runtime":match runtime.as_deref() { Some("active") => "running", Some("inactive" | "failed") => "stopped", _ => "unknown" },
+                "timer":match timer.as_deref() { Some("active") => "active", Some("inactive" | "failed") => "stopped", _ => "unknown" },
+                "pause_state":match pause { Some(i) => match i.paused { Some(true) => "paused", Some(false) => "unpaused", None => "absent" }, None => "unknown" },
+                "verified":verified});
+        }
+        fn verify_transaction_inputs(&self) -> Result<()> {
+            let record = self
+                .transaction
+                .as_ref()
+                .context("missing update transaction")?;
+            ensure!(
+                upgrade_inputs(&self.config)?
+                    == record.payload["inputs"]
+                        .as_str()
+                        .context("missing input identity")?,
+                "configuration or guidance changed during update"
+            );
+            let observed = migration::inspect_upgrade(&self.config)?;
+            ensure!(
+                serde_json::to_value(&observed.database_id)? == record.payload["database_id"],
+                "database identity changed during update"
+            );
+            ensure!(
+                observed
+                    .dispatch_sequence
+                    .zip(record.payload["dispatch_sequence"].as_i64())
+                    .is_none_or(|(actual, before)| actual >= before),
+                "dispatch authority regressed during update"
+            );
+            ensure!(
+                serde_json::to_value(observed.generation)? == record.payload["generation"]
+                    && serde_json::to_value(observed.paused)? == record.payload["paused"],
+                "control intent changed during update"
+            );
+            Ok(())
+        }
+        fn recover_update_definitions(&self) -> Result<()> {
+            let Some(record) = update_state::read(&self.root)? else {
+                return Ok(());
+            };
+            if record.header.payload_format != 1 || record.payload["phase"] != "quiescing" {
+                return Ok(());
+            }
+            validate_update_payload(&record.payload)?;
+            validate_release_metadata(
+                &self.root.join(&record.header.source),
+                &record.header.source,
+                true,
+            )?;
+            for (index, (unit, _, _)) in UNITS.iter().enumerate() {
+                let Some(target) = record.payload["definitions"][index].as_str() else {
+                    continue;
+                };
+                let resolved = fs::canonicalize(self.units.join(target))?;
+                ensure!(
+                    resolved == fs::canonicalize(self.root.join(&record.header.source).join(unit))?
+                        || resolved
+                            == fs::canonicalize(self.root.join(&record.header.target).join(unit))?,
+                    "captured definition is outside the pinned releases"
+                );
+                let definition = self.units.join(unit);
+                match fs::symlink_metadata(&definition) {
+                    Ok(metadata) => ensure!(
+                        metadata.file_type().is_symlink()
+                            && fs::read_link(&definition)? == Path::new(target),
+                        "unit definition changed during interrupted disable"
+                    ),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        symlink(target, &definition)?;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            sync_directory(&self.units)?;
+            self.control(&["daemon-reload"])
+        }
+        fn capture_transaction(&mut self, id: &str, request: &Request<'_>) -> Result<()> {
+            let intent = self.repair_intent().inspect_err(|_| {
+                self.failure = "service_state_unavailable";
+            })?;
+            self.loaded(
+                fs::read_link(self.root.join("current"))?
+                    .to_str()
+                    .context("invalid selected release")?,
+            )?;
+            self.repair_loaded(true)?;
+            let inspection = self
+                .inspection
+                .as_ref()
+                .context("missing source inspection")?;
+            let source = fs::read_link(self.root.join("current"))?
+                .to_str()
+                .context("invalid source release")?
+                .to_owned();
+            validate_release_metadata(&self.root.join(&source), &source, true)?;
+            if intent.runtime == "active" {
+                self.repair_runtime_identity(&source, true)?;
+            }
+            let definitions = serde_json::to_value(self.definition_targets()?)?;
+            let embedded = manifest_output(&self.root.join(id).join("agmi"))?;
+            let mut random = [0u8; 32];
+            File::open("/dev/urandom")?.read_exact(&mut random)?;
+            let nonce = format!("{:x}", Sha256::digest(random));
+            let maintenance = request.migrate && self.maintenance();
+            self.transaction = Some(Record {
+                header: Header {
+                    format: 1,
+                    protocol: 1,
+                    nonce,
+                    root: fs::canonicalize(&self.root)?,
+                    config: fs::canonicalize(&self.config)?,
+                    source,
+                    target: id.to_owned(),
+                    digest: id[2..].to_owned(),
+                    embedded_sha256: format!("{:x}", Sha256::digest(embedded.as_bytes())),
+                    payload_format: 1,
+                },
+                cancelled: false,
+                payload: json!({"phase":"prepared","runtime":intent.runtime == "active" && !request.stopped && !maintenance,
+                    "timer":intent.timer == "active" && !request.stopped && !maintenance,
+                    "enablement":intent.enablement,"definitions":definitions,"boot":boot_identity()?,"original_pause":inspection.paused,
+                    "paused":inspection.paused,"generation":inspection.generation,"database_id":inspection.database_id,
+                    "dispatch_sequence":inspection.dispatch_sequence,"inputs":upgrade_inputs(&self.config)?,
+                    "conversion":self.maintenance(),"explicit_maintenance":maintenance,
+                    "authorization":if self.automatic || (inspection.kind == UpgradeKind::Pending && request.proposal.is_none()) { "preserving" } else { "explicit" },
+                    "token":inspection.pending.as_ref().and_then(|p| p["token"].as_str()),
+                    "decision":false,"pause_pending":false,"resume":null}),
+            });
+            update_state::save(&self.root, self.transaction.as_ref().unwrap())?;
+            self.restoration["status"] = json!("pending");
+            Ok(())
+        }
+        fn pause_transaction(&mut self) -> Result<()> {
+            let inspection = migration::inspect_upgrade(&self.config)?;
+            let record = self
+                .transaction
+                .as_ref()
+                .context("missing update transaction")?;
+            if record.payload["pause_pending"] == true {
+                let before = record.payload["generation"]
+                    .as_i64()
+                    .context("missing source generation")?;
+                if inspection.paused == Some(false) && inspection.generation == Some(before) {
+                    self.verify_transaction_inputs()?;
+                    self.transaction.as_mut().unwrap().payload["pause_pending"] = json!(false);
+                    self.persist_transaction()?;
+                    return self.pause_transaction();
+                }
+                ensure!(
+                    inspection.paused == Some(true)
+                        && inspection.generation == before.checked_add(1)
+                        && serde_json::to_value(&inspection.database_id)?
+                            == record.payload["database_id"],
+                    "interrupted source pause has no exact owned post-state"
+                );
+            } else {
+                self.verify_transaction_inputs()?;
+                if inspection.kind == UpgradeKind::Pending
+                    || inspection.journal_format.is_none_or(|v| v < 3)
+                    || inspection.paused != Some(false)
+                {
+                    return Ok(());
+                }
+                ensure!(
+                    inspection.generation.is_some() && inspection.database_id.is_some(),
+                    "source pause lacks continuity evidence"
+                );
+                self.transaction.as_mut().unwrap().payload["pause_pending"] = json!(true);
+                self.persist_transaction()?;
+                let record = self.transaction.as_ref().unwrap();
+                let release = self.root.join(&record.header.source);
+                validate_release_metadata(&release, &record.header.source, true)?;
+                let mut command = Command::new(release.join("agmi"));
+                command
+                    .arg("--config")
+                    .arg(&self.config)
+                    .args(["--json", "pause"]);
+                self.lock
+                    .as_ref()
+                    .context("missing update lease")?
+                    .inherit(&mut command, &record.header.nonce)?;
+                let output = capture(&mut command, true)?;
+                ensure!(
+                    output.status.success(),
+                    "retained runtime could not persist pause"
+                );
+                let after = migration::inspect_upgrade(&self.config)?;
+                ensure!(
+                    after.paused == Some(true)
+                        && after.generation
+                            == inspection
+                                .generation
+                                .and_then(|generation| generation.checked_add(1))
+                        && after.database_id == inspection.database_id,
+                    "source pause did not produce its exact expected transition"
+                );
+                return self.pause_transaction();
+            }
+            let record = self.transaction.as_mut().unwrap();
+            record.payload["pause_pending"] = json!(false);
+            record.payload["paused"] = json!(inspection.paused);
+            record.payload["generation"] = json!(inspection.generation);
+            self.persist_transaction()
+        }
+        fn config_only_complete(&self, inspection: &migration::UpgradeInspection) -> Result<bool> {
+            let record = self.transaction.as_ref().context("missing transaction")?;
+            Ok(inspection.kind == UpgradeKind::Compatible
+                && inspection.journal_format.is_none()
+                && record.payload["database_id"].is_null()
+                && record.payload["token"].is_string()
+                && inspection.source_sha256 == record.payload["candidate_sha256"]
+                && crate::config::Config::load(&self.config)?.revision()?
+                    == record.payload["candidate_revision"])
+        }
+        fn convert_transaction(&mut self, id: &str, request: &Request<'_>) -> Result<bool> {
+            self.phase = "migration";
+            self.failure = "migration_conflict";
+            let inspection = migration::inspect_upgrade(&self.config)?;
+            let record = self.transaction.as_ref().context("missing transaction")?;
+            let token = record.payload["token"].as_str().map(str::to_owned);
+            if record.payload["decision"] == true && request.proposal.is_none() {
+                self.migration = json!({"phase":"decision_required","release_id":id,"token":token,
+                    "approval_required":true,"participation_resumed":false,"decision_reason":record.payload["decision_reason"],"target_journal_format":CURRENT_JOURNAL_FORMAT});
+                self.failure = "decision_required";
+                return Ok(false);
+            }
+            let sealed = migration::status(&inspection.state_dir)?;
+            let completed = if inspection.kind == UpgradeKind::Pending {
+                let sealed_token = sealed["token"].as_str().context("missing sealed token")?;
+                ensure!(
+                    token.as_deref().is_none_or(|token| token == sealed_token),
+                    "canonical seal differs from update authorization"
+                );
+                migration::resume(&self.config, &inspection.state_dir, sealed_token)?
+            } else if inspection.kind == UpgradeKind::Compatible {
+                if let Some(token) = token {
+                    if inspection.journal_format.is_none() {
+                        ensure!(
+                            self.config_only_complete(&inspection)?,
+                            "config-only conversion completion cannot be proven"
+                        );
+                        json!({"phase":"complete","branch":"config_only","token":token})
+                    } else {
+                        ensure!(
+                            sealed["token"] == token && sealed["phase"] == "complete",
+                            "conversion completion cannot be proven"
+                        );
+                        if record.cancelled {
+                            sealed.clone()
+                        } else {
+                            migration::resume(&self.config, &inspection.state_dir, &token)?
+                        }
+                    }
+                } else {
+                    anyhow::bail!("conversion completion lacks exact recorded approval")
+                }
+            } else {
+                self.verify_transaction_inputs()?;
+                let preserving = record.payload["authorization"] == "preserving";
+                if preserving
+                    && let migration::AutomaticUpgrade::DecisionRequired(reason) =
+                        migration::automatic_upgrade(&self.config)?
+                {
+                    let record = self.transaction.as_mut().unwrap();
+                    record.payload["authorization"] = json!("explicit");
+                    record.payload["decision"] = json!(true);
+                    record.payload["decision_reason"] = json!(reason);
+                    self.persist_transaction()?;
+                    self.migration = json!({"phase":"decision_required","release_id":id,"approval_required":true,
+                        "participation_resumed":false,"decision_reason":reason,"target_journal_format":CURRENT_JOURNAL_FORMAT});
+                    self.failure = "decision_required";
+                    return Ok(false);
+                }
+                let preview = if preserving {
+                    migration::automatic_preview(&self.config)?
+                } else {
+                    migration::preview(&self.config, &self.proposal)?
+                };
+                let preview_token = preview["token"]
+                    .as_str()
+                    .context("missing canonical token")?;
+                if let Some(token) = token.as_deref() {
+                    ensure!(token == preview_token, "approved migration inputs changed");
+                }
+                if !preserving
+                    && (request.expected_token != Some(preview_token)
+                        || (preview["risk_change_required"] == true
+                            && request.accept_risk_change != Some(preview_token)))
+                {
+                    ensure!(
+                        request
+                            .expected_token
+                            .is_none_or(|token| token == preview_token),
+                        "approval token differs from exact preview"
+                    );
+                    let record = self.transaction.as_mut().unwrap();
+                    record.payload["token"] = json!(preview_token);
+                    record.payload["decision"] = json!(true);
+                    self.persist_transaction()?;
+                    self.migration = json!({"phase":"decision_required","release_id":id,"token":preview_token,
+                        "approval_required":true,"risk_change_required":preview["risk_change_required"],"participation_resumed":false,
+                        "target_journal_format":CURRENT_JOURNAL_FORMAT});
+                    self.preview = Some(preview);
+                    self.failure = "decision_required";
+                    return Ok(false);
+                }
+                self.transaction.as_mut().unwrap().payload["token"] = json!(preview_token);
+                self.transaction.as_mut().unwrap().payload["decision"] = json!(false);
+                self.transaction.as_mut().unwrap().payload["candidate_sha256"] =
+                    preview["seal"]["candidate_sha256"].clone();
+                self.transaction.as_mut().unwrap().payload["candidate_revision"] =
+                    preview["seal"]["effective_revision"].clone();
+                self.persist_transaction()?;
+                migration::apply(
+                    &self.config,
+                    &preview["request"],
+                    preview_token,
+                    request.accept_risk_change,
+                )?
+            };
+            ensure!(
+                completed["recovery_prerequisite"].is_null(),
+                "canonical authority prerequisite blocks activation"
+            );
+            let after = migration::inspect_upgrade(&self.config)?;
+            if after.kind != UpgradeKind::Compatible {
+                ensure!(
+                    !self.transaction.as_ref().unwrap().cancelled,
+                    "cancelled historical recovery requires a new conversion decision"
+                );
+                // Historical completed seals may require a distinct current conversion.
+                ensure!(
+                    completed["further_migration_required"] == true,
+                    "conversion remains incomplete"
+                );
+                self.transaction.as_mut().unwrap().payload["token"] = Value::Null;
+                self.transaction.as_mut().unwrap().payload["inputs"] =
+                    json!(upgrade_inputs(&self.config)?);
+                self.transaction.as_mut().unwrap().payload["paused"] = json!(after.paused);
+                self.transaction.as_mut().unwrap().payload["generation"] = json!(after.generation);
+                self.persist_transaction()?;
+                return self.convert_transaction(id, request);
+            }
+            let record = self.transaction.as_mut().unwrap();
+            record.payload["inputs"] = json!(upgrade_inputs(&self.config)?);
+            record.payload["paused"] = json!(after.paused);
+            record.payload["generation"] = json!(after.generation);
+            record.payload["database_id"] = json!(after.database_id);
+            record.payload["revision"] =
+                json!(crate::config::Config::load(&self.config)?.revision()?);
+            self.migration = json!({"phase":"complete","release_id":id,"token":completed["token"],
+                "target_journal_format":CURRENT_JOURNAL_FORMAT,"participation_resumed":false,
+                "paused":after.paused,"generation":after.generation,"pending":false});
+            self.transaction_phase("runtime_ready")?;
+            Ok(true)
+        }
+
+        fn verify_update_runtime(&self, id: &str, revision: &str) -> Result<()> {
+            for _ in 0..100 {
+                checkpoint()?;
+                ensure!(
+                    self.repair_runtime_state(true)? == "active",
+                    "requested runtime did not remain active"
+                );
+                if self.repair_runtime_identity(id, true).is_err() {
+                    // Type=simple may acknowledge the fork before its exec. Never
+                    // accept that process until both executable and policy agree.
+                    std::thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+                let pid = self
+                    .property("agmi.service", "MainPID", true)?
+                    .parse::<u32>()?;
+                let invocation = self.property("agmi.service", "InvocationID", true)?;
+                ensure!(
+                    hex(&invocation, 32),
+                    "runtime invocation identity unavailable"
+                );
+                let config = crate::config::Config::load(&self.config)?;
+                ensure!(
+                    config.revision()? == revision,
+                    "effective configuration changed"
+                );
+                let status = crate::runtime::status_evidence(&config)?;
+                let effective = &status["effective_runtime"];
+                if effective["policy"]["process"]["pid"].as_u64() == Some(u64::from(pid))
+                    && effective["policy"]["process"]["invocation_id"] == invocation
+                    && effective["revision"] == revision
+                    && effective["reload_blocked"] == false
+                {
+                    ensure!(
+                        self.property("agmi.service", "InvocationID", true)? == invocation
+                            && self.property("agmi.service", "MainPID", true)? == pid.to_string(),
+                        "runtime invocation changed"
+                    );
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            anyhow::bail!("current invocation has not published the approved effective policy")
+        }
+        fn restoration_enablement(payload: &Value, index: usize, same_boot: bool) -> Result<&str> {
+            let before = payload["enablement"][index]
+                .as_str()
+                .context("missing boot intent")?;
+            Ok(if before == "enabled-runtime" && !same_boot {
+                "disabled"
+            } else {
+                before
+            })
+        }
+        // Completed prior-boot work verifies durable state, not old transient activity.
+        fn verify_restored_transaction(&self, id: &str) -> Result<bool> {
+            let record = self
+                .transaction
+                .as_ref()
+                .context("missing update transaction")?;
+            let revision = record.payload["revision"]
+                .as_str()
+                .context("missing ready revision")?;
+            ensure!(
+                fs::read_link(self.root.join("current"))? == Path::new(id),
+                "selected target changed"
+            );
+            self.loaded(id)?;
+            self.repair_loaded(true)?;
+            ensure!(
+                crate::config::Config::load(&self.config)?.revision()? == revision,
+                "configuration changed during restoration"
+            );
+            let same_boot = record.payload["boot"] == boot_identity()?;
+            let runtime = record.payload["runtime"] == true;
+            let timer = record.payload["timer"] == true;
+            let completed_after_boot = record.payload["phase"] == "complete"
+                && !same_boot
+                && record.payload["explicit_maintenance"] != true;
+            let actual_runtime = self.repair_runtime_state(true)? == "active";
+            ensure!(
+                completed_after_boot || actual_runtime == runtime,
+                "runtime intent was not restored"
+            );
+            if actual_runtime {
+                self.verify_update_runtime(id, revision)?;
+            }
+            let actual_timer = self.active("agmi-health.timer")?;
+            ensure!(
+                completed_after_boot || actual_timer == timer,
+                "timer intent was not restored"
+            );
+            if record.payload["explicit_maintenance"] == true {
+                self.verify_autostart_disabled()?;
+            } else {
+                for (index, unit) in [(0, "agmi.service"), (2, "agmi-health.timer")] {
+                    let desired = Self::restoration_enablement(&record.payload, index, same_boot)?;
+                    let actual = self.property(unit, "UnitFileState", true)?;
+                    ensure!(
+                        actual == desired
+                            || (!matches!(desired, "enabled" | "enabled-runtime")
+                                && matches!(
+                                    actual.as_str(),
+                                    "disabled"
+                                        | "linked"
+                                        | "linked-runtime"
+                                        | "static"
+                                        | "indirect"
+                                )),
+                        "boot intent was not restored"
+                    );
+                }
+            }
+            let final_control = migration::inspect_upgrade(&self.config)?;
+            ensure!(
+                final_control.kind == UpgradeKind::Compatible,
+                "canonical data is not runtime-ready"
+            );
+            if !record.payload["database_id"].is_null() {
+                ensure!(
+                    serde_json::to_value(&final_control.database_id)?
+                        == record.payload["database_id"],
+                    "database changed during restoration"
+                );
+                let resume = &record.payload["resume"];
+                let (paused, generation) = if resume.is_null() {
+                    (
+                        record.payload["paused"].as_bool(),
+                        record.payload["generation"].as_i64(),
+                    )
+                } else {
+                    (
+                        resume["desired"].as_bool(),
+                        resume["generation"].as_i64().and_then(|g| {
+                            g.checked_add(i64::from(resume["desired"] != resume["paused"]))
+                        }),
+                    )
+                };
+                ensure!(
+                    final_control.paused == paused && final_control.generation == generation,
+                    "control changed during restoration"
+                );
+            }
+            Ok(!completed_after_boot)
+        }
+        fn finish_cancelled_transaction(&mut self, id: &str) -> Result<()> {
+            self.failure = "recovery_required";
+            ensure!(
+                fs::read_link(self.root.join("current"))? == Path::new(id),
+                "cancelled update has not selected its pinned target"
+            );
+            self.loaded(id)?;
+            self.repair_loaded(true)?;
+            let current = migration::inspect_upgrade(&self.config)?;
+            ensure!(
+                current.kind == UpgradeKind::Compatible,
+                "cancelled update still requires canonical conversion"
+            );
+            let record = self.transaction.as_ref().context("missing transaction")?;
+            ensure!(record.cancelled, "restoration was not cancelled");
+            ensure!(
+                serde_json::to_value(&current.database_id)? == record.payload["database_id"],
+                "cancelled update database identity changed"
+            );
+            let nonce = record.header.nonce.clone();
+            self.stop_on_failure = false;
+            self.observed_restoration("cancelled", false);
+            self.transaction_phase("complete")?;
+            update_state::remove(&self.root, &nonce)?;
+            self.activation = "loaded_verified";
+            self.phase = "complete";
+            self.output.push_str("Pinned conversion is complete. Later operator intent cancelled automatic restoration; no historical activity, boot or pause intent was replayed.\n");
+            Ok(())
+        }
+
+        fn restore_transaction(&mut self, id: &str) -> Result<()> {
+            self.phase = "restoring";
+            self.failure = "restoration_incomplete";
+            let record = self
+                .transaction
+                .as_ref()
+                .context("missing transaction")?
+                .clone();
+            if record.cancelled {
+                return self.finish_cancelled_transaction(id);
+            }
+            let same_boot = record.payload["boot"] == boot_identity()?;
+            let runtime = record.payload["runtime"] == true;
+            let timer = record.payload["timer"] == true;
+            let config = crate::config::Config::load(&self.config)?;
+            let revision = record.payload["revision"]
+                .as_str()
+                .context("missing ready configuration revision")?;
+            ensure!(
+                config.revision()? == revision,
+                "ready configuration changed"
+            );
+            self.loaded(id)?;
+            self.repair_loaded(true)?;
+            ensure!(
+                fs::read_link(self.root.join("current"))? == Path::new(id),
+                "selected target changed"
+            );
+            let inspection = migration::inspect_upgrade(&self.config)?;
+            ensure!(
+                inspection.kind == UpgradeKind::Compatible,
+                "canonical data is not runtime-ready"
+            );
+            // A recorded resume transition is reconciled by the canonical helper below,
+            // not by comparing its post-state to a stale pre-state.
+            if record.payload["resume"].is_null() {
+                self.verify_transaction_inputs()?;
+            }
+            self.transaction_phase("restoring")?;
+            if runtime {
+                if self.repair_runtime_state(true)? != "active" {
+                    self.control(&["start", "agmi.service"])?;
+                }
+                self.verify_update_runtime(id, revision)?;
+            } else {
+                ensure!(
+                    self.repair_runtime_state(true)? != "active",
+                    "runtime activity conflicts with recorded stopped intent"
+                );
+            }
+            if record.payload["conversion"] == true
+                && record.payload["explicit_maintenance"] != true
+                && let Some(desired) = record.payload["original_pause"].as_bool()
+            {
+                if record.payload["resume"].is_null() {
+                    self.transaction.as_mut().unwrap().payload["resume"] = json!({
+                            "generation":record.payload["generation"],"paused":record.payload["paused"],"desired":desired});
+                    self.persist_transaction()?;
+                }
+                let resume = &self.transaction.as_ref().unwrap().payload["resume"];
+                let evidence = crate::runtime::restore_update_pause(
+                    &config,
+                    record.payload["database_id"]
+                        .as_str()
+                        .context("missing database identity")?,
+                    resume["generation"]
+                        .as_i64()
+                        .context("missing expected generation")?,
+                    resume["paused"]
+                        .as_bool()
+                        .context("missing expected pause")?,
+                    desired,
+                )?;
+                if !desired {
+                    self.migration["participation_resumed"] = json!(true);
+                }
+                self.migration["paused"] = evidence["paused"].clone();
+                self.migration["generation"] = evidence["generation"].clone();
+            }
+            // Once participation is restored, diagnostics or a timer failure must
+            // not trigger the old blanket failure-stop cleanup.
+            self.stop_on_failure = false;
+            if record.payload["explicit_maintenance"] == true {
+                self.verify_autostart_disabled()?;
+            }
+            if record.payload["explicit_maintenance"] != true {
+                for (index, unit) in [(0, "agmi.service"), (2, "agmi-health.timer")] {
+                    let desired = Self::restoration_enablement(&record.payload, index, same_boot)?;
+                    let actual = self.property(unit, "UnitFileState", true)?;
+                    if actual != desired {
+                        ensure!(
+                            matches!(actual.as_str(), "disabled" | "linked" | "linked-runtime"),
+                            "boot enablement changed outside the update"
+                        );
+                        match desired {
+                            "enabled" => self.control(&["enable", unit])?,
+                            "enabled-runtime" => self.control(&["enable", "--runtime", unit])?,
+                            "disabled" | "linked" | "linked-runtime" | "static" | "indirect" => {
+                                ensure!(
+                                    !matches!(actual.as_str(), "enabled" | "enabled-runtime"),
+                                    "unexpected boot enablement conflicts with intent"
+                                );
+                            }
+                            _ => anyhow::bail!("unsupported boot intent"),
+                        }
+                    }
+                }
+            }
+            if timer {
+                if !self.active("agmi-health.timer")? {
+                    self.control(&["start", "agmi-health.timer"])?;
+                }
+                ensure!(
+                    self.active("agmi-health.timer")?,
+                    "health timer did not restore"
+                );
+            } else {
+                ensure!(
+                    !self.active("agmi-health.timer")?,
+                    "timer activity conflicts with recorded intent"
+                );
+            }
+            self.verify_restored_transaction(id)?;
+            let maintenance = record.payload["explicit_maintenance"] == true;
+            self.observed_restoration(
+                if maintenance {
+                    "not_needed"
+                } else {
+                    "restored"
+                },
+                !maintenance,
+            );
+            self.transaction_phase("complete")?;
+            self.service = if record.payload["explicit_maintenance"] == true {
+                "stopped"
+            } else {
+                "previous_intent_restored"
+            };
+            update_state::remove(&self.root, &record.header.nonce)?;
+            self.phase = "complete";
+            self.output.push_str(if record.payload["explicit_maintenance"] == true {
+                "Explicit migration maintenance completed with services stopped and boot activation disabled.\n"
+            } else {
+                "Activated the pinned target and restored the recorded independent runtime, timer, boot and pause intent.\n"
+            });
+            Ok(())
+        }
+
+        fn managed_update(&mut self, id: &str, request: &Request<'_>) -> Result<()> {
+            self.failure = "recovery_required";
+            if let Some(record) = update_state::read(&self.root)? {
+                ensure!(
+                    pending_update_target(&self.config)?.as_deref() == Some(id),
+                    "update must recover its exact pinned target"
+                );
+                ensure!(
+                    record.header.payload_format == 1,
+                    "unsupported update payload format"
+                );
+                validate_update_payload(&record.payload)?;
+                ensure!(
+                    !request.stopped
+                        || (record.payload["runtime"] != true && record.payload["timer"] != true),
+                    "pending update would restore activity; use a canonical service stop to cancel it"
+                );
+                ensure!(
+                    !request.migrate || record.payload["explicit_maintenance"] == true,
+                    "pending update cannot change to a different maintenance mode"
+                );
+                self.migrate = record.payload["conversion"] == true;
+                self.automatic = record.payload["authorization"] == "preserving";
+                self.state_dir = Some(migration::inspect_upgrade(&self.config)?.state_dir);
+                if record.payload["conversion"] == true {
+                    let resumed = if record.payload["resume"].is_null()
+                        || record.payload["resume"]["desired"] == true
+                    {
+                        Some(false)
+                    } else if record.payload["phase"] == "complete" {
+                        Some(true)
+                    } else {
+                        None
+                    };
+                    self.migration = json!({"phase":if matches!(record.payload["phase"].as_str(), Some("runtime_ready" | "restoring" | "complete")) { "complete" } else { "recovery_required" },
+                        "release_id":id,"token":record.payload["token"],"target_journal_format":CURRENT_JOURNAL_FORMAT,"participation_resumed":resumed});
+                } else {
+                    self.migration = json!({"phase":"not_required","participation_resumed":false});
+                }
+                self.transaction = Some(record);
+                self.restoration["status"] = json!("pending");
+            } else {
+                validate_release(&self.root.join(id), id)?;
+                self.space_checks(&self.root.join(id).join("agmi"), 0, true)?;
+                self.verify_units(&self.root.join(id))?;
+                if fs::read_link(self.root.join("current"))? == Path::new(id)
+                    && !self.maintenance()
+                    && !request.stopped
+                {
+                    self.phase = "complete";
+                    self.activation = "loaded_verified";
+                    self.loaded(id)?;
+                    self.already_current = true;
+                    return Ok(());
+                }
+                self.capture_transaction(id, request)?;
+                self.migrate = self.transaction.as_ref().unwrap().payload["conversion"] == true;
+            }
+            let record = self.transaction.as_ref().unwrap().clone();
+            let phase = record.payload["phase"]
+                .as_str()
+                .context("missing transaction phase")?;
+            ensure!(
+                matches!(
+                    phase,
+                    "prepared"
+                        | "quiescing"
+                        | "converting"
+                        | "runtime_ready"
+                        | "restoring"
+                        | "complete"
+                ),
+                "unknown update phase"
+            );
+            validate_release(&self.root.join(id), id)?;
+            ensure!(
+                digest(File::open(std::env::current_exe()?)?)? == id[2..],
+                "transaction must execute its pinned target"
+            );
+            if phase == "complete" {
+                if record.cancelled {
+                    return self.finish_cancelled_transaction(id);
+                }
+                self.failure = "restoration_incomplete";
+                let activity_verified = self.verify_restored_transaction(id)?;
+                let maintenance = record.payload["explicit_maintenance"] == true;
+                self.observed_restoration(
+                    if maintenance || !activity_verified {
+                        "not_needed"
+                    } else {
+                        "restored"
+                    },
+                    !maintenance && activity_verified,
+                );
+                if record.payload["conversion"] == true
+                    && record.payload["resume"]["desired"] == false
+                {
+                    self.migration["participation_resumed"] = json!(true);
+                }
+                update_state::remove(&self.root, &record.header.nonce)?;
+                self.service = if maintenance {
+                    "stopped"
+                } else if !activity_verified {
+                    "unchanged"
+                } else {
+                    "previous_intent_restored"
+                };
+                self.already_current = !activity_verified;
+                self.phase = "complete";
+                return Ok(());
+            }
+            if record.cancelled && matches!(phase, "runtime_ready" | "restoring") {
+                return self.finish_cancelled_transaction(id);
+            }
+            if record.cancelled && phase != "converting" {
+                self.observed_restoration("cancelled", false);
+                anyhow::bail!("newer operator intent requires an explicit restoration decision");
+            }
+            if record.cancelled {
+                let current = migration::inspect_upgrade(&self.config)?;
+                if !self.config_only_complete(&current)? {
+                    let seal = migration::status(&current.state_dir)?;
+                    ensure!(
+                        record.payload["token"].is_string()
+                            && seal["token"] == record.payload["token"]
+                            && (current.kind == UpgradeKind::Pending
+                                || (current.kind == UpgradeKind::Compatible
+                                    && seal["phase"] == "complete")),
+                        "cancelled pre-conversion intent requires an explicit recovery decision"
+                    );
+                }
+            }
+            if matches!(phase, "prepared" | "quiescing") {
+                self.phase = "stopping";
+                self.failure = "migration_conflict";
+                if record.payload["pause_pending"] != true {
+                    self.verify_transaction_inputs()?;
+                }
+                self.transaction_phase("quiescing")?;
+                self.stop_on_failure = true;
+                if self.migrate || record.payload["explicit_maintenance"] == true {
+                    self.disable_autostart()?;
+                }
+                self.stop_units(true)?;
+                self.verify_upgrade_stopped()?;
+                self.service = "stopped";
+                if self.migrate {
+                    self.pause_transaction()?;
+                }
+                self.transaction_phase("converting")?;
+            }
+            if self.transaction.as_ref().unwrap().payload["phase"] == "converting" {
+                self.verify_upgrade_stopped()?;
+                self.phase = "switching";
+                self.failure = "switch_failed";
+                for (name, destination) in std::iter::once(("agmi", self.bin.join("agmi"))).chain(
+                    UNITS
+                        .iter()
+                        .map(|(name, _, _)| (*name, self.units.join(name))),
+                ) {
+                    let target = self.root.join("current").join(name);
+                    if fs::read_link(&destination).ok().as_ref() != Some(&target) {
+                        replace_link(&target, &destination)?;
+                    }
+                }
+                sync_directory(&self.bin)?;
+                sync_directory(&self.units)?;
+                replace_link(Path::new(id), &self.root.join("current"))?;
+                sync_directory(&self.root)?;
+                self.activation = "selected";
+                self.phase = "reloading";
+                self.failure = "reload_failed";
+                self.control(&["daemon-reload"])?;
+                self.loaded(id)?;
+                self.activation = "loaded_verified";
+                if self.migrate {
+                    self.verify_autostart_disabled()?;
+                    if !self.convert_transaction(id, request)? {
+                        self.observed_restoration("pending", false);
+                        self.stop_on_failure = false;
+                        return Ok(());
+                    }
+                } else {
+                    self.verify_transaction_inputs()?;
+                    self.transaction.as_mut().unwrap().payload["revision"] =
+                        json!(crate::config::Config::load(&self.config)?.revision()?);
+                    self.transaction_phase("runtime_ready")?;
+                }
+            }
+            self.restore_transaction(id)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn with_advisory_owner<T>(work: impl FnOnce() -> Result<T>) -> Result<T> {
+        let home = crate::store::account_home()?;
+        let config = home.join(".config/agmi/config.toml");
+        let selected = super::observe_selected(&config);
+        if selected.ownership == "unmanaged" {
+            return work();
+        }
+        let _owner = (|| -> Result<InstallLock> {
+            ensure!(
+                selected.ownership == "managed",
+                "advisory_adoption_deferred"
+            );
+            ensure!(
+                std::env::var_os("AGMI_UPDATE_LEASE_FD").is_none(),
+                "advisory_adoption_deferred"
+            );
+            let root = selected
+                .root
+                .as_ref()
+                .context("missing installation root")?;
+            let lease = InstallLock::acquire(root)?;
+            ensure!(
+                !lease.inherited && update_state::read(root)?.is_none(),
+                "advisory_adoption_deferred"
+            );
+            let current = super::observe_selected(&config);
+            ensure!(
+                current.release == selected.release && current.image == selected.image,
+                "advisory_adoption_deferred"
+            );
+            let invoking = regular(&std::env::current_exe()?)?;
+            ensure!(
+                Some(image_metadata(&invoking.metadata()?)) == selected.image,
+                "advisory_adoption_deferred"
+            );
+            let deadline = std::time::Instant::now() + Duration::from_millis(500);
+            let mut remaining = 65_536;
+            let before = observation_properties(deadline, &mut remaining)?;
+            ensure!(
+                before["LoadState"] == "loaded" && before["DropInPaths"].is_empty(),
+                "advisory_adoption_deferred"
+            );
+            let release = selected
+                .release
+                .as_deref()
+                .context("missing selected release")?;
+            let (unit, link, selection) =
+                observed_unit(&home, root, release, Path::new(&before["FragmentPath"]))?;
+            let unit_image = image_metadata(&unit.metadata()?);
+            let pid: u32 = before["MainPID"].parse()?;
+            if pid == 0 {
+                ensure!(
+                    matches!(before["ActiveState"].as_str(), "inactive" | "failed"),
+                    "advisory_adoption_deferred"
+                );
+            } else {
+                ensure!(
+                    before["ActiveState"] == "active",
+                    "advisory_adoption_deferred"
+                );
+                let process = PathBuf::from(format!("/proc/{pid}"));
+                ensure!(
+                    fs::metadata(&process)?.uid() == unsafe { libc::geteuid() },
+                    "advisory_adoption_deferred"
+                );
+                ensure!(
+                    Some(image_metadata(
+                        &File::open(process.join("exe"))?.metadata()?
+                    )) == selected.image,
+                    "advisory_adoption_deferred"
+                );
+                ensure!(
+                    managed_argv(
+                        &fs::read(process.join("cmdline"))?,
+                        &root.join(release).join("agmi"),
+                        &config
+                    ),
+                    "advisory_adoption_deferred"
+                );
+            }
+            let after = observation_properties(deadline, &mut remaining)?;
+            let (final_unit, final_link, final_selection) =
+                observed_unit(&home, root, release, Path::new(&after["FragmentPath"]))?;
+            let final_selected = super::observe_selected(&config);
+            ensure!(
+                before == after
+                    && link == final_link
+                    && selection == final_selection
+                    && unit_image == image_metadata(&final_unit.metadata()?)
+                    && selected.image == final_selected.image
+                    && selected.release == final_selected.release
+                    && std::time::Instant::now() < deadline,
+                "advisory_adoption_deferred"
+            );
+            Ok(lease)
+        })()
+        .map_err(|_| anyhow::anyhow!("advisory_adoption_deferred"))?;
+        work()
+    }
+
+    pub(super) fn managed_root(config_path: &Path) -> Result<Option<PathBuf>> {
+        let home = crate::store::account_home()?;
+        let selected = if config_path.is_absolute() {
+            config_path.to_path_buf()
+        } else {
+            std::env::current_dir()?.join(config_path)
+        };
+        if resolve_missing(&selected)? != resolve_missing(&home.join(".config/agmi/config.toml"))? {
+            return Ok(None);
+        }
+        let root = home.join(".local/share/agmi/releases");
+        if !exists(&root)? {
+            return Ok(None);
+        }
+        ensure!(
+            fs::symlink_metadata(&root)?.is_dir(),
+            "invalid release root"
+        );
+        account_owned_ancestors(&root, &home)?;
+        if !exists(&root.join("current"))? && update_state::read(&root)?.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(root))
+    }
+
+    pub(super) fn pending_update_target(config_path: &Path) -> Result<Option<String>> {
+        let Some(root) = managed_root(config_path)? else {
+            return Ok(None);
+        };
+        let Some(record) = update_state::read(&root)? else {
+            return Ok(None);
+        };
+        let h = &record.header;
+        ensure!(
+            h.config == fs::canonicalize(config_path)?,
+            "update configuration identity changed"
+        );
+        let selected = fs::read_link(root.join("current"))?;
+        ensure!(
+            selected == Path::new(&h.source) || selected == Path::new(&h.target),
+            "selected release conflicts with pending update"
+        );
+        let release = root.join(&h.target);
+        ensure!(
+            fs::symlink_metadata(&release)?.is_dir(),
+            "pinned release is missing"
+        );
+        account_owned_ancestors(&release, &crate::store::account_home()?)?;
+        let binary = release.join("agmi");
+        account_owned(&binary)?;
+        ensure!(
+            digest_cancellable(regular(&binary)?, false)? == h.digest,
+            "pinned executable changed"
+        );
+        let mut manifest = String::new();
+        regular(&release.join("MANIFEST"))?
+            .take(16385)
+            .read_to_string(&mut manifest)?;
+        ensure!(
+            manifest.len() <= 16384,
+            "pinned manifest exceeds protocol bound"
+        );
+        ensure!(
+            metadata(&manifest, "update_protocol")? == "1"
+                && metadata(&manifest, "release_id")? == h.target
+                && metadata(&manifest, "binary_sha256")? == h.digest,
+            "pinned release identity changed"
+        );
+        let suffix = format!("\nrelease_id={}\nbinary_sha256={}", h.target, h.digest);
+        let embedded = manifest
+            .trim_end_matches('\n')
+            .strip_suffix(&suffix)
+            .context("invalid pinned identity envelope")?;
+        ensure!(
+            format!("{:x}", Sha256::digest(embedded.as_bytes())) == h.embedded_sha256,
+            "pinned embedded identity changed"
+        );
+        Ok(Some(h.target.clone()))
+    }
+
+    pub(super) fn guard_managed_run(config_path: &Path) -> Result<()> {
+        let Some(root) = managed_root(config_path)? else {
+            return Ok(());
+        };
+        let Some(record) = update_state::read(&root)? else {
+            return Ok(());
+        };
+        pending_update_target(config_path)?;
+        ensure!(
+            record.header.payload_format == 1,
+            "unsupported target update payload"
+        );
+        validate_update_payload(&record.payload)?;
+        ensure!(
+            matches!(
+                record.payload["phase"].as_str(),
+                Some("runtime_ready" | "restoring" | "complete")
+            ),
+            "pending update fences runtime startup"
+        );
+        ensure!(
+            fs::read_link(root.join("current"))? == Path::new(&record.header.target)
+                && digest_cancellable(File::open(std::env::current_exe()?)?, false)?
+                    == record.header.digest,
+            "only the pinned update target may start"
+        );
+        Ok(())
     }
 
     pub(super) fn installed_identity() -> Result<InstalledIdentity> {
@@ -2335,6 +4099,10 @@ mod native {
             );
             account_owned_ancestors(&installation.root, &installation.home)?;
             installation.lock = Some(InstallLock::acquire(&installation.root)?);
+            if let Some(mut record) = update_state::read(&installation.root)? {
+                record.cancelled = true;
+                update_state::save(&installation.root, &record)?;
+            }
             Ok::<_, anyhow::Error>(())
         })()
         .map_err(repair_unavailable)?;
@@ -2455,6 +4223,30 @@ mod native {
         // Keep all owned input and lock paths alive until post-switch cleanup is done.
         let mut private = None;
         let result = (|| -> Result<Option<Value>> {
+            if request.action != "service"
+                && let Some(pending) = pending_update_target(&installation.config)?
+            {
+                let requested = request
+                    .digest
+                    .map(|hash| format!("r-{hash}"))
+                    .unwrap_or_else(|| request.target.to_owned());
+                ensure!(
+                    requested == pending && !request.migration_only,
+                    "pending update cannot be retargeted or changed to bootstrap mode"
+                );
+            }
+            if request.action == "activate" {
+                let target = installation.root.join(request.target).join("agmi");
+                ensure!(
+                    digest_cancellable(regular(&target)?, false)? == request.target[2..],
+                    "retained target executable changed"
+                );
+                if digest_cancellable(File::open(std::env::current_exe()?)?, false)?
+                    != request.target[2..]
+                {
+                    return incoming(&target, &request).map(Some);
+                }
+            }
             let candidate = if let Some(expected) = request.digest {
                 let directory = OwnedPath::directory(&std::env::temp_dir(), "agmi-installer")?;
                 let candidate = directory.path.join("incoming-agmi");
@@ -2502,9 +4294,34 @@ mod native {
             }
             if request.action != "stage" {
                 installation.failure = "manager_context_mismatch";
-                installation.manager_context()?;
+                installation.manager_search_context()?;
             }
             installation.lock = Some(installation.prepare(request.action != "stage")?);
+            if request.action == "service"
+                && !installation
+                    .lock
+                    .as_ref()
+                    .is_some_and(|lock| lock.inherited)
+                && let Some(mut record) = update_state::read(&installation.root)?
+            {
+                record.cancelled = true;
+                update_state::save(&installation.root, &record)?;
+            }
+            if let Some(pending) = pending_update_target(&installation.config)? {
+                let requested = request
+                    .digest
+                    .map(|hash| format!("r-{hash}"))
+                    .unwrap_or_else(|| request.target.to_owned());
+                ensure!(
+                    request.action == "service" || requested == pending,
+                    "pending update cannot be retargeted"
+                );
+            }
+            if request.action != "stage" {
+                installation.failure = "manager_context_mismatch";
+                installation.recover_update_definitions()?;
+                installation.manager_loaded_context()?;
+            }
             if let Some(expected) = request.expected_release {
                 installation.failure = "release_invalid";
                 ensure!(
@@ -2526,18 +4343,19 @@ mod native {
                 installation.service(request.target)?;
                 return Ok(None);
             }
-            let id = if let Some(candidate) = candidate {
+            let id = if let Some(record) = update_state::read(&installation.root)? {
+                record.header.target
+            } else if let Some(candidate) = candidate {
                 installation.stage(&candidate, request.digest.context("missing digest")?)?
             } else {
                 request.target.to_owned()
             };
             if request.action != "stage" {
-                if request.expected_token.is_some() {
-                    installation.continue_upgrade(&id)?;
+                if matches!(request.action, "update" | "activate") && !request.migration_only {
+                    installation.managed_update(&id, &request)?;
                 } else {
                     installation.activate(&id, &request)?;
                 }
-                installation.finish_upgrade(&id, &request)?;
             }
             checkpoint()?;
             installation.stop_on_failure = false;
@@ -2556,10 +4374,17 @@ mod native {
                 }
             }
             Ok(None) => {
-                let evidence = installation.evidence(true);
+                let decision = installation.migration["phase"] == "decision_required";
+                let evidence = installation.evidence(!decision);
                 let mut result =
                     json!({"plan":plan,"installation":evidence,"output":installation.output});
-                for key in ["compatibility", "migration"] {
+                if decision {
+                    result["status"] = json!("decision_required");
+                }
+                if installation.already_current {
+                    result["status"] = json!("current");
+                }
+                for key in ["compatibility", "migration", "restoration"] {
                     if !result["installation"][key].is_null() {
                         result[key] = result["installation"][key].clone();
                     }
@@ -2588,6 +4413,16 @@ mod native {
                         .as_ref()
                         .and_then(|state| migration::status(state).ok());
                     installation.record_migration_failure(status, request.expected_token);
+                }
+                if installation.transaction.is_some() {
+                    let cancelled = installation
+                        .transaction
+                        .as_ref()
+                        .is_some_and(|r| r.cancelled);
+                    installation.observed_restoration(
+                        if cancelled { "cancelled" } else { "failed" },
+                        false,
+                    );
                 }
                 // Private-copy errors precede staging, but failures at a later
                 // boundary must retain that boundary's actual machine evidence.
@@ -2621,6 +4456,308 @@ mod native {
         use super::*;
 
         static TEST_SERIAL: Mutex<()> = Mutex::new(());
+
+        fn observed_unit_fixture() -> Result<(tempfile::TempDir, PathBuf, String, PathBuf)> {
+            let home = tempfile::tempdir()?;
+            fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700))?;
+            let root = home.path().join(".local/share/agmi/releases");
+            let id = format!("r-{}", "a".repeat(64));
+            fs::create_dir_all(root.join(&id))?;
+            let unit = home.path().join(".config/systemd/user/agmi.service");
+            fs::create_dir_all(unit.parent().unwrap())?;
+            for parent in [root.join(&id), unit.parent().unwrap().to_path_buf()] {
+                for ancestor in parent.ancestors() {
+                    fs::set_permissions(ancestor, fs::Permissions::from_mode(0o700))?;
+                    if ancestor == home.path() {
+                        break;
+                    }
+                }
+            }
+            let target = root.join(&id).join("agmi.service");
+            fs::write(&target, b"owned unit")?;
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o600))?;
+            symlink(&id, root.join("current"))?;
+            symlink(root.join("current/agmi.service"), &unit)?;
+            Ok((home, root, id, unit))
+        }
+
+        #[test]
+        fn observed_unit_accepts_only_the_installer_chain_without_writing() -> Result<()> {
+            let (home, root, id, unit) = observed_unit_fixture()?;
+            let target = root.join(&id).join("agmi.service");
+            let before = fs::read(&target)?;
+            // The generic helper must still refuse even this authorized symlink.
+            assert!(regular(&unit).is_err());
+            let (mut file, link, current) = observed_unit(home.path(), &root, &id, &unit)?;
+            let image = image_metadata(&file.metadata()?);
+            let mut contents = Vec::new();
+            file.read_to_end(&mut contents)?;
+            assert_eq!(contents, before);
+            let (again, next_link, next_current) = observed_unit(home.path(), &root, &id, &target)?;
+            assert_eq!(image, image_metadata(&again.metadata()?));
+            assert_eq!(link, next_link);
+            assert_eq!(current, next_current);
+            observed_unit(home.path(), &root, &id, &root.join("current/agmi.service"))?;
+            assert_eq!(fs::read(&target)?, before);
+            assert_eq!(fs::read_link(&unit)?, root.join("current/agmi.service"));
+            assert_eq!(fs::read_link(root.join("current"))?, Path::new(&id));
+            Ok(())
+        }
+
+        #[test]
+        fn observed_unit_rejects_foreign_dangling_and_escaped_chains() -> Result<()> {
+            let (home, root, id, unit) = observed_unit_fixture()?;
+            let target = root.join(&id).join("agmi.service");
+            let foreign = home.path().join("foreign.service");
+            symlink(&target, &foreign)?;
+            assert!(observed_unit(home.path(), &root, &id, &foreign).is_err());
+            for link in [
+                target.clone(),
+                foreign.clone(),
+                PathBuf::from("../../../../.local/share/agmi/releases/current/agmi.service"),
+                home.path().join("missing.service"),
+            ] {
+                fs::remove_file(&unit)?;
+                symlink(link, &unit)?;
+                assert!(observed_unit(home.path(), &root, &id, &unit).is_err());
+            }
+            fs::remove_file(&unit)?;
+            symlink(root.join("current/agmi.service"), &unit)?;
+            for selection in [
+                PathBuf::from("../outside"),
+                root.join(&id),
+                PathBuf::from(format!("r-{}", "b".repeat(64))),
+            ] {
+                fs::remove_file(root.join("current"))?;
+                symlink(selection, root.join("current"))?;
+                assert!(observed_unit(home.path(), &root, &id, &unit).is_err());
+            }
+            fs::remove_file(root.join("current"))?;
+            symlink(&id, root.join("current"))?;
+            fs::rename(&target, root.join(&id).join("saved.service"))?;
+            assert!(observed_unit(home.path(), &root, &id, &unit).is_err());
+            symlink("saved.service", &target)?;
+            assert!(observed_unit(home.path(), &root, &id, &unit).is_err());
+            fs::remove_file(&target)?;
+            fs::rename(root.join(&id).join("saved.service"), &target)?;
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o622))?;
+            assert!(observed_unit(home.path(), &root, &id, &unit).is_err());
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o600))?;
+            let parent = unit.parent().unwrap();
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o722))?;
+            assert!(observed_unit(home.path(), &root, &id, &unit).is_err());
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+            // An exclusively owned directory alias still is not the owned chain.
+            let moved = home.path().join("outside-units");
+            fs::rename(parent, &moved)?;
+            symlink(&moved, parent)?;
+            assert!(observed_unit(home.path(), &root, &id, &unit).is_err());
+            fs::remove_file(parent)?;
+            fs::rename(moved, parent)?;
+            let directory = root.join(&id);
+            let moved = home.path().join("outside-release");
+            fs::rename(&directory, &moved)?;
+            symlink(&moved, &directory)?;
+            assert!(observed_unit(home.path(), &root, &id, &unit).is_err());
+            Ok(())
+        }
+
+        #[test]
+        fn observed_unit_pins_artifact_and_detects_link_replacement() -> Result<()> {
+            let (home, root, id, unit) = observed_unit_fixture()?;
+            let target = root.join(&id).join("agmi.service");
+            let (file, link, current) = observed_unit(home.path(), &root, &id, &unit)?;
+            let image = image_metadata(&file.metadata()?);
+            // Preserve the old objects so inode reuse cannot make the test flaky.
+            fs::rename(&target, root.join(&id).join("old.service"))?;
+            fs::write(&target, b"owned unit")?;
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o600))?;
+            let (replacement, _, _) = observed_unit(home.path(), &root, &id, &unit)?;
+            assert_ne!(image, image_metadata(&replacement.metadata()?));
+            assert_eq!(image.inode, file.metadata()?.ino());
+            fs::rename(&unit, unit.with_extension("old"))?;
+            symlink(root.join("current/agmi.service"), &unit)?;
+            let (_, replacement_link, _) = observed_unit(home.path(), &root, &id, &unit)?;
+            assert_ne!(link, replacement_link);
+            fs::rename(root.join("current"), root.join("old-current"))?;
+            symlink(&id, root.join("current"))?;
+            let (_, _, replacement_current) = observed_unit(home.path(), &root, &id, &unit)?;
+            assert_ne!(current, replacement_current);
+            let next_id = format!("r-{}", "b".repeat(64));
+            fs::create_dir(root.join(&next_id))?;
+            fs::write(root.join(&next_id).join("agmi.service"), b"next unit")?;
+            fs::remove_file(root.join("current"))?;
+            symlink(next_id, root.join("current"))?;
+            assert!(observed_unit(home.path(), &root, &id, &unit).is_err());
+            Ok(())
+        }
+
+        #[test]
+        fn observed_selection_is_metadata_not_checksum_attestation() -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700))?;
+            let root = temp.path().join("releases");
+            fs::create_dir(&root)?;
+            let id = format!("r-{}", "a".repeat(64));
+            let release = root.join(&id);
+            fs::create_dir(&release)?;
+            let binary = release.join("agmi");
+            fs::write(&binary, b"not the claimed checksum")?;
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o700))?;
+            let manifest = format!(
+                "build_format=1\npackage_version=0.2.0\ncommit={}\nsource_dirty=clean\ntarget=test\njournal_schema=4\nupdate_protocol=1\nrelease_id={id}\nbinary_sha256={}\n",
+                "b".repeat(40),
+                "a".repeat(64)
+            );
+            fs::write(release.join("MANIFEST"), &manifest)?;
+            symlink(&id, root.join("current"))?;
+            let launcher = temp.path().join("agmi");
+            symlink(root.join("current/agmi"), &launcher)?;
+            let (_, label, first) = selected_metadata(temp.path(), &root, &launcher)?;
+            assert_eq!(label, manifest);
+            // Same pathname and bytes on another inode are a different object.
+            fs::rename(&binary, release.join("old"))?;
+            fs::copy(release.join("old"), &binary)?;
+            let (_, _, replacement) = selected_metadata(temp.path(), &root, &launcher)?;
+            assert_ne!(first, replacement);
+            // A path escape or contradictory identity never becomes standalone/match.
+            fs::remove_file(root.join("current"))?;
+            symlink("../outside", root.join("current"))?;
+            assert!(selected_metadata(temp.path(), &root, &launcher).is_err());
+            fs::remove_file(root.join("current"))?;
+            symlink(&id, root.join("current"))?;
+            fs::write(release.join("MANIFEST"), manifest.replace(&id, "r-invalid"))?;
+            assert!(selected_metadata(temp.path(), &root, &launcher).is_err());
+            Ok(())
+        }
+
+        #[test]
+        fn observed_arguments_are_exact_and_proc_inputs_are_bounded() -> Result<()> {
+            let binary = Path::new("/release/agmi");
+            let config = Path::new("/account/config.toml");
+            assert!(managed_argv(
+                b"/release/agmi\0--config\0/account/config.toml\0run\0",
+                binary,
+                config
+            ));
+            for argv in [
+                b"/release/agmi\0--config\0/other/config.toml\0run\0".as_slice(),
+                b"/release/agmi\0--config\0/account/config.toml\0run\0--once\0",
+                b"/release/agmi\0--config\0/account/config.toml\0run",
+            ] {
+                assert!(!managed_argv(argv, binary, config));
+            }
+            let file = tempfile::NamedTempFile::new()?;
+            fs::write(file.path(), vec![0; 16_385])?;
+            assert!(bounded_bytes(file.path()).is_err());
+            Ok(())
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn observed_start_ticks_handle_parentheses_and_pid_reuse() -> Result<()> {
+            let stat = |start| {
+                format!(
+                    "42 (name ) with spaces) S {} {start} 0",
+                    vec!["0"; 18].join(" ")
+                )
+            };
+            assert_eq!(process_start(stat(123).as_bytes())?, 123);
+            assert_ne!(
+                process_start(stat(123).as_bytes())?,
+                process_start(stat(124).as_bytes())?
+            );
+            assert!(process_start(b"42 (truncated) S").is_err());
+            assert!(super::super::current_start_ticks().is_some());
+            Ok(())
+        }
+
+        #[test]
+        fn process_snapshot_rollover_and_legacy_absence_are_not_matches() {
+            let tuple = json!({"runtime_instance":"instance-a","authority_epoch":3,
+                "generation":4,"revision":"revision",
+                "process":{"runtime_instance":"instance-a","authority_epoch":3,
+                    "account_generation":4,"pid":42}});
+            let status = json!({"generation":4,"effective_runtime":{
+                "revision":"revision","runtime_instance":"instance-a","authority_epoch":3,
+                "policy":{"process":tuple["process"]}}});
+            assert!(related_runtime_snapshot(&tuple, &status));
+            for (field, changed) in [
+                ("runtime_instance", json!("instance-b")),
+                ("authority_epoch", json!(4)),
+                ("generation", json!(5)),
+                ("revision", json!("revision-b")),
+            ] {
+                let mut rollover = tuple.clone();
+                rollover[field] = changed;
+                assert!(!related_runtime_snapshot(&rollover, &status), "{field}");
+            }
+            let mut legacy = status.clone();
+            legacy["effective_runtime"]["policy"]["process"] = json!({"pid":42});
+            assert!(!related_runtime_snapshot(&tuple, &legacy));
+            assert!(!related_runtime_snapshot(&json!({}), &json!({})));
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        #[test]
+        fn unsupported_process_observation_never_claims_a_match() {
+            let observed = super::super::observe_process(Path::new("/unread"), &json!({}));
+            assert_eq!(observed.state, "not_assessed");
+            assert_eq!(observed.reason, "unsupported_platform");
+            assert_eq!(super::super::current_start_ticks(), None);
+        }
+
+        // Fixture writers belong to a dedicated process: unrelated libtest spawns
+        // must not inherit writable descriptors for executables being staged.
+        fn run_fixture_in_subprocess(name: &str) -> Result<bool> {
+            const SELECTED: &str = "AGMI_INSTALLER_FIXTURE_TEST";
+            const RECEIPT: &str = "AGMI_INSTALLER_FIXTURE_RECEIPT";
+            if std::env::var(SELECTED).ok().as_deref() == Some(name) {
+                let receipt = std::env::var_os(RECEIPT).context("missing fixture entry receipt")?;
+                fs::write(receipt, b"x")?;
+                return Ok(false);
+            }
+            // Preserve the fixture group's existing serialization of syncfs-heavy work.
+            let _serial = TEST_SERIAL.lock().unwrap();
+            let mut receipt = tempfile::NamedTempFile::new()?;
+            let output = Command::new(std::env::current_exe()?)
+                .args(["--exact", name, "--nocapture"])
+                .env(SELECTED, name)
+                .env(RECEIPT, receipt.path())
+                .output()
+                .context("run isolated installer fixture")?;
+            ensure!(
+                output.status.success(),
+                "isolated installer fixture failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            // libtest succeeds when an exact filter matches zero cases.
+            let mut entered = [0];
+            receipt
+                .as_file_mut()
+                .read_exact(&mut entered)
+                .context("isolated installer case did not enter its original body")?;
+            ensure!(entered == *b"x", "invalid fixture entry receipt");
+            Ok(true)
+        }
+
+        #[test]
+        fn target_evidence_preserves_future_schema_and_real_restoration() {
+            let raw = json!({"stage":"complete","failure_code":"none",
+                "compatibility":{"classification":"conversion","migration_required":true,"target_journal_format":5},
+                "migration":{"phase":"complete","target_journal_format":5,"participation_resumed":true},
+                "restoration":{"status":"restored","runtime":"running","timer":"stopped","pause_state":"unpaused","verified":true,"private":"never-export"}});
+            let bounded = installer_evidence(Some(&raw));
+            assert_eq!(bounded["compatibility"]["target_journal_format"], 5);
+            assert_eq!(bounded["migration"]["target_journal_format"], 5);
+            assert_eq!(bounded["migration"]["participation_resumed"], true);
+            assert_eq!(bounded["restoration"]["verified"], true);
+            assert!(bounded["restoration"].get("private").is_none());
+            let invalid = installer_evidence(Some(&json!({"compatibility":{
+                "classification":"conversion","target_journal_format":u64::from(u32::MAX) + 1}})));
+            assert!(invalid["compatibility"]["target_journal_format"].is_null());
+        }
 
         #[test]
         fn schema_crossing_requires_exact_explicit_stopped_forward_pair() {
@@ -2708,7 +4845,7 @@ mod native {
                 installation.service = "unknown";
                 installation.failure = "stop_failed";
                 installation.migration = json!({"phase":"required","token":token,
-                    "release_id":format!("r-{}", "c".repeat(64))});
+                    "release_id":format!("r-{}", "c".repeat(64)),"participation_resumed":false});
                 installation.record_migration_failure(Some(observed), None);
                 let evidence = installation.evidence(false);
                 assert_eq!(evidence["migration"]["phase"], phase);
@@ -2718,9 +4855,18 @@ mod native {
                 assert_eq!(evidence["migration"]["participation_resumed"], false);
             }
             let mut completed = Installation::new(temp.path().to_owned())?;
-            completed.migration = json!({"phase":"complete","token":token});
+            completed.migration =
+                json!({"phase":"complete","token":token,"participation_resumed":true});
             completed.record_migration_failure(None, None);
             assert_eq!(completed.evidence(false)["migration"]["phase"], "complete");
+            completed.record_migration_failure(
+                Some(json!({"phase":"complete","token":token,"target_journal_format":4})),
+                None,
+            );
+            assert_eq!(
+                completed.evidence(false)["migration"]["participation_resumed"],
+                true
+            );
             Ok(())
         }
 
@@ -2865,7 +5011,11 @@ mod native {
         }
         #[test]
         fn migration_bootstrap_requires_durable_disabled_boot_intent() -> Result<()> {
-            let _serial = TEST_SERIAL.lock().unwrap();
+            if run_fixture_in_subprocess(
+                "installer::native::tests::migration_bootstrap_requires_durable_disabled_boot_intent",
+            )? {
+                return Ok(());
+            }
             let _cancellation = InstallerCancellation::acquire()?;
             let temporary = OwnedPath::directory(&std::env::temp_dir(), "agmi-bootstrap-test")?;
             let home = temporary.path.join("home");
@@ -3216,7 +5366,11 @@ esac
         /// manifest validation, publication, fsync and RAII run unchanged.
         #[test]
         fn filesystem_publication_and_failure_boundaries() -> Result<()> {
-            let _serial = TEST_SERIAL.lock().unwrap();
+            if run_fixture_in_subprocess(
+                "installer::native::tests::filesystem_publication_and_failure_boundaries",
+            )? {
+                return Ok(());
+            }
             let _cancellation = InstallerCancellation::acquire()?;
             let temporary =
                 OwnedPath::directory(&std::env::temp_dir(), "agmi-native-installer-test")?;
@@ -3236,14 +5390,13 @@ esac
             installation.analyze = verifier.clone();
             installation.systemctl = temporary.path.join("must-not-contact-a-manager");
             installation.lock = Some(installation.prepare(false)?);
-            let owner = fs::read_to_string(installation.root.join(".install-lock/owner"))?;
-            assert_eq!(owner.trim(), std::process::id().to_string());
+            assert!(installation.root.join(".install-lock").is_file());
             let busy = InstallLock::acquire(&installation.root)
                 .err()
                 .context("lock unexpectedly shared")?;
             assert_eq!(
                 busy.downcast_ref::<InstallerError>().unwrap().evidence["failure_code"],
-                "installer_busy"
+                "update_in_progress"
             );
             let id = installation.stage(&binary, &expected)?;
             let release = installation.root.join(&id);
@@ -3353,7 +5506,7 @@ esac
             installation.lock = Some(installation.prepare(true)?);
             let events = temporary.path.join("systemd-events");
             let control = temporary.path.join("systemctl-fixture");
-            let lock_path = installation.root.join(".install-lock/owner");
+            let lock_path = installation.root.join(".install-lock");
             let active_state = temporary.path.join("active-state");
             let unit_paths = temporary.path.join("unit-paths");
             let fragment_root = temporary.path.join("fragment-root");
@@ -3452,7 +5605,7 @@ esac
             assert!(events.exists());
             let events = fs::read_to_string(events)?;
             assert_eq!(events.matches("--user stop ").count(), 6, "{events}");
-            assert!(!root.join(".install-lock").exists());
+            assert!(root.join(".install-lock").is_file());
             assert!(release.is_dir() && second_release.is_dir());
             assert!(!state.exists());
             assert_eq!(
@@ -3463,7 +5616,8 @@ esac
             no_temporary_paths(&bin)?;
             no_temporary_paths(&units)?;
 
-            // A stale, ownerless lock is not automatically reclaimed.
+            // Pre-feature directory leases are a separate explicit recovery boundary.
+            fs::remove_file(root.join(".install-lock"))?;
             fs::create_dir(root.join(".install-lock"))?;
             assert!(InstallLock::acquire(&root).is_err());
             assert!(root.join(".install-lock").is_dir());
@@ -3578,7 +5732,7 @@ esac
                     quoted(directory),
                     quoted(&installation.units),
                     quoted(Path::new(&id)),
-                    quoted(&installation.root.join(".install-lock/owner")),
+                    quoted(&installation.root.join(".install-lock")),
                 )
                 .as_bytes(),
                 0o700,
@@ -3600,7 +5754,11 @@ esac
 
         #[test]
         fn repair_restores_active_intent_after_actions_errors_and_cancellation() -> Result<()> {
-            let _serial = TEST_SERIAL.lock().unwrap();
+            if run_fixture_in_subprocess(
+                "installer::native::tests::repair_restores_active_intent_after_actions_errors_and_cancellation",
+            )? {
+                return Ok(());
+            }
             let _cancellation = InstallerCancellation::acquire()?;
             let temporary = OwnedPath::directory(&std::env::temp_dir(), "agmi-repair-test")?;
             let directory = &temporary.path;
@@ -3691,7 +5849,11 @@ esac
 
         #[test]
         fn repair_stop_and_restore_failures_never_hide_completed_actions() -> Result<()> {
-            let _serial = TEST_SERIAL.lock().unwrap();
+            if run_fixture_in_subprocess(
+                "installer::native::tests::repair_stop_and_restore_failures_never_hide_completed_actions",
+            )? {
+                return Ok(());
+            }
             let _cancellation = InstallerCancellation::acquire()?;
             let temporary =
                 OwnedPath::directory(&std::env::temp_dir(), "agmi-repair-failure-test")?;
@@ -3775,12 +5937,17 @@ esac
 
         #[test]
         fn repair_refuses_unvalidated_installations_before_manager_actions() -> Result<()> {
-            let _serial = TEST_SERIAL.lock().unwrap();
+            if run_fixture_in_subprocess(
+                "installer::native::tests::repair_refuses_unvalidated_installations_before_manager_actions",
+            )? {
+                return Ok(());
+            }
             let _cancellation = InstallerCancellation::acquire()?;
             let temporary =
                 OwnedPath::directory(&std::env::temp_dir(), "agmi-repair-preflight-test")?;
             let directory = &temporary.path;
-            let installation = repair_fixture(directory)?;
+            let installation =
+                repair_fixture(directory).context("prepare repair preflight fixture")?;
             let refused = || -> Result<()> {
                 fs::write(directory.join("events"), "")?;
                 let error = installation
@@ -3846,7 +6013,10 @@ esac
             refused()?;
             replace_link(&id, &installation.root.join("current"))?;
             assert_eq!(
-                installation.repair_runtime(|| Ok(repair_report()))?["repairs"]["restoration"]["verified"],
+                installation
+                    .repair_runtime(|| Ok(repair_report()))
+                    .context("repair validated installation after refusal cases")?["repairs"]["restoration"]
+                    ["verified"],
                 true
             );
             Ok(())

@@ -101,7 +101,7 @@ impl Recovery {
         } else {
             runtime
                 .store
-                .reconciliation_plan(kind)?
+                .reconciliation_plan(&runtime.config, kind, &mut runtime.reconciliation_pass)?
                 .into_iter()
                 .map(|(op, service)| (op, Some(service)))
                 .collect()
@@ -133,11 +133,15 @@ impl Recovery {
                 continue;
             };
             let flight = if let Some(service) = service {
+                let meta = runtime.meta(Some(kind), Some(&key), None, None)?;
+                let sequence = runtime.sequence;
                 if !runtime.store.reconciliation_read_claimed(
                     &runtime.config,
                     kind,
                     &key,
                     service,
+                    (runtime.authority_epoch, sequence),
+                    &mut runtime.reconciliation_pass,
                 )? {
                     continue;
                 }
@@ -147,6 +151,7 @@ impl Recovery {
                     endpoint,
                     Some(resource),
                     None,
+                    (meta, sequence),
                 )?)
             } else {
                 runtime.launch_read(kind, key.clone(), endpoint, Some(resource), None)?
@@ -171,7 +176,11 @@ impl Recovery {
         }
         self.collect(runtime)?;
         for read in self.reads.drain(..) {
-            runtime.store.cancel_read(&read.flight.key)?;
+            runtime.store.cancel_reconciliation_read(
+                &read.flight.key,
+                read.flight.authority_epoch,
+                read.flight.sequence,
+            )?;
         }
         Ok(())
     }
@@ -239,16 +248,27 @@ impl HostAccess {
                 .request_not_before(&self.config, endpoint, resource)?
                 > cutoff
             || self.store.read_backoff(&key)?.next_at > cutoff
-            || !(if matches!(key, ReadKey::Operation { .. }) {
-                self.store
-                    .reconciliation_read_started(&self.config, kind, &key)?
-            } else {
-                self.store.read_started(&key)?
-            })
         {
             return Ok(None);
         }
-        self.launch_reserved_read(kind, key, endpoint, resource, offset)
+        let meta = self.meta(Some(kind), Some(&key), None, None)?;
+        let sequence = self.sequence;
+        let started = if matches!(key, ReadKey::Operation { .. }) {
+            self.store.reconciliation_read_started(
+                &self.config,
+                kind,
+                &key,
+                self.authority_epoch,
+                sequence,
+                &mut self.reconciliation_pass,
+            )?
+        } else {
+            self.store.read_started(&key)?
+        };
+        if !started {
+            return Ok(None);
+        }
+        self.launch_reserved_read(kind, key, endpoint, resource, offset, (meta, sequence))
             .map(Some)
     }
 
@@ -259,9 +279,8 @@ impl HostAccess {
         endpoint: Endpoint,
         resource: Option<&str>,
         offset: Option<u64>,
+        (meta, sequence): (RequestMeta, u64),
     ) -> Result<ReadFlight> {
-        let meta = self.meta(Some(kind), Some(&key), None, None)?;
-        let sequence = self.sequence;
         let deadline = ReadDeadline::seconds(if key == ReadKey::Identity {
             self.config.identity.read_http_seconds
         } else {
@@ -318,11 +337,27 @@ impl HostAccess {
                     self.store.cancel_read(&flight.key)?;
                     return Ok(None);
                 }
-                self.store.read_finished(
-                    &flight.key,
-                    Some(hosted.response.status),
-                    crate::protocol::failure_category(&hosted.response),
-                )?;
+                let category = crate::protocol::failure_category(&hosted.response);
+                if matches!(flight.key, ReadKey::Operation { .. }) {
+                    let complete =
+                        hosted.response.read_failure.is_none() && hosted.response.body.is_object();
+                    if !self.store.finish_reconciliation_read(
+                        &flight.key,
+                        flight.authority_epoch,
+                        flight.sequence,
+                        Some(hosted.response.status),
+                        category,
+                        complete,
+                    )? {
+                        return Ok(None);
+                    }
+                } else {
+                    self.store.read_finished(
+                        &flight.key,
+                        Some(hosted.response.status),
+                        category,
+                    )?;
+                }
                 Ok(Some(hosted.response))
             }
             Err(error) => {
@@ -342,8 +377,21 @@ impl HostAccess {
                         None,
                     )?;
                 } else {
-                    self.store
-                        .read_finished(&flight.key, None, Some(category.as_str()))?;
+                    if matches!(flight.key, ReadKey::Operation { .. }) {
+                        if !self.store.finish_reconciliation_read(
+                            &flight.key,
+                            flight.authority_epoch,
+                            flight.sequence,
+                            None,
+                            Some(category.as_str()),
+                            false,
+                        )? {
+                            return Ok(None);
+                        }
+                    } else {
+                        self.store
+                            .read_finished(&flight.key, None, Some(category.as_str()))?;
+                    }
                     self.evaluate_read(&flight.key, false)?;
                 }
                 Ok(None)

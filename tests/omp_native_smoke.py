@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Actual omp/18.19.0 acceptance, Python stdlib only; no user's profile or auth.
+"""Actual omp/19.0.1 acceptance, Python stdlib only; no user's profile or auth.
 
 Run: python3 tests/omp_native_smoke.py --omp /absolute/path/to/omp
 The fixture's RPC client is test-only. All inference endpoints are loopback.
@@ -227,7 +227,7 @@ class Rpc:
 
 def run_case(binary, bridge, root, server, name, provider="openrouter", effort="low",
              behavior="normal", mutate=None, expected=None, duplicate=False, model_id="fixture/model",
-             argument_override=None, profile="fixture", native_defaults=False, agent_api=None):
+             argument_override=None, profile="fixture", native_defaults=False, agent_api=None, expected_calls=1):
     case = root / name
     home = case / "home"
     # Explicit native profile and isolated HOME; no inherited auth/config/env.
@@ -324,7 +324,7 @@ def run_case(binary, bridge, root, server, name, provider="openrouter", effort="
             assert [e["data"] for e in again if e.get("customType") == "agmi_omp_result_v1"][-1]["reason_code"] == "native_run_binding_mismatch"
             assert len(server.calls) == calls
         calls = server.calls[count:]
-        assert len(calls) == (0 if mutate or argument_override is not None else 1), calls
+        assert len(calls) == (0 if mutate or argument_override is not None else expected_calls), calls
         if calls:
             path, captured = calls[0]
             if path == "/capture":
@@ -377,7 +377,8 @@ def main():
             run_case(binary, bridge, root, server, "ordinary-wire", provider="ordinary-fixture")
             run_case(binary, bridge, root, server, "ordinary-exact-off", provider="ordinary-fixture",
                      effort="off", model_id="fixture/plain")
-            run_case(binary, bridge, root, server, "antigravity-routing", provider="google-antigravity")
+            run_case(binary, bridge, root, server, "native-paused-provider", provider="google-antigravity",
+                     expected="native_failure", expected_calls=0)
             run_case(binary, bridge, root, server, "unsupported-effort", effort="max", expected="native_api_unsupported")
             run_case(binary, bridge, root, server, "exact-off-refusal", effort="off", expected="native_api_unsupported")
             for api in ("cursor-agent", "gitlab-duo-agent"):

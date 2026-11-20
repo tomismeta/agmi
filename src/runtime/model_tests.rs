@@ -738,7 +738,7 @@ async fn unbounded_once_still_reserves_at_most_one_model_attempt_per_lane() {
     config.capabilities.answer.model.executable = "/nonexistent/atomic-once-native".into();
     let (_temp, mut host, _stop) = fixture_with(config);
     identity_fixture(&mut host, &listener).await;
-    host.once = Some(OncePlan::capture(&host).unwrap());
+    host.once = Some(OncePlan::capture(&mut host).unwrap());
     let observed = observation(&host, LaneId::Answer);
     let mut slot = AnswerModelSlot::default();
     let task = AnswerTask::new(task_request(&host, LaneId::Answer)).unwrap();

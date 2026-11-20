@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="144" height="104" viewBox="6 24 36 26" role="img" aria-labelledby="title desc">
+  <title id="title">agmi logo</title>
+  <desc id="desc">Two open connection points and an inset accent square form the agmi symbol.</desc>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --fg: #162125;
+      --accent: #078b99;
+      color: var(--fg);
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --fg: #e7eef0;
+        --accent: #58d7df;
+      }
+    }
+  </style>
+  <g id="agmi-mark">
+    <path stroke="currentColor" stroke-width="5.5" fill="none" d="M10 43H30V31H37.75"/>
+    <rect fill="var(--accent,currentColor)" x="15" y="28.5" width="9" height="9"/>
+  </g>
+</svg>

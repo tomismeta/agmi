@@ -120,6 +120,17 @@ pub(crate) fn parser(error: &clap::Error, config: Option<&Path>) -> Value {
 }
 
 pub(crate) fn execution(error: &Error, config: Option<&Path>) -> Value {
+    if let Some(reason) = error.downcast_ref::<agmi::protocol::reports::FailureReason>() {
+        return json!({
+            "code":"epoch_report_unavailable",
+            "message":"Public report evidence is unavailable for this authority; no journal outcomes were changed.",
+            "details":{"reason":reason.code()},
+            "next_actions":[
+                action(config, &["epoch", "--help"], false),
+                action(config, &["config", "check"], false)
+            ]
+        });
+    }
     if let Some(error) = error.downcast_ref::<agmi::store::LaneControlError>() {
         return json!({
             "code":error.code(),"message":error.message(),"details":{},
@@ -259,6 +270,7 @@ pub(crate) fn execution(error: &Error, config: Option<&Path>) -> Value {
         | "service_config_unsupported" => &["config", "show"],
         "credential_input_unavailable"
         | "credential_input_interrupted"
+        | "credential_format_invalid"
         | "identity_verification_prerequisite"
         | "credential_identity_unverified"
         | "identity_verification_unavailable" => &["init", "--help"],
@@ -299,7 +311,7 @@ pub(crate) fn execution(error: &Error, config: Option<&Path>) -> Value {
             action(None, &["update", "--help"], false),
             action(None, &["service", "status"], false),
             {"kind":"instruction","authorization_required":false,
-             "message":"Preserve the installed release and user state. Failed or unverifiable discovery is not authorization to downgrade, replay work or clear uncertainty."}
+             "message":"Preserve the pinned update record, retained releases and user state. Inspect the reported operation before retrying; failure never authorizes an older-journal restore, stale-intent restart, work replay or uncertainty reset."}
         ]);
     }
     if code.starts_with("logs_") {
@@ -642,6 +654,13 @@ fn intervention_actions(
                 actions.push(action(config, &["status"], false));
                 return json!(actions);
             }
+            if detail["next_action"] == "inspect_model_workspace" {
+                actions.push(json!({"kind":"instruction","authorization_required":false,
+                    "message":"Inspect the controller's model temporary directory, its parent filesystem capacity, quota and permissions. A local workspace failure is not a model-provider or account-credential rejection. Preserve the journal, WAL, credentials and unknown outcomes. Doctor --repair does not repair model workspaces. A service restart can recreate a deleted private temporary namespace, but stops active model calls; assess in-flight work before explicitly restarting. Do not delete active service directories or reset model attempts."}));
+                actions.push(action(config, &["operations", "list"], false));
+                actions.push(action(config, &["service", "status"], false));
+                return json!(actions);
+            }
             let command: &[&str] = match detail["next_action"].as_str() {
                 Some("resume") => &["resume"],
                 Some("initialize_controller") => &["run", "--once"],
@@ -700,6 +719,27 @@ pub(crate) fn onboarding(data: &mut Value, config: Option<&Path>) {
     ]);
 }
 
+pub(crate) fn release_actions(data: &Value) -> Value {
+    let next = &data["release_advisory"]["next_action"];
+    match next["kind"].as_str() {
+        Some("update") => json!([action(None, &["update"], true)]),
+        Some("check") => json!([action(None, &["update", "--check"], false)]),
+        Some("inspect_service") => json!([action(None, &["service", "status"], false)]),
+        Some("use_install_owner") => json!([{
+            "kind":"instruction","authorization_required":false,
+            "message":"Use the installation owner to update this unmanaged build; agmi update is not authorized."
+        }]),
+        Some("unavailable") => json!([{
+            "kind":"instruction","authorization_required":false,
+            "message":"Release action unavailable. Inspect release evidence, storage and installation ownership; preserve retry floors and unfinished attempts. No retry or installation is authorized."
+        }]),
+        _ => json!([{
+            "kind":"instruction","authorization_required":false,
+            "message":"Release action unavailable; inspect the reported release evidence and installation ownership. No installation is authorized."
+        }]),
+    }
+}
+
 pub(crate) fn human(kind: &str, data: &Value) {
     match kind {
         "health" | "doctor" => {
@@ -710,6 +750,7 @@ pub(crate) fn human(kind: &str, data: &Value) {
             }
             print_unrepresented_issues(data);
             print_risk_caveat(data);
+            print_release_notice(data);
             if kind == "doctor" {
                 print_doctor_repairs(data);
             }
@@ -739,9 +780,18 @@ pub(crate) fn human(kind: &str, data: &Value) {
             }
             print_unrepresented_issues(data);
             print_risk_caveat(data);
+            print_release_notice(data);
             print_next(data);
         }
         "update" => {
+            if data["release_advisory"].is_object() {
+                print_release_notice(data);
+                println!(
+                    "No activation or repair performed. Installability and readiness: not assessed."
+                );
+                print_actions(&data["next_actions"]);
+                return;
+            }
             println!(
                 "Update: {} ({})",
                 data["update"]["status"].as_str().unwrap_or("unknown"),
@@ -798,6 +848,47 @@ pub(crate) fn human(kind: &str, data: &Value) {
                 "Update success is separate from readiness; retained uncertainty and upstream waits are not erased."
             );
         }
+        "epoch" => {
+            println!(
+                "Epoch evidence: work={} close={} (selected local page)",
+                fmt_json(&data["work_epoch"]),
+                fmt_json(&data["close_epoch"])
+            );
+            let summary = &data["summary"];
+            println!(
+                "Answers: graded={} passed={} failed={} expired={} pending_as_of_close={} unknown={}",
+                fmt_json(&summary["graded"]),
+                fmt_json(&summary["passed"]),
+                fmt_json(&summary["failed"]),
+                fmt_json(&summary["expired"]),
+                fmt_json(&summary["pending_as_of_close"]),
+                fmt_json(&summary["unknown_answer_outcomes"])
+            );
+            let reward = &data["account_close_reward"];
+            print!(
+                "Account close reward: {}",
+                reward["status"].as_str().unwrap_or("unknown")
+            );
+            if let Some(amount) = reward["amount"].as_str() {
+                print!(" {amount} (node-reported; ledger not independently verified)");
+            }
+            println!();
+            if let Some(complete) = data["refresh_ok"].as_bool() {
+                println!(
+                    "Refresh: {}",
+                    if complete {
+                        "complete"
+                    } else {
+                        "incomplete; inspect --json source errors"
+                    }
+                );
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&data["rows"]).expect("epoch rows serialize")
+            );
+            println!("Absence remains unknown; reports never authorize replay.");
+        }
         "install" | "service" => {
             let evidence = data.get("installation").unwrap_or(data);
             println!(
@@ -830,6 +921,40 @@ pub(crate) fn human(kind: &str, data: &Value) {
         print_actions(&data["next_actions"]);
     }
 }
+
+fn print_release_notice(data: &Value) {
+    let notice = &data["release_advisory"];
+    if !notice.is_object() {
+        return;
+    }
+    let availability = notice["availability"].as_str().unwrap_or("unknown");
+    let freshness = notice["freshness"].as_str().unwrap_or("unavailable");
+    print!("Release: {availability}; evidence={freshness}");
+    if let Some(reason) = notice["reason"].as_str() {
+        print!("; reason={reason}");
+    }
+    if let Some(version) = notice["latest_version"].as_str() {
+        print!("; latest_recorded={version}");
+    }
+    if let Some(checked_at) = notice["checked_at"].as_i64() {
+        print!("; checked_at={checked_at}");
+    }
+    match notice["next_action"]["kind"].as_str() {
+        Some("update") if availability == "available" && freshness == "fresh" => {
+            print!("; agmi update");
+        }
+        Some("inspect_service") => print!("; inspect service with agmi service status"),
+        Some("use_install_owner") => print!("; use installation owner"),
+        Some("check") => print!("; agmi update --check"),
+        Some("unavailable") => print!("; release action unavailable"),
+        _ => {}
+    }
+    if notice["background"]["enabled"] == false {
+        print!("; automatic checks disabled");
+    }
+    println!();
+}
+
 fn fmt_json(value: &Value) -> Cow<'_, str> {
     match value {
         Value::Bool(true) => Cow::Borrowed("true"),
@@ -1385,16 +1510,22 @@ fn sanitized_step(step: &Value) -> Value {
     step.clone()
 }
 
+fn render_wait(until: &Value) -> String {
+    match until.as_i64() {
+        Some(deadline) => {
+            format!("Wait until Unix timestamp {deadline} (reported deadline)")
+        }
+        None => "Retry time unknown; inspect local evidence.".to_owned(),
+    }
+}
+
 fn print_actions(actions: &Value) {
     let mut seen: Vec<String> = Vec::new();
     let mut index = 0;
     for step in actions.as_array().into_iter().flatten() {
         let description = match step["kind"].as_str() {
             Some("command") => render_argv(&step["argv"]),
-            Some("wait") => format!(
-                "Wait until Unix timestamp {} (reported deadline)",
-                step["until"]
-            ),
+            Some("wait") => render_wait(&step["until"]),
             _ => step["message"]
                 .as_str()
                 .unwrap_or("Inspect local evidence")
@@ -1645,6 +1776,40 @@ mod tests {
     }
 
     #[test]
+    fn workspace_recovery_guidance_never_authorizes_restart_or_abandonment() {
+        let actions = intervention_actions(
+            &json!({"status":"operator_required","reason":"native_workspace_unavailable",
+                "next_action":"inspect_model_workspace"}),
+            &[],
+            None,
+            100,
+        );
+        let actions = actions.as_array().unwrap();
+        assert!(
+            actions
+                .iter()
+                .any(|step| step["argv"] == json!(["agmi", "operations", "list"]))
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|step| step["argv"] == json!(["agmi", "service", "status"]))
+        );
+        assert!(
+            actions
+                .iter()
+                .all(|step| step["authorization_required"] == false)
+        );
+        assert!(actions.iter().any(|step| {
+            step["message"].as_str().is_some_and(|message| {
+                message.contains("stops active model calls")
+                    && message.contains("Doctor --repair does not repair model workspaces")
+            })
+        }));
+        assert!(actions.iter().all(|step| step["kind"] != "wait"));
+    }
+
+    #[test]
     fn doctor_repair_is_an_explicit_opt_in_and_preserves_precise_actions() {
         let mut value = json!({"intervention":{"status":"none_required"},
             "repair_requested":false,"repairs":{"eligible":[{"operation_id":7}]},
@@ -1709,6 +1874,19 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn missing_retry_deadline_does_not_present_a_timed_wait() {
+        let unknown = render_wait(&Value::Null);
+        assert!(unknown.contains("unknown"));
+        assert!(!unknown.contains("null"));
+        assert!(!unknown.contains("timestamp"));
+        assert!(render_wait(&json!(1_700_000_000)).contains("1700000000"));
+        print_actions(&json!([
+            {"kind":"wait","until":null},
+            {"kind":"wait","until":1_700_000_000}
+        ]));
+    }
+
     #[test]
     fn argv_rendering_quotes_boundaries_without_new_quoting_rules() {
         assert_eq!(shell_quote("health"), "health");

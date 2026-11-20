@@ -156,10 +156,10 @@ async fn stale_job_minima_ingest_before_binding_cas_and_split_queued_headers_sta
         let current_key = Store::operation_read_key(&advanced).unwrap();
         stream.write_all(body.as_bytes()).await.unwrap();
         let result = read_result(&mut runtime, &mut flight).await;
-        let response = runtime.finish_read(&flight, result).unwrap().unwrap();
-        runtime
-            .recovery_response(&mut original, &old_key, &response)
-            .unwrap();
+        assert!(
+            runtime.finish_read(&flight, result).unwrap().is_none(),
+            "a stale binding may retain restrictions but not reach state bookkeeping"
+        );
         let current = runtime.store.operation(original.id).unwrap().unwrap();
         assert_eq!(current.state, "included_pending");
         assert_eq!(current.binding_revision, advanced.binding_revision);
@@ -281,7 +281,7 @@ async fn once_keeps_entry_recoveries_when_newer_bound_work_arrives() {
     let (_temp, mut runtime, _stop) = fixture_with(config);
     let first = seed_bound(&mut runtime, LaneId::Judge, "entry-first", "entry-first");
     let second = seed_bound(&mut runtime, LaneId::Judge, "entry-second", "entry-second");
-    runtime.once = Some(OncePlan::capture(&runtime).unwrap());
+    runtime.once = Some(OncePlan::capture(&mut runtime).unwrap());
     let later = seed_bound(&mut runtime, LaneId::Judge, "later", "later");
     runtime.plan().unwrap();
     let db = rusqlite::Connection::open(runtime.config.state_dir.join("state.sqlite3")).unwrap();
@@ -405,7 +405,7 @@ async fn discovery_retry_reload_and_restart_use_one_clock_without_losing_server_
     );
     assert!(!runtime.discovery_allowed(LaneId::Answer).unwrap());
     assert!(
-        !OncePlan::capture(&runtime)
+        !OncePlan::capture(&mut runtime)
             .unwrap()
             .lane(LaneId::Answer)
             .discovery
@@ -421,7 +421,7 @@ async fn discovery_retry_reload_and_restart_use_one_clock_without_losing_server_
     drop(runtime);
     let store = Store::open(&config).unwrap();
     let (_stop, stop) = watch::channel(false);
-    let runtime = HostAccess::new(path, config, protocol, store, stop, true).unwrap();
+    let mut runtime = HostAccess::new(path, config, protocol, store, stop, true).unwrap();
     runtime.store.reschedule_all_reads(&runtime.config).unwrap();
     assert_eq!(runtime.store.read_backoff(&key).unwrap(), shortened);
     assert_eq!(
@@ -451,7 +451,7 @@ async fn discovery_retry_reload_and_restart_use_one_clock_without_losing_server_
     assert!(runtime.store.next_at(LaneId::Answer).unwrap() > now());
     assert!(runtime.discovery_allowed(LaneId::Answer).unwrap());
     assert!(
-        OncePlan::capture(&runtime)
+        OncePlan::capture(&mut runtime)
             .unwrap()
             .lane(LaneId::Answer)
             .discovery
@@ -661,6 +661,80 @@ async fn shutdown_cancels_discovery_before_draining_sent_effect() {
         );
         assert!(AccountAdmissionGuard::try_acquire(&config).is_ok());
         assert!(crate::store::LaneAdmissionGuard::try_acquire(&config, LaneId::Mine).is_ok());
+    }
+}
+
+#[tokio::test]
+async fn failed_submissions_keep_typed_categories_without_resolving_uncertainty() {
+    use crate::protocol::ReadFailure;
+    for failure in [
+        Some(ReadFailure::Timeout),
+        Some(ReadFailure::Connect),
+        Some(ReadFailure::Request),
+        None,
+    ] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = Config::default();
+        config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
+        config.capabilities.answer.mode = Mode::ReadOnly;
+        config.capabilities.judge.mode = Mode::Off;
+        config.capabilities.mine.mode = Mode::Active;
+        let (_temp, mut runtime, _stop) = fixture_with(config);
+        no_discovery(&runtime);
+        identity_fixture(&mut runtime, &listener).await;
+        let op = runtime
+            .store
+            .seed_operation_for_test(
+                LaneId::Mine,
+                "8:mine",
+                "prepared",
+                &json!({"solver":request(LaneId::Mine)}),
+                runtime.store.control().unwrap(),
+                &runtime.config.lane_revision(LaneId::Mine).unwrap(),
+            )
+            .unwrap();
+        offer_mine(&mut runtime, op.clone());
+        runtime.arbitrate().unwrap();
+        let (_stream, _) = accept(&listener).await;
+        let error = match failure {
+            Some(failure) => anyhow::Error::new(failure),
+            None => anyhow::anyhow!("effect task ended"),
+        }
+        .context("private request https://private.invalid/?token=never-retain");
+        let effect = runtime.effect.take().unwrap();
+        runtime.finish_effect(effect, Err(error)).unwrap();
+        let current = runtime.store.operation(op.id).unwrap().unwrap();
+        assert_eq!(current.state, "unknown");
+        assert!(current.job_id.is_none() && current.txid.is_none());
+        let db =
+            rusqlite::Connection::open(runtime.config.state_dir.join("state.sqlite3")).unwrap();
+        let encoded: String = db
+            .query_row(
+                "SELECT evidence FROM operation_evidence WHERE operation_id=?1",
+                [op.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let evidence: Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(evidence["reason"], "transport_unknown");
+        assert!(evidence["status"].is_null());
+        assert_eq!(
+            evidence["error_category"],
+            failure.map_or(Value::Null, |failure| json!(failure.as_str()))
+        );
+        assert!(!encoded.contains("private.invalid") && !encoded.contains("never-retain"));
+        let intents: i64 = db
+            .query_row(
+                "SELECT count(*) FROM events WHERE operation_id=?1 AND code='dispatch_intent'",
+                [op.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(intents, 1);
+        assert!(AccountAdmissionGuard::try_acquire(&runtime.config).is_ok());
+        assert!(
+            crate::store::LaneAdmissionGuard::try_acquire(&runtime.config, LaneId::Mine).is_ok()
+        );
     }
 }
 

@@ -24,7 +24,7 @@ jobs:
       - name: Native bridge contracts
         run: python3 tests/native_bridge_smoke.py
       - name: Behavior tests
-        run: cargo +1.96.0 test --locked
+        run: RUST_BACKTRACE=1 cargo +1.96.0 test --locked
       - name: Lints
         run: cargo +1.96.0 clippy --locked --all-targets -- -D warnings
       - name: Build binary
@@ -82,9 +82,10 @@ jobs:
           cargo +1.96.0 package --locked --allow-dirty
           package_root="$RUNNER_TEMP/agmi-package"
           mkdir -p "$package_root"
-          tar -xzf target/package/agmi-0.1.1.crate -C "$package_root"
-          cargo +1.96.0 test --manifest-path "$package_root/agmi-0.1.1/Cargo.toml" --locked --lib --no-run
-          cargo +1.96.0 install --path "$package_root/agmi-0.1.1" --locked --root "$package_root/install"
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
+          tar -xzf "target/package/agmi-$version.crate" -C "$package_root"
+          cargo +1.96.0 test --manifest-path "$package_root/agmi-$version/Cargo.toml" --locked --lib --no-run
+          cargo +1.96.0 install --path "$package_root/agmi-$version" --locked --root "$package_root/install"
           "$package_root/install/bin/agmi" build-info --manifest
           python3 tests/lifecycle_smoke.py "$package_root/install/bin/agmi" --scenario init
       - name: Isolated systemd release lifecycle
@@ -106,3 +107,12 @@ jobs:
             HOME=/home/agmi-systemd-fixture XDG_RUNTIME_DIR=/run/user/17321 \
             DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/17321/bus \
             python3 -u /src/tests/systemd_smoke.py /input/agmi
+      - name: Isolated model workspace recovery
+        run: |
+          name="agmi-storage-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          trap 'docker rm -f "$name" >/dev/null 2>&1 || true' EXIT
+          docker run -d --name "$name" --privileged --cgroupns=private \
+            --network=none --tmpfs /run --tmpfs /run/lock --tmpfs /tmp:exec,mode=1777 \
+            -v "$PWD:/src:ro" -v "$PWD/target/release/agmi:/input/agmi:ro" \
+            agmi-systemd-fixture
+          docker exec "$name" python3 -u /src/tests/storage_runtime_smoke.py /input/agmi

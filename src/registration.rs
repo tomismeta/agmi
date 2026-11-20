@@ -115,7 +115,6 @@ struct Paths {
     credential: PathBuf,
     metadata: PathBuf,
     network: PathBuf,
-    state: PathBuf,
 }
 impl Paths {
     fn new(config: &Path) -> Result<Self> {
@@ -142,7 +141,6 @@ impl Paths {
             credential: parent.join("credential"),
             metadata: parent.join("registration.json"),
             network: parent.join("network.toml"),
-            state: parent.join("state"),
             config,
             parent,
         })
@@ -370,6 +368,35 @@ fn ensure_absent(path: &Path) -> Result<()> {
     }
 }
 
+/// Inspect journal authority without opening SQLite or claiming the install root.
+fn ensure_no_journal(state: &Path) -> Result<()> {
+    for ancestor in state.ancestors() {
+        let metadata = match fs::symlink_metadata(ancestor) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Err(io_error()),
+        };
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(unsafe_file());
+        }
+        if ancestor == state {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o022 != 0 {
+                    return Err(unsafe_file());
+                }
+            }
+            // An uninspectable directory must not be mistaken for absence.
+            fs::read_dir(state).map_err(|_| io_error())?;
+        }
+    }
+    for name in ["state.sqlite3", "state.sqlite3-wal", "state.sqlite3-shm"] {
+        ensure_absent(&state.join(name))?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct Binding {
@@ -549,7 +576,6 @@ fn last_attempt(paths: &Paths) -> Result<Option<Saved>> {
         {
             return Err(unknown());
         }
-        drop(saved.take());
         if !has_intent || attempt as usize != index + 1 {
             return Err(unknown());
         }
@@ -559,7 +585,23 @@ fn last_attempt(paths: &Paths) -> Result<Option<Saved>> {
             || intent.attempt != attempt
             || intent.binding.config_file != paths.config
             || intent.binding.credential_file != paths.credential
-            || intent.binding.state_dir != paths.state
+            || !intent.binding.state_dir.is_absolute()
+            || intent.binding.state_dir.file_name().is_none()
+            || !safe_segment(&intent.binding.chain, 64)
+            || intent.binding.label.is_empty()
+            || intent.binding.label.len() > 256
+            || intent.binding.label.chars().any(char::is_control)
+            || intent
+                .binding
+                .invited_by
+                .as_ref()
+                .is_some_and(|value| !valid_address(value))
+            || intent.binding.api.validate().is_err()
+            || validate_origin_with_trust(&intent.binding.base_url, &intent.binding.trusted_origins)
+                .is_err()
+            || saved
+                .as_ref()
+                .is_some_and(|previous| previous.intent.binding != intent.binding)
         {
             return Err(unknown());
         }
@@ -589,7 +631,7 @@ fn last_attempt(paths: &Paths) -> Result<Option<Saved>> {
     }
     Ok(saved)
 }
-fn binding(paths: &Paths, options: &CreateOptions) -> Result<Binding> {
+fn binding(paths: &Paths, options: &CreateOptions, state_dir: PathBuf) -> Result<Binding> {
     options.api.validate().map_err(|_| {
         error(
             "registration_invalid_routes",
@@ -632,7 +674,7 @@ fn binding(paths: &Paths, options: &CreateOptions) -> Result<Binding> {
     Ok(Binding {
         config_file: paths.config.clone(),
         credential_file: paths.credential.clone(),
-        state_dir: paths.state.clone(),
+        state_dir,
         label: options.label.clone(),
         chain: options.chain.clone(),
         base_url: origin.as_str().trim_end_matches('/').into(),
@@ -788,7 +830,7 @@ fn summary(
             json!({"stage":"rejected","attempt":saved.intent.attempt,"rejection":code,"retry_not_before":retry_not_before,"retry_after_seconds":retry_not_before.saturating_sub(now()?),"retry_allowed":now()? >= retry_not_before,"created":false,"note":"A fresh attempt requires explicit identity create --confirm --retry-rejected after the retained deadline, with the same identity options. Previous evidence is preserved."}),
         ),
         Outcome::Created { address, key } => {
-            let metadata = json!({"schema":1,"attempt":saved.intent.attempt,"intent_sha256":saved.intent_hash,"account":address,"chain":saved.intent.binding.chain,"base_url":saved.intent.binding.base_url,"credential_file":paths.credential,"config_file":paths.config,"state_dir":paths.state});
+            let metadata = json!({"schema":1,"attempt":saved.intent.attempt,"intent_sha256":saved.intent_hash,"account":address,"chain":saved.intent.binding.chain,"base_url":saved.intent.binding.base_url,"credential_file":paths.credential,"config_file":paths.config,"state_dir":saved.intent.binding.state_dir});
             let metadata_bytes = serde_json::to_vec(&metadata).map_err(|_| io_error())?;
             let existing_key = read_private(&paths.credential, 4096)?;
             let credential_matches_capture =
@@ -842,7 +884,7 @@ fn summary(
                         .trim_end_matches('/')
                         != saved.intent.binding.base_url
                     || config.network.credential_file != paths.credential
-                    || config.state_dir != paths.state
+                    || config.state_dir != bound.state_dir
                     || config.network.api != bound.api
                     || config.network.trusted_origins != bound.trusted_origins
                 {
@@ -897,10 +939,10 @@ fn status_inner(config_path: &Path) -> Result<Value> {
         &paths.credential,
         &paths.metadata,
         &paths.network,
-        &paths.state,
     ] {
         ensure_absent(path)?;
     }
+    ensure_no_journal(&crate::config::default_state_dir_for_config(&paths.config))?;
     Ok(json!({"stage":"clean","created":false,"credential_saved":false}))
 }
 
@@ -956,7 +998,12 @@ async fn create_inner(
     confirmed: bool,
 ) -> Result<Value> {
     let paths = Paths::new(config_path)?;
-    let binding = binding(&paths, options)?;
+    let retained = last_attempt(&paths)?;
+    let state_dir = retained.as_ref().map_or_else(
+        || crate::config::default_state_dir_for_config(&paths.config),
+        |saved| saved.intent.binding.state_dir.clone(),
+    );
+    let mut binding = binding(&paths, options, state_dir)?;
     // Route validation and client construction happen before any durable intent.
     let origin = validate_origin_with_trust(&binding.base_url, &binding.trusted_origins)
         .map_err(|_| conflict())?;
@@ -979,6 +1026,10 @@ async fn create_inner(
     parent_exists(&paths)?;
     let _guard = admin::lock_config_directory(&paths.config).map_err(|_| io_error())?;
     let saved = last_attempt(&paths)?;
+    // Reobserve under the config lease: another creator may have bound a sequence.
+    if let Some(last) = saved.as_ref() {
+        binding.state_dir = last.intent.binding.state_dir.clone();
+    }
     let next_attempt = if let Some(last) = saved.as_ref() {
         if last.intent.binding != binding {
             return Err(conflict());
@@ -1027,10 +1078,10 @@ async fn create_inner(
         &paths.credential,
         &paths.metadata,
         &paths.network,
-        &paths.state,
     ] {
         ensure_absent(path)?;
     }
+    ensure_no_journal(&binding.state_dir)?;
     let timeout = Duration::from_secs(options.http_seconds);
     let client = protocol::private_http_client(timeout, timeout).map_err(|_| io_error())?;
     let challenge = protocol::complete_raw_response(client.get(challenge_url)).await.map_err(|_| error("registration_challenge_unavailable", "Admission challenge unavailable; no registration was sent and no retry was attempted.", json!({})))?;
@@ -1137,7 +1188,12 @@ mod tests {
             schema: 1,
             attempt: 1,
             created_at: 100,
-            binding: binding(paths, &options()).unwrap(),
+            binding: binding(
+                paths,
+                &options(),
+                crate::config::default_state_dir_for_config(&paths.config),
+            )
+            .unwrap(),
             challenge: "fixture".into(),
             nonce: "1".into(),
             bits: 3,
@@ -1368,5 +1424,62 @@ mod tests {
         fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
         assert!(publish_matching(&target, b"replacement").is_err());
         assert_eq!(fs::read(&target).unwrap(), b"original");
+    }
+
+    #[test]
+    fn journal_gate_preserves_populated_roots_and_refuses_authority() {
+        let root = private_root();
+        let root = root.path().canonicalize().unwrap();
+        let state = root.join("agmi");
+        fs::create_dir(&state).unwrap();
+        fs::create_dir(state.join("releases")).unwrap();
+        fs::create_dir(state.join("update-advisory")).unwrap();
+        publish(&state.join("releases/retained"), b"immutable release").unwrap();
+        ensure_no_journal(&state).unwrap();
+        for name in ["state.sqlite3", "state.sqlite3-wal", "state.sqlite3-shm"] {
+            let artifact = state.join(name);
+            publish(&artifact, b"existing authority").unwrap();
+            assert!(ensure_no_journal(&state).is_err());
+            assert_eq!(fs::read(&artifact).unwrap(), b"existing authority");
+            fs::remove_file(artifact).unwrap();
+        }
+        assert_eq!(
+            fs::read(state.join("releases/retained")).unwrap(),
+            b"immutable release"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            symlink(root.join("missing"), state.join("state.sqlite3-wal")).unwrap();
+            assert!(ensure_no_journal(&state).is_err());
+            fs::remove_file(state.join("state.sqlite3-wal")).unwrap();
+            symlink(&state, root.join("state-alias")).unwrap();
+            assert!(ensure_no_journal(&root.join("state-alias")).is_err());
+        }
+    }
+
+    #[test]
+    fn legacy_binding_is_retained_and_sequence_rebinding_is_refused() {
+        let root = private_root();
+        let paths = Paths::new(&root.path().join("config.toml")).unwrap();
+        let mut saved = fixture(
+            &paths,
+            json!({"ok":false,"retry_after_seconds":1}),
+            429,
+            None,
+        );
+        saved.intent.binding.state_dir = paths.parent.join("state");
+        let bytes = serde_json::to_vec(&saved.intent).unwrap();
+        saved.intent_hash = digest(&bytes);
+        saved.capture.as_mut().unwrap().intent_sha256 = saved.intent_hash.clone();
+        write_saved(&paths, &saved);
+        let loaded = last_attempt(&paths).unwrap().unwrap();
+        assert_eq!(loaded.intent.binding.state_dir, paths.parent.join("state"));
+        assert_eq!(fs::read(paths.intent(1)).unwrap(), bytes);
+        let mut second = saved.intent;
+        second.attempt = 2;
+        second.binding.state_dir = paths.parent.join("another-state");
+        publish(&paths.intent(2), &serde_json::to_vec(&second).unwrap()).unwrap();
+        assert!(last_attempt(&paths).is_err());
     }
 }

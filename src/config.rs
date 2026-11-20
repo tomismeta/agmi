@@ -692,6 +692,17 @@ fn default_state_dir() -> PathBuf {
         .join("agmi")
 }
 
+/// Resolve a new account's default exactly as a stored configuration does.
+/// Callers pass the selected absolute configuration path.
+pub(crate) fn default_state_dir_for_config(config: &Path) -> PathBuf {
+    resolve_path(
+        config
+            .parent()
+            .expect("absolute configuration has a parent"),
+        &default_state_dir(),
+    )
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -2069,6 +2080,28 @@ mod tests {
         let error = Config::load(&file).unwrap_err().to_string();
         assert!(!error.contains("never-print-this"));
         assert!(toml::from_str::<Config>("unknown = 1").is_err());
+    }
+
+    #[test]
+    fn new_account_default_matches_config_resolution_and_relative_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.toml");
+        let parsed = Config::parse_bytes(&file, b"", false).unwrap();
+        assert_eq!(default_state_dir_for_config(&file), parsed.state_dir);
+        let serialized = toml::to_string(&Config::default()).unwrap();
+        assert_eq!(
+            default_state_dir_for_config(&file),
+            Config::parse_bytes(&file, serialized.as_bytes(), false)
+                .unwrap()
+                .state_dir
+        );
+        // The default without a platform data root remains config-relative.
+        let fallback = Config::parse_bytes(&file, b"state_dir = './agmi'", false).unwrap();
+        assert_eq!(
+            fallback.state_dir,
+            resolve_path(dir.path(), Path::new("./agmi"))
+        );
+        assert_eq!(fallback.state_dir, dir.path().join("agmi"));
     }
 
     #[test]

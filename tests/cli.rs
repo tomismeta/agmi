@@ -1,7 +1,11 @@
 use std::{fs, process::Command};
 
 fn binary() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_agmi"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agmi"));
+    command
+        .env("AGMI_UPDATE_CHECKS", "0")
+        .env("XDG_CACHE_HOME", env!("CARGO_TARGET_TMPDIR"));
+    command
 }
 
 #[test]
@@ -38,6 +42,44 @@ fn update_check_cannot_authorize_repair_or_mix_release_sources() {
         assert_eq!(error["error"]["details"]["reason"], "conflicting_fields");
         assert!(!String::from_utf8_lossy(&output.stderr).contains("r-private-value"));
         assert!(!config.parent().unwrap().exists());
+    }
+}
+
+#[test]
+fn expected_release_requires_one_explicit_source_and_no_preview_or_repair() {
+    let release = format!("r-{}", "a".repeat(64));
+    let digest = &release[2..];
+    for source in [
+        vec![],
+        vec!["--binary", "/candidate"],
+        vec!["--sha256", digest],
+        vec![
+            "--release",
+            release.as_str(),
+            "--binary",
+            "/candidate",
+            "--sha256",
+            digest,
+        ],
+        vec!["--release", release.as_str(), "--check"],
+        vec!["--release", release.as_str(), "--repair"],
+        vec!["--release", release.as_str(), "--dry-run"],
+        vec!["--binary", "/candidate", "--sha256", digest, "--check"],
+        vec!["--binary", "/candidate", "--sha256", digest, "--repair"],
+        vec!["--binary", "/candidate", "--sha256", digest, "--dry-run"],
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let output = binary()
+            .env("HOME", root.path())
+            .args(["--json", "update", "--expected-release", &release])
+            .args(source)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(error["error"]["code"], "invalid_arguments");
+        assert!(!root.path().join(".local").exists());
     }
 }
 
@@ -93,15 +135,15 @@ fn update_repair_dry_run_preserves_user_files_and_never_executes_candidate() {
 }
 
 #[test]
-fn update_migration_flags_require_explicit_mode_and_release_pinned_approval() {
+fn update_approval_flags_require_release_pinning_and_preserve_private_errors() {
     let private = "private-approval-or-path-value";
     for json in [false, true] {
         for arguments in [
             vec!["update", "--migrate", "--repair"],
             vec!["update", "--migrate", "--migration-only", "--stopped"],
-            vec!["update", "--proposal", private],
+            vec!["update", "--check", "--proposal", private],
             vec!["update", "--migrate", "--expected-token", private],
-            vec!["update", "--release", private, "--expected-token", private],
+            vec!["update", "--expected-token", private],
             vec!["update", "--migrate", "--accept-risk-change", private],
             vec![
                 "update",
@@ -176,7 +218,7 @@ fn update_private_proposals_are_bounded_objects_and_errors_never_echo_inputs() {
                 command.arg("--json");
             }
             let output = command
-                .args(["update", "--migrate", "--dry-run", "--proposal"])
+                .args(["update", "--dry-run", "--proposal"])
                 .arg(&proposal)
                 .output()
                 .unwrap();
@@ -192,7 +234,7 @@ fn update_private_proposals_are_bounded_objects_and_errors_never_echo_inputs() {
     }
     fs::remove_file(&proposal).unwrap();
     let output = binary()
-        .args(["--json", "update", "--migrate", "--proposal"])
+        .args(["--json", "update", "--proposal"])
         .arg(&proposal)
         .output()
         .unwrap();
@@ -202,7 +244,7 @@ fn update_private_proposals_are_bounded_objects_and_errors_never_echo_inputs() {
 
 #[cfg(unix)]
 #[test]
-fn update_migration_dry_run_never_executes_or_transports_private_proposal() {
+fn update_dry_run_never_executes_or_transports_private_proposal() {
     use sha2::Digest;
     use std::{io::Write, os::unix::fs::PermissionsExt, process::Stdio};
     let root = tempfile::tempdir().unwrap();
@@ -231,7 +273,7 @@ fn update_migration_dry_run_never_executes_or_transports_private_proposal() {
             .env("TMPDIR", &temporary)
             .env("PATH", root.path())
             .env("AGMI_PREVIEW_MARKER", &marker)
-            .args(["--json", "update", "--migrate", "--dry-run", "--binary"])
+            .args(["--json", "update", "--dry-run", "--binary"])
             .arg(&candidate)
             .args(["--sha256", &digest]);
         if let Some(source) = source {
@@ -267,6 +309,53 @@ fn update_migration_dry_run_never_executes_or_transports_private_proposal() {
         assert!(value["data"]["update"].get("doctor_status").is_none());
         assert!(!String::from_utf8_lossy(&output.stdout).contains(secret));
         assert!(!String::from_utf8_lossy(&output.stderr).contains(secret));
+    }
+}
+
+#[test]
+fn initialization_format_errors_are_private_and_precede_network_or_publication() {
+    use std::{io::Write, net::TcpListener, process::Stdio};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let account = format!("poa1{}2", "1".repeat(31));
+    for input in [
+        b"pk_private_canary with spaces\n".as_slice(),
+        b"pk_private_canary\x1b[201~\n",
+        b"\"pk_private_canary\"\n",
+        b"{\"api_key\":\"pk_private_canary\",\"extra\":\"private\"}\n",
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let mut child = binary()
+            .args(["--json", "--config"])
+            .arg(root.path().join("config.toml"))
+            .args([
+                "init",
+                "--account",
+                &account,
+                "--base-url",
+                &origin,
+                "--state-dir",
+            ])
+            .arg(root.path().join("state"))
+            .arg("--key-stdin")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(input).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(error["error"]["code"], "credential_format_invalid");
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("pk_private_canary"));
+        assert!(fs::read_dir(root.path()).unwrap().next().is_none());
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
 }
 
@@ -495,7 +584,7 @@ fn control_commands_preserve_live_writer_visibility() {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             assert!(writer.try_wait().unwrap().is_none(), "writer exited");
-            let status = agmi::runtime::status(config);
+            let status = agmi::runtime::status(&path, config);
             if status
                 .as_ref()
                 .is_ok_and(|s| s["effective_runtime"]["revision"].as_str() == Some(expected))

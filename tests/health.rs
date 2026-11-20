@@ -7,6 +7,9 @@ fn run_health(config: &Config, args: &[&str]) -> (tempfile::TempDir, std::proces
     let path = dir.path().join("config.toml");
     fs::write(&path, toml::to_string(config).unwrap()).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_agmi"))
+        .env("AGMI_UPDATE_CHECKS", "0")
+        .env("HOME", dir.path())
+        .env("XDG_CACHE_HOME", dir.path().join("cache"))
         .arg("--config")
         .arg(path)
         .args(["--json", "health"])
@@ -32,12 +35,22 @@ fn default_health_omits_retained_trees_but_verbose_preserves_them() {
     for field in [
         "healthy",
         "admission_blocked",
-        "effective_capabilities",
+        "operational",
         "observations",
         "intervention",
     ] {
         assert_eq!(compact["data"][field], verbose["data"][field], "{field}");
     }
+    assert_eq!(
+        compact["data"]["effective_capabilities"]["answer"]["mode"],
+        verbose["data"]["effective_capabilities"]["answer"]["mode"]
+    );
+    assert!(
+        compact["data"]["effective_capabilities"]["answer"]
+            .get("model")
+            .is_none()
+    );
+    assert!(serde_json::to_vec(&compact).unwrap().len() <= 16 * 1024);
 }
 
 #[test]
@@ -245,8 +258,9 @@ fn uninitialized_status_and_health_share_progress_without_creating_state() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = Config::default();
     config.state_dir = dir.path().join("missing-state");
-    let status = agmi::runtime::status(&config).unwrap();
+    let status = agmi::runtime::status(&config.state_dir.join("config.toml"), &config).unwrap();
     let result = agmi::health::check(
+        &config.state_dir.join("config.toml"),
         &config,
         agmi::health::Options {
             min_free_mib: 0,
@@ -944,6 +958,7 @@ fn retained_remote(db: &rusqlite::Connection, lane: &str, state: &str, epoch: u6
 
 fn diagnostic_health(config: &Config) -> Value {
     agmi::health::check(
+        &config.state_dir.join("config.toml"),
         config,
         agmi::health::Options {
             min_free_mib: 0,
@@ -966,7 +981,8 @@ fn finite_and_unbounded_remote_history_is_risk_across_every_lane_and_surface() {
                     .query_row("PRAGMA data_version", [], |row| row.get(0))
                     .unwrap();
                 let health = diagnostic_health(&config);
-                let status = agmi::runtime::status(&config).unwrap();
+                let status =
+                    agmi::runtime::status(&config.state_dir.join("config.toml"), &config).unwrap();
                 for report in [&health, &status] {
                     assert_eq!(
                         report["healthy"], true,
@@ -1204,7 +1220,10 @@ fn background_history_cannot_supply_missing_inventory_or_hide_current_failures()
         db.execute(mutation, []).unwrap();
         let missing = diagnostic_health(&config);
         assert_eq!(missing["healthy"], false, "{missing}");
-        assert_eq!(missing["components"]["judge"]["state"], "unknown");
+        assert_eq!(
+            missing["components"]["judge"]["state"], "unknown",
+            "{missing}"
+        );
         assert_ne!(missing["work"]["judge"]["progress"], "idle");
         assert_eq!(missing["risk"]["background_remote_work"], 1);
         assert!(
@@ -1484,10 +1503,10 @@ fn confirmed_current_judgment_is_accepted_with_nonblocking_finality_followup() {
     .unwrap();
     for report in [
         diagnostic_health(&config),
-        agmi::runtime::status(&config).unwrap(),
+        agmi::runtime::status(&config.state_dir.join("config.toml"), &config).unwrap(),
     ] {
         assert_eq!(report["healthy"], false, "{report}");
-        assert_eq!(report["operational"]["status"], "unknown");
+        assert_eq!(report["operational"]["status"], "unknown", "{report}");
         assert_eq!(report["components"]["judge"]["state"], "unknown");
         assert_ne!(report["work"]["judge"]["progress"], "idle");
         assert_eq!(report["pending_work"][0]["state"], "confirmed");
@@ -1631,7 +1650,7 @@ fn model_failure_categories_require_model_attempt_failure_evidence() {
             .unwrap();
             for report in [
                 diagnostic_health(&config),
-                agmi::runtime::status(&config).unwrap(),
+                agmi::runtime::status(&config.state_dir.join("config.toml"), &config).unwrap(),
             ] {
                 let model = &report["work"][lane]["model"];
                 assert_eq!(model["operation_id"], 1, "{lane}/{state}: {report}");
@@ -1816,8 +1835,11 @@ fn judging_exclusion_witnesses_keep_unrelated_history_background_and_current_rea
                 cli["data"]["work"]["judge"]["background_recovery"]["count"],
                 1
             );
+            assert!(cli["data"]["work"]["judge"].get("read_key").is_none());
+            let (_config_dir, verbose) = run_health(&config, &["--min-free-mib", "0", "--verbose"]);
+            let verbose: Value = serde_json::from_slice(&verbose.stdout).unwrap();
             assert_eq!(
-                cli["data"]["work"]["judge"]["read_key"]["resource"],
+                verbose["data"]["work"]["judge"]["read_key"]["resource"],
                 assignment_b
             );
             assert_ne!(cli["data"]["work"]["judge"]["progress"], "idle");
@@ -1903,7 +1925,10 @@ fn judging_legacy_or_truncated_exclusions_do_not_invent_current_operation_identi
             Value::Null
         );
         assert_eq!(unknown["healthy"], false, "{unknown}");
-        assert_eq!(unknown["components"]["judge"]["state"], "unknown");
+        assert_eq!(
+            unknown["components"]["judge"]["state"], "unknown",
+            "{unknown}"
+        );
         assert_ne!(unknown["work"]["judge"]["next_action"], "read_job");
         assert!(
             !unknown["issues"]
@@ -1975,4 +2000,40 @@ fn unreadable_journal_evidence_does_not_claim_empty_history_or_assessed_filesyst
         }
     }
     assert_eq!(fs::read(&path).unwrap(), corrupt);
+}
+
+#[test]
+fn compact_diagnostics_bounds_adversarial_lists_without_reclassifying_health() {
+    use serde_json::json;
+    let text = "sensitive-diagnostic-fixture".repeat(100);
+    let action = json!({"kind":"command","authorization_required":false,
+        "message":text,"argv":vec![text.clone();32]});
+    let mut report = json!({
+        "healthy":false,"attention_required":true,"issues":vec![text.clone();128],
+        "warnings":vec![text.clone();128],"affected_capabilities":vec![text.clone();128],
+        "operational":{"status":"degraded","issues":vec![text.clone();128]},
+        "intervention":{"status":"operator_required","reason":text},
+        "risk":{"unresolved_effects":37,"unresolved_model_attempts":0,
+            "historical_eligible_answers":12},
+        "diagnostics":vec![json!({"code":text,"message":text,
+            "next_actions":vec![action;32]});32],
+        "effective_runtime":{"policy":{"private":"must-not-appear"}}
+    });
+    agmi::health::compact_diagnostics(&mut report);
+    assert_eq!(report["healthy"], false);
+    assert_eq!(report["operational"]["status"], "degraded");
+    assert_eq!(report["risk"]["unresolved_effects"], 37);
+    assert_eq!(report["operator_action_required"], true);
+    assert_eq!(report["presentation"]["truncated"], true);
+    assert!(report["issues"].is_array());
+    let bytes = serde_json::to_vec(&json!({
+        "schema":"agmi.cli.v1","ok":false,"type":"health","data":report
+    }))
+    .unwrap();
+    assert!(bytes.len() <= 16 * 1024, "{}", bytes.len());
+    assert!(
+        !String::from_utf8(bytes)
+            .unwrap()
+            .contains("must-not-appear")
+    );
 }

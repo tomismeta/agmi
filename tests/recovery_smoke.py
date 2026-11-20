@@ -282,6 +282,8 @@ mode = "off"
             initial_binary = str(args.old_binary.resolve()) if args.old_binary else binary
             command = [initial_binary, '--config', str(config), '--json']
             def invoke(*words, stdin=None):
+                if not args.baseline and command[0] == binary and words[0] in ('status', 'health'):
+                    words += ('--verbose',)
                 result = subprocess.run(command + list(words), input=stdin, capture_output=True, text=True, timeout=10)
                 if result.returncode and words[0] != 'health':
                     raise AssertionError(result.stderr)
@@ -496,7 +498,7 @@ mode = "off"
             wait_until(lambda: observed_answer_epoch() == 11)
             # Allow multiple observer turns, not merely a single early snapshot.
             time.sleep(4)
-            after = invoke('status', *([] if args.baseline else ['--verbose']))['data']
+            after = invoke('status')['data']
             calls = (root / 'calls').read_text().splitlines()
             assert len(shared['writes']) == 1, 'uncertain effect replayed or bypassed'
             assert after['pending']['state'] == 'unknown', 'unknown erased on restart'

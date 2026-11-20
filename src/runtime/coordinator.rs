@@ -288,6 +288,11 @@ impl HostAccess {
         effect: EffectInFlight,
         result: Result<HostedResponse>,
     ) -> Result<()> {
+        let error_category = result
+            .as_ref()
+            .err()
+            .and_then(|error| error.downcast_ref::<crate::protocol::ReadFailure>())
+            .map(|failure| failure.as_str());
         let response = match result {
             Ok(hosted) => {
                 self.store.ingest_restrictions(&hosted.restrictions())?;
@@ -298,13 +303,14 @@ impl HostAccess {
             }
             Err(_) => None,
         };
+        let mut evidence =
+            response_evidence(effect.op.kind, ResponseSource::Submit, response.as_ref());
+        if let Some(category) = error_category {
+            evidence.error_category = Some(category.to_owned());
+        }
         self.store.record_submission_evidence(
             effect.op.id,
-            &serde_json::to_value(response_evidence(
-                effect.op.kind,
-                ResponseSource::Submit,
-                response.as_ref(),
-            ))?,
+            &serde_json::to_value(evidence)?,
             &response
                 .as_ref()
                 .map(crate::protocol::response_candidates)

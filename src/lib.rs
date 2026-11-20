@@ -7,6 +7,7 @@ pub mod capability;
 pub mod config;
 pub mod doctor;
 pub mod endpoints;
+pub mod epoch;
 pub mod health;
 mod installer;
 pub mod journal;

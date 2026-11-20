@@ -23,7 +23,7 @@ pub(super) fn check_version(bytes: &[u8]) -> Result<()> {
     let text =
         std::str::from_utf8(bytes).map_err(|_| SolverNotStarted("unsupported_harness_version"))?;
     ensure!(
-        matches!(text.trim(), "18.19.0" | "omp/18.19.0" | "omp 18.19.0"),
+        matches!(text.trim(), "19.0.1" | "omp/19.0.1" | "omp 19.0.1"),
         SolverNotStarted("unsupported_harness_version")
     );
     Ok(())
@@ -614,9 +614,9 @@ mod tests {
     }
     #[test]
     fn native_version_is_qualified_exactly() {
-        check_version(b"18.19.0\n").unwrap();
-        assert!(check_version(b"18.19.1").is_err());
-        assert!(check_version(b"untrusted 18.19.0").is_err());
+        check_version(b"19.0.1\n").unwrap();
+        assert!(check_version(b"19.0.2").is_err());
+        assert!(check_version(b"untrusted 19.0.1").is_err());
     }
 
     fn model() -> ModelConfig {

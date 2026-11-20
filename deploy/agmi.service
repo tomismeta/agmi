@@ -1,12 +1,18 @@
 [Unit]
-Description=agmi — Agents Gonna Mine It [release=@AGMI_RELEASE_ID@]
+Description=agmi — Agent network harness [release=@AGMI_RELEASE_ID@]
 After=network-online.target
 Wants=network-online.target
+# Applies to manual starts as well as automatic failure restarts.
+StartLimitIntervalSec=300
+StartLimitBurst=3
 
 [Service]
 Type=simple
 ExecStart="%h/.local/share/agmi/releases/@AGMI_RELEASE_ID@/agmi" --config "%h/.config/agmi/config.toml" run
 Environment="PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
+RuntimeDirectory=agmi
+RuntimeDirectoryMode=0700
+Environment="TMPDIR=%t/agmi"
 Restart=on-failure
 RestartSec=5
 KillMode=control-group

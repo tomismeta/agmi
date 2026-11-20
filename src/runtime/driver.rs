@@ -38,6 +38,7 @@ impl HostAccess {
                 .into_iter()
                 .map(|_| Recovery::default())
                 .collect(),
+            reconciliation_pass: Default::default(),
             identity: None,
             permit: None,
             effect: None,
@@ -387,8 +388,10 @@ impl HostAccess {
         self.refresh_idle_identity()?;
         self.store.retry_models(&self.config)?;
         let mut lanes = std::mem::take(&mut self.lanes);
+        self.reconciliation_pass = Default::default();
         let result = lanes.iter_mut().try_for_each(|mut lane| lane.advance(self));
         self.lanes = lanes;
+        self.reconciliation_pass = Default::default();
         result?;
         self.record_admission_observations()?;
         self.arbitrate()
@@ -398,7 +401,9 @@ impl HostAccess {
         self.identity_nonblocking = self.controller && !once;
         self.store.reschedule_all_reads(&self.config)?;
         if once {
-            self.once = Some(OncePlan::capture(self)?);
+            let plan = OncePlan::capture(self);
+            self.reconciliation_pass = Default::default();
+            self.once = Some(plan?);
         }
         loop {
             self.store.continuity()?;
@@ -504,7 +509,7 @@ pub(in crate::runtime) struct OncePlan {
     pub(in crate::runtime) cutoff: AdmissionCutoff,
 }
 impl OncePlan {
-    pub(in crate::runtime) fn capture(runtime: &HostAccess) -> Result<Self> {
+    pub(in crate::runtime) fn capture(runtime: &mut HostAccess) -> Result<Self> {
         let cutoff = runtime.store.admission_cutoff()?;
         let entry_at = cutoff.at;
         let capture = |kind| -> Result<OnceLane> {
@@ -521,7 +526,7 @@ impl OncePlan {
                 effect: runtime.config.mode(kind) == Mode::Active,
                 recovery: runtime
                     .store
-                    .reconciliation_batch(kind)?
+                    .reconciliation_batch(&runtime.config, kind, &mut runtime.reconciliation_pass)?
                     .into_iter()
                     .map(|op| op.id)
                     .collect(),

@@ -177,8 +177,8 @@ pub(crate) fn status_evidence(config: &Config) -> Result<Value> {
     })
 }
 
-pub fn status(config: &Config) -> Result<Value> {
-    let mut status = status_evidence(config)?;
+pub fn status(config_path: &Path, config: &Config) -> Result<Value> {
+    let mut status = crate::health::local_status(config_path, config, now())?;
     crate::health::enrich_status(&mut status, crate::health::Options::default(), now());
     Ok(status)
 }
@@ -200,7 +200,7 @@ pub fn operations_list(
 ) -> Result<Value> {
     crate::store::validate_page(before, limit)?;
     match Store::read_only(config)? {
-        Some(store) => store.operations_list(kind, state, before, limit),
+        Some(store) => store.operations_list(config, kind, state, before, limit),
         None => Ok(json!({"operations":[],"next_before":null})),
     }
 }
@@ -236,6 +236,33 @@ pub fn resume(config: &Config) -> Result<()> {
     }
     let gate = AccountAdmissionGuard::for_control(config)?;
     AccountLock::control_store(config, &gate)?.set_paused(false, &gate)
+}
+
+pub(crate) fn restore_update_pause(
+    config: &Config,
+    database_id: &str,
+    expected_generation: i64,
+    expected_paused: bool,
+    desired_paused: bool,
+) -> Result<Value> {
+    if !desired_paused {
+        config.validate()?;
+        if config.network.address.is_empty()
+            || config.network.credential_file.as_os_str().is_empty()
+        {
+            bail!("resume requires a configured account and credential file");
+        }
+    }
+    // Restoration requires existing anchored authority; unlike ordinary initial
+    // control, this must never create a journal, account witness or admission gate.
+    let gate = AccountAdmissionGuard::acquire(config)?;
+    AccountLock::control_store(config, &gate)?.restore_update_pause(
+        database_id,
+        expected_generation,
+        expected_paused,
+        desired_paused,
+        &gate,
+    )
 }
 
 /// Explicitly release model-only uncertainty while the writer is stopped.
@@ -303,6 +330,7 @@ pub(super) struct HostAccess {
     wake: Arc<Notify>,
     lanes: NativeLanes,
     recovery: Vec<Recovery>,
+    reconciliation_pass: crate::store::ReconciliationPass,
     identity: Option<IdentityRead>,
     permit: Option<IdentityPermit>,
     effect: Option<EffectInFlight>,
@@ -408,6 +436,8 @@ pub async fn run(config_path: &Path, once: bool) -> Result<()> {
         store.runtime_state(&config, false)?;
     }
     let (stop_tx, stop) = watch::channel(false);
+    let mut runtime = HostAccess::new(config_path.to_owned(), config, protocol, store, stop, true)?;
+    let signal_stop = stop_tx.clone();
     let signal = tokio::spawn(async move {
         #[cfg(unix)]
         {
@@ -421,10 +451,23 @@ pub async fn run(config_path: &Path, once: bool) -> Result<()> {
         }
         #[cfg(not(unix))]
         let _ = tokio::signal::ctrl_c().await;
-        let _ = stop_tx.send(true);
+        let _ = signal_stop.send(true);
     });
-    let mut runtime = HostAccess::new(config_path.to_owned(), config, protocol, store, stop, true)?;
+    let advisory = if !once && crate::update::advisory::background_policy()["enabled"] == true {
+        Some(tokio::spawn(crate::update::advisory::run(
+            config_path.to_owned(),
+            runtime.stop.clone(),
+        )))
+    } else {
+        None
+    };
     let result = runtime.run_loop(once).await;
+    // Signals already stop advisory HTTP alongside effect draining. Internal
+    // exits must also stop it, then allow only local leased finalization.
+    let _ = stop_tx.send(true);
+    if let Some(task) = advisory {
+        crate::update::advisory::finish_background(task).await;
+    }
     signal.abort();
     result
 }

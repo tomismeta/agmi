@@ -1,4 +1,4 @@
-// Invocation-only bridge qualified against omp v18.19.0 (04cd1a7549a02d62ad1d24826198d52507595683).
+// Invocation-only bridge qualified against omp v19.0.1 (f40f335845f0b136453d12fec8d6057011082766).
 // Provider factories are trusted native profile code, not a sandbox. Only their
 // pending provider registrations enter the live runner; their handlers never do.
 import { createHash } from "node:crypto";
@@ -35,7 +35,7 @@ class Failure extends Error { constructor(readonly code: string) { super(code); 
 function requireThat(ok: unknown, code: string): asserts ok { if (!ok) throw new Failure(code); }
 
 export default async function (pi: ExtensionAPI) {
-  requireThat(VERSION === "18.19.0", "native_api_unsupported");
+  requireThat(VERSION === "19.0.1", "native_api_unsupported");
   const raw = await readFile(new URL("./omp-bootstrap.json", import.meta.url), "utf8");
   requireThat(bytes(raw) <= 16 * 1024, "native_bootstrap");
   const boot = bootstrapSchema.parse(JSON.parse(raw));

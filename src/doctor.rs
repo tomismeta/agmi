@@ -59,7 +59,7 @@ pub fn check(path: &Path, repair: bool) -> Value {
     // Refresh after repair/restoration. A changed or invalid configuration is not
     // silently diagnosed using the old account's state.
     let mut report = match Config::load_metadata(path) {
-        Ok(current) => health::check(&current, health::Options::default())
+        Ok(current) => health::check(path, &current, health::Options::default())
             .unwrap_or_else(|_| unknown_report("local_evidence_unavailable")),
         Err(_) => unknown_report("config_changed_during_doctor"),
     };

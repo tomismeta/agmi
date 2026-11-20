@@ -1,9 +1,9 @@
 [package]
 name = "agmi"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.96"
-description = "Reliable, configurable MinePOA participation for autonomous agents"
+description = "Agent network harness. Schedule, submit, recover. MinePOA is the first supported network."
 repository = "https://github.com/tomismeta/agmi"
 license = "MIT"
 publish = false
@@ -28,6 +28,8 @@ include = [
     "/examples/judge/core-guidance.md",
     "/examples/judge/user-guidance.md",
     "/docs/OPERATIONS.md",
+    "/docs/assets/architecture.svg",
+    "/docs/assets/logo.svg",
     "/README.md",
     "/LICENSE",
     "/ARCHITECTURE.md",

@@ -18,6 +18,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+pub mod reports;
 mod transport;
 use std::sync::atomic::{AtomicU64, Ordering};
 pub use transport::{
@@ -71,21 +72,7 @@ impl EffectIntent {
         deadline: EffectDeadline,
         meta: RequestMeta,
     ) -> Result<impl Future<Output = Result<HostedResponse>> + Send + 'static + use<>> {
-        validate_payload(self.lane(), payload)?;
-        ensure!(
-            protocol.key.is_some() && !protocol.address.is_empty(),
-            "submission requires configured identity"
-        );
-        ensure!(
-            meta.owner == Some(self.lane()),
-            "effect owner does not match typed intent"
-        );
-        let payload = if matches!(self, Self::Mine(_)) {
-            None
-        } else {
-            Some(payload)
-        };
-        protocol.request_query(self.endpoint(), None, payload, None, deadline.0, meta)
+        protocol.prepare_submission(self.lane(), payload, deadline, meta)
     }
 }
 const HALT_MIDDLEWARE_ERROR: &str = "endpoint temporarily halted — API hardening in progress";
@@ -267,6 +254,12 @@ pub enum ResponseSource {
     BoundJob,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MiningEvidence {
+    pub ok: bool,
+    pub attested: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DiagnosticEvidence {
     pub stage: ResponseSource,
@@ -278,6 +271,8 @@ pub struct DiagnosticEvidence {
     /// Diagnostic vocabulary only; it never grants retry or recovery authority.
     #[serde(default)]
     pub error_category: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mining: Option<MiningEvidence>,
 }
 
 /// Private, untrusted leads only. Deliberately no Debug: job IDs are bearer
@@ -336,6 +331,21 @@ pub struct Assignment {
     #[serde(default)]
     pub author_prior: AuthorHistory,
 }
+#[derive(Debug)]
+pub(crate) struct CredentialFormatError;
+
+impl CredentialFormatError {
+    pub(crate) const MESSAGE: &str = "Hosted API key format is invalid. Paste only pk_ followed by letters, digits, '-' or '_', without quotes, spaces, extra lines or terminal control characters.";
+}
+
+impl std::fmt::Display for CredentialFormatError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(Self::MESSAGE)
+    }
+}
+
+impl std::error::Error for CredentialFormatError {}
+
 impl Protocol {
     pub fn new(config: &Config) -> Result<Self> {
         config.validate()?;
@@ -727,13 +737,15 @@ fn read_credential(path: &Path) -> Result<HeaderValue> {
     file.take(4097)
         .read_to_end(&mut bytes)
         .map_err(|_| anyhow::anyhow!("cannot read credential file"))?;
-    parse_credential(&bytes)
+    Ok(parse_credential(&bytes)?)
 }
 
-fn parse_credential(bytes: &[u8]) -> Result<HeaderValue> {
-    ensure!(bytes.len() <= 4096, "credential file exceeds size limit");
+fn parse_credential(bytes: &[u8]) -> std::result::Result<HeaderValue, CredentialFormatError> {
+    if bytes.len() > 4096 {
+        return Err(CredentialFormatError);
+    }
     let text = std::str::from_utf8(bytes)
-        .map_err(|_| anyhow::anyhow!("invalid credential encoding"))?
+        .map_err(|_| CredentialFormatError)?
         .trim_end_matches(['\r', '\n']);
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -742,18 +754,15 @@ fn parse_credential(bytes: &[u8]) -> Result<HeaderValue> {
     }
     let parsed;
     let token = if text.trim_start().starts_with('{') {
-        parsed = serde_json::from_str::<Credential>(text)
-            .map_err(|_| anyhow::anyhow!("credential JSON must contain only one api_key string"))?;
+        parsed = serde_json::from_str::<Credential>(text).map_err(|_| CredentialFormatError)?;
         parsed.api_key.as_str()
     } else {
         text
     };
-    ensure!(
-        token.starts_with("pk_") && token.len() >= 4 && safe_segment(token, 4096),
-        "credential file must contain one API key"
-    );
-    let mut key =
-        HeaderValue::from_str(token).map_err(|_| anyhow::anyhow!("invalid credential format"))?;
+    if !token.starts_with("pk_") || token.len() < 4 || !safe_segment(token, 4096) {
+        return Err(CredentialFormatError);
+    }
+    let mut key = HeaderValue::from_str(token).map_err(|_| CredentialFormatError)?;
     key.set_sensitive(true);
     Ok(key)
 }
@@ -1152,16 +1161,26 @@ fn response_error_category(kind: LaneId, response: &Response) -> Option<&'static
     }
 }
 
-/// Static bounded labels only: never copy arbitrary errors, text or identifiers.
+/// Bounded labels and validated facts only: never copy arbitrary text or identifiers.
 pub fn response_evidence(
     kind: LaneId,
     source: ResponseSource,
     response: Option<&Response>,
 ) -> DiagnosticEvidence {
-    let (reason, shape) = match response {
-        None => ("transport_unknown".to_owned(), "unavailable"),
+    let (reason, shape, mining) = match response {
+        None => ("transport_unknown".to_owned(), "unavailable", None),
         Some(response) => {
-            let reason = match classify_source(kind, response, source) {
+            let outcome = classify_source(kind, response, source);
+            let mining = if kind == LaneId::Mine && matches!(&outcome, Outcome::Completed) {
+                response
+                    .body
+                    .get("attested")
+                    .and_then(Value::as_u64)
+                    .map(|attested| MiningEvidence { ok: true, attested })
+            } else {
+                None
+            };
+            let reason = match outcome {
                 Outcome::Queued { .. } => "queued".into(),
                 Outcome::Included { .. } => "included".into(),
                 Outcome::Rejected { code } | Outcome::ProcessedRejected { code, .. } => code,
@@ -1177,6 +1196,7 @@ pub fn response_evidence(
                 } else {
                     "unavailable"
                 },
+                mining,
             )
         }
     };
@@ -1192,6 +1212,7 @@ pub fn response_evidence(
                 response_error_category(kind, value).or_else(|| failure_category(value))
             })
             .map(str::to_owned),
+        mining,
     }
 }
 

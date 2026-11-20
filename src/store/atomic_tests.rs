@@ -139,7 +139,7 @@ fn missing_job_failure_does_not_delay_healthy_same_lane_or_other_lane() {
     store.fail_read(&ka, 180, 900, 0, None).unwrap();
     assert_eq!(
         store
-            .reconciliation_batch(LaneId::Judge)
+            .reconciliation_batch(&config, LaneId::Judge, &mut Default::default())
             .unwrap()
             .iter()
             .map(|o| o.id)
@@ -147,7 +147,10 @@ fn missing_job_failure_does_not_delay_healthy_same_lane_or_other_lane() {
         vec![b.id]
     );
     assert_eq!(
-        store.reconciliation_batch(LaneId::Answer).unwrap()[0].id,
+        store
+            .reconciliation_batch(&config, LaneId::Answer, &mut Default::default())
+            .unwrap()[0]
+            .id,
         c.id
     );
     store.read_finished(&kb, Some(200), None).unwrap();
@@ -215,7 +218,10 @@ fn recovery_round_robin_is_lane_owned_and_includes_off_finality() {
     finality.state = "confirmed".into();
     store.save(&finality, "receipt_included").unwrap();
     config.capabilities.answer.mode = Mode::Off;
-    let batch = store.reconciliation_batch(LaneId::Judge).unwrap();
+    store.set_authority_epoch(1).unwrap();
+    let batch = store
+        .reconciliation_batch(&config, LaneId::Judge, &mut Default::default())
+        .unwrap();
     assert_eq!(batch.len(), 2);
     // Newest-first service with a fair cursor that cannot be overtaken.
     assert_eq!(batch[0].id, ids[3]);
@@ -224,19 +230,29 @@ fn recovery_round_robin_is_lane_owned_and_includes_off_finality() {
         let key = Store::operation_read_key(op).unwrap();
         assert!(
             store
-                .reconciliation_read_started(&config, LaneId::Judge, &key)
+                .reconciliation_read_started(
+                    &config,
+                    LaneId::Judge,
+                    &key,
+                    1,
+                    u64::try_from(op.id).unwrap(),
+                    &mut Default::default(),
+                )
                 .unwrap()
         );
     }
     // Both slots are durably occupied until their reads finish or fail.
     assert!(
         store
-            .reconciliation_batch(LaneId::Judge)
+            .reconciliation_batch(&config, LaneId::Judge, &mut Default::default())
             .unwrap()
             .is_empty()
     );
     assert_eq!(
-        store.reconciliation_batch(LaneId::Answer).unwrap()[0].id,
+        store
+            .reconciliation_batch(&config, LaneId::Answer, &mut Default::default())
+            .unwrap()[0]
+            .id,
         finality.id
     );
     drop(store);
@@ -246,7 +262,7 @@ fn recovery_round_robin_is_lane_owned_and_includes_off_finality() {
     // reads but the durable service reservation stands.
     assert!(
         store
-            .reconciliation_batch(LaneId::Judge)
+            .reconciliation_batch(&config, LaneId::Judge, &mut Default::default())
             .unwrap()
             .is_empty()
     );
@@ -270,7 +286,10 @@ fn queued_resource_floor_and_shared_floor_have_distinct_authority() {
         },
     );
     assert_eq!(
-        store.reconciliation_batch(LaneId::Judge).unwrap()[0].id,
+        store
+            .reconciliation_batch(&config, LaneId::Judge, &mut Default::default())
+            .unwrap()[0]
+            .id,
         b.id
     );
     assert_eq!(
@@ -293,7 +312,7 @@ fn queued_resource_floor_and_shared_floor_have_distinct_authority() {
     );
     assert!(
         store
-            .reconciliation_batch(LaneId::Judge)
+            .reconciliation_batch(&config, LaneId::Judge, &mut Default::default())
             .unwrap()
             .is_empty()
     );
@@ -568,7 +587,10 @@ fn mining_interval_does_not_gate_discovery_or_existing_recovery() {
     assert_eq!(store.next_at(LaneId::Mine).unwrap(), 0);
     assert!(store.participation_next_at(LaneId::Mine).unwrap() > now());
     assert_eq!(
-        store.reconciliation_batch(LaneId::Mine).unwrap()[0].id,
+        store
+            .reconciliation_batch(&config, LaneId::Mine, &mut Default::default())
+            .unwrap()[0]
+            .id,
         op.id
     );
 }

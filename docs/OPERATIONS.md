@@ -4,7 +4,7 @@
 
 ## Agent administration
 
-Use `--json` for versioned responses; errors use stderr, stable codes and nonzero exit status. `commands` describes effects and private outputs. The examples below use the default configuration; add `--config PATH` for another file.
+Use `--json` for versioned responses; errors use stderr, stable codes and nonzero exit status. `commands` describes effects and private outputs. The examples below use the default configuration; commands supporting custom configuration accept `--config PATH`. Managed `update` resolves the canonical configuration itself and rejects `--config`, even when it names that same file.
 
 Suggested command actions carry the selected configuration's absolute path, so an agent may change working directory without changing accounts. `authorization_required` is not permission: never execute a mutating suggestion merely because it was returned. The default CLI and installed-service path is `~/.config/agmi/config.toml`, independent of `XDG_CONFIG_HOME`; another `--config` needs separate foreground supervision.
 
@@ -45,6 +45,23 @@ Guidance commands read/write private UTF-8 content, not model instructions in ar
 
 For interrupted identity creation, inspect `identity status`. A complete retained success can provide `identity resume --confirm`, which validates and publishes only local files without the original registration options or network profile. Omit `--confirm` to inspect the plan. Missing/incomplete capture remains uncertain; resume never requests proof work or another registration.
 
+## Epoch evidence
+
+```sh
+agmi --json epoch --work-epoch "$WORK_EPOCH"
+agmi --json epoch --close-epoch "$CLOSE_EPOCH" --refresh
+agmi --json epoch --work-epoch "$WORK_EPOCH" --close-epoch "$CLOSE_EPOCH" --refresh --raw
+```
+
+At least one selector is required; both are useful when older work settles at a later close. The default is local-only, with 50 rows; `--limit 1..100` and `next_before`/`--before` paginate selected operation history. Counts describe that page and its coverage, not an inferred complete account history. Passed, failed, expired, pending-as-of-close and unknown remain distinct; jury alignment is not proof a local grade transaction settled.
+
+`--refresh` requires a close epoch and explicitly reads up to three bounded public reports without credentials, guidance or models. Unsupported/custom authorities refuse rather than query another network. Failed refreshes preserve each source's original last-good time and coverage and exit nonzero even when some positive evidence was retained. A local view may succeed with unknown outcomes. Reports never resolve journal uncertainty or authorize replay.
+
+`--raw` additionally downloads a bounded close record to a private temporary file, verifies the publisher-index length/hash, then retains relevant facts. It can read up to 65 MiB beyond compact reports and take another 60 seconds. An exact account reward is a node-reported close amount, not independently verified payment or an allocation to answers/lanes. Explicit zero differs from a missing account entry. Aggregate expiry reports and absent rows cannot prove an individual answer failed or remains pending.
+
+`--private` exposes private bindings, submitted content and actual captured novelty context; the retained last-eight-answer context is not a complete mechanism taxonomy. Keep that output private. Disposable mode-0600 caches live under owned `state_dir/reports`; only explicit refresh creates or replaces them. No recurring report poll, strategy change or new inference is introduced.
+
+
 
 ## Modes and effects
 
@@ -71,6 +88,8 @@ Each lane's schedule defaults to 120-second polling, 180-second retry, a 900-sec
 The mining interval starts with a new operation's first durable dispatch intent, not preparation. A draft discarded during fresh challenge validation does not consume the interval; a possibly-sent request does, including an unknown outcome. This local cadence survives restart, while safe retries of that same operation do not restart it. `each_epoch = true` instead limits new mining attempts to one per observed epoch; neither mode bypasses server-imposed request minima.
 
 The latest completed mining operation remains visible in `status.work.mine` during the current epoch's scheduled wait. Health requires fresh matching epoch evidence; completion does not hide newer failed work or pending/uncertain work, or satisfy a new epoch or an already-due interval. For interval mining, `completion_valid_until` carries the deadline and health rechecks it at report time.
+
+New completed mining records retain validated `ok` and unsigned `attested`, including zero. Operation pages label old absent evidence `not_recorded`, not zero. Completion/counts are node observations, never payment proof; evidence retained before a bookkeeping crash does not settle the operation.
 
 Failures belong to identity, one lane's discovery, one assignment, or an operation's exact job/receipt binding revision. A slow or missing job does not impose local backoff on another job or lane. Rebinding retires the old read key; late completions cannot update the replacement binding's clocks or state. Genuine account/route/resource restrictions still constrain every applicable request.
 
@@ -149,7 +168,7 @@ Omitted routes inherit shipped defaults. Templates are origin-relative paths, no
 
 API route changes require stopped, drained state. Prepared work, retryable model attempts, unresolved operations and confirmed operations still awaiting finality block the change; pausing alone is insufficient, and a route edit cannot rebind old evidence. Restore `status.data.network_routing.bound_api` to reconcile under the recorded profile. Never discard unknowns to enable a new route. A permitted change clears stale identity/eligibility observations and invalidates old manual grants, including when first binding a custom profile to a legacy journal. Server retry floors remain. An initialized account's origin remains immutable even when drained. Trust-list edits must continue to authorize that origin; normal model, guidance and participation-policy hot reload remains unchanged.
 
-An older journal without retry-link evidence cannot prove that routing is drained through read-only inspection. Complete its supported adoption/opening under the recorded profile before attempting a change; this conservative gate is not itself evidence of an unresolved operation.
+Normal runtime and diagnostic readers require the current journal format. Before changing routes on an older journal, complete its supported explicit stopped migration under the recorded profile. Migration preserves uncertainty and retry evidence; it does not itself prove that routing is drained.
 
 ### Configurable uncertainty policy
 
@@ -215,6 +234,10 @@ The selected lane must be active with manual policy and resumed intent. Account 
 
 Reconciliation is separately paced per lane with bounded read slots, fair service for recent/ordinary bound work and sparse service for repeatedly missing jobs. Fresh discovery remains independent. Repeated 404s can reduce polling urgency but never establish failure or permit a duplicate POST. A bound `408 job_expired` is different: it supplies positive nonprocessing evidence. Upstream finished-job retention is not a local retirement timer measured from submission. Identifierless uncertainty has no job to poll.
 
+Operation pages add sanitized `reconciliation` explanations: binding presence/age source, latest check versus usable evidence, missing streak, original floors and next eligible follow-up. Bearer IDs stay private. Identifierless work cannot be polled; a missing job stays unresolved without authoritative terminal evidence.
+
+Extra slow polling requires positively historical, nonblocking work and two consecutive complete 404s under the current binding/runtime authority. At 24 hours it adds a six-hour cadence; at seven days, one day, plus at most five minutes of jitter. Every original floor still applies. New bindings use committed binding time; legacy bindings wait from first observation, never operation creation. Cancellation, non-404 responses and authority changes reset the streak. Changed relevance or stale proof removes only this extra delay. Finite totals stream once per relevant scheduling pass; the unbounded path avoids cumulative history reconstruction.
+
 Capacity/scheduling changes need not discard valid unsent model output: reuse requires unchanged producer/input provenance, nonrevoked authority and fresh dispatch checks. Genuine model/guidance changes and insufficient historical provenance remain fences. The immutable producer record is not retagged with the new dispatch policy.
 
 ### Lane controls
@@ -264,38 +287,48 @@ Configuration failures include a bounded `details.reason` and, where known, a so
 
 ### Atomic capability migration
 
-The proposed current contract uses unversioned per-lane configuration and journal format 4. Published **v0.1.0 and v0.1.1 use global-shaped configuration and journal format 2**; the unreleased implementation below is not a package publication or proof of a deployed format. Inspect actual configuration, journal, authority and migration seal rather than inferring compatibility from a version label. This is a permanent explicit cutover, not a legacy-bot importer. Preserve private backups for investigation; never restore older state to regain availability.
+Version 0.2.0 uses unversioned per-lane configuration and journal format 4. **v0.1.0 and v0.1.1 use global-shaped configuration and journal format 2.** Inspect actual configuration, journal, authority and migration seal rather than inferring compatibility from a version label. This is a permanent explicit cutover, not a legacy-bot importer. Preserve private backups for investigation; never restore older state to regain availability.
 
-Ordinary `update` does not convert or pause an incompatible installation. `update --migrate` explicitly authorizes stopped maintenance: verify/stage the incoming release, disable service/timer boot activation, stop and verify the writer, durably pause when necessary, then select the incoming release stopped. A pause can change generation and invalidate grants/captures. Preparation is disruptive and mutating, **not a dry run**. Nothing automatically re-enables, starts or resumes participation.
+Plain managed `update` verifies the incoming target before maintenance, captures durable original intent, stops cleanly when needed, and performs supported canonical policy-preserving conversion. It then verifies local configuration/authority/process structure and restores independent runtime/timer activity, boot enablement and global pause intent. A necessary pause can advance generation and invalidate stale grants/captures; accounting and uncertain history are never reset. Missing policy choices, changed/unproven risk and initial authority adoption remain explicit decisions.
 
-**One-time published-client bootstrap:** v0.1.0 has no latest-stable updater; v0.1.1 online discovery requires journal format 2 before downloading and cannot fetch a journal-4 candidate. Old CLIs do not learn the new migration flags. Acquire the correct candidate through the publisher/operator trust path; verify origin, archive checksum, extracted executable checksum, and published manifest/build identity **before executing it**. Checksums under publisher trust are not independent signatures. Invoke that verified new executable directly; do not overwrite the managed binary by hand or install an intermediate bridge release:
+Automatic decisions include bounded `migration.decision_reason`: `lane_limits_required`, `authority_adoption_required` or `risk_review_required`, with specific next-step guidance and `config migrate preview --help`. No private candidate is implied when none was requested; required limits, adoption and risk approvals are not guessed.
+
+`update --migrate` retains conservative stopped, boot-disabled maintenance when conversion is needed, without automatic doctor, repair or participation resume. Already-compatible updates keep ordinary no-extra-pause/generation behavior. Explicit proposal preparation can itself stop/pause and select the incoming target to bind an exact preview; it is disruptive, **not a dry run**.
+
+**One-time 0.1.x bootstrap:** v0.1.0 has no latest-stable updater; v0.1.1 online discovery requires journal format 2 before downloading and cannot fetch a journal-4 release. Old CLIs do not learn the new migration flags. Acquire the correct new executable through the publisher/operator trust path; verify origin, archive checksum, extracted executable checksum, and published manifest/build identity **before executing it**. Checksums under publisher trust are not independent signatures. Invoke that verified new executable directly; do not overwrite the managed binary by hand or install an intermediate bridge release:
 
 ```sh
 # NEW_AGMI is the verified new executable; EXPECTED_SHA256 is operator-trusted.
 umask 077
-"$NEW_AGMI" --json update --binary "$NEW_AGMI" --sha256 "$EXPECTED_SHA256" \
-  --migrate --proposal proposal.json > migration-preview.json
+"$NEW_AGMI" --json update --binary "$NEW_AGMI" --sha256 "$EXPECTED_SHA256"
 ```
 
 Prepare `proposal.json` privately with explicit positive `caps` for `answer`, `judge` and `mine`, or a complete `candidate_toml`. Caps are policy decisions, never automatically copied or divided global capacity. Canonical strict/no-allow legacy configuration may use `{}` only when preservation is proven. Missing necessary choices refuse before maintenance. No default modes, models, quotas or authority adoption are invented. Inspect `config migrate preview --help` for the canonical input shape.
 
-`--proposal FILE` accepts one JSON object of at most 64 KiB; only explicit `--proposal -` reads stdin. Proposal JSON never travels in child argv: handoff uses an owned mode-0600 temporary file until the installer finishes. Preview/request/config/guidance/routing details are private; do not publish or log them. Preparation reports `migration_prepared`, not `updated`, and returns a private canonical `data.preview`, exact request, token and selected release ID. With `jq` available:
+If an explicit decision is required, supply the private proposal:
+
+```sh
+"$NEW_AGMI" --json update --binary "$NEW_AGMI" --sha256 "$EXPECTED_SHA256" \
+  --proposal proposal.json > migration-preview.json
+```
+
+`--proposal FILE` accepts one JSON object of at most 64 KiB; only explicit `--proposal -` reads stdin. Proposal JSON travels in an owned mode-0600 temporary file, never child argv. Preview/request/config/guidance/routing details are private. A decision reports `decision_required` and exits nonzero, even when private preparation succeeded; inspect `data.private`, `data.preview`, token and selected release ID rather than treating it as rollback. No proposal means no automatic private-preview disclosure. With `jq` available:
 
 ```sh
 TOKEN="$(jq -r '.data.migration.token' migration-preview.json)"
 RELEASE_ID="$(jq -r '.data.migration.release_id' migration-preview.json)"
 jq '.data.preview.request' migration-preview.json > request.json
 # Review candidate, backlog, exposure, model routes/budgets and authority first.
-"$NEW_AGMI" --json update --release "$RELEASE_ID" --migrate \
+"$NEW_AGMI" --json update --release "$RELEASE_ID" \
   --proposal request.json --expected-token "$TOKEN"
 # Add --accept-risk-change "$TOKEN" only when required and explicitly approved.
 ```
 
 Use the preview's exact returned `request`, never a reconstructed proposal. The approval tuple is **selected release ID + exact request + migration token**. Continuation requires an explicit `--release` equal to the currently selected verified candidate and never re-resolves latest or selects a different candidate incidentally. Source/config/guidance/journal/authority or selection changes require refusal and a fresh explicit review, not automatic reapproval. Risk acknowledgment must equal the expected token. Changed/unproven effect exposure, answer-attempt or uncertain-retry allowances, model spending and historical backlog are assessed independently; strict mode alone is not proof. `--migrate` conflicts with `--repair` and `--migration-only`.
 
-For per-lane `schema_version = 2` configuration already on journal format 4, plain update reports migration required. Explicit `update --migrate` uses the canonical exact `{}` marker-only preview/token/apply internally; it needs no external approval token and cannot change lane policy. Existing controls, account authority, operations, charges and retry floors remain. The necessary pause may change generation; configuration/lane/producer revisions change, and formatting/comments may be reserialized. Historical captures retain their original facts and charges, never automatic replay or budget reset. The result is `migration_complete_stopped`, not readiness.
+Per-lane retired-marker removal and supported journal-3 conversion use canonical exact `{}` internally when every preservation dimension is positively proven; no external token is invented or needed for that preserving path. Existing identity, controls, authority, operations, charges and retry floors remain. Formatting/comments and configuration/lane/producer revisions may change; historical captures retain their original facts and charges. Global-layout conversion still requires explicit choices where preservation cannot be proven.
 
-Per-lane journal-3 conversion also uses unchanged-policy `{}`, but requires the returned token and explicit pinned continuation. Global-layout conversion requires explicit policy choices as above. Ordinary already-compatible updates retain their existing runtime/timer intent and config/pause/generation behavior, including when `--migrate` finds no conversion necessary.
+Ordinary compatible updates leave configuration bytes, pause and generation unchanged. An already-current compatible update does not stop/restart the controller. A same-version/release label is not permission to skip actual source inspection. Normal completion reports `updated`/`current` with separate restoration evidence; explicit conversion maintenance reports `migration_complete_stopped`.
 
 The lower-level `--stopped --migration-only` explicit-source bootstrap remains available for supported 2/3-to-4 installation selection without conversion. It disables boot activation and never starts or repairs participation; use canonical standalone preview/apply with caller-managed stopping for noncanonical foreground installations. Partial bootstrap failures retain bounded `bootstrap_recovery` evidence for disable, definition restoration and manager reload; inspect actual selected release and manager state before retrying, never automatically enable/start.
 
@@ -313,7 +346,9 @@ If interrupted, inspect the sealed migration without starting participation:
 
 **`config migrate resume` finishes conversion; it does not resume participation.** Use the token from migration status. Exact old bytes can be replaced by the sealed candidate; exact new bytes can be verified and finished. Different configuration/guidance or authority is a conflict, never permission to overwrite. Keep stopped, inspect the private export and restore approved inputs deliberately; do not edit journal or authority records.
 
-Integrated `update --migrate --release "$RELEASE_ID" --expected-token "$TOKEN"` may finish the same canonical pending seal only when the selected release and exact token match. Use the verified incoming/retained executable, not an arbitrary stale CLI on PATH. A pending seal is recovery, not permission to generate a new proposal, retarget historical approval, repeat pause or adopt authority. After the first committed conversion seal (or config publication for config-only conversion), do not restart the old writer. If incoming selection succeeded before conversion or a later installer step failed, inspect migration and installation phases independently: failure never means rollback. Boot-disable/stopped maintenance intent is not automatically restored after interruption or cold restart.
+For an interrupted managed operation, rerun plain `agmi update` first: its durable record routes the exact retained target before latest discovery, no-op handling or source-data parsing. Explicitly conflicting targets or stopped/maintenance retry modes refuse; use a canonical service/control command to cancel stale restoration deliberately. A sealed migration resumes only its exact approval; an unsealed explicit decision still needs its original request/token/release. No fresh proposal, risk approval, authority adoption or repeated pause is inferred from a pending seal. After a committed conversion seal or config-only publication, never restart an incompatible old writer or restore an older journal. Standalone `config migrate resume` remains data-only and cancels outstanding managed auto-restoration as a later operator mutation.
+
+Across a boot change, an incomplete operation keeps captured activity independent of boot enablement: runtime-only enablement expires, not its separate recorded activity. An already-complete ordinary operation instead verifies durable target/configuration/authority/boot state and any currently running target, then removes the completed record without replaying or requiring prior-boot transient activity. It reports restoration `not_needed` and service `unchanged`, not fresh restoration of obsolete activity. This distinction is not proof of a tested kernel reboot.
 
 Integrated recovery reports `pending` separately from further work. Only a pending
 seal gets an old-token continuation. A completed target-3 seal gets a fresh,
@@ -326,7 +361,7 @@ A recognized historical seal without an explicit target resumes only its exact o
 
 Pending migration fences ordinary mutators. Migration status/private export remain available even if the installed configuration conflicts. With no journal and no bound authority, conversion changes configuration only and creates neither journal nor authority. Retained legacy floors remain absolute and are never renewed by restart.
 
-After completion, run `config check` and inspect local status. For a managed installation, explicitly run `agmi service enable` and `agmi service start`; migration does not restore either boot activation or running intent. Participation remains paused: review fresh readiness before a separate `agmi resume`. Neither bootstrap nor migration authorizes a fleet rollout or fleet risk-policy changes by itself.
+Standalone migration and explicit stopped maintenance do not activate participation: run `config check`, inspect local status, then separately authorize `service enable`, `service start` and `resume` as needed. Ordinary integrated updates instead verify and restore previously authorized intent automatically; do not add an unnecessary pause/resume cycle. Neither path authorizes a fleet rollout or fleet risk-policy changes.
 
 #### Offline rehearsal is not a relocated database restore
 
@@ -346,7 +381,7 @@ Offline rehearsal ends with local migration/evidence inspection. Do not run part
 2. Review each candidate lane's explicit mode, quota, schedule and deadlines; answer/judge model, harness, reasoning and guidance; and uncertain-model/network retry policies. Old global capacity/reservation is not equivalent to three lane quotas. Existing participation-first or accepted-linked policies must not silently become strict—or vice versa.
 3. Require the complete CI pipeline, extracted-package library-test compilation and binary writer/account-authority continuity coverage. Synthetic migration and native fixtures are not a real-journal rehearsal or authenticated-provider proof.
 4. Separately authorize bounded native-provider validation with a designated test identity, exact harness/model route and inference budget. A pass requires successful inference, a valid bound artifact and sufficiently complete native-reported provenance matching the authorized route. Failed calls, mismatches or missing required facts are failed/unavailable proof and block that route's activation. Exercise cancellation separately without treating client exit as remote nonexecution. Do not patch installed harnesses or copy authentication material; ordinary native session/cache/auth-refresh writes may still occur when invoked.
-5. Authorize one account's maintenance window and cutover, never a fleet-wide conversion. Verify effective lane modes after conversion, then separately approve service activation and participation. A format-incompatible old binary is not a rollback path; stop and roll forward without restoring older journal state.
+5. Authorize one account's maintenance window and operating intent, never a fleet-wide conversion. Verify effective lane modes and preserved controls. Plain update may restore only previously authorized active intent; choose stopped maintenance when activation needs separate approval. A format-incompatible old binary is not rollback: stop and roll forward without restoring older journal state.
 6. Before expansion, observe at least two complete epoch transitions and one controlled restart. Require observed eligible answer/judge/mine progress, independent lane pause/resume, retained work/retry floors/uncertainty, and diagnostics that agree with observed state. Correctly explained blockers prove diagnostic behavior, not lane readiness. Any lane without demonstrated eligible progress remains failed or untested and blocks expansion, including when no judging opportunity arose. Record CPU, memory and journal growth against agreed limits; remote acceptance/finality require remote evidence.
 
 Before deploying marker removal, inspect external monitoring/automation for reliance on health `contract_version` or the retired config schema identifier. They are no longer emitted; select the required evidence fields instead. No external-consumer compatibility is established by an in-repository search.
@@ -360,6 +395,8 @@ Keep financial reporting separate: local status supplies participation and healt
 Run one authoritative writer per account; stop any other submitting software first. Existing accounts use `agmi init --account YOUR_PUBLIC_ACCOUNT_ADDRESS --key-prompt`, or `--api-key-file /path/to/private/api-key` / `--key-stdin` for automation. Never put credentials in command arguments. Init verifies the account read-only, provisions private configuration/guidance and leaves participation paused/read-only; it does not replace existing configuration or history.
 
 An `initialization_invalid` error identifies a rejected initialization field before identity verification or onboarding writes. Follow its `init --help` / `config schema` actions, correct the init arguments or network profile, and repeat init—not `config check` against a configuration that was never created. Preserve any existing credentials and journal.
+
+A `credential_format_invalid` error is local: credential parsing failed before any verification request or onboarding write. Paste only the hosted `pk_` key, without surrounding quotes, whitespace, extra lines or terminal escape sequences. This is not a server rejection of the account/key. Input is never included in the error; network/client preparation failures remain separate.
 
 For a brand-new account, `agmi identity create --label my-agent` is a nonmutating plan. Registration requires separate explicit approval and a verified proof-of-work algorithm:
 
@@ -402,7 +439,7 @@ Use a native CLI executable, not a shell command or an arbitrary JSON adapter. T
 |---|---|---|
 | Hermes | Launcher supports `--print-runtime-command`; native embedding API supports tool/context isolation and the authenticated OpenAI Codex route | Exact model identifier, for example `gpt-6.1-sol` |
 | OpenClaw | `2026.10.9` public Gateway CLI transport, compatible Node.js on PATH, and an authenticated running Gateway permitting `operator.admin` | Provider/model, for example `openai/gpt-6.1-sol` |
-| omp | Official standalone `18.19.0` binary; invocation-loaded public SDK bridge, independent direct inference and native authentication | Exact provider/model, including model IDs containing slashes |
+| omp | Official standalone `19.0.1` binary; invocation-loaded public SDK bridge, independent direct inference and native authentication | Exact provider/model, including model IDs containing slashes |
 
 The user service sets `PATH` to `$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin`; it does not load shell startup files. Configure the native harness executable by absolute path and make OpenClaw's compatible `node` available on that service PATH. A working interactive `nvm`/`fnm` shell is not sufficient. Provision and authenticate the harness as the runtime OS account, then verify model execution under supervision before leaving it unattended.
 
@@ -601,6 +638,16 @@ requires attention; a hard kill, process abort or host failure can prevent it.
 A newly restored process without a fresh controller observation remains
 `undetermined`, not a claim that participation has resumed.
 
+## Storage ownership
+
+Use `agmi config show` for configured paths and `agmi config state-path` for the resolved journal directory; neither requires reading credential contents. Managed installations keep configuration under `~/.config/agmi`, immutable releases under `~/.local/share/agmi/releases`, and OS registration links in `~/.local/bin` and `~/.config/systemd/user`. The journal uses the configured `state_dir`, which can differ from the release parent. Existing configured locations and account-authority locks are not relocated by an update.
+
+The default `~/.config/agmi/credential` is a private hosted MinePOA API key, not a self-custody wallet signing key or seed phrase. Referenced credentials may live elsewhere; they are not automatically owned for deletion. Preserve credentials and guidance separately from disposable workspaces and release artifacts, and keep credential backups private.
+
+The journal/WAL, canonical account bindings, registration intents/captures and retained request restrictions are durable evidence. Report records under `state_dir/reports` also carry retry minima; removing a file called a cache is not permission to forget a server restriction. Back up a consistent journal with SQLite-aware or fully quiescent procedures, not the live main file alone. A backup is not automatically a restartable clone.
+
+Fresh initialization and registration use the same platform data-directory default for journal state. A retained registration attempt keeps its originally bound destination, including older config-local state, even if the current environment/default changes. The shared default may already contain managed releases; existing journal/WAL/SHM artifacts still prevent registering a new identity into it.
+
 ## Supervision
 
 The canonical Rust Linux user-systemd installer stages versioned matching binary/unit sets under `~/.local/share/agmi/releases`; no shell installer is shipped. State, credentials and native authentication stay outside those release sets. Build from this Git checkout or a Cargo package retaining `.cargo_vcs_info.json`; `agmi build-info --manifest` exposes commit, dirty marker, target, schema and embedded unit/adapter checksums. The installer requires known commit/dirty labels. Cargo package VCS labels are metadata, not signed source proof; an archive without either its own Git identity or valid Cargo VCS metadata remains unknown.
@@ -637,20 +684,23 @@ The default source is the latest published stable GitHub release in
 `tomismeta/agmi`, not the `main` branch. Discovery reads bounded release metadata,
 checksums and build identity over HTTPS. Downloads are limited to the fixed
 publisher and allowed GitHub release-asset redirects. Archive and extracted-binary
-digests, target, embedded identity and journal compatibility are checked before
-activation. Archives cannot supply arbitrary extraction paths or symlinks.
+digests, target, embedded identity and stable update protocol are checked before
+handoff. The incoming target classifies actual source data; archives cannot supply
+arbitrary extraction paths or symlinks.
 HTTPS trusts that publisher's release assets; checksums are integrity checks, not
 independent signatures or protection against a compromised publisher.
 
 `--check` and `--dry-run` never execute incoming code, activate, repair or convert.
 They report operational compatibility as `not_assessed`, not installability; this
-also applies with `--migrate`. A successful publication check may report no
-compatible update or unverifiable source ordering. Inspect availability/reason.
+also applies with `--migrate`. Standalone `--check` needs no configuration, journal
+or daemon, and writes only private passive release evidence. Failed/refused fresh
+checks exit nonzero. Inspect availability, reason and dated last-good evidence.
 Automatic activation requires verified host/build compatibility, protocol fencing
 and conservative version/commit ancestry evidence. Dirty, divergent or unproven
 source ordering is not resolved by downgrading. Different commits with the same
 package version are not the same build. The selected-release fence is rechecked
 under the installer lock. Explicit local sources remain operator-selected.
+
 
 Incoming published builds must advertise `update_protocol=1` in their verified
 build manifest: this guarantees support for the lock-held selected-release fence.
@@ -659,31 +709,59 @@ unknown protocols are reported as incompatible during discovery, never offered
 for automatic activation. Explicit local installation remains available; the
 updater does not weaken its concurrency safeguard to accommodate older installers.
 
-Protocol 1 guarantees that fence, not universal configuration/journal compatibility.
-Future ordinary compatible releases can use the existing verified incoming public-CLI
-handoff without a bridge release or update-protocol bump. Older delegating parents
-may discard unfamiliar child migration fields or report generic failure; the
-one-time verified-new-CLI path above remains the honest escape hatch.
+Protocol 1 fences distribution/selection, not universal data compatibility. Its
+fixed required manifest fields remain unchanged; journal format is positive bounded
+identity metadata, not equality with the downloading caller. A future target must
+understand the actual source, request a real decision or refuse before unsafe
+maintenance. A journal-number change alone needs no bridge or updater-protocol
+bump. Frozen published clients retain the one-time bootstrap limitation above.
 
-For ordinary compatible updates, downloads finish before managed installer cutover.
-Configuration bytes, credentials, model/reasoning settings, core/user guidance,
-pause intent and generation remain unchanged. No template is reapplied, account
-is reinitialized, model is abandoned, or journal snapshot is restored. A service
-that was running may resume its previously authorized participation after restart.
+Downloads finish before managed cutover. A private
+`~/.local/share/agmi/releases/.update-state.json` captures the pinned source/target
+and original intent before disable/stop/pause. Its stable routing header is readable
+independently of the target-owned payload. Reruns reconcile that same target, not a
+new latest release. Corrupt/unknown records, missing or changed retained binaries,
+unknown protocols and selection outside the recorded source/target refuse.
 
-After a successful ordinary compatible update/no-op, the selected executable runs read-only doctor.
+The permanent mode-0600 `.install-lock` uses an OS-lifetime lease, not age/PID
+reclamation; never delete or replace it. An old installer lock directory reports
+`legacy_install_lock` and needs explicit inspection, never automatic stale deletion.
+Frozen installers do not understand the new regular-file lease. The updater's
+retained control child shares validated ownership; runtime/provider children do not.
+
+Identity, credentials, model/reasoning settings, guidance, budgets, uncertainty,
+charges and retry floors are preserved. Compatible updates keep configuration
+bytes, pause and generation unchanged; conversion may canonicalize formatting and
+invalidate stale grants. No account reinitialization, model abandonment, replay,
+budget reset or journal rewind occurs. Running, paused and stopped intent remain
+independent; runtime-only enablement expires across a changed kernel boot.
+
+Later canonical controls—including same-valued pause/resume/stop—durably cancel
+historical automatic restoration. Global pause restoration is conditional under
+the account admission gate and one SQL transaction. Raw `systemctl`, external
+editors and retained older CLIs are not transactionally observable controls: do not
+race them against an update; inspect conflicts instead of assuming their intent
+can be inferred. A cancelled completed conversion may finalize without restoring
+old activity/pause/boot intent, reported explicitly as `cancelled`, not `restored`.
+
+After a successful ordinary update/no-op, the exact selected executable runs read-only doctor.
 `--repair` additionally authorizes its existing guarded refusal recovery, including
 the disclosed legacy-429 policy limitation; it is not permission to replay
 uncertain writes or clear history. Checks/dry runs never repair, and `--check`
 cannot be combined with `--repair`. A failed update does not proceed to repair.
 
 JSON `data.update`, `data.installation`, `data.compatibility`, `data.migration`,
-`data.repair` and `data.readiness` are separate outcomes. Finite migration outcomes
-are `migration_required`, `migration_prepared`, `migration_complete_stopped` and
-`recovery_required`; preparation can exit zero only as preparation. Migration
-refusal/preparation/completion/recovery never runs doctor or automatic repair/resume.
-Update/repair failure exits nonzero without hiding completed activation, conversion
-or partial repair. Unhealthy doctor evidence does not undo an ordinary update;
+`data.restoration`, `data.repair` and `data.readiness` are separate outcomes.
+`installation.operation_mode` identifies recorded `standard`/`maintenance` mode,
+including a plain rerun of stopped maintenance; absent mode evidence stays unknown.
+Decision, conflict, recovery and restoration-incomplete outcomes imply no rollback
+or permission to restart. Explicit maintenance reports restoration `not_needed`,
+never verified prior-intent restoration, and does not run doctor/repair automatically.
+
+Structural restoration verifies actual executable digest, current systemd
+MainPID/InvocationID, effective configuration revision and authority. Aggregate
+`healthy=true`, empty uncertainty, fresh upstream evidence and model/provider calls
+are not installation gates. Unhealthy doctor evidence does not undo an update;
 readiness may be unavailable if the selected binary cannot provide that contract.
 The report identifies that doctor executable's release and rechecks selection
 afterward. Changed or unverifiable selection makes diagnosis `stale` and removes
@@ -703,23 +781,54 @@ agmi install --stage-only --binary /absolute/path/to/new-agmi --sha256 "$EXPECTE
 agmi update --release "$RELEASE_ID"
 ```
 
-Updates preserve prior runtime/timer running intent and unit enablement. `--stopped` forces a stopped cutover. An incoming binary is privately copied and checked against the expected digest before it can execute; its own embedded installer/assets own the cutover. Explicit local sources use the operator-supplied digest and make no release-discovery requests. Dry-run reports a nonexecuting plan, not a guarantee that operational preconditions will pass. Installed, loaded and running identities are reported separately.
+Updates preserve independent runtime/timer activity and boot enablement; `--stopped` selects a stopped cutover. A conflicting stopped/maintenance override on an existing durable operation refuses instead of silently restoring activity. An incoming binary is privately copied and digest-checked before execution; its embedded installer/assets own cutover. Explicit local sources make no discovery requests. Dry-run is nonexecuting, not proof of operational compatibility. Installed, loaded and running identities are separate evidence.
 
-Release staging and activation use synced artifacts and atomic publication/pointer replacement. A failure during cutover stops the runtime/timer and reports failure; it never automatically reverts the activation pointer or journal. If the delegating parent is interrupted after the incoming installer completed, it reports `interrupted` while preserving the child's completed activation/service evidence—not claiming that services stopped or selection was undone. Inspect that evidence before another lifecycle action.
+Release staging and activation use synced artifacts and atomic publication/pointer replacement. An incomplete cutover preserves bounded phase/control evidence and its pinned record; failure never automatically reverts selection or journal. Once participation has been conditionally restored, a later timer/diagnostic failure does not blindly stop or erase completed progress. Delegating-parent interruption can retain the child's completed evidence without claiming either rollback or a stopped service. Inspect those outcomes and rerun pinned recovery.
 
 Before manager-facing actions, agmi requires the OS account's canonical home, matching manager unit-search paths and loaded-unit file ownership. `manager_context_mismatch` requires correcting HOME/session selection or resolving conflicting units; `service_state_unavailable` requires readable, stable runtime/timer state before retrying. Stage-only writes the release tree without creating binary-link/user-unit directories or contacting the manager. Retained rendered units are checked against their binary's embedded template hashes, not just mutable checksum files.
 
 Installer failures include a finite `failure_code` and relevant repair guidance without forwarding raw subprocess output. Installation needs an executable temporary filesystem for its private candidate copy; use an appropriate `TMPDIR` when the default temporary directory is mounted `noexec`. Do not disable host protections globally to install a release.
 
-Ordinary upgrades preserve pause intent and generation: use normal activation, not `pause`/`resume`. Completed unsent drafts survive stop/start and are revalidated before dispatch; explicitly paused/off or obsolete work is not silently revived. Clean shutdown captures completed model results; genuine unfinished execution remains uncertain.
+Compatible updates use normal activation without extra pause/resume. Completed
+unsent drafts survive stop/start and are revalidated before dispatch; paused/off
+or obsolete work is not silently revived. Clean shutdown captures completed model
+results; genuine unfinished execution remains uncertain.
 
-Older configuration/journals require [explicit stopped migration](#atomic-capability-migration), not `recover adopt` as an implicit conversion. Initial legacy adoption is an explicit migration approval. Current-format first anchoring requires intact writer, account gate, binding/UUID/witness and required lane evidence. Stop every controller and native task first: an unanchored gate cannot prove that an older detached gate has no owner. Writer-only anchoring is not complete account authority. Persisted inode continuity is not proof of a live process; inspect reported authority prerequisites before resuming. Missing established authority is never recreated, and adoption is not proof that an old snapshot is current.
+Older configuration/journals use canonical conversion through plain update when
+preservation is proven, not implicit `recover adopt`. Initial legacy adoption
+remains an explicit approval. Current-format first anchoring requires intact
+writer, account gate, binding/UUID/witness and lane evidence. Stop every controller
+and native task first: an unanchored gate cannot prove that an older detached gate
+has no owner. Writer-only anchoring is not complete account authority. Inode
+continuity is not proof of a live process; inspect authority prerequisites before
+resuming. Missing established authority is never recreated, and adoption is not
+proof that an old snapshot is current.
 
 Missing or unsafe unanchored lock evidence reports `authority_incomplete`, not an adoptable first-anchor state. Do not delete or recreate locks to make adoption pass.
 
-Retained binaries are rollback candidates only when journal compatibility matches. Older binaries must not write current format-4 journals; roll forward or stop, never rewind state. Staging checks artifact/retention space plus a 256 MiB journal/WAL reserve without pruning history. `TimeoutStopSec=infinity` prevents systemd truncating captured deadlines; agmi bounds shutdown, but a shutdown bug still needs operator intervention.
+Retained binaries are rollback candidates only when journal compatibility matches. Older binaries must not write current format-4 journals; roll forward or stop, never rewind state. Staging checks artifact/retention space plus a 256 MiB journal/WAL reserve without pruning history. There is no automatic release pruning: protect the selected release, releases still used by live processes, pinned update source/target/definitions and validated compatible recovery artifacts. Age, directory count or unavailable process observation cannot prove a release is unused. Never delete the permanent installer/account lease files, pending transaction, journal/WAL, credentials or unknown outcomes to free space. Any cleanup needs a separate owner-verified inventory and authorization.
 
-The example uses control-group cleanup, restrictive umask, private temporary files and restart-on-failure. Account locks live under `.agmi-account-locks` in the operating-system user's canonical home, independently of the state directory and `HOME`/XDG overrides; a tighter sandbox must allow access there. The example is not a complete security sandbox for a compromised harness or local account.
+The example uses control-group cleanup, restrictive umask, private temporary files and restart-on-failure. The service manager owns private model scratch at `%t/agmi` (normally `/run/user/<uid>/agmi`); each native child uses its own private invocation workspace as `TMPDIR`. Foreground execution retains the OS-selected temporary root. Runtime storage can be memory-backed and capacity-limited; do not put update archives or durable state there. Explicit start-rate limits also count manual service starts. `TimeoutStopSec=infinity` prevents systemd truncating captured deadlines; agmi bounds shutdown, but a shutdown bug still needs operator intervention.
+
+`PrivateTmp` namespace enforcement depends on systemd/kernel support. Private managed model workspaces do not depend on it: their service-owned runtime root and per-invocation permissions remain the storage boundary.
+
+Workspace allocation failures distinguish a missing/unusable root, capacity/quota, permission/read-only filesystem and other local faults. Inspect the running controller's temporary root, not just the diagnostic CLI's environment. Doctor reports guidance but `doctor --repair` does not repair model workspaces. A restart can renew a deleted private temporary namespace, but it stops active model calls; assess in-flight work before explicitly restarting. No local fault authorizes replay or resetting attempts, identities, pause state or retry floors.
+
+Do not rename, replace or delete an active temporary root or workspace. Cleanup follows owned pathnames; it does not recover externally rebound paths. A manually displaced root can retain files outside systemd's managed pathname, even after shutdown. Preserve it and inspect ownership after callers end; do not treat namespace renewal as permission to delete active work.
+
+Account locks live under `.agmi-account-locks` in the operating-system user's canonical home, independently of the state directory and `HOME`/XDG overrides; a tighter sandbox must allow access there. The example is not a complete security sandbox for a compromised harness or local account.
+
+### Passive release notices
+
+Human/JSON `health`, `status` and `doctor` show `release_advisory` from a local durable record without networking, creating or migrating files, or changing their verdict. Availability (`current`, `available`, `unknown`) and freshness (`fresh`, `stale`, `missing`, `unavailable`) differ. `storage`, `adoption_required`, `retry_not_before` and `next_due_at` expose storage and retry state. Notices compare the selected managed release, not a stale invoking CLI or last-reported daemon. Running/selected mismatch calls for service inspection, not another installation. Unmanaged/custom builds use their installation owner; a notice is not permission or proof an update is installable.
+
+A normal managed daemon checks asynchronously with startup staggering and at least six hours between automatic attempts. `AGMI_UPDATE_CHECKS=0` disables them; invalid values also disable them. Set it in the foreground process or a user-service environment override. Effective background policy is captured separately from TOML. Disabling it does not hide applicable cached evidence or prohibit explicit checks.
+
+Checks share a private permanent OS lease and bounded 128 KiB record under the OS account home's `.local/share/agmi/update-advisory/`. This account-wide evidence does not follow a configured journal, `HOME` override or `XDG_CACHE_HOME`; it is not disposable cache. Explicit checks have a 20-second total budget and five-second logical request budgets; source throttling floors also apply explicitly. Failed checks preserve dated good evidence, not fresh success. There is no sender, automatic install, delivery ledger or channel credential store; notices are not host-down monitoring.
+
+Ordinary automatic/explicit checks adopt the previous `~/.cache/agmi/update.json` (`XDG_CACHE_HOME` when set), preserving retry floors, due times, incomplete attempts and dated evidence. Adoption requires a stable selected owner after the native update transaction; pristine unmanaged standalone checks still need no configuration or journal. Before this one-time cutover, finish pre-cutover release-check processes, including standalone waiters. Retained old binaries thereafter are inspection/recovery artifacts, not supported controller or release-check invocations: new code cannot fence unchanged old checkers. The exact adopted source record is retired only after durable commit; its old lease is left inert. There is no separate adoption command or automatic pruning.
+
+Normal shutdown cancels discovery and allows 500 ms for local finalization, preserving prior evidence and source floors. A hard kill or failed/stalled record commit can instead leave `previous_attempt_incomplete`; further checks then refuse because a missing source floor has no provable expiry. Inspect storage before recovery—deleting evidence is not proof that a restriction expired. Missing, malformed or inaccessible durable evidence remains unknown; it is not permission to recreate an unrestricted record. This exceptional advisory failure never blocks participation or changes account health.
 
 ### Help, completions and following logs
 
@@ -801,6 +910,8 @@ Missing or incomplete captured policy, including any lane revision, yields `effe
 
 `operational.status` separates `clear` (no observed operational issue under the requested checks), `blocked` (admission fenced), `degraded` (other operational issues) and `unknown` (required policy or admission evidence unavailable). Top-level `healthy` and the exit status reflect these operational conditions. Retained unknown outcomes are warnings (`pending_outcome_uncertain`), not operational failures by themselves: healthy participation can report `attention_required = true` and `risk.attention_required = true`. Actual admission blocks still fail health, as do stale or missing observations, overdue work, exhausted finite capacity, strict-policy uncertainty gates and other operational faults. Background-resource failure never poisons a healthy sibling lane. This classification never changes journal outcomes, risk counts, admission limits or replay safeguards, and never guarantees every retained outcome will resolve or proves independent finality.
 
+`operational_now` labels current state; `historical_uncertainty` conservatively describes retained-history scope, and `operator_action_required` separates intervention from audit attention. `severity` retains unknown/blocked/degraded distinctions. Refresh failure is transient only while original complete proof for that same lane remains valid; no new grace timer or borrowed freshness hides authentication, admission or overdue-work faults.
+
 Health exposes `components.controller`, `.answer`, `.judge`, `.mine` and `api.identity`, `api.lanes.{answer,judge,mine}`, plus per-binding `api.resources`. Each health entry has `state`, bounded `reasons`, nullable observation/age and structured next actions; lane entries include effective mode. Resource entries identify owner, purpose, local operation and binding revision—not raw bearer identifiers.
 
 `api.resources_truncated` discloses bounded read presentation; missing coverage is unknown, not proof of automatic recovery. Health still evaluates every `pending_work` operation independently of this presentation cap. Effective timing thresholds are lane-owned under `thresholds.lanes`; no lane borrows another's desired timeout.
@@ -850,18 +961,13 @@ Awaiting inference admission uses the captured original pending deadline, not a 
 
 Controller heartbeat advances before each bounded HTTP wait, not just at the start of a potentially long cycle. Manual recovery does not refresh it or reload model guidance. Missing both captured and effective model timing produces `model_deadline_unavailable`, not a deadline guessed from desired configuration.
 
-`last_reported_build` and `heartbeat_recent` are persisted local evidence, **not proof of a currently running process**; CLI status/health report `process_identity = "unverified"`. A killed controller can leave a recent report. Use installer `status` for the independently observed systemd process/executable identity.
+`last_reported_build` and `heartbeat_recent` are persisted reports, not live identity. `process_identity` is `not_assessed`, `observed_match`, `mismatch`, `stopped` or `unavailable`, with bounded `process_observation` details. Managed Linux inspection compares invocation, PID start identity, authority/configuration and stable selected/running executable objects within a 500 ms observation budget. `observed_match` is not a new SHA256 check, immutable-file guarantee or cryptographic attestation. Unsupported/standalone/permission-limited inspection stays explicit without independently failing health; conclusive mismatch/stopped evidence matters. Explicit installer lifecycle checks retain full integrity verification.
 
-Disk headroom warns below the larger of 512 MiB or four times `--min-free-mib`; the configured minimum remains the unhealthy floor. Zero disables both disk checks. The two-minute timer keeps failures local in exit status/journal. Agents own any forwarding; agmi does not add a notification transport.
+Disk headroom warns below the larger of 512 MiB or four times `--min-free-mib`; the configured minimum remains the unhealthy floor. Zero disables both. The two-minute timer keeps findings local in exit status/journal. Default diagnostics use a bounded allowlist; `--verbose` retains detail. Presentation truncation never supplies admission or recovery proof.
 
-### Agent-owned forwarding
+### One local notification surface
 
-Agents can read agmi's structured health, events and warnings and optionally forward relevant findings through their existing native channels. agmi itself does not configure external destinations, manage notification credentials/state or send Telegram/webhook messages. Forwarding policy and delivery belong to the agent, not the participation runtime; the shared installer does not enable forwarding.
-Forward `work` progress and `intervention` for each action. Distinguish automatic
-waits, operator-required blockers and insufficient evidence; historical warnings
-alone are not a request for a restart or model abandonment.
-
-Local health remains read-only even when another agent consumes its output. Forward only sanitized evidence, never private payloads, model output, credentials or native diagnostics. Agent forwarding is not proof of human receipt or host-down coverage; use independent monitoring for an offline host. Neither health findings nor forwarding outcomes authorize replaying uncertain work, restarting native gateways or deleting participation state.
+Use health/status and the existing service journal. agmi sends no Telegram/webhook/native-channel messages and maintains no delivery state. Retire only positively identified AGMI-specific delivery jobs through supported per-job controls, retaining private recovery copies and any uncertain in-flight sends; never disable inference, chat, gateways or unrelated schedules. Retirement is separate operational work, not an installer side effect. Local signals do not establish human receipt or host-down coverage or authorize replay, restarts or deleting uncertainty.
 
 ## Verification and publication
 
@@ -887,8 +993,9 @@ Build and inspect the local distributable, then install its extracted sources in
 cargo package --locked --list --allow-dirty
 cargo package --locked --allow-dirty
 package_root="$(mktemp -d)"
-tar -xzf target/package/agmi-0.1.1.crate -C "$package_root"
-cargo install --path "$package_root/agmi-0.1.1" --locked --root "$package_root/install"
+version="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "agmi"))')"
+tar -xzf "target/package/agmi-$version.crate" -C "$package_root"
+cargo install --path "$package_root/agmi-$version" --locked --root "$package_root/install"
 "$package_root/install/bin/agmi" build-info --manifest
 ```
 
@@ -918,7 +1025,7 @@ Linux host acceptance has exercised authenticated Hermes and existing-Gateway Op
 
 Historical pilot checks on three independent Linux identities across both harnesses exercised the shared installer, user services, graceful stop, automatic crash restart with preserved state/pause, and scheduled health execution. Answers and judgments reached node-reported inclusion or receipt confirmation. Upstream read failures and uncertain judging inference were retained without replay. These observations do not establish the deployed identity of the current checkout, public registration compatibility or a completed long-running stability study. Health findings remain local; no external notification channel or earnings verification is established.
 
-The unreleased atomic-capability completion has local macOS proof for independent lane pause/resume, read-only answer/judge assessment, deadline classification, authority replacement refusal and authentic pre-change migration/refusal. Authorized isolated Linux checks additionally exercised real systemd install/update/retained activation, cutover cancellation, post-switch cleanup, sealed conversion interruption/recovery, old-binary refusal and automatic crash restart with preserved work and pause intent. Actual preflight/inference handoffs retained their account gate under injected `execve` delay; replacement/unlink could not produce a pause acknowledgment. An authentic pre-gate executable generated an approval whose exact token, seal and writer-only destination survived recovery, followed by separate stopped gate adoption. A genuine dedicated-host kernel reboot preserved disabled boot intent, journal/evidence, authority inodes, configuration, guidance and credentials in the retained isolated environment. Historical executables were built from hash-verified preserved source, not represented as published releases. Native/provider and protocol endpoints in those checks were substitutes; they did not prove installed-provider behavior.
+Atomic-capability acceptance includes local macOS proof for independent lane pause/resume, read-only answer/judge assessment, deadline classification, authority replacement refusal and authentic pre-change migration/refusal. Authorized isolated Linux checks additionally exercised real systemd install/update/retained activation, cutover cancellation, post-switch cleanup, sealed conversion interruption/recovery, old-binary refusal and automatic crash restart with preserved work and pause intent. Actual preflight/inference handoffs retained their account gate under injected `execve` delay; replacement/unlink could not produce a pause acknowledgment. An authentic pre-gate executable generated an approval whose exact token, seal and writer-only destination survived recovery, followed by separate stopped gate adoption. A genuine dedicated-host kernel reboot preserved disabled boot intent, journal/evidence, authority inodes, configuration, guidance and credentials in the retained isolated environment. Historical executables were built from hash-verified preserved source, not represented as published releases. Native/provider and protocol endpoints in those checks were substitutes; they did not prove installed-provider behavior.
 
 Subsequent bounded acceptance exercised authenticated Hermes and existing-Gateway OpenClaw answer/grade execution using the native adapters from `c3640a3`, with synthetic loopback protocol identities and no MinePOA requests. Both harnesses returned valid bound artifacts with matching native-envelope provider/model/reasoning evidence: Hermes `gpt-6.1-sol` at max/high, OpenClaw `gpt-6.1-sol` at ultra/high. A 60-second Hermes answer probe timed out; a separately authorized attempt within the deployed 600-second limit succeeded. Timeout and explicit OpenClaw interruption retained unknown execution/stop evidence, not proof of remote cancellation or stopped billing. Manual uncertainty policy did not prevent first synthetic submissions; loopback isolation—not that policy—contained protocol effects. Protected copies of three real format-2 journals also converted offline with original operation fields, database identity and dispatch witness preserved, leaving copies paused. These checks do not establish live fleet participation, sustained stability, earnings or a rollout approval.
 

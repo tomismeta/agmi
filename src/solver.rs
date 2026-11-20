@@ -176,6 +176,9 @@ fn hermes_failure(value: &Value) -> Option<NativeFailure> {
 /// as execution. Retry policy must distinguish that from a lost native response.
 pub fn execution_may_have_started(error: &anyhow::Error) -> bool {
     error.downcast_ref::<SolverNotStarted>().is_none()
+        && error
+            .downcast_ref::<cleanup::WorkspaceAllocationError>()
+            .is_none()
 }
 
 /// Safe for events/status: never contains provider output, paths or credentials.
@@ -184,6 +187,11 @@ pub fn failure_code(error: &anyhow::Error) -> &'static str {
         .downcast_ref::<SolverNotStarted>()
         .map(|marker| marker.0)
         .or_else(|| error.downcast_ref::<NativeFailure>().map(|marker| marker.0))
+        .or_else(|| {
+            error
+                .downcast_ref::<cleanup::WorkspaceAllocationError>()
+                .map(|error| error.reason().as_str())
+        })
         .unwrap_or("model_execution_unknown")
 }
 
@@ -558,6 +566,7 @@ fn spawn_native(executable: &Path, args: &[String], cwd: &Path) -> Result<OwnedC
         .args(args)
         .current_dir(cwd)
         .env_clear()
+        .env("TMPDIR", cwd)
         .env(
             "HOME",
             dirs::home_dir().context("native harness home unavailable")?,
@@ -691,7 +700,7 @@ async fn collect_native_evidence(
     Ok(output)
 }
 
-fn private_directory(path: &Path) -> Result<()> {
+fn private_directory(path: &Path) -> std::result::Result<(), cleanup::WorkspaceAllocationError> {
     let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
     {
@@ -700,7 +709,7 @@ fn private_directory(path: &Path) -> Result<()> {
     }
     builder
         .create(path)
-        .context("cannot create isolated adapter workspace")
+        .map_err(cleanup::WorkspaceAllocationError)
 }
 
 #[cfg(test)]
@@ -786,6 +795,54 @@ pub(crate) mod tests {
             candidate_author: None,
             author_history: None,
         }
+    }
+
+    #[test]
+    fn workspace_fault_preflight_is_not_started_without_launch_evidence() {
+        const ISOLATED: &str = "AGMI_TEST_WORKSPACE_FAULT";
+        if std::env::var_os(ISOLATED).is_none() {
+            let root = tempfile::tempdir().unwrap();
+            let file = root.path().join("not-a-directory");
+            std::fs::write(&file, b"preserve").unwrap();
+            for path in [root.path().join("missing"), file] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "solver::tests::workspace_fault_preflight_is_not_started_without_launch_evidence",
+                        "--nocapture",
+                    ])
+                    .env("TMPDIR", path)
+                    .env(ISOLATED, "1")
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "{output:?}");
+            }
+            return;
+        }
+        let model = crate::config::Config::default().capabilities.answer.model;
+        let selection = contract::ModelSelection::new(&model).unwrap();
+        let request =
+            contract::NativeRequest::Answer(contract::AnswerTask::new(request()).unwrap());
+        let PreflightStart::Finished(completion) =
+            start_preflight(request, selection, Duration::from_secs(2))
+        else {
+            panic!("workspace fault launched discovery");
+        };
+        assert_eq!(
+            completion.result.unwrap_err(),
+            contract::NativeReasonCode::NativeWorkspaceUnavailable
+        );
+        assert_eq!(completion.evidence.phase, contract::NativePhase::Preflight);
+        assert_eq!(
+            completion.evidence.execution,
+            contract::NativeExecution::NotStarted
+        );
+        assert_eq!(
+            completion.evidence.outcome,
+            contract::NativeOutcome::NotStarted
+        );
+        assert_eq!(completion.evidence.inference_spawned_at, None);
+        assert_eq!(completion.evidence.reported, Default::default());
     }
     fn artifact() -> Value {
         json!({"answer": "The clock imposes separate work on every identity.",

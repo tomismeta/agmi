@@ -56,6 +56,8 @@ pub(super) fn unknown_work(reason: &str) -> Value {
     for name in LANES {
         work[name] = json!({"progress":finding.progress,"intervention":finding.value(None, None),
             "operational":{"state":"unknown","reasons":[reason]},
+            "refresh":{"state":"unknown","reason":reason,"observed_at":null,"valid_until":null,
+                "evidence":"same_lane_original_completion_not_retry_authority"},
             "background_recovery":{"count":null,"bound_count":null,"unbound_count":null,
                 "required_for_participation":null,"next_action":"inspect_local_evidence",
                 "next_at":null,"evidence":"unavailable"}});
@@ -68,7 +70,7 @@ pub(super) fn unknown(reason: &str) -> Value {
     let mut result = finding.value(None, None);
     result["unattended"] = Value::Null;
     result["controller"] = json!({"ready":null,"reason":reason,"observed_at":null,
-        "evidence_fresh":null,"process_identity":"unverified"});
+        "evidence_fresh":null,"process_identity":"not_assessed"});
     result["lanes"] = json!({"answer":"undetermined","judge":"undetermined","mine":"undetermined"});
     result
 }
@@ -133,7 +135,14 @@ fn controller(status: &Value, at: i64, stale: Option<u64>) -> (Option<bool>, Fin
             status["effective_runtime"]["reload_blocked"] == true,
             "config_reload_rejected",
         ),
-        (status["controller_stopped"] == true, "controller_stopped"),
+        (
+            status["controller_stopped"] == true || status["process_identity"] == "stopped",
+            "controller_stopped",
+        ),
+        (
+            status["process_identity"] == "mismatch",
+            "process_identity_mismatch",
+        ),
     ] {
         if blocked {
             return (Some(false), core_reason(reason));
@@ -480,6 +489,25 @@ fn lane<'a>(
     }
     let model = &work["model"];
     if !read_only && model.is_object() {
+        if model["current_route"] == true
+            && model["current_runtime"] == true
+            && model["scope"] == "current_work"
+            && model["state"] == "prelaunch_failed"
+            && status["controller_stopped"] == false
+            && fresh(
+                status["effective_runtime"]["observed_at"].as_i64(),
+                at,
+                stale,
+            )
+            && let Some(
+                code @ ("native_workspace_unavailable"
+                | "native_workspace_capacity"
+                | "native_workspace_permission"
+                | "native_workspace_failure"),
+            ) = model["failure_category"].as_str()
+        {
+            return Finding::blocked(code, "inspect_model_workspace");
+        }
         if model["current_route"] == true
             && matches!(
                 model["failure_category"].as_str(),
@@ -838,7 +866,7 @@ pub(super) fn project(status: &Value, options: Options, at: i64) -> (Value, Valu
     let core = controller.value(observed, current);
     let mut root = core.clone();
     root["controller"] = json!({"ready":ready,"reason":controller.reason,"observed_at":observed,
-        "evidence_fresh":current,"process_identity":"unverified"});
+        "evidence_fresh":current,"process_identity":status["process_identity"].as_str().unwrap_or("not_assessed")});
     reduce(
         &mut root,
         &work,
@@ -1051,6 +1079,7 @@ fn core_reason(reason: &str) -> Finding<'_> {
             Finding::blocked(reason, "repair_config")
         }
         "controller_stopped" => Finding::blocked(reason, "start_controller"),
+        "process_identity_mismatch" => Finding::blocked(reason, "inspect_managed_service"),
         "state_disk_space_low" => Finding::blocked(reason, "inspect_state_filesystem"),
         "state_disk_space_unavailable" => {
             let mut finding = Finding::unknown(reason);
@@ -1471,6 +1500,52 @@ mod tests {
             projection(&status).0["judge"]["intervention"]["status"],
             "operator_required"
         );
+    }
+
+    #[test]
+    fn local_workspace_failures_require_host_inspection_not_model_recovery() {
+        for code in [
+            "native_workspace_unavailable",
+            "native_workspace_capacity",
+            "native_workspace_permission",
+            "native_workspace_failure",
+        ] {
+            let mut status = fixture();
+            status["work"]["answer"]["model"] = json!({
+                "state":"prelaunch_failed","retry_eligible":true,
+                "scope":"current_work","current_route":true,"current_runtime":true,
+                "failure_category":code
+            });
+            let (work, _) = projection(&status);
+            assert_eq!(work["answer"]["intervention"]["reason"], code);
+            assert_eq!(
+                work["answer"]["intervention"]["status"],
+                "operator_required"
+            );
+            assert_eq!(
+                work["answer"]["intervention"]["next_action"],
+                "inspect_model_workspace"
+            );
+            assert!(work["answer"]["intervention"]["next_at"].is_null());
+            status["work"]["answer"]["model"]["current_route"] = json!(false);
+            assert_eq!(
+                projection(&status).0["answer"]["intervention"]["reason"],
+                "model_retry_eligible"
+            );
+            status["work"]["answer"]["model"]["current_route"] = json!(true);
+            for (field, value) in [
+                ("current_runtime", json!(false)),
+                ("scope", json!("historical_assignment")),
+                ("state", json!("confirmed")),
+            ] {
+                let mut changed = status.clone();
+                changed["work"]["answer"]["model"][field] = value;
+                assert_ne!(
+                    projection(&changed).0["answer"]["intervention"]["next_action"],
+                    "inspect_model_workspace"
+                );
+            }
+        }
     }
 
     #[test]
