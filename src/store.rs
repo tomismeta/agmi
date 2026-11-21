@@ -7259,7 +7259,8 @@ mod tests {
         drop(store);
         let mut store = Store::open(&config).unwrap();
         let work = store.status(&config).unwrap()["work"]["judge"].clone();
-        assert_eq!(work["reason"], "no_eligible_in_observed_inventory");
+        assert_eq!(work["phase"], "observing");
+        assert_eq!(work["reason"], "cadence");
         assert_eq!(work["assessment"]["observed_opportunities"], 2);
         assert_eq!(work["assessment"]["completeness"], "bounded_partial");
         assert!(work["next_at"].as_i64().unwrap() > now());
