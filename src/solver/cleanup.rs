@@ -53,6 +53,7 @@ fn worker() -> Result<&'static mpsc::Sender<Cleanup>> {
 }
 
 pub(crate) async fn drain_native_cleanup_until(deadline: tokio::time::Instant) -> Result<bool> {
+    omp::qualification::release_cache();
     let Some(worker) = WORKER.get() else {
         return Ok(true);
     };

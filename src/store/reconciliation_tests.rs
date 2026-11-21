@@ -85,7 +85,7 @@ fn inspection_reports_only_recorded_binding_checks_not_reservations_or_cancellat
             if completed {
                 assert!(
                     store
-                        .finish_reconciliation_read(&key, 7, 1, Some(404), None, true)
+                        .finish_reconciliation_read(&key, (7, 1), Some(404), None, true, &[])
                         .unwrap()
                 );
                 let checked = inspect();
@@ -1020,14 +1020,14 @@ fn reconciliation_streak_requires_consecutive_complete_fenced_responses() {
     claim(1, at);
     assert!(
         store
-            .finish_reconciliation_read(&key, 7, 1, Some(404), Some("not_found"), true)
+            .finish_reconciliation_read(&key, (7, 1), Some(404), Some("not_found"), true, &[])
             .unwrap()
     );
     assert_eq!(count(), 1);
     claim(2, at + 1);
     assert!(
         !store
-            .finish_reconciliation_read(&key, 7, 1, Some(202), None, true)
+            .finish_reconciliation_read(&key, (7, 1), Some(202), None, true, &[])
             .unwrap()
     );
     assert!(!store.cancel_reconciliation_read(&key, 7, 1).unwrap());
@@ -1040,13 +1040,13 @@ fn reconciliation_streak_requires_consecutive_complete_fenced_responses() {
     );
     assert!(
         store
-            .finish_reconciliation_read(&key, 7, 2, Some(404), None, true)
+            .finish_reconciliation_read(&key, (7, 2), Some(404), None, true, &[])
             .unwrap()
     );
     assert_eq!(count(), 2);
     assert!(
         !store
-            .finish_reconciliation_read(&key, 7, 2, Some(202), None, true)
+            .finish_reconciliation_read(&key, (7, 2), Some(202), None, true, &[])
             .unwrap()
     );
     assert_eq!(count(), 2);
@@ -1058,13 +1058,13 @@ fn reconciliation_streak_requires_consecutive_complete_fenced_responses() {
     ] {
         claim(sequence, at + sequence as i64);
         store
-            .finish_reconciliation_read(&key, 7, sequence, status, category, complete)
+            .finish_reconciliation_read(&key, (7, sequence), status, category, complete, &[])
             .unwrap();
         assert_eq!(count(), 0);
     }
     claim(7, at + 7);
     store
-        .finish_reconciliation_read(&key, 7, 7, Some(404), None, true)
+        .finish_reconciliation_read(&key, (7, 7), Some(404), None, true, &[])
         .unwrap();
     claim(8, at + 8);
     store.cancel_reconciliation_read(&key, 7, 8).unwrap();
@@ -1073,7 +1073,7 @@ fn reconciliation_streak_requires_consecutive_complete_fenced_responses() {
     store.set_authority_epoch(8).unwrap();
     assert!(
         !store
-            .finish_reconciliation_read(&key, 7, 9, Some(404), None, true)
+            .finish_reconciliation_read(&key, (7, 9), Some(404), None, true, &[])
             .unwrap()
     );
     assert!(!store.cancel_reconciliation_read(&key, 7, 9).unwrap());
@@ -1156,7 +1156,14 @@ fn operation_flights_fence_receipt_and_job_stale_completion_cancellation_and_aut
         let b = evidence();
         assert!(
             !store
-                .finish_reconciliation_read(&key, 7, 1, Some(401), Some("unauthorized"), true)
+                .finish_reconciliation_read(
+                    &key,
+                    (7, 1),
+                    Some(401),
+                    Some("unauthorized"),
+                    true,
+                    &[],
+                )
                 .unwrap()
         );
         assert!(!store.cancel_reconciliation_read(&key, 7, 1).unwrap());
@@ -1172,13 +1179,13 @@ fn operation_flights_fence_receipt_and_job_stale_completion_cancellation_and_aut
         );
         assert!(
             store
-                .finish_reconciliation_read(&key, 7, 2, Some(404), None, true)
+                .finish_reconciliation_read(&key, (7, 2), Some(404), None, true, &[])
                 .unwrap()
         );
         let completed = evidence();
         assert!(
             !store
-                .finish_reconciliation_read(&key, 7, 2, Some(202), None, true)
+                .finish_reconciliation_read(&key, (7, 2), Some(202), None, true, &[])
                 .unwrap()
         );
         assert!(!store.cancel_reconciliation_read(&key, 7, 2).unwrap());
@@ -1193,7 +1200,14 @@ fn operation_flights_fence_receipt_and_job_stale_completion_cancellation_and_aut
         let obsolete = evidence();
         assert!(
             !store
-                .finish_reconciliation_read(&key, 7, 3, Some(401), Some("unauthorized"), true)
+                .finish_reconciliation_read(
+                    &key,
+                    (7, 3),
+                    Some(401),
+                    Some("unauthorized"),
+                    true,
+                    &[],
+                )
                 .unwrap()
         );
         assert!(
@@ -1231,7 +1245,7 @@ fn operation_flights_fence_receipt_and_job_stale_completion_cancellation_and_aut
         assert!(!store.cancel_reconciliation_read(&key, 8, 4).unwrap());
         assert!(
             !store
-                .finish_reconciliation_read(&key, 7, 3, Some(401), None, true)
+                .finish_reconciliation_read(&key, (7, 3), Some(401), None, true, &[])
                 .unwrap()
         );
         assert!(in_flight());
@@ -1242,8 +1256,20 @@ fn operation_flights_fence_receipt_and_job_stale_completion_cancellation_and_aut
         );
         assert!(
             store
-                .finish_reconciliation_read(&key, 9, 5, Some(202), None, true)
+                .finish_reconciliation_read(
+                    &key,
+                    (9, 5),
+                    Some(408),
+                    Some(BOUND_JOB_EXPIRY_CONFLICT),
+                    true,
+                    &[],
+                )
                 .unwrap()
+        );
+        let op = store.operation(1).unwrap().unwrap();
+        assert_eq!(
+            store.job_expiry_conflict(&op).unwrap(),
+            phase == ReadPhase::Job
         );
         let p = store.reconciliation_provenance(1, 1).unwrap().unwrap();
         assert_eq!(p.active_request_sequence, None);
@@ -1486,7 +1512,7 @@ fn rebound_and_restarted_observers_cannot_inherit_missing_continuity() {
     );
     assert!(
         !store
-            .finish_reconciliation_read(&old, 1, 1, Some(404), None, true)
+            .finish_reconciliation_read(&old, (1, 1), Some(404), None, true, &[])
             .unwrap()
     );
     assert_eq!(
@@ -1498,7 +1524,7 @@ fn rebound_and_restarted_observers_cannot_inherit_missing_continuity() {
         Some(2)
     );
     store
-        .finish_reconciliation_read(&new, 1, 2, Some(404), None, true)
+        .finish_reconciliation_read(&new, (1, 2), Some(404), None, true, &[])
         .unwrap();
     let mut p = store.reconciliation_provenance(1, 2).unwrap().unwrap();
     p.bound_since = Some(at - 2 * 86_400);
@@ -1526,7 +1552,7 @@ fn rebound_and_restarted_observers_cannot_inherit_missing_continuity() {
     );
     assert_eq!(p.consecutive_404, 0);
     store
-        .finish_reconciliation_read(&new, 2, 3, Some(404), None, true)
+        .finish_reconciliation_read(&new, (2, 3), Some(404), None, true, &[])
         .unwrap();
     assert_eq!(
         store

@@ -81,6 +81,13 @@ struct ReconciliationClaim {
     flight: Option<(u64, u64)>,
 }
 
+#[derive(Default)]
+struct ReconciliationReadCompletion<'a> {
+    status: Option<u16>,
+    category: Option<&'a str>,
+    complete: bool,
+}
+
 /// Synchronous scheduling-pass evidence only; reset after any coordinator work.
 /// Invalidated evidence drops the optional decay, never a preexisting floor.
 #[derive(Default)]
@@ -374,19 +381,21 @@ impl Store {
     pub(crate) fn finish_reconciliation_read(
         &self,
         key: &ReadKey,
-        authority_epoch: u64,
-        sequence: u64,
+        stamp: (u64, u64),
         status: Option<u16>,
         category: Option<&str>,
         complete: bool,
+        evidence: &[RestrictionEvidence],
     ) -> Result<bool> {
         self.finish_reconciliation_read_inner(
             key,
-            (authority_epoch, sequence),
-            status,
-            category,
-            complete,
-            false,
+            stamp,
+            Some(ReconciliationReadCompletion {
+                status,
+                category,
+                complete,
+            }),
+            evidence,
         )
     }
 
@@ -396,27 +405,32 @@ impl Store {
         authority_epoch: u64,
         sequence: u64,
     ) -> Result<bool> {
-        self.finish_reconciliation_read_inner(
-            key,
-            (authority_epoch, sequence),
-            None,
-            None,
-            false,
-            true,
-        )
+        self.finish_reconciliation_read_inner(key, (authority_epoch, sequence), None, &[])
     }
 
     fn finish_reconciliation_read_inner(
         &self,
         key: &ReadKey,
-        (epoch, sequence): (u64, u64),
-        status: Option<u16>,
-        category: Option<&str>,
-        complete: bool,
-        cancel: bool,
+        stamp: (u64, u64),
+        completion: Option<ReconciliationReadCompletion<'_>>,
+        evidence: &[RestrictionEvidence],
     ) -> Result<bool> {
         self.continuity()?;
         let tx = rusqlite::Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
+        self.ingest_restrictions_in(&tx, evidence)?;
+        let finished = self.write_reconciliation_read_finished(&tx, key, stamp, completion)?;
+        // Stale or inactive flights still carry valid request-bound floors.
+        tx.commit()?;
+        Ok(finished)
+    }
+
+    fn write_reconciliation_read_finished(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        key: &ReadKey,
+        (epoch, sequence): (u64, u64),
+        completion: Option<ReconciliationReadCompletion<'_>>,
+    ) -> Result<bool> {
         if !self.read_current(key)? {
             return Ok(false);
         }
@@ -460,14 +474,19 @@ impl Store {
             p.active_request_sequence = None;
             p.consecutive_404 = 0;
             self.save_reconciliation_provenance(*operation_id, &p)?;
-            self.db.execute(
+            tx.execute(
                 "UPDATE read_state SET in_flight=0 WHERE operation_id=?1
                  AND binding_revision=?2 AND purpose=?3 AND retired=0 AND in_flight=1",
                 params![operation_id, binding_revision, purpose],
             )?;
-            tx.commit()?;
             return Ok(false);
         }
+        let cancel = completion.is_none();
+        let ReconciliationReadCompletion {
+            status,
+            category,
+            complete,
+        } = completion.unwrap_or_default();
         // Receipt flights share only the attempt fence, never job-missing evidence.
         if *phase == ReadPhase::Job {
             p.consecutive_404 = if complete
@@ -503,7 +522,6 @@ impl Store {
         // The stamp was consumed above under this same transaction. The inner
         // generic writer is intentionally transaction-aware (identity also uses it).
         self.write_read_finished(key, status, category, cancel)?;
-        tx.commit()?;
         Ok(true)
     }
 
@@ -748,9 +766,23 @@ impl Store {
         Ok(())
     }
 
-    /// Stage one of completion handling: independent of the local state CAS.
+    /// Ingest restrictions independently of local state for non-reconciliation requests.
     pub(crate) fn ingest_restrictions(&self, evidence: &[RestrictionEvidence]) -> Result<()> {
         self.continuity()?;
+        let tx = self.db.unchecked_transaction()?;
+        self.ingest_restrictions_in(&tx, evidence)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn ingest_restrictions_in(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        evidence: &[RestrictionEvidence],
+    ) -> Result<()> {
+        if evidence.is_empty() {
+            return Ok(());
+        }
         let (database_id, _) = self.database_identity()?;
         let identity: String =
             self.db
@@ -774,7 +806,6 @@ impl Store {
         )?
         .origin()
         .ascii_serialization();
-        let tx = self.db.unchecked_transaction()?;
         for item in evidence {
             let context = item.context();
             if context.meta.database_id != database_id
@@ -817,16 +848,20 @@ impl Store {
                 RestrictionBasis::ServerRetryAfter => "server_retry_after",
                 RestrictionBasis::LocalUnscoped429Cooldown => "local_unscoped_429_cooldown",
             };
+            let server_minimum = item
+                .server_minimum_seconds()
+                .map(|seconds| i64::try_from(seconds).unwrap_or(i64::MAX));
+            // Saturated deadlines can tie even when their underlying evidence
+            // differs. Keep the latest observation and its provenance together.
             tx.execute("INSERT INTO request_restrictions VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
                 ON CONFLICT(authority,origin,scope,target,basis) DO UPDATE SET
-                not_before=MAX(not_before,excluded.not_before),
-                observed_at=CASE WHEN excluded.not_before>not_before THEN excluded.observed_at ELSE observed_at END,
-                request_id=CASE WHEN excluded.not_before>not_before THEN excluded.request_id ELSE request_id END,
-                source=CASE WHEN excluded.not_before>not_before THEN excluded.source ELSE source END,
-                server_minimum_seconds=CASE WHEN excluded.not_before>not_before THEN excluded.server_minimum_seconds ELSE server_minimum_seconds END,
-                policy=CASE WHEN excluded.not_before>not_before THEN excluded.policy ELSE policy END",
+                not_before=excluded.not_before,observed_at=excluded.observed_at,
+                request_id=excluded.request_id,source=excluded.source,
+                server_minimum_seconds=excluded.server_minimum_seconds,policy=excluded.policy
+                WHERE excluded.not_before>not_before
+                    OR (excluded.not_before=?14 AND not_before=?14 AND excluded.observed_at>=observed_at)",
                 params![authority,origin,scope,target,basis,item.not_before(),item.observed_at(),context.meta.request_id,
-                    endpoint_name(context.endpoint)?,reads,effects,item.server_minimum_seconds(),item.policy()])?;
+                    endpoint_name(context.endpoint)?,reads,effects,server_minimum,item.policy(),i64::MAX])?;
             if scope == "resource"
                 && authority == current_authority
                 && origin == current_origin
@@ -840,7 +875,6 @@ impl Store {
                     params![item.not_before(),id,revision,context.resource])?;
             }
         }
-        tx.commit()?;
         Ok(())
     }
 

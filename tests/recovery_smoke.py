@@ -136,7 +136,9 @@ def main():
             key.write_text('pk_test_fixture')
             key.chmod(0o600)
             native = root / 'openclaw'
-            native.write_text("#!/bin/sh\nprintf 'OpenClaw 2026.10.9\\n'\n")
+            # An historical binary still expects a version in its own preflight.
+            native.write_text("#!/bin/sh\nprintf 'OpenClaw " +
+                              ("2026.10.9" if args.baseline or args.old_binary else "2026.11.6") + "\\n'\n")
             native.chmod(0o700)
             (root / 'package.json').write_text(json.dumps({'name': 'openclaw', 'type': 'module',
                 'exports': {'./plugin-sdk/gateway-runtime': './gateway.mjs'}}))

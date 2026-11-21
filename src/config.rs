@@ -304,7 +304,7 @@ pub(crate) enum OmpSelectionError {
 }
 
 impl ModelConfig {
-    /// Validate local syntax only. The pinned omp runtime owns catalog lookup, model-specific
+    /// Validate local syntax only. The installed omp runtime owns catalog lookup, model-specific
     /// effort support and authentication. Split only the provider prefix; IDs may be namespaced.
     pub(crate) fn omp_selection(&self) -> std::result::Result<(&str, &str), OmpSelectionError> {
         let id_char = |byte: u8| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte);
@@ -326,7 +326,7 @@ impl ModelConfig {
         {
             return Err(OmpSelectionError::ToolEnabled);
         }
-        // Local wire vocabulary of the qualified bridge (omp 19.0.1).
+        // Local wire vocabulary of the bridge; the runtime validates per-model support.
         if !matches!(
             self.reasoning.as_str(),
             "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
@@ -827,15 +827,23 @@ impl Config {
     }
 
     pub fn load(path: &Path) -> Result<Self> {
-        Self::load_config(path, true)
+        Self::parse_bytes(path, &Self::read_file_bytes(path)?, true)
+    }
+
+    /// Validate the saved configuration and hash the exact TOML bytes used to load it.
+    pub fn load_with_file_revision(path: &Path) -> Result<(Self, String)> {
+        let bytes = Self::read_file_bytes(path)?;
+        let config = Self::parse_bytes(path, &bytes, true)?;
+        config.validate()?;
+        Ok((config, format!("{:x}", Sha256::digest(&bytes))))
     }
 
     /// Local controls must not depend on optional model-input files being usable.
     pub fn load_metadata(path: &Path) -> Result<Self> {
-        Self::load_config(path, false)
+        Self::parse_bytes(path, &Self::read_file_bytes(path)?, false)
     }
 
-    fn load_config(path: &Path, load_guidance: bool) -> Result<Self> {
+    fn read_file_bytes(path: &Path) -> Result<Vec<u8>> {
         let file = std::fs::File::open(path).map_err(|error| {
             ConfigDiagnostic::new(
                 if error.kind() == std::io::ErrorKind::NotFound {
@@ -850,7 +858,7 @@ impl Config {
         file.take(65537)
             .read_to_end(&mut bytes)
             .map_err(|_| ConfigDiagnostic::new("file_unreadable", "Cannot read configuration."))?;
-        Self::parse_bytes(path, &bytes, load_guidance)
+        Ok(bytes)
     }
 
     pub(crate) fn parse_bytes(path: &Path, bytes: &[u8], load_guidance: bool) -> Result<Self> {

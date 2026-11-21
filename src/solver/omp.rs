@@ -4,6 +4,7 @@ use super::*;
 use crate::config::OmpConfig;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use std::io::Write;
+pub(super) mod qualification;
 mod rpc;
 
 const BRIDGE: &str = include_str!("../../adapters/omp.ts");
@@ -14,19 +15,28 @@ const TERMINAL: &str = "agmi_omp_result_v1";
 const BODY_LIMIT: usize = 2 * MAX_INPUT + 16 * 1024;
 const STDERR_LIMIT: usize = 256 * 1024;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum GoMode {
+    Stock,
+    Probe,
+    #[cfg(feature = "omp-go-fixture")]
+    Fixture,
+}
+
+impl GoMode {
+    fn inference() -> Self {
+        #[cfg(feature = "omp-go-fixture")]
+        if std::env::var("AGMI_OMP_TEST_LOOPBACK").is_ok_and(|value| value == "1") {
+            return Self::Fixture;
+        }
+        Self::Stock
+    }
+}
+
 pub(super) struct Prepared {
     pub args: Vec<String>,
     pub input: Vec<u8>,
-}
-
-pub(super) fn check_version(bytes: &[u8]) -> Result<()> {
-    let text =
-        std::str::from_utf8(bytes).map_err(|_| SolverNotStarted("unsupported_harness_version"))?;
-    ensure!(
-        matches!(text.trim(), "19.0.1" | "omp/19.0.1" | "omp 19.0.1"),
-        SolverNotStarted("unsupported_harness_version")
-    );
-    Ok(())
 }
 
 fn selection(model: &ModelConfig) -> Result<(String, String, String)> {
@@ -79,6 +89,28 @@ pub(super) fn prepare(
     scratch: &Path,
     deadline: ExecutionDeadline,
 ) -> Result<Prepared> {
+    let request_json = String::from_utf8(encode_request(request.request())?)
+        .map_err(|_| SolverNotStarted("invalid_solver_setup"))?;
+    prepare_json(
+        model,
+        request_json,
+        SECURITY_AND_OUTPUT,
+        invocation_id,
+        scratch,
+        deadline,
+        GoMode::inference(),
+    )
+}
+
+fn prepare_json(
+    model: &ModelConfig,
+    request_json: String,
+    policy: &str,
+    invocation_id: &str,
+    scratch: &Path,
+    deadline: ExecutionDeadline,
+    go_mode: GoMode,
+) -> Result<Prepared> {
     ensure!(
         scratch.is_absolute() && safe_identifier(invocation_id),
         SolverNotStarted("invalid_solver_setup")
@@ -86,10 +118,7 @@ pub(super) fn prepare(
     let default_route = OmpConfig::default();
     let route = model.omp.as_ref().unwrap_or(&default_route);
     let (provider, name, selection_digest) = selection(model)?;
-    let request_bytes = encode_request(request.request())?;
-    let request_digest = format!("{:x}", Sha256::digest(&request_bytes));
-    let request_json =
-        String::from_utf8(request_bytes).map_err(|_| SolverNotStarted("invalid_solver_setup"))?;
+    let request_digest = format!("{:x}", Sha256::digest(request_json.as_bytes()));
     let home = if route.provider_discovery_cwd.is_none() {
         dirs::home_dir()
     } else {
@@ -105,17 +134,20 @@ pub(super) fn prepare(
         SolverNotStarted("invalid_solver_setup")
     );
     let timeout_ms = remaining_ms(deadline)?;
-    let bootstrap = json!({
+    let mut bootstrap = json!({
         "protocol":1, "invocation_id":invocation_id, "request_digest":request_digest,
         "selection_digest":selection_digest, "provider":provider, "model":name,
         "reasoning_effort":model.reasoning, "provider_discovery_cwd":discovery,
         "deadline_unix_ms":deadline.unix_millis()
     });
+    if provider == "opencode-go" {
+        bootstrap["go_mode"] = json!(go_mode);
+    }
     let mut body = json!({
         "protocol":1, "invocation_id":invocation_id, "request_digest":request_digest,
         "selection_digest":selection_digest, "provider":provider, "model":name,
         "reasoning_effort":model.reasoning,
-        "policy":SECURITY_AND_OUTPUT, "timeout_ms":timeout_ms
+        "policy":policy, "timeout_ms":timeout_ms
     });
     body["request_json"] = Value::String(request_json);
     let input = serde_json::to_vec(&body)?;
@@ -130,7 +162,7 @@ pub(super) fn prepare(
         &scratch.join("omp-bootstrap.json"),
         &serde_json::to_vec(&bootstrap)?,
     )?;
-    private_file(&overlay, br#"{"autoResume":false,"retry":{"enabled":false,"modelFallback":false},"providers":{"cacheWarming":"off"}}"#)?;
+    private_file(&overlay, br#"{"autoResume":false,"retry":{"enabled":false,"modelFallback":false},"providers":{"cacheWarming":"off"},"startup":{"checkUpdate":false},"update":{"auto":false}}"#)?;
     let tmp = scratch.join("tmp");
     let mut directory = std::fs::DirBuilder::new();
     #[cfg(unix)]
@@ -185,6 +217,18 @@ pub(super) fn spawn(
     cwd: &Path,
     route: &OmpConfig,
 ) -> Result<OwnedChild> {
+    let home = dirs::home_dir().context(SolverNotStarted("invalid_solver_setup"))?;
+    spawn_environment(executable, args, cwd, route, &home, None)
+}
+
+fn spawn_environment(
+    executable: &Path,
+    args: &[String],
+    cwd: &Path,
+    route: &OmpConfig,
+    home: &Path,
+    loopback_proxy: Option<&str>,
+) -> Result<OwnedChild> {
     route
         .validate()
         .map_err(|_| SolverNotStarted("invalid_solver_setup"))?;
@@ -193,10 +237,7 @@ pub(super) fn spawn(
         .args(args)
         .current_dir(cwd)
         .env_clear()
-        .env(
-            "HOME",
-            dirs::home_dir().context(SolverNotStarted("invalid_solver_setup"))?,
-        )
+        .env("HOME", home)
         .env(
             "PATH",
             std::env::var_os("PATH").unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".into()),
@@ -206,6 +247,13 @@ pub(super) fn spawn(
         if let Some(value) = std::env::var_os(name) {
             command.env(name, value);
         }
+    }
+    if let Some(origin) = loopback_proxy {
+        command
+            .env("HTTP_PROXY", origin)
+            .env("HTTPS_PROXY", origin)
+            .env("ALL_PROXY", origin)
+            .env("NO_PROXY", "127.0.0.1,localhost");
     }
     command.env("OMP_PROFILE", route.profile.as_deref().unwrap_or("default"));
     if let Some(directory) = &route.agent_dir {
@@ -282,7 +330,10 @@ fn ready_entry(data: &Value, expected: &Value) -> Result<String> {
                         .is_some_and(|data| data.len() == BINDING_KEYS.len() + 3)
                     && matches!(
                         reason,
-                        "native_api_unsupported" | "native_failure" | "model_deadline_exceeded"
+                        "native_api_unsupported"
+                            | "native_auth_unavailable"
+                            | "native_failure"
+                            | "model_deadline_exceeded"
                     ),
                 NativeFailure("native_envelope_invalid")
             );
@@ -341,6 +392,8 @@ fn terminal_entry<'a>(
         );
         binding(&entries[0]["data"], expected)?;
     }
+    // Post-command failures remain ambiguous even without a DISPATCH entry:
+    // an unqualified SDK transport could skip the extension's fetch callback.
     let last = &entries[entries.len() - 1];
     ensure!(
         last["type"] == "custom" && last["customType"] == TERMINAL,
@@ -476,12 +529,31 @@ impl ReceivedTerminal {
     }
 }
 
+enum Descriptor<'a> {
+    Probe(&'a str),
+    Qualified(&'a qualification::Qualified),
+    NotRequired,
+}
+
 pub(super) async fn collect(
     owner: &mut OwnedChild,
     input: Vec<u8>,
     deadline: ExecutionDeadline,
     facts: &mut NativeAttemptCompletion,
+    qualification: Option<&qualification::Qualified>,
 ) -> Result<ReceivedTerminal> {
+    let descriptor = qualification.map_or(Descriptor::NotRequired, Descriptor::Qualified);
+    let (terminal, _) = exchange_inference(owner, input, deadline, descriptor, Some(facts)).await?;
+    Ok(terminal)
+}
+
+async fn exchange_inference(
+    owner: &mut OwnedChild,
+    input: Vec<u8>,
+    deadline: ExecutionDeadline,
+    descriptor: Descriptor<'_>,
+    facts: Option<&mut NativeAttemptCompletion>,
+) -> Result<(ReceivedTerminal, Option<String>)> {
     use base64::Engine as _;
     let operation = async {
         ensure!(
@@ -547,9 +619,27 @@ pub(super) async fn collect(
             {
                 // Do not dispatch after a potential startup refusal. Only the
                 // controller validates the bound terminal and classifies it.
-                return Ok(ReceivedTerminal::new(initial, body, true));
+                return Ok((ReceivedTerminal::new(initial, body, true), None));
             }
             let cursor = ready_entry(&initial, &body)?;
+            let model_digest = match descriptor {
+                Descriptor::NotRequired => None,
+                descriptor => {
+                    let entry = initial["entries"]
+                        .as_array()
+                        .and_then(|entries| entries.iter().find(|entry| entry["id"] == cursor))
+                        .context(SolverNotStarted("native_qualification_failed"))?;
+                    Some(match descriptor {
+                        Descriptor::Probe(endpoint) => {
+                            qualification::verify_descriptor(&entry["data"], endpoint)?
+                        }
+                        Descriptor::Qualified(proof) => {
+                            proof.verify_before_dispatch(&entry["data"])?
+                        }
+                        Descriptor::NotRequired => unreachable!(),
+                    })
+                }
+            };
             body["timeout_ms"] = json!(remaining_ms(deadline)?);
             let bytes =
                 serde_json::to_vec(&body).map_err(|_| NativeFailure("native_envelope_invalid"))?;
@@ -577,7 +667,10 @@ pub(super) async fn collect(
                 &json!({"id":"terminal-entries","type":"get_entries","since":cursor}),
             )
             .await?;
-            Ok(ReceivedTerminal::new(final_entries, body, false))
+            Ok((
+                ReceivedTerminal::new(final_entries, body, false),
+                model_digest,
+            ))
         };
         tokio::pin!(conversation);
         let drain = drain_stderr(stderr);
@@ -599,15 +692,17 @@ pub(super) async fn collect(
         .unwrap_or(i64::MAX);
     // Stop the owned group without delaying terminal delivery for process reaping.
     let stopped = owner.stop_and_observe();
-    facts.cancellation = CancellationEvidence {
-        requested_at: Some(requested_at),
-        local_process_stop: if stopped {
-            LocalProcessStop::Observed
-        } else {
-            LocalProcessStop::Unknown
-        },
-        remote_run_stop: RemoteRunStop::Unknown,
-    };
+    if let Some(facts) = facts {
+        facts.cancellation = CancellationEvidence {
+            requested_at: Some(requested_at),
+            local_process_stop: if stopped {
+                LocalProcessStop::Observed
+            } else {
+                LocalProcessStop::Unknown
+            },
+            remote_run_stop: RemoteRunStop::Unknown,
+        };
+    }
     outcome
 }
 
@@ -771,11 +866,20 @@ mod tests {
             assert!(!format!("{error:?}").contains("secret"));
         }
     }
+
     #[test]
-    fn native_version_is_qualified_exactly() {
-        check_version(b"19.0.1\n").unwrap();
-        assert!(check_version(b"19.0.2").is_err());
-        assert!(check_version(b"untrusted 19.0.1").is_err());
+    fn go_terminal_without_forwarding_evidence_does_not_refund_the_attempt() {
+        let mut expected = expected();
+        expected["provider"] = json!("opencode-go");
+        let mut terminal = expected.clone();
+        terminal["ok"] = json!(false);
+        terminal["reason_code"] = json!("native_api_unsupported");
+        let data = json!({"entries": [entry("terminal", TERMINAL, terminal)]});
+        let mut evidence = NativeReportedEvidence::default();
+        let error = terminal_entry(&data, &expected, &mut evidence).unwrap_err();
+        assert_eq!(failure_code(&error), "native_api_unsupported");
+        assert!(execution_may_have_started(&error));
+        assert!(evidence.reasoning_effort.is_none());
     }
 
     fn model() -> ModelConfig {

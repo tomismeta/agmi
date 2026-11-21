@@ -124,11 +124,13 @@ impl Response {
         use crate::config::{safe_segment, valid_address};
         use HostedIdentityBody::*;
 
-        if ["ok", "success"].iter().any(|field| {
-            self.body
-                .get(field)
-                .is_some_and(|value| value.as_bool() != Some(true))
-        }) {
+        if super::failed(&self.body)
+            || ["ok", "success"].iter().any(|field| {
+                self.body
+                    .get(field)
+                    .is_some_and(|value| value.as_bool() != Some(true))
+            })
+        {
             return Invalid;
         }
         let Some(address) = self
@@ -550,6 +552,106 @@ mod tests {
         assert_eq!(restriction.basis, RestrictionBasis::ServerRetryAfter);
         assert_eq!(restriction.not_before, result.observed_at + 7);
         assert_eq!(restriction.policy, None);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn assembled_bound_expiry_conflict_preserves_authenticated_retry_minimum() {
+        use super::super::{BOUND_JOB_EXPIRY_CONFLICT, response_candidates, unknown};
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = Config::default();
+        config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
+        let protocol = Protocol::with_key(
+            &config,
+            Some(reqwest::header::HeaderValue::from_static("pk_fixture")),
+        )
+        .unwrap();
+        let cases = [
+            (LaneId::Answer, "", "13", 13),
+            (
+                LaneId::Judge,
+                "Retry-After: 9\r\n",
+                r#"24,"retry_after_seconds":6"#,
+                24,
+            ),
+            (
+                LaneId::Answer,
+                "Retry-After: 2\r\n",
+                r#"19,"retry_after_seconds":"60""#,
+                19,
+            ),
+            (LaneId::Judge, "Retry-After: 31\r\n", "8", 31),
+            (
+                LaneId::Answer,
+                "Retry-After: 7\r\nRetry-After: 18446744073709551616\r\n",
+                "8",
+                u64::MAX,
+            ),
+        ];
+        let server = tokio::spawn(async move {
+            for (_, header, delays, _) in cases {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                receive_headers(&mut stream).await;
+                let body = format!(
+                    concat!(
+                        r#"{{"state":"expired","error":"job_expired","processed":true,"processed":false,"#,
+                        r#""job_id":"other-job","txid":"{}","metadata":{{"retry_after_seconds":900}},"#,
+                        r#""retry_after_seconds":{}}}"#,
+                    ),
+                    "a".repeat(64),
+                    delays,
+                );
+                let reply = format!(
+                    "HTTP/1.1 408 Request Timeout\r\n{header}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                stream.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+
+        for (kind, _, _, expected) in cases {
+            let result = protocol
+                .get(
+                    Endpoint::Job,
+                    Some("old-job"),
+                    ReadDeadline::seconds(2).unwrap(),
+                    RequestMeta {
+                        owner: Some(kind),
+                        ..meta()
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                result.response.read_failure,
+                Some(super::super::ReadFailure::BoundJobExpiryConflict)
+            );
+            assert_eq!(
+                classify_source(kind, &result.response, ResponseSource::BoundJob),
+                unknown(BOUND_JOB_EXPIRY_CONFLICT),
+            );
+            let candidates = response_candidates(&result.response);
+            assert!(candidates.job_id.is_none());
+            assert!(candidates.transaction_ids.is_empty());
+
+            let restrictions = result.restrictions();
+            let [restriction] = restrictions.as_slice() else {
+                panic!("expected exactly one authenticated retry restriction");
+            };
+            assert_eq!(restriction.scope, RestrictionScope::AccountAuthenticated);
+            assert_eq!(restriction.basis, RestrictionBasis::ServerRetryAfter);
+            assert_eq!(restriction.server_minimum_seconds, Some(expected));
+            assert_eq!(
+                restriction.not_before,
+                result
+                    .observed_at
+                    .saturating_add(i64::try_from(expected).unwrap_or(i64::MAX))
+            );
+            assert_eq!(restriction.context.resource.as_deref(), Some("old-job"));
+            assert_eq!(restriction.context.meta.binding_revision, Some(1));
+        }
         server.await.unwrap();
     }
 

@@ -513,6 +513,7 @@ impl ModelSlot {
                     NativeOutcome::NotStarted
                 },
                 reason_code: NativeReasonCode::Interrupted,
+                grade_failure: None,
                 collected_at: Some(now()),
                 preflight_started_at: work.preflight_started_at,
                 inference_spawned_at: work.inference_spawned_at,

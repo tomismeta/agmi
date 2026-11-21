@@ -27,17 +27,22 @@ jobs:
         run: node --check adapters/openclaw.mjs
       - name: Native bridge contracts
         run: python3 tests/native_bridge_smoke.py
-      - name: Qualified standalone omp bridge
+      - name: Standalone omp compatibility fixtures
         run: |
           omp_dir="$RUNNER_TEMP/agmi-omp"
           mkdir -p "$omp_dir"
-          curl --fail --silent --show-error --location \
-            https://github.com/can1357/oh-my-pi/releases/download/v19.0.1/omp-linux-x64 \
-            --output "$omp_dir/omp"
-          printf '%s  %s\n' 6ceef04430851bb1050c6fda3af467412eb44a11df0a6ff8121fe601013c5415 "$omp_dir/omp" \
-            | sha256sum --check
-          chmod 0755 "$omp_dir/omp"
-          python3 tests/omp_native_smoke.py --omp "$omp_dir/omp"
+          fetch_omp() {
+            local version="$1" digest="$2" output="$omp_dir/omp-$1"
+            curl --fail --silent --show-error --location \
+              "https://github.com/can1357/oh-my-pi/releases/download/v$version/omp-linux-x64" \
+              --output "$output"
+            printf '%s  %s\n' "$digest" "$output" | sha256sum --check
+            chmod 0755 "$output"
+          }
+          # Reproducible test inputs, not runtime version requirements.
+          fetch_omp 18.22.2 80a692c5adb9c71124bb11e77bd7edb3cf8fbbab6980db3206dcb6a4cb2905b5
+          fetch_omp 19.0.1 6ceef04430851bb1050c6fda3af467412eb44a11df0a6ff8121fe601013c5415
+          python3 tests/omp_native_smoke.py --omp "$omp_dir/omp-19.0.1"
       - name: Behavior tests
         run: RUST_BACKTRACE=1 cargo +1.96.0 test --locked
       - name: Lints
@@ -189,32 +194,57 @@ jobs:
       - name: Build identity
         run: ./target/debug/agmi build-info --manifest
       - name: Inspect distributable contents
-        run: cargo +1.96.0 package --locked --list --allow-dirty
+        run: cargo +1.96.0 package --locked --list
       - name: Install and exercise extracted package
         run: |
-          cargo +1.96.0 package --locked --allow-dirty
+          cargo +1.96.0 package --locked
           package_root="$RUNNER_TEMP/agmi-package"
           mkdir -p "$package_root"
           version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
           tar -xzf "target/package/agmi-$version.crate" -C "$package_root"
           cargo +1.96.0 test --manifest-path "$package_root/agmi-$version/Cargo.toml" --locked --lib --no-run
           cargo +1.96.0 install --path "$package_root/agmi-$version" --locked --root "$package_root/install"
-          "$package_root/install/bin/agmi" build-info --manifest
+          manifest="$package_root/BUILD-INFO.txt"
+          "$package_root/install/bin/agmi" build-info --manifest | tee "$manifest"
+          grep -Fx "package_version=$version" "$manifest"
+          grep -Fx "commit=$(git rev-parse HEAD)" "$manifest"
+          grep -Fx 'source_dirty=clean' "$manifest"
           python3 tests/lifecycle_smoke.py "$package_root/install/bin/agmi" --scenario init
           python3 tests/lifecycle_smoke.py "$package_root/install/bin/agmi" --scenario prompt
-      - name: Qualify source-package and release omp adapters and release setup
+      - name: Build fixture-only OpenCode Go controller
+        run: |
+          cargo +1.96.0 build --locked --bin agmi --features omp-go-fixture \
+            --target-dir "$RUNNER_TEMP/agmi-omp-go-fixture"
+      - name: Test exact packaged adapters and separately built OpenCode Go fixture
         run: |
           docker build -f tests/systemd_fixture.Dockerfile -t agmi-systemd-fixture tests
           docker run --rm --init --network=none --tmpfs /tmp:exec,mode=1777 \
             -v "$PWD/tests:/tests:ro" \
             -v "$RUNNER_TEMP/agmi-package/install/bin/agmi:/input/agmi-source:ro" \
             -v "$AGMI_PACKAGED_MUSL:/input/agmi:ro" \
-            -v "$RUNNER_TEMP/agmi-omp/omp:/input/omp:ro" \
+            -v "$RUNNER_TEMP/agmi-omp:/input/omp:ro" \
+            -v "$RUNNER_TEMP/agmi-omp-go-fixture/debug/agmi:/input/agmi-go-fixture:ro" \
             --entrypoint /bin/sh agmi-systemd-fixture -ec '
               runuser -u agmi-systemd-fixture -- \
-                python3 -u /tests/packaged_omp_smoke.py /input/agmi-source --omp /input/omp
+                python3 -u /tests/packaged_omp_smoke.py /input/agmi-source --omp /input/omp/omp-19.0.1
               runuser -u agmi-systemd-fixture -- \
-                python3 -u /tests/packaged_omp_smoke.py /input/agmi --omp /input/omp
+                python3 -u /tests/packaged_omp_smoke.py /input/agmi --omp /input/omp/omp-19.0.1
+              # Exact distributed binaries must reject a valid custom overlay even with the old switch set.
+              for binary in /input/agmi-source /input/agmi; do
+                runuser -u agmi-systemd-fixture -- \
+                  python3 -u /tests/omp_go_qualification_smoke.py "$binary" \
+                    --omp /input/omp/omp-19.0.1 --expect-production-refusal
+              done
+              # Only this separate, non-distributed controller may dispatch synthetic hosted work.
+              for version in 18.22.2 19.0.1; do
+                runuser -u agmi-systemd-fixture -- \
+                  python3 -u /tests/omp_go_qualification_smoke.py /input/agmi-go-fixture --omp "/input/omp/omp-$version"
+              done
+              for model in glm-5.3 kimi-k3; do
+                runuser -u agmi-systemd-fixture -- \
+                  python3 -u /tests/omp_go_qualification_smoke.py /input/agmi-go-fixture \
+                    --omp /input/omp/omp-19.0.1 --judge-only --model "$model"
+              done
               runuser -u agmi-systemd-fixture -- \
                 python3 -u /tests/lifecycle_smoke.py /input/agmi --scenario init
               runuser -u agmi-systemd-fixture -- \
@@ -239,22 +269,26 @@ jobs:
             HOME=/home/agmi-systemd-fixture XDG_RUNTIME_DIR=/run/user/17321 \
             DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/17321/bus \
             python3 -u /src/tests/systemd_smoke.py /input/agmi
-      - name: Isolated systemd retained writer refusal
-        timeout-minutes: 5
+      - name: Isolated systemd retained writer and managed health outcomes
+        timeout-minutes: 8
         run: |
-          name="agmi-rollback-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          trap 'docker rm -f "$name" >/dev/null 2>&1 || true' EXIT
-          docker run -d --name "$name" --privileged --cgroupns=private \
-            --network=none --tmpfs /run --tmpfs /run/lock --tmpfs /tmp:exec,mode=1777 \
-            -v "$PWD:/src:ro" -v "$AGMI_PACKAGED_MUSL:/input/agmi:ro" \
-            -v "$AGMI_ROLLBACK_BINARY:/input/agmi-old:ro" agmi-systemd-fixture
-          timeout 60 docker exec "$name" sh -c \
-            'until systemctl start user@17321.service; do sleep 1; done'
-          timeout 180 docker exec "$name" runuser -u agmi-systemd-fixture -- env \
-            HOME=/home/agmi-systemd-fixture XDG_RUNTIME_DIR=/run/user/17321 \
-            DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/17321/bus \
-            python3 -u /src/tests/systemd_smoke.py /input/agmi --suite retained-rollback \
-            --old-binary /input/agmi-old --old-sha256 "$AGMI_ROLLBACK_SHA256"
+          for suite in retained-rollback managed-health; do
+            name="agmi-$suite-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            trap 'docker rm -f "$name" >/dev/null 2>&1 || true' EXIT
+            docker run -d --name "$name" --privileged --cgroupns=private \
+              --network=none --tmpfs /run --tmpfs /run/lock --tmpfs /tmp:exec,mode=1777 \
+              -v "$PWD:/src:ro" -v "$AGMI_PACKAGED_MUSL:/input/agmi:ro" \
+              -v "$AGMI_ROLLBACK_BINARY:/input/agmi-old:ro" agmi-systemd-fixture
+            timeout 60 docker exec "$name" sh -c \
+              'until systemctl start user@17321.service; do sleep 1; done'
+            timeout 180 docker exec "$name" runuser -u agmi-systemd-fixture -- env \
+              HOME=/home/agmi-systemd-fixture XDG_RUNTIME_DIR=/run/user/17321 \
+              DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/17321/bus \
+              python3 -u /src/tests/systemd_smoke.py /input/agmi --suite "$suite" \
+              --old-binary /input/agmi-old --old-sha256 "$AGMI_ROLLBACK_SHA256"
+            docker rm -f "$name"
+            trap - EXIT
+          done
       - name: Isolated model workspace recovery
         run: |
           name="agmi-storage-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"

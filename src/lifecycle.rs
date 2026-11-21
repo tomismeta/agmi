@@ -730,15 +730,37 @@ pub struct ManagedMutationGuard {
 }
 
 pub fn guard_managed_mutation(config_path: &Path) -> Result<Option<ManagedMutationGuard>> {
+    guard_managed_mutation_inner(config_path, false)
+}
+
+/// Detached recovery may change outcomes the selected writer must honor.
+pub fn guard_managed_recovery_mutation(config_path: &Path) -> Result<Option<ManagedMutationGuard>> {
+    guard_managed_mutation_inner(config_path, true)
+}
+
+fn guard_managed_mutation_inner(
+    config_path: &Path,
+    require_selected_fence: bool,
+) -> Result<Option<ManagedMutationGuard>> {
     #[cfg(unix)]
     {
         let Some(root) = crate::installer::managed_root(config_path)? else {
             return Ok(None);
         };
-        crate::installer::pending_update_target(config_path)?;
+        if !require_selected_fence {
+            crate::installer::pending_update_target(config_path)?;
+        }
         let lease = update_state::Lease::acquire(&root)?;
+        let pending = if require_selected_fence || !lease.inherited {
+            update_state::read(&root)?
+        } else {
+            None
+        };
+        if require_selected_fence {
+            crate::installer::guard_managed_recovery(config_path, &root, pending.as_ref())?;
+        }
         if !lease.inherited
-            && let Some(mut record) = update_state::read(&root)?
+            && let Some(mut record) = pending
         {
             record.cancelled = true;
             update_state::save(&root, &record)?;
@@ -747,7 +769,7 @@ pub fn guard_managed_mutation(config_path: &Path) -> Result<Option<ManagedMutati
     }
     #[cfg(not(unix))]
     {
-        let _ = config_path;
+        let _ = (config_path, require_selected_fence);
         Ok(None)
     }
 }
@@ -761,6 +783,14 @@ pub fn guard_managed_run(config_path: &Path) -> Result<()> {
     #[cfg(not(unix))]
     let _ = config_path;
     Ok(())
+}
+
+#[cfg(unix)]
+pub(crate) fn selected_replay_fence_error() -> LifecycleError {
+    LifecycleError {
+        code: "selected_replay_fence_required",
+        message: "Cannot verify bound-job replay protection in the selected managed release. No journal or service intent was changed.",
+    }
 }
 
 /// Safe, bounded evidence from the canonical installer, never child output text.
@@ -809,7 +839,8 @@ pub(crate) fn installer_evidence(value: Option<&Value>) -> Value {
                 "installer_busy",
                 "update_in_progress",
                 "legacy_install_lock",
-                "stopped_update_required",
+                "target_replay_fence_required",
+                "selected_replay_fence_required",
                 "decision_required",
                 "recovery_required",
                 "restoration_incomplete",

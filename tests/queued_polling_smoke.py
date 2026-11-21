@@ -19,6 +19,7 @@ class QueuedFixture(Fixture):
         self.job_minimum = None
         self.expire_jobs = False
         self.contradictory_expiry = False
+        self.contradictory_floor = None
         self.job_requests = []
         self.slow_job = None
         self.bad_job = None
@@ -35,6 +36,13 @@ class QueuedFixture(Fixture):
         fixture = self
 
         class Upstream(parent):
+            def reply_raw_expiry(self, body):
+                self.send_response(408)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
             def do_GET(self):
                 if '/api/job/' in self.path:
                     job = self.path.split('?')[0].rsplit('/', 1)[1]
@@ -47,12 +55,34 @@ class QueuedFixture(Fixture):
                         self.reply(404, {'error': 'unknown job'})
                         return
                     with fixture.lock:
+                        poll_number = len(fixture.job_polls) + 1
                         fixture.job_polls.append(time.monotonic())
                         pending = len(fixture.job_polls) <= fixture.pending_polls
                     if fixture.expire_jobs:
+                        if fixture.expire_jobs == 'incomplete_first':
+                            if poll_number == 1:
+                                self.reply(408, {'state': 'expired', 'code': 'bound_job_expiry_conflict'})
+                                return
+                            if poll_number == 2:
+                                self.reply_raw_expiry(
+                                    b'{"state":"expired","error":{"code":"job_expired"},'
+                                    b'"retry_after_seconds":1,"retry_after_seconds":0}'
+                                )
+                                return
                         self.reply(408, {'state': 'expired', 'error': 'job_expired'})
                         return
                     if fixture.contradictory_expiry:
+                        if fixture.contradictory_expiry == 'nested':
+                            self.reply(408, {'error': {'state': 'expired', 'processed': True},
+                                             'challenge_txid': 'a1' * 32},
+                                       fixture.contradictory_floor)
+                            return
+                        if fixture.contradictory_floor is not None:
+                            body = (b'{"state":"expired","error":"job_expired","status":"processing",'
+                                    b'"status":"expired","retry_after_seconds":%d,"retry_after_seconds":1}'
+                                    % fixture.contradictory_floor)
+                            self.reply_raw_expiry(body)
+                            return
                         self.reply(408, {'state': 'expired', 'error': 'job_expired', 'processed': True})
                         return
                     if pending:
@@ -467,20 +497,27 @@ def slow_bad_jobs(f):
 
 
 def retry_age(f):
-    f.expire_jobs = True
-    f.apply_config({'capabilities': {'answer': {'schedule': {'queued_job_polling': {'initial_seconds': 1, 'max_seconds': 4}}}}})
+    f.expire_jobs = 'incomplete_first'
+    f.apply_config({'capabilities': {'answer': {'schedule': {'retry_seconds': 2,
+                                                           'queued_job_polling': {'initial_seconds': 1,
+                                                                                  'max_seconds': 4}}}}})
     f.start(resume=True)
     f.wait(lambda: any(o['state'] == 'retry' for o in f.operations('answer')),
            'authoritative job expiry did not retain retryable work')
+    assert len(f.job_polls) >= 3, 'untrusted or incomplete expiry must wait for a canonical response'
+    assert not f.rows("SELECT 1 FROM operation_evidence "
+                      "WHERE json_extract(policy,'$.bound_job_expiry_conflict_revision') IS NOT NULL")
     operation = f.invoke('operations', 'list', '--limit', '1')['operations'][0]
     assert operation['wait']['unsent_since_capture_seconds'] is None, (
         'sent/queued time was mislabeled as unsent', operation['wait'])
     assert len(f.writes) == 1 and f.model_calls('answer') == 1
-    return {'expired_sent_work_not_labeled_unsent': True, 'writes': 1}
+    return {'incomplete_expiry_did_not_latch': True,
+            'expired_sent_work_not_labeled_unsent': True, 'writes': 1}
 
 
-def contradictory_expiry(f):
-    f.contradictory_expiry = True
+def contradictory_expiry(f, *, nested=False):
+    f.contradictory_expiry = 'nested' if nested else True
+    f.contradictory_floor = 7
     f.pending_polls = 0
     f.lanes['answer']['schedule'].update(retry_seconds=1,
                                         queued_job_polling={'initial_seconds': 1, 'max_seconds': 4})
@@ -492,6 +529,21 @@ def contradictory_expiry(f):
     assert original['job_id'] == 'answer-10' and len(f.writes) == 1, original
     inspected = f.invoke('recover', 'inspect', '--operation', str(original['id']))
     assert json.loads(inspected['details']['evidence'])['reason'] == 'bound_job_expiry_conflict', inspected
+    if nested:
+        candidates = f.rows('SELECT candidates,truncated FROM operation_candidates WHERE operation_id=?',
+                            (original['id'],))
+        assert all(not row['truncated'] and 'a1' * 32 not in row['candidates']
+                   for row in candidates), ('contradictory expiry changed candidate evidence', candidates)
+
+    def job_floor():
+        return f.rows("SELECT scope,server_minimum_seconds,not_before FROM request_restrictions "
+                      "WHERE source='job' AND basis='server_retry_after'")
+
+    floors = job_floor()
+    assert len(floors) == 1, ('disputed response did not retain its account retry floor', floors)
+    floor = floors[0]
+    assert floor['scope'] == 'account_authenticated' and floor['server_minimum_seconds'] == 7, floor
+    assert len(f.job_polls) == 1, 'poll retried before the disputed response floor'
 
     f.stop(crash=True)
     f.contradictory_expiry = False
@@ -499,7 +551,10 @@ def contradictory_expiry(f):
     polls = len(f.job_polls)
     f.start()
     f.loaded()
+    assert job_floor() == [floor], 'restart lost the original account minimum'
     f.wait(lambda: len(f.job_polls) >= polls + 2, 'disputed binding was not polled after restart')
+    gap = f.job_polls[1] - f.job_polls[0]
+    assert gap >= 7, ('disputed response minimum was shortened', gap)
     f.cycles(6)
     assert len(f.writes) == 1 and len(f.dispatched('answer')) == 1, f.writes
     current = f.operations('answer')[0]
@@ -511,7 +566,8 @@ def contradictory_expiry(f):
     f.wait(lambda: f.operations('answer')[0]['state'] == 'confirmed',
            'a later positive job and receipt did not settle the original operation')
     assert len(f.writes) == 1 and f.model_calls('answer') == 1
-    return {'bound_after_restart': True, 'settled_original': True, 'writes': 1}
+    return {'bound_after_restart': True, 'server_minimum_seconds': 7,
+            'actual_poll_gap_seconds': round(gap, 3), 'settled_original': True, 'writes': 1}
 
 
 SCENARIOS = {'fast_polling': fast_polling, 'retained_floor': retained_floor,
@@ -519,6 +575,7 @@ SCENARIOS = {'fast_polling': fast_polling, 'retained_floor': retained_floor,
              'due_backlog': due_backlog, 'independent_scope': independent_scope,
              'slow_bad_jobs': slow_bad_jobs, 'retry_age': retry_age,
              'contradictory_expiry': contradictory_expiry,
+             'nested_disputed_expiry': lambda f: contradictory_expiry(f, nested=True),
              'transient_job_loss': transient_job_loss}
 
 

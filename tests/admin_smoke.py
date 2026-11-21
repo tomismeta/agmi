@@ -2,8 +2,9 @@
 """Actual-CLI administration acceptance; stdlib only, no production actions."""
 import argparse
 import concurrent.futures
-import hashlib
+import errno
 import fcntl
+import hashlib
 import http.server
 import json
 import os
@@ -19,6 +20,50 @@ import uuid
 
 def revision(data):
     return hashlib.sha256(data).hexdigest()
+
+
+def replaced_check_snapshot(binary, root, environment):
+    config = root / 'checked-snapshot.toml'
+    replacement = root / 'replacement.toml'
+    snapshot = b'[runtime]\nshutdown_seconds = 17\n'
+    next_bytes = b'[runtime]\nshutdown_seconds = 18\n'
+    command = [binary, '--json', '--config', str(config), 'config', 'check']
+    config.write_bytes(snapshot)
+    baseline = subprocess.run(command, capture_output=True, timeout=15,
+                              env=environment, check=True)
+    expected = json.loads(baseline.stdout)['data']
+    config.unlink()
+    os.mkfifo(config, 0o600)
+    replacement.write_bytes(next_bytes)
+    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          env=environment) as child:
+        deadline = time.monotonic() + 5
+        try:
+            while True:
+                try:
+                    writer = os.open(config, os.O_WRONLY | os.O_NONBLOCK)
+                    break
+                except OSError as error:
+                    if (error.errno != errno.ENXIO or child.poll() is not None
+                            or time.monotonic() >= deadline):
+                        raise
+                    time.sleep(0.01)
+            try:
+                written = os.write(writer, snapshot)
+                assert written == len(snapshot)
+                # The check cannot finish reading until this writer closes.
+                replacement.replace(config)
+            finally:
+                os.close(writer)
+            stdout, stderr = child.communicate(timeout=15)
+        finally:
+            if child.poll() is None:
+                child.kill()
+        assert child.returncode == 0, stderr
+    actual = json.loads(stdout)['data']
+    assert actual['file_revision'] == revision(snapshot)
+    assert actual['effective_revision'] == actual['revision'] == expected['effective_revision']
+    assert config.read_bytes() == next_bytes
 
 
 def startup_race(binary, root, environment, chain, address, account_keys, lock_root, origin):
@@ -138,7 +183,32 @@ def main():
             def show():
                 data = invoke('config', 'show')
                 assert data['file_revision'] == revision(config.read_bytes())
+                assert data['effective_revision'] == data['revision']
+                assert data['guidance_validation'] == 'not_loaded'
+                assert data['guidance_assessment'] == 'not_checked_by_config_show'
+                assert 'Use config check to validate saved guidance' in data['guidance_note']
+                assert data['runtime_application'] == 'unverified'
                 return data
+
+            def check():
+                data = invoke('config', 'check')
+                assert data['valid'] and data['file_revision'] == revision(config.read_bytes())
+                assert data['effective_revision'] == data['revision']
+                assert secret not in json.dumps(data)
+                return data
+
+            def assert_conflict(envelope, flag, field, token, kind=None, layer=None):
+                error = envelope['error']
+                expected = {'flag': flag, 'revision_field': field, 'current_revision': token,
+                            'refresh': 'config'}
+                command = ['config', 'show']
+                if kind is not None:
+                    expected.update(refresh='guidance', kind=kind, layer=layer)
+                    command = ['guidance', 'show', '--kind', kind, '--layer', layer]
+                assert error['details'] == expected
+                actions = [action for action in error['next_actions'] if action['kind'] == 'command']
+                assert len(actions) == 1 and actions[0]['argv'][3:] == command
+                assert actions[0]['authorization_required'] is False
 
             def apply(patch, expected=None, dry=False, error=None):
                 token = expected if expected is not None else show()['file_revision']
@@ -146,7 +216,10 @@ def main():
                 if dry:
                     words.append('--dry-run')
                 stdin = patch if isinstance(patch, bytes) else json.dumps(patch).encode()
-                return invoke(*words, stdin=stdin, expected=error)
+                data = invoke(*words, stdin=stdin, expected=error)
+                if error is None:
+                    assert data['effective_revision'] == data['revision']
+                return data
 
             def guidance(kind='answer', layer='user'):
                 return invoke('guidance', 'show', '--kind', kind, '--layer', layer)
@@ -179,7 +252,7 @@ def main():
             assert schema['guidance']['layers'] == ['core', 'user']
             assert schema['guidance']['default_layer'] == 'user'
             invoke('config', 'init')
-            initial = show()
+            assert show()['effective_revision'] is not None
             assert not state.exists()
             credential = root / 'credential'
             credential.write_text('pk_test_private_fixture')
@@ -201,9 +274,18 @@ def main():
             populated_bytes = config.read_bytes()
             assert 'credential_file = "credential"' in populated_bytes.decode()
             assert 'executable = "./never-run"' in populated_bytes.decode()
-            apply({'capabilities': {'answer': {'schedule': {'poll_seconds': 5}}}}, expected=initial['file_revision'],
-                  error='admin_revision_conflict')
-            assert config.read_bytes() == populated_bytes
+            checked = check()
+            assert checked['effective_revision'] == populated['effective_revision']
+            assert checked['effective_revision'] == show()['effective_revision']
+            commented_bytes = populated_bytes + b'\n# Revision fixture: comment only\n'
+            config.write_bytes(commented_bytes)
+            commented = check()
+            assert checked['file_revision'] != commented['file_revision']
+            assert checked['effective_revision'] == commented['effective_revision']
+            stale = apply({'capabilities': {'answer': {'schedule': {'poll_seconds': 5}}}},
+                          expected=checked['file_revision'], error='admin_revision_conflict')
+            assert_conflict(stale, '--expected-revision', 'file_revision', commented['file_revision'])
+            assert config.read_bytes() == commented_bytes
 
             # Invalid inputs never change bytes, expose input, initialize state, or run models.
             bad_patches = [b'{', b'[]', b'null', b'"' + secret.encode() + b'"',
@@ -240,13 +322,16 @@ def main():
                 current = guidance(kind, 'core')
                 assert current['content'] == core_text.decode()
                 assert current['guidance_revision'] == revision(core_text)
-                set_guidance(b'stale', kind=kind, layer='core',
-                             config_rev=current['config_file_revision'], guidance_rev='missing',
-                             error='admin_revision_conflict')
+                stale = set_guidance(b'stale', kind=kind, layer='core',
+                                     config_rev=current['config_file_revision'], guidance_rev='missing',
+                                     error='admin_revision_conflict')
+                assert_conflict(stale, '--expected-revision', 'guidance_revision',
+                                current['guidance_revision'], kind, 'core')
                 for invalid in (b'', b' \n', b'\xff'):
                     set_guidance(invalid, kind=kind, layer='core', error='admin_validation')
                 assert core_path.read_bytes() == core_text
             assert invoke('guidance', 'show', '--kind', 'answer')['layer'] == 'user'
+            original_judge_policy = show()['config']['capabilities']['judge']['participation']
             before = config.read_bytes()
             dry = apply({'capabilities': {
                 'answer': {'mode': 'active',
@@ -269,7 +354,9 @@ def main():
             assert applied['answer']['participation']['mode'] == 'participation_first'
             assert applied['answer']['model']['model'] == 'configured-model'
             assert applied['mine']['schedule']['each_epoch']
-            assert applied['judge']['participation'] == schema['defaults']['capabilities']['judge']['participation']
+            # Fresh onboarding writes explicit fleet policy; editing the other lanes
+            # must preserve it rather than replacing it with omitted-field defaults.
+            assert applied['judge']['participation'] == original_judge_policy
             apply({'capabilities': {'answer': {'timeouts': {'read_http_seconds': None},
                                                'participation': {'mode': None}}}})
             restored = show()['config']['capabilities']
@@ -296,6 +383,12 @@ def main():
             dry = set_guidance(text, dry=True)
             assert not dry['saved'] and config.read_bytes() == before
             assert not (root / 'answer-guidance.md').exists()
+            rejected_token = 'not-a-revision-canary'
+            stale = set_guidance(text, config_rev=absent['config_file_revision'],
+                                 guidance_rev=rejected_token, error='admin_revision_conflict')
+            assert_conflict(stale, '--expected-revision', 'guidance_revision', 'missing', 'answer', 'user')
+            assert rejected_token not in json.dumps(stale)
+            assert config.read_bytes() == before and not (root / 'answer-guidance.md').exists()
             first = set_guidance(text)
             assert first['private'] and first['saved'] and secret not in json.dumps(first)
             answer_path = root / 'answer-guidance.md'
@@ -304,14 +397,23 @@ def main():
             assert viewed['content'] == text.decode() and viewed['guidance_revision'] == revision(text)
             assert viewed['status'] == 'present'
             before = config.read_bytes()
-            set_guidance(b'wrong', config_rev=absent['config_file_revision'], guidance_rev='missing',
-                         error='admin_revision_conflict')
-            set_guidance(b'wrong', config_rev=viewed['config_file_revision'], guidance_rev='missing',
-                         error='admin_revision_conflict')
+            stale_config = set_guidance(b'wrong', config_rev=absent['config_file_revision'],
+                                        guidance_rev=viewed['guidance_revision'],
+                                        error='admin_revision_conflict')
+            assert_conflict(stale_config, '--expected-config-revision', 'config_file_revision',
+                            viewed['config_file_revision'], 'answer', 'user')
+            stale_content = set_guidance(b'wrong', config_rev=viewed['config_file_revision'],
+                                         guidance_rev='missing', error='admin_revision_conflict')
+            assert_conflict(stale_content, '--expected-revision', 'guidance_revision',
+                            viewed['guidance_revision'], 'answer', 'user')
             assert answer_path.read_bytes() == text and config.read_bytes() == before
+            before_guidance_edit = check()
             updated = set_guidance(b'Updated private guidance\n')
             assert updated['config_file_revision'] == revision(before)
             assert config.read_bytes() == before
+            after_guidance_edit = check()
+            assert after_guidance_edit['file_revision'] == before_guidance_edit['file_revision']
+            assert after_guidance_edit['effective_revision'] != before_guidance_edit['effective_revision']
             set_guidance(b'\xff', error='admin_validation')
             set_guidance(b'x' * 65537, error='admin_input_too_large')
             assert answer_path.read_bytes() == b'Updated private guidance\n'
@@ -326,7 +428,7 @@ def main():
             answer_path.unlink()
             missing = guidance()
             assert missing['status'] == 'missing' and missing['guidance_revision'] == 'missing'
-            assert show()['guidance_validation'] == 'not_loaded'
+            assert show()['effective_revision'] is None
             set_guidance(text)
             assert guidance()['content'] == text.decode()
 
@@ -336,13 +438,14 @@ def main():
             core_text = core_path.read_bytes()
             core_path.unlink()
             assert guidance(layer='core')['status'] == 'missing'
-            assert show()['guidance_validation'] == 'not_loaded'
+            assert show()['effective_revision'] is None
             apply({'capabilities': {'answer': {'schedule': {'poll_seconds': 5}}}}, error='admin_guidance_missing')
             for words in (('status',), ('logs',), ('agents',), ('config', 'show')):
                 assert secret not in json.dumps(invoke(*words))
-            checked = subprocess.run(base + ['config', 'check'], capture_output=True,
-                                     timeout=15, env=environment)
-            assert checked.returncode != 0 and secret.encode() not in checked.stdout + checked.stderr
+            failure = invoke('config', 'check', expected='config_invalid')
+            assert failure['error']['details']['reason'] == 'guidance_missing'
+            assert failure['error']['details']['kind'] == 'answer'
+            assert failure['error']['details']['layer'] == 'core'
             assert not state.exists()
             set_guidance(core_text, layer='core')
             assert guidance(layer='core')['content'] == core_text.decode()
@@ -351,7 +454,7 @@ def main():
             core_path.chmod(0o600)
             apply({'capabilities': {'answer': {'schedule': {'poll_seconds': 5}}}}, error='admin_validation')
             set_guidance(core_text, layer='core')
-            assert invoke('config', 'check') is not None
+            check()
             # Config/guidance files must not be symlinks, hardlinks, FIFOs or directories.
             preserved = answer_path.read_bytes()
             answer_path.unlink()
@@ -443,6 +546,7 @@ def main():
             show()
             guidance()
             assert journal_snapshot() == journal_before
+            replaced_check_snapshot(binary, root, environment)
             startup_race(binary, root, environment, chain, address, account_keys, lock_root,
                          f'http://127.0.0.1:{server.server_port}')
             assert not requests and not (root / 'model-called').exists()

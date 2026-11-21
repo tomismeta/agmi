@@ -101,6 +101,51 @@ fn judging_work_current_at(assessment: &Value, key: &str, at: i64) -> Option<boo
     (assessment["excluded_work_truncated"] == false && covered >= count).then_some(false)
 }
 
+fn judging_model_scope(context: &RemoteWorkContext, key: &str) -> &'static str {
+    let assessment = &context.assessment;
+    if !context.fresh
+        || !assessment["source"].is_string()
+        || assessment["completeness"] != "complete"
+    {
+        return "unassessed_assignment";
+    }
+    if judging_work_current_at(assessment, key, context.at) == Some(true) {
+        return "current_work";
+    }
+    // Unlike the runtime's independent-work check, a diagnostic claim of
+    // historical failure needs negative evidence about this exact assignment.
+    match assessment["observed_opportunities"].as_u64() {
+        Some(0)
+            if crate::health::judge_inventory(assessment)
+                == crate::health::JudgeInventory::Idle =>
+        {
+            "historical_assignment"
+        }
+        Some(observed)
+            if assessment["eligible_candidates"] == 0
+                && crate::health::judge_inventory(assessment)
+                    != crate::health::JudgeInventory::Unresolved
+                && assessment["excluded_work_truncated"] == false
+                && assessment["excluded_work"].as_array().is_some_and(|rows| {
+                    observed == rows.len() as u64
+                        && rows.iter().enumerate().all(|(index, row)| {
+                            row["work_key"].as_str().is_some_and(|current| {
+                                !current.eq_ignore_ascii_case(key)
+                                    && !rows[..index].iter().any(|previous| {
+                                        previous["work_key"].as_str().is_some_and(|other| {
+                                            other.eq_ignore_ascii_case(current)
+                                        })
+                                    })
+                            })
+                        })
+                }) =>
+        {
+            "historical_assignment"
+        }
+        _ => "unassessed_assignment",
+    }
+}
+
 /// One lane's bounded, validated participation-relevance snapshot.
 pub(super) struct RemoteWorkContext {
     kind: LaneId,
@@ -256,6 +301,23 @@ impl Store {
         at: i64,
         admission_open: bool,
     ) -> Result<RemoteWorkContext> {
+        self.remote_observation_context_with_revision(
+            config,
+            kind,
+            at,
+            admission_open,
+            config.lane_revision(kind).ok().as_deref(),
+        )
+    }
+
+    pub(super) fn remote_observation_context_with_revision(
+        &self,
+        config: &Config,
+        kind: LaneId,
+        at: i64,
+        admission_open: bool,
+        lane_revision: Option<&str>,
+    ) -> Result<RemoteWorkContext> {
         #[cfg(test)]
         REMOTE_CONTEXT_CONSTRUCTIONS.with(|count| count.set(count.get() + 1));
         let observation = self.lane_observation(kind)?;
@@ -284,7 +346,7 @@ impl Store {
         let config_current: bool = self.db.query_row(
             "SELECT EXISTS(SELECT 1 FROM runtime_policy WHERE singleton=1
              AND json_extract(policy,'$.lane_revisions.'||?1)=?2)",
-            params![kind.as_str(), config.lane_revision(kind).ok()],
+            params![kind.as_str(), lane_revision],
             |r| r.get(0),
         )?;
         let mut decay_provenance = kind == LaneId::Judge && config_current;
@@ -362,6 +424,7 @@ impl Store {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn remote_work_context(
         &self,
         config: &Config,
@@ -369,7 +432,25 @@ impl Store {
         at: i64,
         accounting: &accounting::AccountingReadSnapshot,
     ) -> Result<RemoteWorkContext> {
-        let base = self.remote_observation_context(config, kind, at, false)?;
+        self.remote_work_context_with_revision(
+            config,
+            kind,
+            at,
+            accounting,
+            config.lane_revision(kind).ok().as_deref(),
+        )
+    }
+
+    fn remote_work_context_with_revision(
+        &self,
+        config: &Config,
+        kind: LaneId,
+        at: i64,
+        accounting: &accounting::AccountingReadSnapshot,
+        lane_revision: Option<&str>,
+    ) -> Result<RemoteWorkContext> {
+        let base =
+            self.remote_observation_context_with_revision(config, kind, at, false, lane_revision)?;
         let RemoteWorkContext {
             observation,
             assessment,
@@ -748,10 +829,21 @@ impl Store {
     ) -> Result<(Value, Vec<RemoteWorkContext>)> {
         let control = self.control()?;
         let waits = self.wait_evidence()?;
+        let at = accounting.cutoff.at;
         let mut work = json!({});
         let mut scopes = Vec::with_capacity(LaneId::COUNT);
         for kind in LaneId::ALL {
-            let context = self.remote_work_context(config, kind, now(), accounting)?;
+            // The applied snapshot has the revision captured by the controller;
+            // metadata-only config cannot recompute guidance-dependent revisions.
+            let context = self.remote_work_context_with_revision(
+                config,
+                kind,
+                at,
+                accounting,
+                lane_revisions[kind.as_str()].as_str(),
+            )?;
+            // Keep live scheduling relevance unchanged. Only the diagnostic
+            // model candidate below needs stronger exact-assignment evidence.
             let RemoteWorkContext {
                 scope,
                 ref observation,
@@ -770,9 +862,16 @@ impl Store {
             let mut id = None;
             while let Some(candidate) = candidates.next()? {
                 let state = candidate.get_ref(1)?.as_str()?;
-                if context.nonblocking(state, candidate.get(2)?, candidate.get_ref(3)?.as_str()?)
-                    == Some(false)
-                {
+                let key = candidate.get_ref(3)?.as_str()?;
+                if kind == LaneId::Judge && state == "model_unknown" {
+                    let relevance = judging_model_scope(&context, key);
+                    if relevance == "historical_assignment"
+                        || (scope.admission_open && relevance != "current_work")
+                    {
+                        continue;
+                    }
+                }
+                if context.nonblocking(state, candidate.get(2)?, key) == Some(false) {
                     id = Some(candidate.get::<_, i64>(0)?);
                     break;
                 }
@@ -798,24 +897,23 @@ impl Store {
                 .or_else(|| {
                     (kind == LaneId::Judge
                         && op.is_none()
-                        && assessment["locally_judgeable"] == false)
-                        .then_some(&assessment["excluded_work"])
-                        .and_then(Value::as_array)
-                        .and_then(|rows| {
-                            rows.iter().find(|row| {
-                                matches!(
-                                    row["reason"].as_str(),
-                                    Some(
-                                        "assignment_read_backoff"
-                                            | "assignment_resource_restricted"
-                                    )
-                                )
-                            })
+                        && context.fresh
+                        && crate::health::judge_inventory(assessment)
+                            == crate::health::JudgeInventory::Blocked("api_dependency_unavailable"))
+                    .then_some(&assessment["excluded_work"])
+                    .and_then(Value::as_array)
+                    .and_then(|rows| {
+                        rows.iter().find(|row| {
+                            matches!(
+                                row["reason"].as_str(),
+                                Some("assignment_read_backoff" | "assignment_resource_restricted")
+                            )
                         })
-                        .and_then(|row| row["work_key"].as_str())
-                        .map(|assignment_id| ReadKey::Assignment {
-                            assignment_id: assignment_id.to_owned(),
-                        })
+                    })
+                    .and_then(|row| row["work_key"].as_str())
+                    .map(|assignment_id| ReadKey::Assignment {
+                        assignment_id: assignment_id.to_owned(),
+                    })
                 })
                 .unwrap_or(ReadKey::Discovery {
                     lane: kind,
@@ -1016,7 +1114,7 @@ impl Store {
             let mut lane = json!({"phase":phase,"reason":reason,"next_action":action,"next_at":next,"epoch":epoch,
                 "operation_id":id,"operation_epoch":op.as_ref().and_then(|o|o.request["solver"]["epoch"].as_u64()),
                 "completion_valid_until":if phase=="completed" { completion_valid_until } else { None },
-                "binding_revision":op.as_ref().map(|o|o.binding_revision),"read_key":self.read_key_projection(&key)?,
+                "binding_revision":op.as_ref().map(|o|o.binding_revision),"read_key":read_key,
                 "admission":admission,"manual_authorized":self.manual_authorized(kind,epoch)?});
             let effect_since = id
                 .map(|id| {
@@ -1047,7 +1145,7 @@ impl Store {
                      FROM operations o LEFT JOIN operation_evidence e ON e.operation_id=o.id
                      WHERE o.kind=?1 AND (?2 IS NULL OR o.request ->> '$.solver.epoch' = ?2)
                      AND (?3 IS NULL OR o.work_key=?3)
-                     AND (e.model_attempt IS NOT NULL OR o.state IN ('model_unknown','superseded_model_unknown','retry_model','prelaunch_failed','rejected'))
+                     AND (e.model_attempt IS NOT NULL OR o.state IN ('model_unknown','superseded_model_unknown','abandoned_model','retry_model','prelaunch_failed','rejected'))
                      ORDER BY o.id DESC LIMIT 1",
                     params![kind.as_str(),if kind==LaneId::Answer { epoch } else { None },if kind==LaneId::Judge { op.as_ref().map(|op|op.key.as_str()) } else { None }],
                     |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional()?;
@@ -1069,26 +1167,26 @@ impl Store {
                     // completion can identify a model failure.
                     model["failure_category"] = json!(
                         completion
+                            .as_ref()
                             .filter(|completion| completion.outcome != NativeOutcome::Captured)
                             .map(|completion| completion.reason_code.as_str())
                     );
+                    if let Some(detail) = completion.and_then(|entry| entry.grade_failure) {
+                        model["grade_failure"] = json!(detail);
+                    }
                     model["current_route"] = json!(
                         lane_revisions[kind.as_str()]
                             .as_str()
                             .map(|current| revision == current)
                     );
                     model["scope"] = json!(if kind == LaneId::Answer
-                        || op.as_ref().is_some_and(|op| op.key == key)
-                        || (state == "prelaunch_failed"
-                            && current_runtime == Some(true)
-                            && model["failure_category"]
-                                .as_str()
-                                .is_some_and(|code| { code.starts_with("native_workspace_") })
-                            && judging_work_current_at(assessment, &key, now()) == Some(true))
+                        || op
+                            .as_ref()
+                            .is_some_and(|op| op.key == key && op.state != "model_unknown")
                     {
                         "current_work"
                     } else {
-                        "historical_assignment"
+                        judging_model_scope(&context, &key)
                     });
                 }
             }
@@ -1146,15 +1244,12 @@ impl Store {
             if kind == LaneId::Judge {
                 lane["assessment"] = assessment.clone();
                 if op.is_none()
-                    && lane["assessment"]["locally_judgeable"] == false
-                    && lane["assessment"]["exclusions"]["assignment_read_backoff"]
-                        .as_u64()
-                        .unwrap_or(0)
-                        == 0
-                    && lane["assessment"]["exclusions"]["assignment_resource_restricted"]
-                        .as_u64()
-                        .unwrap_or(0)
-                        == 0
+                    && context.fresh
+                    && assessment["source"].is_string()
+                    && crate::health::judge_inventory(assessment)
+                        == crate::health::JudgeInventory::Idle
+                    && crate::health::model_route_fault(&lane["model"]).is_none()
+                    && !crate::health::judge_model_relevance_unknown(&lane["model"])
                     && !in_flight
                     && backoff.next_at <= now()
                     && lane["phase"] == "observing"
@@ -1168,32 +1263,84 @@ impl Store {
         Ok((work, scopes))
     }
 
-    pub(crate) fn status(&self, config: &Config) -> Result<Value> {
-        let snapshot = self.db.unchecked_transaction()?;
-        let control = self.control()?;
-        let stored_identity: String =
+    pub(super) fn diagnostic_journal_identity(&self) -> Result<(String, Value)> {
+        let stored: String =
             self.db
                 .query_row("SELECT identity FROM control WHERE singleton=1", [], |r| {
                     r.get(0)
                 })?;
-        let stored: Value = serde_json::from_str(&stored_identity)?;
+        let identity = serde_json::from_str(&stored)?;
+        Ok((stored, identity))
+    }
+
+    pub(super) fn diagnostic_runtime_policy(&self) -> Result<Option<Value>> {
+        let policy: Option<String> = self
+            .db
+            .query_row(
+                "SELECT p.policy FROM runtime_policy p
+             JOIN runtime_state r USING(singleton) WHERE p.singleton=1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(policy.as_deref().map(serde_json::from_str).transpose()?)
+    }
+
+    pub(super) fn diagnostic_applied_config(
+        config: &Config,
+        stored: &Value,
+        policy: Option<&Value>,
+    ) -> Result<Option<Config>> {
+        if let Some(policy) = policy
+            && let (Ok(capabilities), Ok(identity), Ok(runtime)) = (
+                <crate::config::Capabilities as serde::Deserialize>::deserialize(&policy["capabilities"]),
+                <crate::config::IdentityPolicy as serde::Deserialize>::deserialize(&policy["identity"]),
+                <crate::config::RuntimePolicy as serde::Deserialize>::deserialize(&policy["runtime"]),
+            )
+            // Captures are complete serialized output, not partial config input.
+            // Round trips reject missing defaulted fields at every nesting level.
+            && serde_json::to_value(&capabilities)? == policy["capabilities"]
+            && serde_json::to_value(identity)? == policy["identity"]
+            && serde_json::to_value(runtime)? == policy["runtime"]
+            && LaneId::ALL.into_iter().all(|lane| {
+                policy["lane_revisions"][lane.as_str()]
+                    .as_str()
+                    .is_some_and(|revision| !revision.is_empty())
+            })
+        {
+            let mut captured = config.clone();
+            captured.network.chain = stored["chain"]
+                .as_str()
+                .context("journal chain missing")?
+                .to_owned();
+            captured.network.address = stored["address"]
+                .as_str()
+                .context("journal address missing")?
+                .to_owned();
+            captured.network.base_url = stored["base_url"]
+                .as_str()
+                .context("journal origin missing")?
+                .to_owned();
+            captured.capabilities = capabilities;
+            captured.identity = identity;
+            captured.runtime = runtime;
+            Ok(Some(captured))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub(crate) fn status(&self, config: &Config) -> Result<Value> {
+        let snapshot = self.db.unchecked_transaction()?;
+        let control = self.control()?;
+        let (stored_identity, stored) = self.diagnostic_journal_identity()?;
         let mut stmt = self.db.prepare(
             "SELECT kind,state,COUNT(*) FROM operations GROUP BY kind,state ORDER BY kind,state",
         )?;
         let counts=stmt.query_map([],|r|Ok(json!({"kind":r.get::<_,String>(0)?,"state":r.get::<_,String>(1)?,"count":r.get::<_,u64>(2)?})))?.collect::<std::result::Result<Vec<_>,_>>()?;
         let runtime:Option<(String,bool,String,i64)>=self.db.query_row("SELECT effective_revision,reload_blocked,capabilities,observed_at FROM runtime_state WHERE singleton=1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
-        let policy: Option<String> = self
-            .db
-            .query_row(
-                "SELECT policy FROM runtime_policy WHERE singleton=1",
-                [],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let policy = policy
-            .map(|p| serde_json::from_str::<Value>(&p))
-            .transpose()?;
-        let mut effective_config = None;
+        let policy = self.diagnostic_runtime_policy()?;
+        let effective_config = Self::diagnostic_applied_config(config, &stored, policy.as_ref())?;
         let runtime_instance: Option<String> = self
             .db
             .query_row(
@@ -1212,32 +1359,6 @@ impl Store {
             )
             .optional()?;
         let effective=runtime.as_ref().map(|(revision,reload,capabilities,at)| -> Result<Value>{
-            if let Some(policy)=&policy
-                && let (Ok(capabilities), Ok(identity), Ok(runtime)) = (
-                    <crate::config::Capabilities as serde::Deserialize>::deserialize(&policy["capabilities"]),
-                    <crate::config::IdentityPolicy as serde::Deserialize>::deserialize(&policy["identity"]),
-                    <crate::config::RuntimePolicy as serde::Deserialize>::deserialize(&policy["runtime"]),
-                )
-                // Captures are complete serialized output, not partial config input.
-                // Round trips reject missing defaulted fields at every nesting level.
-                && serde_json::to_value(&capabilities)? == policy["capabilities"]
-                && serde_json::to_value(identity)? == policy["identity"]
-                && serde_json::to_value(runtime)? == policy["runtime"]
-                && LaneId::ALL.into_iter().all(|lane| {
-                    policy["lane_revisions"][lane.as_str()]
-                        .as_str()
-                        .is_some_and(|revision| !revision.is_empty())
-                })
-            {
-                let mut captured=config.clone();
-                captured.network.chain=stored["chain"].as_str().context("journal chain missing")?.to_owned();
-                captured.network.address=stored["address"].as_str().context("journal address missing")?.to_owned();
-                captured.network.base_url=stored["base_url"].as_str().context("journal origin missing")?.to_owned();
-                captured.capabilities=capabilities;
-                captured.identity=identity;
-                captured.runtime=runtime;
-                effective_config=Some(captured);
-            }
             Ok(json!({"revision":revision,"runtime_instance":runtime_instance,"authority_epoch":authority_epoch,
                 "reload_blocked":reload,"capabilities":serde_json::from_str::<Value>(capabilities)?,"observed_at":at,"policy":policy}))
         }).transpose()?;
@@ -1317,6 +1438,31 @@ impl Store {
                 lanes[kind.as_str()] = Value::Null;
             }
         }
+        let (reads, reads_truncated) = self.current_read_projection()?;
+        // Bounded witnesses only: selected lane operations, canonical blockers
+        // and the existing retained-read page. Never project the whole history.
+        let mut poll_ids = std::collections::HashSet::new();
+        poll_ids.extend(
+            reads
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|row| row["operation_id"].as_i64()),
+        );
+        for lane in LaneId::NAMES {
+            poll_ids.extend(work[lane]["operation_id"].as_i64());
+            for detail in [&work[lane]["admission"], &lanes[lane]] {
+                if detail["required_release"].as_u64().is_some_and(|n| n > 0) {
+                    poll_ids.extend(
+                        detail["blocker_ids"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_i64),
+                    );
+                }
+            }
+        }
         let mut pending_work = Vec::new();
         let mut captured_work = Vec::new();
         let mut statement=self.db.prepare("SELECT o.id,o.kind,o.state,o.created_at,o.updated_at,o.next_at,o.revision,o.generation,o.binding_revision,
@@ -1390,6 +1536,27 @@ impl Store {
                     .expect("known lane")];
                 entry["nonblocking_for_fresh_work"] =
                     json!(context.nonblocking(&state, epoch, row.get_ref(19)?.as_str()?));
+                if phase.is_some() && poll_ids.contains(&id) {
+                    let observation =
+                        self.bound_next_observation(policy, id, context, accounting.cutoff.at)?;
+                    if !observation.is_null() {
+                        if work[kind.as_str()]["operation_id"] == id {
+                            let lane = &mut work[kind.as_str()];
+                            if matches!(
+                                lane["next_action"].as_str(),
+                                Some("read_job" | "read_receipt")
+                            ) {
+                                lane["next_at"] = if observation["status"] == "eligible" {
+                                    json!(accounting.cutoff.at)
+                                } else {
+                                    observation["not_before"].clone()
+                                };
+                            }
+                            lane["bound_observation"] = observation.clone();
+                        }
+                        entry["bound_observation"] = observation;
+                    }
+                }
                 entry["admission"] = self
                     .admission_projection_with(policy, kind, epoch, candidate.as_ref(), accounting)?
                     .value;
@@ -1469,7 +1636,6 @@ impl Store {
         let mut restrictions=self.db.prepare("SELECT scope,basis,not_before,observed_at,source,server_minimum_seconds,policy FROM request_restrictions WHERE not_before>?1 ORDER BY not_before DESC")?;
         let restrictions=restrictions.query_map([now()],|r|Ok(json!({"scope":r.get::<_,String>(0)?,"basis":r.get::<_,String>(1)?,"not_before":r.get::<_,i64>(2)?,
             "observed_at":r.get::<_,i64>(3)?,"source":r.get::<_,String>(4)?,"server_minimum_seconds":r.get::<_,Option<u64>>(5)?,"policy":r.get::<_,Option<String>>(6)?})))?.collect::<std::result::Result<Vec<_>,_>>()?;
-        let (reads, reads_truncated) = self.current_read_projection()?;
         let mut lane_controls = json!({});
         for lane in LaneId::ALL {
             lane_controls[lane.as_str()] = Self::lane_control_projection(&self.db, lane)?;

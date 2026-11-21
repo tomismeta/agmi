@@ -199,14 +199,19 @@ def init(f):
         failure = json.loads(output)['error']
         assert failure['code'] == code and failure['details']['reason'] == reason, output
         assert snapshot(f.root) == before and not target.exists()
-    for i, chain_id in enumerate((None, 17, '', 'invalid chain', 'different-chain')):
-        target = f.root / f'chain-evidence-{i}'
+    for i, (evidence, mismatch) in enumerate((
+        *(({'chain_id': value}, False) for value in (None, 17, '', 'invalid chain')),
+        ({'chain_id': 'different-chain'}, True),
+        ({'error': 'fixture refusal'}, False),
+        ({'halted': True}, False),
+    )):
+        target = f.root / f'identity-evidence-{i}'
         expected = (
             ('credential_identity_unverified', 'account_or_chain_mismatch')
-            if chain_id == 'different-chain'
+            if mismatch
             else ('identity_verification_unavailable', 'identity_response_invalid')
         )
-        f.identity_response_once = (200, {'address': f.address, 'chain_id': chain_id})
+        f.identity_response_once = (200, {'address': f.address, **evidence})
         before = snapshot(f.root)
         count = len(f.identity_reads)
         output = f.cli(target / 'config.toml', f.init_args(target) + ['--key-stdin'], OLD, succeeds=False)

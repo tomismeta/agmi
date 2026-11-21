@@ -251,7 +251,7 @@ pub(crate) fn execution(error: &Error, config: Option<&Path>) -> Value {
         "admin_validation" => "Invalid configuration, patch or guidance; check schema, types and file references.",
         "admin_unsafe_file" => "Administration requires private owned regular files without symlinks or hardlinks.",
         "admin_io" => "Cannot read or persist administration files; a save may have completed. Reread revisions before retrying.",
-        "admin_revision_conflict" => "Revision conflict; read the current revision before retrying.",
+        "admin_revision_conflict" => "Revision conflict; review the current saved state before deciding whether to retry.",
         "admin_busy" => "Configuration acquisition deadline reached or directory busy; lane control was not changed. Retry after inspecting the current lane token.",
         "admin_routing_runtime_active" => "Stop the controller before changing API routes; preserve its journal and pause state.",
         _ => "Operation failed; inspect local prerequisites before retrying.",
@@ -283,6 +283,19 @@ pub(crate) fn execution(error: &Error, config: Option<&Path>) -> Value {
         _ => &["health"],
     };
     let mut value = json!({"code":code,"message":message,"details":{},"next_actions":[action(config, command, false)]});
+    if let Some(details) = agmi::admin::revision_conflict_details(error) {
+        if details["refresh"] == "guidance"
+            && let (Some(kind @ ("answer" | "judge")), Some(layer @ ("core" | "user"))) =
+                (details["kind"].as_str(), details["layer"].as_str())
+        {
+            value["next_actions"] = json!([action(
+                config,
+                &["guidance", "show", "--kind", kind, "--layer", layer],
+                false,
+            )]);
+        }
+        value["details"] = details;
+    }
     if let Some(details) = agmi::lifecycle::verification_details(error) {
         value["details"] = details;
         if value["details"]["transient"] == true {
@@ -399,6 +412,21 @@ pub(crate) fn execution(error: &Error, config: Option<&Path>) -> Value {
             value["next_actions"].as_array_mut().unwrap().remove(0);
         }
     }
+    if code == "selected_replay_fence_required"
+        || value["details"]["failure_code"] == "selected_replay_fence_required"
+    {
+        if code != "selected_replay_fence_required" {
+            value["message"] = json!(
+                "Cannot verify bound-job replay protection in the selected managed release. No service intent was changed."
+            );
+        }
+        value["next_actions"] = json!([
+            action(None, &["service", "status"], false),
+            {"kind":"instruction","authorization_required":true,
+             "message":"Roll forward to a digest-verified compatible release before starting or enabling the service or resolving hosted work. If leaving the old release selected, explicitly stop and disable it with the current CLI; existing activity and boot enablement are not changed automatically."},
+            action(None, &["update", "--help"], false)
+        ]);
+    }
     value
 }
 
@@ -484,16 +512,30 @@ pub(crate) fn diagnostics(data: &mut Value, config: Option<&Path>) {
             .map(|duration| i64::try_from(duration.as_secs()).unwrap_or(i64::MAX))
             .unwrap_or(0)
     });
-    if let Some(work) = data["work"].as_object_mut() {
-        for detail in work.values_mut() {
-            detail["next_actions"] =
-                intervention_actions(&detail["intervention"], &diagnostics, config, checked_at);
-            if detail["background_recovery"]["count"].as_u64().unwrap_or(0) > 0 {
-                detail["background_recovery"]["next_actions"] = json!([
-                    action(config, &["operations", "list"], false),
-                    action(config, &["reads"], false),
-                ]);
-            }
+    for lane in agmi::capability::LaneId::NAMES {
+        let detail = &data["work"][lane];
+        if !detail.is_object() {
+            continue;
+        }
+        let show_hint = detail["intervention"]["next_action"] == "review_model_configuration"
+            && detail["model"]["current_route"] == true
+            && detail["model"]["state"] == "prelaunch_failed"
+            && detail["model"]["failure_category"] == "native_api_unsupported"
+            && data["effective_capabilities"][lane]["model"]["harness"] == "openclaw";
+        let detail = &mut data["work"][lane];
+        detail["next_actions"] =
+            intervention_actions(&detail["intervention"], &diagnostics, config, checked_at);
+        if show_hint {
+            detail["next_actions"]
+                .as_array_mut()
+                .expect("intervention actions array")
+                .insert(0, openclaw_setup_instruction());
+        }
+        if detail["background_recovery"]["count"].as_u64().unwrap_or(0) > 0 {
+            detail["background_recovery"]["next_actions"] = json!([
+                action(config, &["operations", "list"], false),
+                action(config, &["reads"], false),
+            ]);
         }
     }
     for lane in agmi::capability::LaneId::NAMES {
@@ -590,6 +632,12 @@ pub(crate) fn diagnostics(data: &mut Value, config: Option<&Path>) {
     data["next_actions"] = json!(actions);
     data["diagnostics"] = Value::Array(diagnostics);
 }
+
+fn openclaw_setup_instruction() -> Value {
+    json!({"kind":"instruction","authorization_required":false,
+        "message":"Check the service's Node.js and OpenClaw installation before retrying. agmi requires a compatible Gateway SDK, not a fixed version."})
+}
+
 fn inspection_gate(data: &Value) -> Option<&'static str> {
     if data["intervention"]["next_action"] == "inspect_state_filesystem"
         || data["components"]["controller"]["reasons"]
@@ -1031,15 +1079,22 @@ fn print_diagnostic_verdict(kind: &str, data: &Value) {
 }
 
 fn retry_floor_label(detail: &Value) -> Option<&'static str> {
-    match detail["retry_floor"].as_str()? {
-        "server_restriction" => Some("server retry restriction"),
-        "shared_restriction" => Some("shared retry restriction (source unknown)"),
-        "local_backoff" => Some("local retry backoff"),
-        "retained_floor" => Some("retained retry restriction"),
-        "operation_minimum" => Some("operation retry minimum"),
-        "participation_grace" => Some("participation grace period"),
-        _ => None,
-    }
+    floor_label(detail["retry_floor"].as_str()?)
+}
+
+fn floor_label(kind: &str) -> Option<&'static str> {
+    Some(match kind {
+        "server_restriction" => "server retry restriction",
+        "shared_restriction" => "shared retry restriction (source unknown)",
+        "local_backoff" => "local retry backoff",
+        "retained_floor" => "retained retry restriction",
+        "operation_minimum" => "operation retry minimum",
+        "participation_grace" => "participation grace period",
+        "historical_missing_binding" => "historical job polling cadence",
+        "operation_poll" => "operation polling schedule",
+        "reconciliation_service" => "reconciliation service cadence",
+        _ => return None,
+    })
 }
 
 fn intervention_reason(detail: &Value) -> &str {
@@ -1112,7 +1167,58 @@ fn print_lane_row(data: &Value, lane: &str) {
             }
         }
     }
-    if intervention["status"] == "automatic_recovery"
+    let primary = &intervention["next_observation"];
+    let background = &work["background_recovery"];
+    let historical_missing = background
+        .get("missing_observation")
+        .or_else(|| background.get("next_observation"))
+        .filter(|row| row["http_status"] == 404);
+    let (observation, label) = if primary.is_null()
+        && let Some(missing) = historical_missing
+    {
+        (missing, "background observation")
+    } else {
+        (primary, "next observation")
+    };
+    if let (
+        Some(owner @ ("account" | "answer" | "judge" | "mine")),
+        Some(purpose @ ("identity" | "job" | "receipt")),
+    ) = (
+        observation["owner"].as_str(),
+        observation["purpose"].as_str(),
+    ) {
+        print!("; {label}: {owner}/{purpose}");
+        if let Some(id) = observation["operation_id"].as_i64() {
+            print!(" for local operation #{id}");
+        }
+        if let Some(at) = observation["not_before"].as_i64() {
+            print!(" not before {at}");
+            if let Some(label) = observation["floor_kind"].as_str().and_then(floor_label) {
+                print!(" ({label})");
+            }
+        } else if observation["status"] == "in_flight" {
+            print!(" (in flight)");
+        } else if observation["status"] == "eligible" {
+            print!(" (eligible; poll time not guaranteed)");
+        } else {
+            print!(" (timing not established)");
+        }
+        if observation["http_status"] == 404 {
+            print!("; HTTP 404, outcome unknown");
+            if observation["historical_cadence_qualified"] == true {
+                print!("; historical polling eligible");
+            }
+            match observation["scope"].as_str() {
+                Some("current") => print!("; current dependency"),
+                Some("background") => print!("; background recovery"),
+                _ => {}
+            }
+        }
+    } else if observation["status"] == "no_safe_binding" {
+        print!("; no safe reconciliation read");
+    } else if observation["status"] == "truncated" {
+        print!("; reconciliation read evidence incomplete");
+    } else if intervention["status"] == "automatic_recovery"
         && let Some(at) = intervention["next_at"].as_i64()
     {
         print!("; next_at={at}");
@@ -1135,7 +1241,7 @@ fn print_lane_row(data: &Value, lane: &str) {
             print!("; {label}={at}");
         }
     }
-    if intervention["resolution"] == "polling_not_guaranteed" {
+    if intervention["resolution"] == "polling_not_guaranteed" && observation["http_status"] != 404 {
         print!("; at least one bound read returned 404");
         if intervention["status"] == "automatic_recovery"
             && matches!(
@@ -1164,7 +1270,10 @@ fn print_lane_row(data: &Value, lane: &str) {
     if model["current_route"] == true {
         match model["failure_category"].as_str() {
             Some("artifact_grade_invalid") => {
-                print!("; completed inference returned an invalid grade")
+                print!("; completed inference returned an invalid grade");
+                if let Some(detail) = model["grade_failure"].as_str() {
+                    print!(" ({detail})");
+                }
             }
             Some("native_stream_failed") => {
                 print!("; native stream failed, execution outcome unknown")
@@ -1302,9 +1411,9 @@ fn print_risk_caveat(data: &Value) {
 fn print_doctor_repairs(data: &Value) {
     let repairs = &data["repairs"];
     let count = |key: &str| {
-        repairs[key]
-            .as_array()
-            .map_or("unknown".to_owned(), |rows| rows.len().to_string())
+        repairs["counts"][key]
+            .as_u64()
+            .map_or("unknown".to_owned(), |total| total.to_string())
     };
     println!(
         "Repairs: requested={}; eligible={}, ineligible={}, applied={}, skipped={}",
@@ -1409,6 +1518,13 @@ pub(crate) fn human_error(error: &Value) {
         if let Some(value) = error["details"][key].as_str() {
             eprintln!("{label}: {value}");
         }
+    }
+    if let (Some(flag), Some(field), Some(current)) = (
+        error["details"]["flag"].as_str(),
+        error["details"]["revision_field"].as_str(),
+        error["details"]["current_revision"].as_str(),
+    ) {
+        eprintln!("Current {field} for {flag}: {current}");
     }
     if let Some(status) = error["details"]["http_status"].as_u64() {
         eprintln!("HTTP status: {status}");
@@ -1911,6 +2027,49 @@ mod tests {
                 .iter()
                 .any(|step| step["argv"] == json!(["agmi", "recover", "resolve", "--help"]))
         );
+    }
+
+    #[test]
+    fn doctor_gives_sdk_setup_advice_only_for_a_current_openclaw_refusal() {
+        for (harness, current_route, uncertain, show_hint) in [
+            ("openclaw", true, false, true),
+            ("omp", true, false, false),
+            ("openclaw", false, false, false),
+            ("openclaw", true, true, false),
+        ] {
+            let (state, reason) = if uncertain {
+                ("model_unknown", "native_execution_evidence_mismatch")
+            } else {
+                ("prelaunch_failed", "native_api_unsupported")
+            };
+            let intervention = json!({"status":"operator_required","reason":"model_configuration_failed",
+                "next_action":"review_model_configuration"});
+            let mut report = json!({
+                "repair_requested":false,
+                "intervention":intervention,
+                "effective_capabilities":{"judge":{"model":{"harness":harness}}},
+                "work":{"judge":{"intervention":intervention,
+                    "model":{"state":state,"current_route":current_route,"failure_category":reason}}}
+            });
+            diagnostics(&mut report, None);
+            agmi::health::compact_diagnostics(&mut report);
+            let actions = report["work"]["judge"]["next_actions"].as_array().unwrap();
+            assert_eq!(
+                actions.iter().any(|step| {
+                    step["authorization_required"] == false
+                        && step["message"].as_str().is_some_and(|message| {
+                            message.contains("compatible Gateway SDK")
+                                && message.contains("not a fixed version")
+                        })
+                }),
+                show_hint,
+                "{harness}/{state}/{current_route}/{reason}: {actions:?}"
+            );
+            assert!(actions.iter().any(|step| {
+                step["argv"] == json!(["agmi", "config", "show"])
+                    && step["authorization_required"] == false
+            }));
+        }
     }
 
     #[test]

@@ -17,6 +17,7 @@ from pathlib import Path
 
 STARTED = False
 PRELAUNCH_CODE = 78
+REQUESTED_RUN_ID = None
 REPORTED = {}
 
 
@@ -60,11 +61,12 @@ def validate_turn(agent, result, invocation_id, prompt, output):
         raise NativeFailure("binding")
 
 def main():
-    global STARTED, PRELAUNCH_CODE, REPORTED
+    global STARTED, PRELAUNCH_CODE, REPORTED, REQUESTED_RUN_ID
     payload = json.load(sys.stdin)
     invocation_id = identifier(payload.get("invocation_id"))
     if invocation_id is None:
         raise RuntimeError("missing native invocation identity")
+    REQUESTED_RUN_ID = invocation_id
     tree = ast.parse(sys.argv[1])
     roots = []
     for node in ast.walk(tree):
@@ -171,4 +173,7 @@ if __name__ == "__main__":
             elif isinstance(error, (asyncio.CancelledError, KeyboardInterrupt)):
                 kind = "cancelled"
             print(json.dumps({"ok": False, **REPORTED, "error": {"kind": kind}}))
+        elif REQUESTED_RUN_ID is not None:
+            print(json.dumps({"ok": False, "status": "error", "runId": REQUESTED_RUN_ID,
+                              "error": {"kind": "hermes_refused_before_call"}}))
         raise SystemExit(1 if STARTED else PRELAUNCH_CODE)

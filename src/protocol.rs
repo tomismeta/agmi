@@ -90,6 +90,7 @@ pub enum ReadFailure {
     ResponseTooLarge,
     InvalidJson,
     CredentialEchoRedacted,
+    BoundJobExpiryConflict,
 }
 
 impl ReadFailure {
@@ -102,6 +103,7 @@ impl ReadFailure {
             Self::ResponseTooLarge => "response_too_large",
             Self::InvalidJson => "invalid_json",
             Self::CredentialEchoRedacted => "credential_echo_redacted",
+            Self::BoundJobExpiryConflict => BOUND_JOB_EXPIRY_CONFLICT,
         }
     }
 }
@@ -577,25 +579,46 @@ impl Protocol {
                 }
             }
         }
-        let Ok(body) = decode_hosted_body(&bytes, context.endpoint, context.meta.owner, status)
-        else {
-            return Ok(unavailable(ReadFailure::InvalidJson));
+        let credential = key
+            .as_ref()
+            .map(HeaderValue::to_str)
+            .transpose()
+            .map_err(|_| anyhow::anyhow!("invalid internal credential encoding"))?;
+        let (body, body_delay) = match decode_hosted_body(
+            &bytes,
+            context.endpoint,
+            context.meta.owner,
+            status,
+            credential,
+        ) {
+            Ok(decoded) => decoded,
+            Err(failure) => return Ok(unavailable(failure)),
         };
-        if let Some(key) = &key {
-            let secret = key
-                .to_str()
-                .map_err(|_| anyhow::anyhow!("invalid internal credential encoding"))?;
-            if contains_credential(&body, secret) {
-                return Ok(unavailable(ReadFailure::CredentialEchoRedacted));
-            }
-        }
-        let body_delay = body.get("retry_after_seconds").and_then(Value::as_u64);
-        Ok(assembled(Response {
+        Ok(assembled(body.into_response(
+            status,
+            max_delay(header_delay, body_delay),
+        )))
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum DecodedBody {
+    Value(Value),
+    Discarded(ReadFailure),
+}
+
+impl DecodedBody {
+    fn into_response(self, status: u16, retry_after_seconds: Option<u64>) -> Response {
+        let (body, read_failure) = match self {
+            Self::Value(body) => (body, None),
+            Self::Discarded(reason) => (Value::Null, Some(reason)),
+        };
+        Response {
             status,
             body,
-            retry_after_seconds: max_delay(header_delay, body_delay),
-            read_failure: None,
-        }))
+            retry_after_seconds,
+            read_failure,
+        }
     }
 }
 
@@ -604,115 +627,159 @@ fn decode_hosted_body(
     endpoint: Endpoint,
     owner: Option<LaneId>,
     status: u16,
-) -> serde_json::Result<Value> {
-    if endpoint != Endpoint::Job
-        || status != 408
-        || !matches!(owner, Some(LaneId::Answer | LaneId::Judge))
-    {
-        return serde_json::from_slice(bytes);
+    credential: Option<&str>,
+) -> Result<(DecodedBody, Option<u64>), ReadFailure> {
+    let mut json = serde_json::Deserializer::from_slice(bytes);
+    let bound_job_expiry = endpoint == Endpoint::Job
+        && status == 408
+        && matches!(owner, Some(LaneId::Answer | LaneId::Judge));
+    let decoder = HostedBodyDecoder {
+        credential,
+        bound_job_expiry,
+    };
+    let decoded = de::DeserializeSeed::deserialize(decoder, &mut json)
+        .map_err(|_| ReadFailure::InvalidJson)?;
+    json.end().map_err(|_| ReadFailure::InvalidJson)?;
+    if decoded.credential_echo {
+        return Err(ReadFailure::CredentialEchoRedacted);
     }
-    let decoded: JobTimeoutBody = serde_json::from_slice(bytes)?;
-    if decoded.expiry_hint && decoded.duplicate_key {
-        // Preserve a complete, contradictory observation for the durable
-        // expiry fence, but discard all ambiguous fields and candidates.
-        return Ok(serde_json::json!({"code": BOUND_JOB_EXPIRY_CONFLICT}));
-    }
-    Ok(decoded.body)
+    let body = if decoded.expiry.disputed() {
+        DecodedBody::Discarded(ReadFailure::BoundJobExpiryConflict)
+    } else if decoded.duplicate_key {
+        // Duplicate delay hints may supply a maximum, but never outcome authority.
+        DecodedBody::Discarded(ReadFailure::InvalidJson)
+    } else {
+        DecodedBody::Value(decoded.body)
+    };
+    // Top-level retry minima are independent of outcome authority.
+    Ok((body, decoded.retry_after_seconds))
 }
 
-struct JobTimeoutBody {
+struct HostedBody {
     body: Value,
     duplicate_key: bool,
-    expiry_hint: bool,
+    expiry: ExpiryEvidence,
+    credential_echo: bool,
+    retry_after_seconds: Option<u64>,
 }
 
-impl JobTimeoutBody {
+impl HostedBody {
     fn plain(body: Value) -> Self {
         Self {
             body,
             duplicate_key: false,
-            expiry_hint: false,
+            expiry: ExpiryEvidence::default(),
+            credential_echo: false,
+            retry_after_seconds: None,
         }
     }
 }
 
-impl<'de> Deserialize<'de> for JobTimeoutBody {
-    fn deserialize<D: de::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct Visitor;
+#[derive(Clone, Copy)]
+struct HostedBodyDecoder<'a> {
+    credential: Option<&'a str>,
+    bound_job_expiry: bool,
+}
 
-        impl<'de> de::Visitor<'de> for Visitor {
-            type Value = JobTimeoutBody;
+impl HostedBodyDecoder<'_> {
+    fn echoes(self, value: &str) -> bool {
+        self.credential.is_some_and(|secret| value.contains(secret))
+    }
+}
 
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("a JSON value")
+impl<'de> de::DeserializeSeed<'de> for HostedBodyDecoder<'_> {
+    type Value = HostedBody;
+
+    fn deserialize<D: de::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<HostedBody, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> de::Visitor<'de> for HostedBodyDecoder<'_> {
+    type Value = HostedBody;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a JSON value")
+    }
+
+    fn visit_map<M: de::MapAccess<'de>>(self, mut map: M) -> Result<HostedBody, M::Error> {
+        let mut body = serde_json::Map::new();
+        let mut duplicate_key = false;
+        let mut expiry = ExpiryEvidence::default();
+        let mut credential_echo = false;
+        let mut retry_after_seconds = None;
+        while let Some(key) = map.next_key::<String>()? {
+            let member = map.next_value_seed(self)?;
+            // Check decoded occurrences before overwriting or normalizing them.
+            credential_echo |= self.echoes(&key) || member.credential_echo;
+            if self.bound_job_expiry {
+                expiry.observe(&key, &member.body, member.expiry);
             }
-
-            fn visit_map<M: de::MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
-                let mut body = serde_json::Map::new();
-                let mut duplicate_key = false;
-                let mut expiry_hint = false;
-                while let Some((key, member)) = map.next_entry::<String, JobTimeoutBody>()? {
-                    // Inspect every occurrence before map insertion can replace it.
-                    // An object-valued error can also carry an expiry claim.
-                    expiry_hint |= match key.as_str() {
-                        "state" => member.body == "expired",
-                        "code" => member.body == "job_expired",
-                        "error" => member.body == "job_expired" || member.expiry_hint,
-                        _ => false,
-                    };
-                    duplicate_key |= member.duplicate_key | body.insert(key, member.body).is_some();
-                }
-                Ok(JobTimeoutBody {
-                    body: Value::Object(body),
-                    duplicate_key,
-                    expiry_hint,
-                })
+            if key == "retry_after_seconds" {
+                retry_after_seconds = max_delay(retry_after_seconds, member.body.as_u64());
             }
-
-            fn visit_seq<S: de::SeqAccess<'de>>(self, mut seq: S) -> Result<Self::Value, S::Error> {
-                let mut body = Vec::new();
-                let mut duplicate_key = false;
-                while let Some(member) = seq.next_element::<JobTimeoutBody>()? {
-                    duplicate_key |= member.duplicate_key;
-                    body.push(member.body);
-                }
-                Ok(JobTimeoutBody {
-                    body: Value::Array(body),
-                    duplicate_key,
-                    expiry_hint: false,
-                })
-            }
-
-            fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
-                Ok(JobTimeoutBody::plain(Value::Null))
-            }
-
-            fn visit_bool<E: de::Error>(self, value: bool) -> Result<Self::Value, E> {
-                Ok(JobTimeoutBody::plain(value.into()))
-            }
-
-            fn visit_i64<E: de::Error>(self, value: i64) -> Result<Self::Value, E> {
-                Ok(JobTimeoutBody::plain(value.into()))
-            }
-
-            fn visit_u64<E: de::Error>(self, value: u64) -> Result<Self::Value, E> {
-                Ok(JobTimeoutBody::plain(value.into()))
-            }
-
-            fn visit_f64<E: de::Error>(self, value: f64) -> Result<Self::Value, E> {
-                Ok(JobTimeoutBody::plain(value.into()))
-            }
-
-            fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
-                Ok(JobTimeoutBody::plain(value.into()))
-            }
-
-            fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
-                Ok(JobTimeoutBody::plain(value.into()))
-            }
+            duplicate_key |= member.duplicate_key | body.insert(key, member.body).is_some();
         }
+        Ok(HostedBody {
+            body: Value::Object(body),
+            duplicate_key,
+            expiry,
+            credential_echo,
+            retry_after_seconds,
+        })
+    }
 
-        deserializer.deserialize_any(Visitor)
+    fn visit_seq<S: de::SeqAccess<'de>>(self, mut seq: S) -> Result<HostedBody, S::Error> {
+        let mut body = Vec::new();
+        let mut duplicate_key = false;
+        let mut credential_echo = false;
+        while let Some(member) = seq.next_element_seed(self)? {
+            duplicate_key |= member.duplicate_key;
+            credential_echo |= member.credential_echo;
+            body.push(member.body);
+        }
+        Ok(HostedBody {
+            duplicate_key,
+            credential_echo,
+            ..HostedBody::plain(Value::Array(body))
+        })
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<HostedBody, E> {
+        Ok(HostedBody::plain(Value::Null))
+    }
+
+    fn visit_bool<E: de::Error>(self, value: bool) -> Result<HostedBody, E> {
+        Ok(HostedBody::plain(value.into()))
+    }
+
+    fn visit_i64<E: de::Error>(self, value: i64) -> Result<HostedBody, E> {
+        Ok(HostedBody::plain(value.into()))
+    }
+
+    fn visit_u64<E: de::Error>(self, value: u64) -> Result<HostedBody, E> {
+        Ok(HostedBody::plain(value.into()))
+    }
+
+    fn visit_f64<E: de::Error>(self, value: f64) -> Result<HostedBody, E> {
+        Ok(HostedBody::plain(value.into()))
+    }
+
+    fn visit_str<E: de::Error>(self, value: &str) -> Result<HostedBody, E> {
+        Ok(HostedBody {
+            credential_echo: self.echoes(value),
+            ..HostedBody::plain(value.into())
+        })
+    }
+
+    fn visit_string<E: de::Error>(self, value: String) -> Result<HostedBody, E> {
+        Ok(HostedBody {
+            credential_echo: self.echoes(&value),
+            ..HostedBody::plain(value.into())
+        })
     }
 }
 
@@ -804,18 +871,6 @@ pub fn parse_selected_assignment(
     }
     parse_assignment(&bound)
 }
-fn contains_credential(value: &Value, secret: &str) -> bool {
-    match value {
-        Value::String(value) => value.contains(secret),
-        Value::Array(values) => values
-            .iter()
-            .any(|value| contains_credential(value, secret)),
-        Value::Object(values) => values
-            .iter()
-            .any(|(key, value)| key.contains(secret) || contains_credential(value, secret)),
-        _ => false,
-    }
-}
 fn read_credential(path: &Path) -> Result<HeaderValue> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
@@ -886,8 +941,19 @@ fn parse_credential(bytes: &[u8]) -> std::result::Result<HeaderValue, Credential
     key.set_sensitive(true);
     Ok(key)
 }
+
+pub(crate) const GRADE_REASONING_LENGTH: std::ops::RangeInclusive<usize> = 10..=500;
+
+pub(crate) fn grade_reasoning_length(reasoning: &str) -> usize {
+    reasoning
+        .trim()
+        .chars()
+        .take(GRADE_REASONING_LENGTH.end() + 1)
+        .count()
+}
+
 pub(crate) fn valid_grade_reasoning(reasoning: &str) -> bool {
-    (10..=500).contains(&reasoning.trim().chars().count())
+    GRADE_REASONING_LENGTH.contains(&grade_reasoning_length(reasoning))
 }
 
 pub(crate) fn has_required_words(answer: &str, words: &[String]) -> bool {
@@ -948,13 +1014,22 @@ fn validate_payload(kind: LaneId, payload: &Value) -> Result<()> {
 }
 fn parse_retry_after(value: &str) -> Option<u64> {
     let value = value.trim();
-    value.parse().ok().or_else(|| {
-        httpdate::parse_http_date(value).ok().map(|time| {
-            let delay = time.duration_since(SystemTime::now()).unwrap_or_default();
-            delay
-                .as_secs()
-                .saturating_add(u64::from(delay.subsec_nanos() != 0))
+    if !value.is_empty()
+        && let Some(seconds) = value.bytes().try_fold(0_u64, |seconds, byte| {
+            byte.is_ascii_digit().then(|| {
+                seconds
+                    .saturating_mul(10)
+                    .saturating_add(u64::from(byte - b'0'))
+            })
         })
+    {
+        return Some(seconds);
+    }
+    httpdate::parse_http_date(value).ok().map(|time| {
+        let delay = time.duration_since(SystemTime::now()).unwrap_or_default();
+        delay
+            .as_secs()
+            .saturating_add(u64::from(delay.subsec_nanos() != 0))
     })
 }
 fn max_delay(a: Option<u64>, b: Option<u64>) -> Option<u64> {
@@ -1051,10 +1126,94 @@ fn processing_evidence(body: &Value) -> bool {
         )
 }
 
+#[derive(Clone, Copy, Default)]
+struct ExpiryEvidence {
+    code: bool,
+    expired_state: bool,
+    other_code: bool,
+    opposition: bool,
+}
+
+impl ExpiryEvidence {
+    fn observe(&mut self, key: &str, value: &Value, nested: Self) {
+        match key {
+            "error" if value.is_object() => {
+                self.code |= nested.code;
+                self.expired_state |= nested.expired_state;
+                self.other_code |= nested.other_code;
+                self.opposition |= nested.opposition;
+            }
+            "code" | "error" => {
+                self.code |= value == "job_expired";
+                self.other_code |= value != "job_expired";
+                self.opposition |= value == "duplicate_in_flight";
+            }
+            "job_id" | "id" | "challenge_txid" | "txid" | "next_nonce" | "attested" => {
+                self.opposition = true;
+            }
+            "state" => {
+                self.expired_state |= value == "expired";
+                self.opposition |= value != "expired";
+            }
+            "status" => self.opposition |= value != "expired",
+            "queued" | "accepted" | "ok" | "success" | "processed" => {
+                self.opposition |= value != false;
+            }
+            _ => {}
+        }
+    }
+
+    fn from_body(body: &Value) -> Self {
+        let mut evidence = Self::default();
+        if let Some(fields) = body.as_object() {
+            for (key, value) in fields {
+                let nested = if key == "error" && value.is_object() {
+                    Self::from_body(value)
+                } else {
+                    Self::default()
+                };
+                evidence.observe(key, value, nested);
+            }
+        }
+        evidence
+    }
+
+    fn disputed(self) -> bool {
+        (self.code || self.expired_state) && (self.opposition || (self.code && self.other_code))
+    }
+}
+
+fn bound_expiry(body: &Value) -> Option<Outcome> {
+    let evidence = ExpiryEvidence::from_body(body);
+    if !evidence.code && !evidence.expired_state {
+        return None;
+    }
+    if evidence.disputed() {
+        return Some(unknown(BOUND_JOB_EXPIRY_CONFLICT));
+    }
+    // Missing facts are not contradictions, and a noncanonical shape does not
+    // establish that the engine never processed the operation.
+    let flat = body.get("error").is_none_or(|value| value == "job_expired");
+    let state_expired = body.get("state").is_some_and(|value| value == "expired");
+    Some(if state_expired && evidence.code && flat {
+        Outcome::Expired
+    } else {
+        unknown("bound_job_expiry_incomplete")
+    })
+}
+
 pub fn classify_source(kind: LaneId, response: &Response, source: ResponseSource) -> Outcome {
     let body = &response.body;
+    let bound_job_expiry =
+        kind != LaneId::Mine && source == ResponseSource::BoundJob && response.status == 408;
+    if bound_job_expiry && response.read_failure == Some(ReadFailure::BoundJobExpiryConflict) {
+        return unknown(BOUND_JOB_EXPIRY_CONFLICT);
+    }
     if response.read_failure.is_some() || !body.is_object() {
         return unknown("response_shape_unknown");
+    }
+    if bound_job_expiry && let Some(outcome) = bound_expiry(body) {
+        return outcome;
     }
     let explicit_code = body.get("code").and_then(Value::as_str);
     let explicit_error = body.get("error").and_then(Value::as_str);
@@ -1076,31 +1235,6 @@ pub fn classify_source(kind: LaneId, response: &Response, source: ResponseSource
         .iter()
         .any(|field| body.get(field).is_some_and(|value| value != false))
         || matches!(state, Some("queued" | "running" | "processing"));
-    if kind != LaneId::Mine
-        && source == ResponseSource::BoundJob
-        && response.status == 408
-        && (explicit_code == Some(BOUND_JOB_EXPIRY_CONFLICT)
-            || [explicit_code, explicit_error].contains(&Some("job_expired")))
-    {
-        return if explicit_code == Some(BOUND_JOB_EXPIRY_CONFLICT)
-            || has_job
-            || state != Some("expired")
-            || ["code", "error"]
-                .iter()
-                .any(|field| body.get(field).is_some_and(|value| value != "job_expired"))
-            || has_tx
-            || accepting
-            || processing_evidence(body)
-            || ["ok", "success"]
-                .iter()
-                .any(|field| body.get(field).is_some_and(|value| value != false))
-            || body.get("status").is_some_and(|value| value != "expired")
-        {
-            unknown(BOUND_JOB_EXPIRY_CONFLICT)
-        } else {
-            Outcome::Expired
-        };
-    }
     if conflicting_codes {
         return unknown("conflicting_error_codes");
     }
@@ -1908,7 +2042,8 @@ mod tests {
         }
         assert_eq!(parse_retry_after("3600"), Some(3600));
         assert_eq!(parse_retry_after("-1"), None);
-        assert_eq!(parse_retry_after("18446744073709551616"), None);
+        assert_eq!(parse_retry_after("18446744073709551616"), Some(u64::MAX));
+        assert_eq!(parse_retry_after("18446744073709551616x"), None);
     }
 
     #[test]
@@ -2176,31 +2311,81 @@ mod tests {
     #[tokio::test]
     async fn unavailable_bodies_retain_safe_categories_status_and_retry_after() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        for (status, body, length, failure) in [
-            (429, "", 0, ReadFailure::InvalidJson),
+        let invalid_expiry = concat!(
+            r#"{"state":"expired","error":"job_expired","processed":true,"processed":false,"#,
+            r#""retry_after_seconds":900} trailing"#,
+        );
+        let echoed_expiry = r#"{"state":"expired","error":"job_expired","retry_after_seconds":900,"detail":"private-test-credential"}"#;
+        let echoed_duplicate = r#"{"state":"expired","error":{"code":"job_expired"},"processed":true,"retry_after_seconds":900,"detail":["private-test-credenti\u0061l"],"detail":"ordinary"}"#;
+        let echoed_throttle =
+            r#"{"retry_after_seconds":0,"detail":"private-test-credential","detail":"ordinary"}"#;
+        for (endpoint, status, body, length, failure) in [
+            (Endpoint::Status, 429, "", 0, ReadFailure::InvalidJson),
             (
+                Endpoint::Status,
                 503,
                 "<html>unavailable</html>",
                 24,
                 ReadFailure::InvalidJson,
             ),
-            (503, "{", 100, ReadFailure::BodyInterrupted),
             (
+                Endpoint::Status,
+                503,
+                "{",
+                100,
+                ReadFailure::BodyInterrupted,
+            ),
+            (
+                Endpoint::Status,
                 503,
                 "",
                 MAX_RESPONSE_BYTES + 1,
                 ReadFailure::ResponseTooLarge,
             ),
             (
+                Endpoint::Status,
                 200,
                 "\"private-test-credential\"",
                 25,
+                ReadFailure::CredentialEchoRedacted,
+            ),
+            (
+                Endpoint::Job,
+                408,
+                invalid_expiry,
+                invalid_expiry.len(),
+                ReadFailure::InvalidJson,
+            ),
+            (
+                Endpoint::Job,
+                408,
+                echoed_expiry,
+                echoed_expiry.len(),
+                ReadFailure::CredentialEchoRedacted,
+            ),
+            (
+                Endpoint::Job,
+                408,
+                echoed_duplicate,
+                echoed_duplicate.len(),
+                ReadFailure::CredentialEchoRedacted,
+            ),
+            (
+                Endpoint::Identity,
+                429,
+                echoed_throttle,
+                echoed_throttle.len(),
                 ReadFailure::CredentialEchoRedacted,
             ),
         ] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let mut config = Config::default();
             config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
+            let retry_headers = if endpoint == Endpoint::Identity {
+                ""
+            } else {
+                "Retry-After: 1\r\nRetry-After: 300\r\n"
+            };
             let server = tokio::spawn(async move {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut request = [0_u8; 4096];
@@ -2214,20 +2399,37 @@ mod tests {
                     received += count;
                 }
                 let reply = format!(
-                    "HTTP/1.1 {status} Unavailable\r\nRetry-After: 1\r\nRetry-After: 300\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status} Unavailable\r\n{retry_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     length,
                 );
                 stream.write_all(reply.as_bytes()).await.unwrap();
             });
             let mut protocol = Protocol::new(&config).unwrap();
             protocol.key = Some(HeaderValue::from_static("private-test-credential"));
-            let response = protocol
-                .get(Endpoint::Status, None, read_deadline(), meta())
+            let hosted = protocol
+                .get(
+                    endpoint,
+                    (endpoint == Endpoint::Job).then_some("old-job"),
+                    read_deadline(),
+                    RequestMeta {
+                        owner: Some(LaneId::Answer),
+                        ..meta()
+                    },
+                )
                 .await
-                .unwrap()
-                .response;
+                .unwrap();
+            if endpoint == Endpoint::Identity {
+                assert_eq!(
+                    hosted.authenticated_retry_minimum(),
+                    Some((30, RestrictionBasis::LocalUnscoped429Cooldown))
+                );
+            }
+            let response = hosted.response;
             assert_eq!(response.status, status);
-            assert_eq!(response.retry_after_seconds, Some(300));
+            assert_eq!(
+                response.retry_after_seconds,
+                (endpoint != Endpoint::Identity).then_some(300)
+            );
             assert_eq!(response.read_failure, Some(failure));
             assert!(response.body.is_null());
             let public = serde_json::to_string(&response).unwrap();
@@ -2305,17 +2507,19 @@ mod tests {
     }
     #[test]
     fn echoed_credentials_are_detected_even_when_json_escaped() {
-        let body: Value =
-            serde_json::from_str(r#"{"nested":["value with p\u006b_fixture"]}"#).unwrap();
-        assert!(contains_credential(&body, "pk_fixture"));
-        assert!(contains_credential(
-            &json!({"pk_fixture":"value"}),
-            "pk_fixture"
-        ));
-        assert!(!contains_credential(
-            &json!({"ordinary":"value"}),
-            "pk_fixture"
-        ));
+        let decode =
+            |body: &[u8]| decode_hosted_body(body, Endpoint::Status, None, 200, Some("pk_fixture"));
+        for body in [
+            &br#"{"nested":["value with p\u006b_fixture"]}"#[..],
+            br#"{"p\u006b_fixture":"value","pk_fixture":"duplicate"}"#,
+            br#"{"nested":{"old":"pk_fixture","old":"harmless"}}"#,
+        ] {
+            assert_eq!(decode(body), Err(ReadFailure::CredentialEchoRedacted));
+        }
+        assert_eq!(
+            decode(br#"{"ordinary":"value"}"#),
+            Ok((DecodedBody::Value(json!({"ordinary":"value"})), None))
+        );
     }
     #[test]
     fn acceptance_evidence_prevents_refusal_retries() {
@@ -2523,17 +2727,20 @@ mod tests {
                 &br#"{"state":"expired","error":"job_expired","processed":true,"processed":false}"#[..],
                 br#"{"state":"expired","error":"job_expired","processed":true,"proces\u0073ed":false}"#,
                 br#"{"state":"done","state":"expired","code":"job_expired"}"#,
+                br#"{"state":"done","state":"expired"}"#,
+                br#"{"state":"expired","processed":true,"processed":false}"#,
                 br#"{"state":"expired","error":"other_error","error":"job_expired"}"#,
                 br#"{"state":"expired","error":"job_expired","status":"processing","status":"expired"}"#,
                 br#"{"code":"job_expired","code":"duplicate_in_flight","job_id":"other-job"}"#,
                 br#"{"error":{"code":"job_expired","code":"other_error"}}"#,
                 br#"{"code":"job_expired","error":{"processed":true,"processed":false}}"#,
-                br#"{"state":"expired","error":"job_expired","metadata":[{"same":1,"same":1}]}"#,
+                br#"{"error":{"state":"expired","processed":true,"processed":false}}"#,
             ] {
-                let body = decode_hosted_body(bytes, Endpoint::Job, Some(kind), 408).unwrap();
-                // A complete object carries the conflict into the durable read fence.
-                assert!(body.is_object());
-                let observed = response(408, body);
+                let (body, delay) =
+                    decode_hosted_body(bytes, Endpoint::Job, Some(kind), 408, None).unwrap();
+                assert_eq!(delay, None);
+                let observed = body.into_response(408, delay);
+                assert!(observed.body.is_null(), "conflicting wire data is discarded");
                 assert_eq!(
                     classify_source(kind, &observed, ResponseSource::BoundJob),
                     unknown(BOUND_JOB_EXPIRY_CONFLICT),
@@ -2545,28 +2752,82 @@ mod tests {
                 &br#"{"state":"expired","error":"job_expired"}"#[..],
                 br#"{"state":"expired","code":"job_expired","status":"expired","processed":false}"#,
             ] {
-                let body = decode_hosted_body(bytes, Endpoint::Job, Some(kind), 408).unwrap();
+                let (body, _) =
+                    decode_hosted_body(bytes, Endpoint::Job, Some(kind), 408, None).unwrap();
                 assert_eq!(
-                    classify_source(kind, &response(408, body), ResponseSource::BoundJob),
+                    classify_source(
+                        kind,
+                        &body.into_response(408, None),
+                        ResponseSource::BoundJob
+                    ),
                     Outcome::Expired,
                 );
             }
         }
 
-        let duplicate =
-            br#"{"state":"expired","error":"job_expired","processed":true,"processed":false}"#;
+        let duplicate = br#"{"state":"expired","error":"job_expired","processed":true,"processed":false,"retry_after_seconds":20,"retry_after_seconds":5}"#;
         for (endpoint, kind, status) in [
             (Endpoint::Status, LaneId::Answer, 408),
             (Endpoint::Grade, LaneId::Judge, 408),
             (Endpoint::Job, LaneId::Answer, 200),
             (Endpoint::Job, LaneId::Mine, 408),
+            (Endpoint::Answer, LaneId::Answer, 429),
+            (Endpoint::Grade, LaneId::Judge, 503),
         ] {
-            let body = decode_hosted_body(duplicate, endpoint, Some(kind), status).unwrap();
-            assert_eq!(body["processed"], false);
+            let (body, delay) =
+                decode_hosted_body(duplicate, endpoint, Some(kind), status, None).unwrap();
+            assert_eq!(delay, Some(20));
+            assert_eq!(body, DecodedBody::Discarded(ReadFailure::InvalidJson));
         }
-        let timeout = br#"{"error":"temporary","error":"request_timeout"}"#;
-        let body = decode_hosted_body(timeout, Endpoint::Job, Some(LaneId::Answer), 408).unwrap();
-        assert_eq!(body["error"], "request_timeout");
+        let timeout = br#"{"error":"temporary","error":"request_timeout","retry_after_seconds":20,"retry_after_seconds":5}"#;
+        let (body, delay) =
+            decode_hosted_body(timeout, Endpoint::Job, Some(LaneId::Answer), 408, None).unwrap();
+        assert_eq!(delay, Some(20));
+        assert_eq!(body, DecodedBody::Discarded(ReadFailure::InvalidJson));
+    }
+
+    #[test]
+    fn bound_expiry_distinguishes_missing_facts_from_contradictions() {
+        let classify = |body| {
+            let (body, _) =
+                decode_hosted_body(body, Endpoint::Job, Some(LaneId::Judge), 408, None).unwrap();
+            classify_source(
+                LaneId::Judge,
+                &body.into_response(408, None),
+                ResponseSource::BoundJob,
+            )
+        };
+        for bytes in [
+            &br#"{"state":"expired"}"#[..],
+            br#"{"error":"job_expired"}"#,
+            br#"{"state":"expired","error":{"code":"job_expired"}}"#,
+            br#"{"error":{"state":"expired"}}"#,
+            br#"{"state":"expired","code":"bound_job_expiry_conflict"}"#,
+        ] {
+            assert_eq!(classify(bytes), unknown("bound_job_expiry_incomplete"));
+        }
+        for bytes in [
+            &br#"{"state":"expired","processed":true}"#[..],
+            br#"{"error":{"state":"expired","processed":true}}"#,
+            br#"{"state":"expired","error":"duplicate_in_flight"}"#,
+            br#"{"state":"expired","error":{"code":"duplicate_in_flight"}}"#,
+            br#"{"state":"expired","error":{"code":"job_expired","processed":true}}"#,
+            br#"{"state":"expired","error":"job_expired","status":"running"}"#,
+        ] {
+            assert_eq!(classify(bytes), unknown(BOUND_JOB_EXPIRY_CONFLICT));
+        }
+        for bytes in [
+            &br#"{"state":"expired","arbitrary":true,"arbitrary":false}"#[..],
+            br#"{"code":"job_expired","arbitrary":true,"arbitrary":false}"#,
+            br#"{"state":"expired","error":{"code":"job_expired"},"retry_after_seconds":20,"retry_after_seconds":5}"#,
+            br#"{"state":"expired","error":"job_expired","metadata":[{"same":1,"same":1}]}"#,
+        ] {
+            assert_eq!(classify(bytes), unknown("response_shape_unknown"));
+        }
+        assert_ne!(
+            classify(br#"{"code":"bound_job_expiry_conflict"}"#),
+            unknown(BOUND_JOB_EXPIRY_CONFLICT)
+        );
     }
 
     #[test]

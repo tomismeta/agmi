@@ -13,7 +13,7 @@ CLI and installer defaults follow process `HOME`; the systemd unit resolves `%h`
 ```sh
 agmi --json config schema
 agmi --json config show
-# FILE_REVISION is data.file_revision from config show.
+# FILE_REVISION is data.file_revision from config show or config check.
 printf '%s\n' '{"capabilities":{"answer":{"participation":{"mode":"participation_first","uncertainty_grace_seconds":300}}}}' |
   agmi --json config apply --expected-revision "$FILE_REVISION" --dry-run
 # Remove --dry-run to save the validated patch.
@@ -27,7 +27,7 @@ agmi --json recover grants --limit 20
 
 Saved `config apply` patches also take the account admission gate. A change to strict/off therefore serializes with the final dispatch check; it may wait for an in-flight bounded request and cannot retract that request. Dry-run validates a snapshot without acquiring this gate.
 
-A saved configuration is not evidence of runtime application. Compare the returned `revision` with `status.data.effective_runtime.revision`; `file_revision` is a separate byte-level update token. Invalid edits do not partially apply. On an I/O error, reread revisions before retrying. `config state-path` uses a JSON envelope with `--json` and plain text otherwise. `build-info --manifest` is the explicit raw installer-manifest exception.
+A saved configuration is not evidence of runtime application. Compare `effective_revision` (also reported as `revision` for existing consumers) from `config check` or `config apply` with `status.data.effective_runtime.revision`. Only `file_revision`, a digest of the actual TOML bytes, authorizes a config edit. `config check` derives both from the snapshot it validates. A conflict names the failed flag and the current token seen at comparison; reread and review the saved state before deciding whether to retry. `config show` does not read private guidance; use `config check` to validate it. Invalid edits do not partially apply. On an I/O error, reread revisions before retrying. `config state-path` uses a JSON envelope with `--json` and plain text otherwise. `build-info --manifest` is the explicit raw installer-manifest exception.
 
 `status.work.<kind>.wait` and each `operations list` row expose elapsed generation, unsent-since-capture, queued and unresolved-effect ages with their retained start timestamps. Ages apply only to the current phase; missing, pruned or invalid timing evidence is `null`, never reconstructed from the latest poll time. Retry states do not report an unsent-since-capture age: that interval can include an earlier submission and queue wait. Read these alongside `status.work.reason` and `next_action`: a current cause does not explain every second of historical elapsed time.
 
@@ -100,13 +100,16 @@ evidence: an interrupted 503 body may be labeled `timeout`, not a proven halt.
 
 | Category | Next action |
 | --- | --- |
+| Validated success (`200`) | Apply only the expected route evidence; for included Answer/Judge effects, poll the existing receipt until settled. |
+| Valid queued acknowledgement (`202` or `duplicate_in_flight` with a usable job binding) | Poll that same job after its retained minimum; do not submit it again. |
 | `halt_middleware`, `endpoint_halted`, `service_unavailable`, `bad_gateway`, `gateway_timeout`, `upstream_error` | Let scheduled read recovery proceed; inspect freshness and work deadlines. |
 | `rate_limited`, `answer_global_ceiling`, `grade_queue_full` | Honor the retained retry floor; do not restart to bypass it. |
 | `authentication_rejected`, `permission_denied` | Inspect credential configuration with `config check` and recorded endpoint evidence with `reads`; neither validates a credential remotely. Do not move credentials into a URL or register a replacement identity. A 403 alone does not prove an invalid key. |
 | `redirect_refused`, `not_found`, `gone`, `request_rejected`, `upstream_rejected` | Inspect the configured network profile and operation evidence. A missing job or receipt is not proof a write failed. |
+| Bound job `404` | Keep the original binding unresolved; allow scheduled polling. Inspect if stale or blocking, but do not treat a `404` as replay authority. |
 | `invalid_json`, `body_interrupted`, `response_too_large`, `timeout`, `connect` | Preserve uncertainty and let the owning read's backoff run; escalate if evidence becomes stale or work overdue. |
 
-The longest parseable `Retry-After` header (seconds or HTTP-date) and JSON `retry_after_seconds` wins. Headers are retained privately until the body completes or its deadline expires; classification then determines scope. A valid queued 202 minimum is resource-local, not a global pause. Malformed or interrupted bodies retain conservative header evidence. Restrictions are ingested before stale local-completion checks, so an obsolete binding cannot erase a genuine shared limit.
+The longest parseable `Retry-After` header (seconds or HTTP-date) and valid top-level JSON `retry_after_seconds` wins. An ambiguous bound `408` body is quarantined as outcome evidence, but its valid delay still applies. Malformed, interrupted, or credential-echoing bodies retain only independent header evidence. A valid queued `202` minimum is resource-local, not a global pause. A stale completion can retain a genuine limit without changing the operation. Deadlines and reported minima larger than the journal can store saturate at its maximum instead of dropping the restriction.
 
 A bare 429 without a valid minimum uses a fixed, versioned 30-second local cooldown anchored to the original observation—not a server-supplied duration or another lane's exponential backoff. Displayed deadlines mean **retry no earlier than**, not “the service will recover then.” Free-form outage prose never supplies a recovery timestamp.
 
@@ -117,13 +120,17 @@ it is not a general rule that all 4xx/5xx responses prove nonexecution.
 Acceptance indicators or contradictory response fields prevent this shortcut.
 Generic 503, 502/504, interrupted responses and timeouts remain uncertain.
 Job/receipt lookup errors never establish rejection of the original submission.
-A bound `408 job_expired` permits retry only when it contains no evidence
-of processing or acceptance. Contradictory evidence keeps the original job
-bound after restart; a later expiry alone cannot clear it. Same-epoch answer
-retries stop for that dispute, but the controller can keep polling and settle
-the original operation when authoritative evidence arrives.
-An older runtime does not honor this retained dispute fence. If a disputed
-job is still open, keep the older controller stopped and roll forward.
+A bound `408 job_expired` permits retry only when it contains the canonical
+expiry fields and no processing or acceptance evidence. An incomplete expiry
+does not disqualify a later clean result. Neither a wire-supplied internal code
+nor repeated delay fields create a dispute without conflicting outcome evidence.
+Contradictory expiry and its retry floor commit together with the original binding;
+a later expiry alone cannot clear that dispute. Same-epoch answer retries
+stop for that dispute, but authoritative job or receipt evidence can still
+settle the original operation.
+The journal stays at format 4. Older binaries can still open it directly but
+do not honor the retained dispute fence. Do not start an older controller
+against this journal; roll forward to a compatible release.
 Retained server minima still apply, including an earlier one-hour `Retry-After`;
 maintenance prose or an expected server fix does not shorten them.
 
@@ -390,7 +397,7 @@ Offline rehearsal ends with local migration/evidence inspection. Do not run part
 
 1. Record each host's observed executable/build, journal format, selected configuration, service/timer intent and current uncertainty. Do not infer deployed versions from an earlier review or a release label alone.
 2. Review each candidate lane's explicit mode, quota, schedule and deadlines; answer/judge model, harness, reasoning and guidance; and uncertain-model/network retry policies. Old global capacity/reservation is not equivalent to three lane quotas. Existing participation-first or accepted-linked policies must not silently become strict—or vice versa.
-3. Require the complete CI pipeline, extracted-package library-test compilation and binary writer/account-authority continuity coverage. The packaged CLI exercises private key onboarding over a pseudo-terminal. CI also runs the upstream standalone omp release pinned by version and digest against a loopback fixture. Neither check replaces a real-journal rehearsal, a first-run check over SSH or authenticated-provider proof.
+3. Require the complete CI pipeline, extracted-package library-test compilation and binary writer/account-authority continuity coverage. The packaged CLI exercises private key onboarding over a pseudo-terminal and qualifies OpenCode Go against digest-verified standalone omp fixtures on loopback. Neither check replaces a real-journal rehearsal, a first-run check over SSH or authenticated-provider proof.
 4. Separately authorize bounded native-provider validation with a designated test identity, exact harness/model route and inference budget. A pass requires successful inference, a valid bound artifact and sufficiently complete native-reported provenance matching the authorized route. Failed calls, mismatches or missing required facts are failed/unavailable proof and block that route's activation. Exercise cancellation separately without treating client exit as remote nonexecution. Do not patch installed harnesses or copy authentication material; ordinary native session/cache/auth-refresh writes may still occur when invoked.
 5. Authorize one account's maintenance window and operating intent, never a fleet-wide conversion. Verify effective lane modes and preserved controls. Plain update may restore only previously authorized active intent; choose stopped maintenance when activation needs separate approval. A format-incompatible old binary is not rollback: stop and roll forward without restoring older journal state.
 6. Before expansion, observe at least two complete epoch transitions and one controlled restart. Require observed eligible answer/judge/mine progress, independent lane pause/resume, retained work/retry floors/uncertainty, and diagnostics that agree with observed state. Correctly explained blockers prove diagnostic behavior, not lane readiness. Any lane without demonstrated eligible progress remains failed or untested and blocks expansion, including when no judging opportunity arose. Record CPU, memory and journal growth against agreed limits; remote acceptance/finality require remote evidence.
@@ -453,8 +460,8 @@ Use a native CLI executable, not a shell command or an arbitrary JSON adapter. T
 | Harness | Inspected execution contract | Model syntax |
 |---|---|---|
 | Hermes | Launcher supports `--print-runtime-command`; native embedding API supports tool/context isolation and the authenticated OpenAI Codex route | Exact model identifier, for example `gpt-6.1-sol` |
-| OpenClaw | `2026.10.9` public Gateway CLI transport, compatible Node.js on PATH, and an authenticated running Gateway permitting `operator.admin` | Provider/model, for example `openai/gpt-6.1-sol` |
-| omp | Official standalone `19.0.1` binary; invocation-loaded public SDK bridge, independent direct inference and native authentication | Exact provider/model, including model IDs containing slashes |
+| OpenClaw | Native Gateway SDK transport, compatible Node.js on PATH, and an authenticated running Gateway permitting `operator.admin`; no exact release pin | Provider/model, for example `openai/gpt-6.1-sol` |
+| omp | Official standalone binary; invocation-loaded SDK bridge, independent direct inference and native authentication | Exact provider/model, including model IDs containing slashes |
 
 The user service sets `PATH` to `$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin`; it does not load shell startup files. Configure the native harness executable by absolute path and make OpenClaw's compatible `node` available on that service PATH. A working interactive `nvm`/`fnm` shell is not sufficient. Provision and authenticate the harness as the runtime OS account, then verify model execution under supervision before leaving it unattended.
 
@@ -462,29 +469,7 @@ Unsupported native contracts fail explicitly; a matching product name alone does
 
 `capabilities.answer.model.hermes_api_url` and `capabilities.judge.model.hermes_api_url` independently declare the expected authenticated Hermes URL, defaulted from [`defaults/model.toml`](../defaults/model.toml). It must match the native authentication route; changing it never silently redirects a native key. OpenClaw resolves its endpoint through its existing Gateway configuration.
 
-Install the [pinned standalone omp release](https://github.com/can1357/oh-my-pi/releases/tag/v19.0.1)
-and verify its SHA-256 before making it executable:
-
-```sh
-(
-  set -eu
-  case "$(uname -s)/$(uname -m)" in
-    Linux/x86_64) asset=omp-linux-x64; digest=6ceef04430851bb1050c6fda3af467412eb44a11df0a6ff8121fe601013c5415 ;;
-    Darwin/arm64) asset=omp-darwin-arm64; digest=2fe420bbd00f81899816e51cbeeb9593afa59d9368d62c9d3e78535d540e32f6 ;;
-    *) printf '%s\n' 'Select the matching standalone asset and verify its published SHA-256 before running it.' >&2; exit 2 ;;
-  esac
-  tmp=$(mktemp)
-  trap 'rm -f "$tmp"' EXIT
-  curl --proto '=https' --proto-redir '=https' -fsSL \
-    "https://github.com/can1357/oh-my-pi/releases/download/v19.0.1/$asset" -o "$tmp"
-  printf '%s  %s\n' "$digest" "$tmp" | shasum -a 256 --check
-  mkdir -p "$HOME/.local/bin"
-  install -m 0755 "$tmp" "$HOME/.local/bin/omp"
-  "$HOME/.local/bin/omp" --version
-)
-```
-
-Authenticate in omp as the service OS account. No source checkout, npm SDK, external Bun/Node runtime or permanent plugin installation is required. Other omp versions fail qualification rather than silently changing the adapter contract.
+Install the platform-matching standalone binary from the [official omp releases](https://github.com/can1357/oh-my-pi/releases). Verify the asset against its published SHA-256 before installing it. Authenticate in omp as the service OS account. No source checkout, npm SDK, external Bun/Node runtime or permanent plugin installation is required.
 
 Either model lane can independently use:
 
@@ -507,7 +492,22 @@ env = [] # Native environment variable NAMES to inherit, never credential values
 
 Native paths are config-relative; native profile/auth/cache ownership stays with omp. Choose either `profile` or `agent_dir`, never both. Profiles use canonical native names: at most 64 lowercase ASCII letters/digits/dots/underscores/hyphens, beginning with a letter/digit; trailing dots and reserved device names are rejected before launch. Service-only environment inheritance is explicit: shell startup files are not read. HOME/PATH/LANG, private temporary/config controls and all native profile/root selectors (`OMP_PROFILE`, `PI_PROFILE`, `PI_CONFIG_DIR`, `PI_CODING_AGENT_DIR`) cannot be replaced through `env`. Native broker, proxy or provider environment variables must be named deliberately. Omp does not use `hermes_api_url`.
 
-The omp adapter performs version-only preflight, waits for final admission, then owns one fresh native process and temporary extension per attempt. The extension also checks its actual bundled SDK version before projecting providers, so replacement during admission waiting cannot silently select an unqualified SDK. A fixed local command calls the public SDK directly with agmi's privileged policy and both captured guidance layers; native conversation, project instructions and tool hooks are not inherited into inference. Normal factory-time native providers are projected without attaching their tools/handlers. Providers registered only during live session lifecycle are not projected.
+The omp adapter waits for final admission, then owns one fresh native process and temporary extension per attempt. A fixed local command calls the SDK directly with agmi's privileged policy and both captured guidance layers; native conversation, project instructions and tool hooks are not inherited into inference. Factory-time native providers are projected without attaching their tools/handlers. Providers registered only during live session lifecycle are not projected.
+
+For `opencode-go`, agmi qualifies a private byte snapshot of the configured
+standalone executable and requested effort using synthetic data and credentials
+against a private loopback endpoint. Actual tasks go only to the stock HTTPS
+endpoint using the default native profile and catalog. Custom endpoint and
+project settings are refused. The bound route is checked again before sending
+task data; changed executables or relevant settings invalidate cached proof.
+The final serialized request must still match the qualified model, effort,
+captured prompt, and tool policy, carry a native Bearer, and go to the bound
+endpoint without redirects.
+An incompatible update fails locally with `native_qualification_failed` or
+`native_qualification_unavailable`; install a compatible executable or restore
+the stock profile. agmi does not downgrade, reinstall, or switch routes. This
+proof covers the selected executable image, not programs it may load or launch.
+Other native omp routes retain their in-process contract checks.
 
 Native profile/provider factories remain trusted executable code, and the outer shell can initialize native facilities: this is tool-free direct inference, not a sandbox against startup side effects or opaque remote agent/tool behavior. Native endpoint-routing settings are passed explicitly; tools and configured fallback chains are not requested, returned tool calls fail, and unsupported exact reasoning-off fails closed. Host invocation/effort evidence is labeled adapter-owned, not provider-issued attestation. Native auth refresh/retries/cache writes remain native behavior; one logical attempt is not a hard HTTP-call or monetary cap. Killing the owned process does not prove remote cancellation, and possible execution remains charged.
 
@@ -522,17 +522,22 @@ routed APIs are not qualified.
 The native `compat.extraBody` setting may provide finite numeric sampling
 tuning only. It cannot replace agmi's model, prompt, reasoning, or tool
 policy. The effective outbound model must still match the catalog's wire route.
-An Anthropic pause or unrecognized stop is not a final answer.
+An Anthropic result requires a supported stop from the same response as
+the artifact, including through Factory's Messages route. The shared Chat
+Completions encoder cannot submit a rebuilt request at another reasoning
+effort, including through Factory. A refusal does not silently lower effort.
 
 Run `python3 tests/omp_native_smoke.py --omp /absolute/path/to/omp` for isolated default-binary/loopback acceptance. It uses temporary profiles and fixture credentials, not the operator's native login. Real authenticated provider acceptance remains separate.
 
 OpenClaw uses its existing Gateway and native authentication through a small embedded Node bridge to `callGatewayFromCli`. Prompts travel over stdin, never argv. Each request is a fresh one-shot raw model run with tools, bootstrap context and delivery disabled. The Gateway chooses its configured default agent; no shared configuration is changed. Model overrides require the native `operator.admin` scope; insufficient authority fails rather than silently using another model.
 
+agmi loads `openclaw/plugin-sdk/gateway-runtime` from the configured installation, not from a bundled copy. A current invocation-bound SDK refusal establishes that agmi did not call the Gateway; older `native_api_unsupported` records alone do not establish that. An incompatible or lost response after dispatch stays uncertain. Compatibility also requires the running Gateway's bound model, effort, run ID, fallback, tool and bootstrap evidence. Doctor points to the service's Node.js and installed SDK, not a fixed OpenClaw version. Qualify an updated CLI and Gateway together on the intended route before leaving them unattended.
+
 Choosing OpenClaw trusts that Gateway's configuration, plugins and hooks. This is not isolated execution: hooks may influence routing before inference. agmi checks the returned model, reasoning, run binding and explicit no-tool/no-bootstrap/no-fallback evidence before accepting output; that cannot undo calls already made by the trusted Gateway. Hermes places policy in its native `system_message` channel. The inspected OpenClaw interface still combines policy and untrusted request data in one message; agmi does not claim privileged policy isolation or prompt-injection immunity there. Pause closes new admission and fences pre-pause results; already-started inference may continue. Timeout or shutdown cancels agmi's local adapter, not the shared Gateway. Remote inference may continue until its native deadline.
 
 `operations list` and private `recover inspect` expose separate model-attempt producer, launch and completion evidence. Requested harness/model/effort are not native-reported facts. Completion retains safely parsed reports even on invalid artifacts or provenance mismatch; missing provider, effort, fallback or run facts stay unknown. Launch permission is not proof inference started, and crash recovery never invents a completion.
 
-`artifact_grade_invalid` means a bound model completion failed grade validation. It can be regenerated only within the lane's existing model budget. `native_stream_failed` means the omp stream did not yield a usable completion and may have executed remotely; unlike a bad grade, that remains an unknown attempt. `native_process_failed` identifies local process failure. None of these outcomes establishes that a MinePOA submission occurred or authorizes replay.
+`artifact_grade_invalid` means a bound model completion failed grade validation. New attempts include an allowlisted `grade_failure` code (for example, `score_not_integer` or `reasoning_too_long`), not the rejected model text. Older records may not name a field. This counts against the affected assignment's existing model budget, not a fresh assignment's budget. `native_stream_failed` means the omp stream did not yield a usable completion and may have executed remotely; unlike a bad grade, that remains an unknown attempt. `native_process_failed` identifies local process failure. None of these outcomes establishes that a MinePOA submission occurred or authorizes replay.
 
 Native authentication and OS privilege isolation remain deployment prerequisites, not fixes delivered by this release. Provision authentication through the native harness; never copy another account's auth material. Same-user hostile processes and privileged Gateway access are not isolated by these adapters. Stronger OS identity/auth/container isolation is explicitly deferred; see [security boundaries](../SECURITY.md).
 
@@ -614,6 +619,18 @@ new-work blocker, under finite as well as unbounded policy. Current actions take
 precedence over background reconciliation. Shell-rendered actions preserve the selected configuration path.
 Where retained evidence identifies blocking local operation IDs, use `agmi operations list` to inspect them. A bound evidence read returning 404 does not prove the original submission failed or that another poll will settle it. A scheduled poll is not permission to replay.
 
+`intervention.next_observation` identifies a relevant local identity, job or
+receipt read when the evidence supports one. It names the read owner (which
+can differ from the blocked lane), the local operation and binding
+revision when applicable, and the governing read floor. It describes the
+earliest evidenced observation, not when all blockers will clear. A read
+that is eligible is not necessarily scheduled to run immediately. For a
+bound 404 the diagnostic separates historical cadence qualification from
+the floor actually governing the next eligible poll.
+For a selected bound read, `work.<lane>.next_at` uses the same floor and is
+absent while the read is in flight. `operations list` uses the same captured
+runtime policy and lane revisions without loading guidance from disk.
+
 In diagnostic JSON, `retry_floor` identifies the latest recorded admission wait;
 `next_at` cannot precede an active request restriction just because an operation
 backoff expires sooner. The existing `shared_server_restriction` reason code
@@ -653,9 +670,15 @@ pause/inactivity; `null` preserves insufficient evidence. A live process alone,
 an old successful epoch or retained audit warnings do not establish this result.
 Completion is scoped to fresh local epoch/inventory evidence, not rewards.
 
-The existing `health` exit contract is unchanged: admission waits can still fail
-health even when recovery is automatic. Agents should use `intervention`, not
+The default `health` exit contract is unchanged: admission waits can still
+fail health even when recovery is automatic. The installed `agmi-health.service`
+opts into `--managed-exit`: exit 0 is clear (possibly with warnings), exit 3 is a
+proven timed admission wait with no independently failing check, and exit 1
+remains a health failure. The unit accepts 0 and 3. This does not change `ok`,
+`healthy`, readiness issues or authority. Agents should use `intervention`, not
 `attention_required` or the exit code alone, to decide whether to ask a human.
+A concurrent current discovery failure still fails the managed check even
+when an independent retry has a known deadline.
 `doctor` exits successfully only when `unattended` is true and its repair scan/
 application has no failure. A repair can therefore be `applied` while the command
 still exits nonzero because participation is paused or other blockers remain.
@@ -868,11 +891,28 @@ proof that an old snapshot is current.
 
 Missing or unsafe unanchored lock evidence reports `authority_incomplete`, not an adoptable first-anchor state. Do not delete or recreate locks to make adoption pass.
 
-Retained binaries are rollback candidates only when journal compatibility matches. For an active handoff the digest-verified target must report `bound_dispute_fence=1` via `build-info --installer-capabilities`; this is separate from the v1 release manifest. Otherwise the update is refused (`stopped_update_required`). The target can still be staged or selected with `--stopped`, which does not restore runtime or timer activity. `--stopped` preserves existing boot enablement; use `agmi service disable` first if the target must remain disabled after reboot. Do not restart a writer that lacks the fence with unresolved disputed jobs; roll forward or stop, never rewind state.
+Retained binaries are rollback candidates only when journal compatibility matches
+and the digest-verified target reports `bound_dispute_fence=1` via
+`build-info --installer-capabilities`. That check is separate from the v1
+release manifest. An unfenced target can be staged and inspected, but managed
+activation refuses it (`target_replay_fence_required`), even with `--stopped`
+and both units disabled. The refusal leaves the selected release and service
+intent unchanged. Do not bypass it by directly launching the older binary
+against the journal. If no compatible target is available, stop or roll forward
+without rewinding state.
+
+The current CLI also refuses `service start`, `restart`, and `enable`, and
+detached controller startup or mutating recovery for the canonical managed
+configuration, if the selected release lacks the fence
+(`selected_replay_fence_required`). Inspection, `service stop`, and
+`service disable` remain available. The refusal does not disable existing boot
+activation; explicitly stop and disable an old selection if leaving it in place.
 
 Staging checks artifact/retention space plus a 256 MiB journal/WAL reserve without pruning history. There is no automatic release pruning: protect the selected release, releases still used by live processes, pinned update source/target/definitions and validated compatible recovery artifacts. Age, directory count or unavailable process observation cannot prove a release is unused. Never delete the permanent installer/account lease files, pending transaction, journal/WAL, credentials or unknown outcomes to free space. Any cleanup needs a separate owner-verified inventory and authorization.
 
 The example uses control-group cleanup, restrictive umask, private temporary files and restart-on-failure. The service manager owns private model scratch at `%t/agmi` (normally `/run/user/<uid>/agmi`); each native child uses its own private invocation workspace as `TMPDIR`. Foreground execution retains the OS-selected temporary root. Runtime storage can be memory-backed and capacity-limited; do not put update archives or durable state there. Explicit start-rate limits also count manual service starts. `TimeoutStopSec=infinity` prevents systemd truncating captured deadlines; agmi bounds shutdown, but a shutdown bug still needs operator intervention.
+
+Stock OpenCode Go requires scratch space for a private copy of the standalone executable and a scratch mount that permits execution. Do not point agmi at a launcher script or relax mount protections globally. If qualification refuses, check the service's configured executable and scratch filesystem before changing the route.
 
 `PrivateTmp` namespace enforcement depends on systemd/kernel support. Private managed model workspaces do not depend on it: their service-owned runtime root and per-invocation permissions remain the storage boundary.
 
@@ -1077,7 +1117,10 @@ verifies that the final ELF links its allocator from Rust's musl archive and
 emits a link map and digest-bound provenance. CI verifies the shipped archive
 with the production updater verifier, then runs `tests/packaged_omp_smoke.py`
 with the extracted source-package binary and the exact binary extracted from
-the updater archive. The pinned standalone omp connects only to loopback fixtures.
+the updater archive. The digest-verified standalone omp fixtures run without external networking.
+The exact distributed builds must refuse an enabled OpenCode Go loopback
+override. Positive OpenCode Go tests use the separate `omp-go-fixture` build
+and only synthetic credentials and tasks; that build is never a release asset.
 Keep the checked archive, `BUILD-INFO.txt`, `SHA256SUMS` and allocator evidence
 together; a fresh rebuild is a different candidate.
 

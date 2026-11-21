@@ -50,6 +50,12 @@ fn timestamp(row: &Value, field: &str) -> Option<i64> {
     row.get(field)?.as_i64().filter(|value| *value >= 0)
 }
 
+pub(super) fn has_future_observation(row: &Value, at: i64) -> bool {
+    ["started_at", "last_success_at", "last_failure_at"]
+        .into_iter()
+        .any(|field| row[field].as_i64().is_some_and(|time| time > at))
+}
+
 fn empty(reason: &str) -> Value {
     json!({
         "state": "unknown",

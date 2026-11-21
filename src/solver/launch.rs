@@ -9,6 +9,7 @@ pub struct PendingLaunch {
     executable: PathBuf,
     args: Vec<String>,
     protocol: NativeProtocol,
+    omp_qualification: Option<std::sync::Arc<omp::qualification::Qualified>>,
     scratch: Scratch,
     deadline: ExecutionDeadline,
     preflight_started_at: i64,
@@ -46,7 +47,7 @@ pub enum InferenceStart {
     Finished(NativeCompletion),
 }
 pub struct PreflightFlight {
-    child: OwnedChild,
+    child: Option<OwnedChild>,
     model: ModelConfig,
     request: NativeRequest,
     invocation_id: String,
@@ -140,7 +141,7 @@ fn inference_completion(
     }
 }
 
-fn new_invocation_id() -> Result<String> {
+pub(super) fn new_invocation_id() -> Result<String> {
     #[cfg(not(target_env = "musl"))]
     use libc::getentropy;
     // libc omits this declaration on musl, which exports the same POSIX ABI.
@@ -182,6 +183,7 @@ fn evidence(
         execution: NativeExecution::NotStarted,
         outcome: NativeOutcome::NotStarted,
         reason_code: NativeReasonCode::InvalidSolverSetup,
+        grade_failure: None,
         collected_at: Some(now()),
         preflight_started_at: started,
         inference_spawned_at: spawned,
@@ -192,6 +194,7 @@ fn evidence(
 fn failed(error: anyhow::Error, mut facts: NativeAttemptCompletion) -> NativeCompletion {
     let code = NativeReasonCode::from_error(&error);
     facts.reason_code = code;
+    facts.grade_failure = error.downcast_ref::<GradeFailure>().copied();
     facts.collected_at = Some(now());
     if facts.inference_spawned_at.is_some() && execution_may_have_started(&error) {
         facts.execution = NativeExecution::Unknown;
@@ -228,7 +231,7 @@ fn failed(error: anyhow::Error, mut facts: NativeAttemptCompletion) -> NativeCom
         evidence: facts,
     }
 }
-/// Performs the first real discovery spawn before returning ownership to the caller.
+/// Allocate private preflight state and start any immediate native discovery.
 pub fn start_preflight(
     request: NativeRequest,
     selection: ModelSelection,
@@ -272,14 +275,14 @@ pub fn start_preflight(
             tokio::time::Instant::now() < deadline,
             SolverNotStarted("model_deadline_exceeded")
         );
-        let args = vec![
-            match model.harness {
-                Harness::Hermes => "--print-runtime-command",
-                Harness::Openclaw | Harness::Omp => "--version",
-            }
-            .to_owned(),
-        ];
-        let child = spawn_native(&executable, &args, &scratch.0)?;
+        let child = match model.harness {
+            Harness::Hermes => Some(spawn_native(
+                &executable,
+                &["--print-runtime-command".into()],
+                &scratch.0,
+            )?),
+            Harness::Openclaw | Harness::Omp => None,
+        };
         let started_at = now();
         Ok(PreflightFlight {
             child,
@@ -309,14 +312,19 @@ impl PreflightFlight {
         let facts = evidence(NativePhase::Preflight, Some(self.started_at), None);
         let deadline = self.deadline;
         let operation = async {
-            let bytes = collect_native_evidence(
-                &mut self.child,
-                Vec::new(),
-                NativeProtocol::Discovery,
-                None,
-                &mut Default::default(),
-            )
-            .await?;
+            let bytes = if let Some(child) = &mut self.child {
+                collect_native_evidence(
+                    child,
+                    Vec::new(),
+                    NativeProtocol::Discovery,
+                    None,
+                    &mut Default::default(),
+                )
+                .await?
+            } else {
+                Vec::new()
+            };
+            let mut omp_qualification = None;
             let (executable, mut args, protocol) = match self.model.harness {
                 Harness::Hermes => {
                     let runtime: Vec<String> = serde_json::from_slice(&bytes)
@@ -340,14 +348,6 @@ impl PreflightFlight {
                     )
                 }
                 Harness::Openclaw => {
-                    let version = std::str::from_utf8(&bytes)
-                        .map_err(|_| NativeFailure("native_envelope_invalid"))?;
-                    ensure!(
-                        version
-                            .split_whitespace()
-                            .any(|part| part == OPENCLAW_VERSION),
-                        SolverNotStarted("unsupported_harness_version")
-                    );
                     let node = resolve_executable(Path::new("node"))
                         .map_err(|e| e.context(SolverNotStarted("executable_unavailable")))?;
                     (
@@ -362,7 +362,12 @@ impl PreflightFlight {
                     )
                 }
                 Harness::Omp => {
-                    omp::check_version(&bytes)?;
+                    omp_qualification = omp::qualification::qualify(
+                        &self.model,
+                        &self.executable,
+                        self.execution_deadline,
+                    )
+                    .await?;
                     (self.executable.clone(), Vec::new(), NativeProtocol::Omp)
                 }
             };
@@ -398,14 +403,14 @@ impl PreflightFlight {
                 !remaining.is_zero(),
                 SolverNotStarted("model_deadline_exceeded")
             );
-            Ok((executable, args, protocol, input))
+            Ok((executable, args, protocol, input, omp_qualification))
         };
         let result = tokio::time::timeout_at(deadline, operation).await;
         // The child/process group is stopped before its workspace is handed off,
         // including when collection fails. Cancellation drops self in field order.
         drop(self.child);
         match result {
-            Ok(Ok((executable, args, protocol, input))) => {
+            Ok(Ok((executable, args, protocol, input, omp_qualification))) => {
                 PreflightCompletion::Pending(PendingLaunch {
                     model: self.model,
                     request: self.request,
@@ -414,6 +419,7 @@ impl PreflightFlight {
                     executable,
                     args,
                     protocol,
+                    omp_qualification,
                     scratch: self.scratch,
                     deadline: self.execution_deadline,
                     preflight_started_at: self.started_at,
@@ -453,12 +459,20 @@ impl PendingLaunch {
             ));
         }
         let spawned = if self.model.harness == Harness::Omp {
-            omp::spawn(
-                &self.executable,
-                &self.args,
-                &self.scratch.0,
-                self.model.omp.as_ref().unwrap_or(&Default::default()),
-            )
+            self.omp_qualification
+                .as_deref()
+                .map_or(
+                    Ok(self.executable.as_path()),
+                    omp::qualification::Qualified::executable,
+                )
+                .and_then(|executable| {
+                    omp::spawn(
+                        executable,
+                        &self.args,
+                        &self.scratch.0,
+                        self.model.omp.as_ref().unwrap_or(&Default::default()),
+                    )
+                })
         } else {
             spawn_native(&self.executable, &self.args, &self.scratch.0)
         };
@@ -510,7 +524,14 @@ impl InferenceFlight {
         let p = &mut self.pending;
         let input = std::mem::take(&mut p.input);
         if matches!(p.protocol, NativeProtocol::Omp) {
-            let terminal = omp::collect(&mut self.child, input, deadline, &mut facts).await;
+            let terminal = omp::collect(
+                &mut self.child,
+                input,
+                deadline,
+                &mut facts,
+                p.omp_qualification.as_deref(),
+            )
+            .await;
             let PendingLaunch { model, request, .. } = self.pending;
             return ReceivedInference(Received::Omp {
                 terminal,
@@ -524,7 +545,7 @@ impl InferenceFlight {
                 &mut self.child,
                 input,
                 p.protocol,
-                (p.model.harness == Harness::Openclaw).then_some(p.invocation_id.as_str()),
+                Some(p.invocation_id.as_str()),
                 &mut facts.reported,
             )
             .await?;

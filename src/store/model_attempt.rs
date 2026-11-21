@@ -726,6 +726,7 @@ impl Store {
                     NativeOutcome::NotStarted
                 },
                 reason_code: NativeReasonCode::Interrupted,
+                grade_failure: None,
                 collected_at: Some(now()),
                 preflight_started_at: None,
                 inference_spawned_at: None,
@@ -855,6 +856,7 @@ mod tests {
             execution,
             outcome,
             reason_code: NativeReasonCode::NativeProvenanceMismatch,
+            grade_failure: None,
             collected_at: Some(now()),
             preflight_started_at: Some(now()),
             inference_spawned_at: (execution != NativeExecution::NotStarted).then(now),

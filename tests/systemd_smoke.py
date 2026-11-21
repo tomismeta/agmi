@@ -943,8 +943,7 @@ def retained_rollback(binary, old, expected_hash, home):
     config_root = home / '.config/agmi'
     config_root.mkdir(parents=True, mode=0o700)
     fixture = QueuedFixture(str(binary), config_root)
-    fixture.contradictory_expiry = True
-    fixture.pending_polls = 0
+    fixture.pending_polls = 10_000  # The authentic old writer binds one unresolved job.
     fixture.lanes['answer']['schedule'].update(
         retry_seconds=1, queued_job_polling=dict(initial_seconds=1, max_seconds=4))
     fixture.configure('answer', mode='participation_first', retry_uncertain_answers=True,
@@ -953,12 +952,77 @@ def retained_rollback(binary, old, expected_hash, home):
     current_id = 'r-' + digest(binary)
     old_id = 'r-' + expected_hash
     previous = ('--binary', str(old), '--sha256', expected_hash)
+    record = releases / '.update-state.json'
+    boot_units = ('agmi.service', 'agmi-health.timer')
 
     def cli(*words, success=True):
         result = run([str(binary), '--json', *words], success=success)
         envelope = json.loads(result.stdout)
         assert envelope['schema'] == 'agmi.cli.v1' and envelope['ok'] is success, envelope
         return envelope['data']
+
+    def managed_refusal(*words):
+        result = run([str(binary), '--json', *words], success=False)
+        envelope = json.loads(result.stderr)
+        assert envelope['schema'] == 'agmi.cli.v1' and envelope['ok'] is False, envelope
+        error = envelope['error']
+        if words[0] == 'service':
+            assert error['code'] == 'installer_failed', error
+            assert error['details']['failure_code'] == 'selected_replay_fence_required', error
+            assert error['details']['stage'] == 'preflight', error
+        else:
+            assert error['code'] == 'selected_replay_fence_required', error
+        assert any(action['kind'] == 'instruction' for action in error['next_actions']), error
+
+    def service_intent():
+        return [(property_value(unit, 'ActiveState'), property_value(unit, 'UnitFileState'),
+                 property_value(unit, 'InvocationID')) for unit in boot_units] + [
+                    property_value('agmi.service', 'MainPID')]
+
+    def stopped_evidence():
+        with fixture.lock:
+            traffic = (len(fixture.reads), len(fixture.job_requests), len(fixture.writes))
+        return (
+            os.readlink(releases / 'current'), service_intent(),
+            record.read_bytes() if record.exists() else None,
+            journal_rows(fixture.database), traffic, fixture.model_calls('answer'),
+        )
+
+    def interrupt_forward_update():
+        # A real interruption after publication, before quiescing mutates units.
+        with (home / 'retained-interrupted.stdout').open('w') as output, \
+                (home / 'retained-interrupted.stderr').open('w') as errors:
+            child = subprocess.Popen([
+                'strace', '-f', '-o', str(home / 'retained-interrupted.trace'),
+                '-e', 'trace=rename,renameat,renameat2',
+                '-e', 'inject=rename,renameat,renameat2:delay_exit=2s',
+                str(binary), '--json', 'update', '--stopped', '--binary', str(binary),
+                '--sha256', current_id[2:],
+            ], stdout=output, stderr=errors, start_new_session=True)
+            try:
+                fixture.wait(lambda: record.exists() or child.poll() is not None,
+                             'forward updater did not publish its pin', seconds=30)
+                assert child.poll() is None, 'forward updater exited before interruption'
+            finally:
+                if child.poll() is None:
+                    os.killpg(child.pid, signal.SIGKILL)
+                child.wait(timeout=10)
+        intent = json.loads(record.read_text())
+        assert intent['payload']['phase'] == 'prepared' and not intent['cancelled'], intent
+        assert (intent['header']['source'], intent['header']['target']) == (old_id, current_id)
+
+    def assert_refused(selection, *flags):
+        before = service_intent()
+        refusal = cli('update', *selection, *flags, success=False)
+        assert refusal['update']['status'] == 'refused', refusal
+        assert refusal['update']['reason'] == 'target_replay_fence_required', refusal
+        evidence = refusal['installation']
+        assert evidence['failure_code'] == 'target_replay_fence_required', refusal
+        assert evidence['activation'] == evidence['staging'] == 'not_started'
+        assert os.readlink(releases / 'current') == current_id
+        assert service_intent() == before
+        assert not (releases / '.update-state.json').exists()
+        assert any(action['kind'] == 'instruction' for action in refusal['next_actions'])
 
     try:
         staged = cli('install', '--stage-only', *previous)
@@ -968,9 +1032,48 @@ def retained_rollback(binary, old, expected_hash, home):
         assert not (releases / 'current').is_symlink()
         assert not fixture.database.exists()
 
-        cli('pause')
-        cli('install', '--binary', str(binary), '--sha256', current_id[2:])
-        cli('resume')
+        run([str(old), '--json', 'pause'])
+        run([str(old), '--json', 'install', *previous])
+        assert os.readlink(releases / 'current') == old_id
+        run([str(old), '--json', 'resume'])
+        run([str(old), '--json', 'service', 'start'])
+        fixture.wait(lambda: any(op['job_id'] == 'answer-10' for op in fixture.dispatched('answer')),
+                     'authentic old writer did not bind the queued fixture job')
+        pid = property_value('agmi.service', 'MainPID')
+        assert digest(pathlib.Path(f'/proc/{pid}/exe')) == expected_hash
+        assert f"installed_release={old_id}\n" in cli('service', 'status')['output']
+        cli('service', 'stop')
+        assert all(not active(unit) for unit in UNITS)
+        assert property_value('agmi.service', 'MainPID') == '0'
+        assert all(property_value(unit, 'UnitFileState') == 'enabled' for unit in boot_units)
+        bound, = fixture.dispatched('answer')
+
+        resolve = ('recover', 'resolve', '--operation', str(bound['id']))
+        before = stopped_evidence()
+        managed_refusal(*resolve)
+        managed_refusal('run', '--once')
+        assert stopped_evidence() == before and not record.exists()
+        cli('service', 'disable')
+        assert all(property_value(unit, 'UnitFileState') in ('disabled', 'linked', 'linked-runtime')
+                   for unit in boot_units)
+
+        interrupt_forward_update()
+        before = stopped_evidence()
+        for action in ('start', 'restart', 'enable'):
+            managed_refusal('service', action)
+            assert stopped_evidence() == before
+        managed_refusal(*resolve)
+        assert stopped_evidence() == before
+
+        upgraded = cli('update', '--stopped')
+        assert upgraded['installation']['activation'] == 'loaded_verified'
+        assert os.readlink(releases / 'current') == current_id and not record.exists()
+        assert not active('agmi.service') and fixture.dispatched('answer') == [bound]
+        print('PASS selected old writer refuses positive management and detached writers without changing systemd, journal, or pinned intent', flush=True)
+
+        with fixture.lock:
+            fixture.contradictory_expiry = True
+        cli('service', 'enable')
         cli('service', 'start')
         fixture.unknown('answer')
         original, = fixture.dispatched('answer')
@@ -978,7 +1081,7 @@ def retained_rollback(binary, old, expected_hash, home):
         inspected = cli('recover', 'inspect', '--operation', str(original['id']))
         assert json.loads(inspected['details']['evidence'])['reason'] == 'bound_job_expiry_conflict'
         pid = property_value('agmi.service', 'MainPID')
-        invocation = property_value('agmi.service', 'InvocationID')
+        assert all(property_value(unit, 'UnitFileState') == 'enabled' for unit in boot_units)
         assert digest(pathlib.Path(f'/proc/{pid}/exe')) == current_id[2:]
 
         # A clean 408 after the conflict is just where the retained format-4
@@ -1002,33 +1105,24 @@ def retained_rollback(binary, old, expected_hash, home):
                     old_manifest.write_bytes(forged)
                     new_entry = f'{digest(old_manifest)}  MANIFEST'.encode()
                     old_sums.write_bytes(sum_bytes.replace(old_entry, new_entry))
-                refusal = cli('update', *selection, success=False)
-                assert refusal['update']['status'] == 'refused', refusal
-                evidence = refusal['installation']
-                assert evidence['failure_code'] == 'stopped_update_required', refusal
-                assert evidence['activation'] == evidence['staging'] == 'not_started'
-                assert os.readlink(releases / 'current') == current_id
-                assert property_value('agmi.service', 'MainPID') == pid
-                assert property_value('agmi.service', 'InvocationID') == invocation
-                assert active('agmi.service') and active('agmi-health.timer')
-                assert not (releases / '.update-state.json').exists()
+                assert_refused(selection)
+                assert_refused(selection, '--stopped')
         finally:
             old_manifest.write_bytes(manifest_bytes)
             old_sums.write_bytes(sum_bytes)
         fixture.wait(lambda: len(fixture.job_polls) >= polls + 2,
                      'current invocation did not continue polling the disputed job')
 
-        # Offline recovery is explicit. Remove boot activation first; an older
-        # writer selected for maintenance must not run or restore activity.
+        cli('service', 'stop')
         cli('service', 'disable')
-        stopped = cli('update', '--release', old_id, '--stopped')
-        assert stopped['installation']['activation'] == 'loaded_verified'
-        assert os.readlink(releases / 'current') == old_id
         assert all(not active(unit) for unit in UNITS)
-        assert property_value('agmi.service', 'MainPID') == '0'
         assert all(property_value(unit, 'UnitFileState') in ('disabled', 'linked', 'linked-runtime')
-                   for unit in ('agmi.service', 'agmi-health.timer'))
-        restored = cli('update', '--release', current_id)
+                   for unit in boot_units)
+        for selection in (previous, ('--release', old_id)):
+            assert_refused(selection)
+            assert_refused(selection, '--stopped')
+
+        restored = cli('update', '--release', current_id, '--stopped')
         assert restored['installation']['activation'] == 'loaded_verified'
         assert os.readlink(releases / 'current') == current_id
         assert all(not active(unit) for unit in UNITS)
@@ -1037,7 +1131,7 @@ def retained_rollback(binary, old, expected_hash, home):
         for field in ('id', 'state', 'job_id', 'binding_revision'):
             assert retained[field] == original[field], retained
         assert len(fixture.writes) == fixture.model_calls('answer') == 1
-        print('PASS authentic format4 writer refused for active retained and binary updates; stage-only and stopped recovery preserved', flush=True)
+        print('PASS format-4 legacy staging and refusal with live or stopped services; compatible stopped update preserved the journal', flush=True)
     finally:
         primary_failure = sys.exc_info()[0] is not None
         try:
@@ -1054,10 +1148,73 @@ def retained_rollback(binary, old, expected_hash, home):
             print(f'Additional fixture cleanup failure: {error}', file=sys.stderr)
 
 
+class ManagedWaitFixture(Fixture):
+    def handler(self):
+        parent = super().handler()
+
+        class Upstream(parent):
+            def reply(self, status, body, retry_after=None):
+                if status == 503 and self.path.endswith('/api/hosted/answer'):
+                    # Proven pre-acceptance refusal with a real server minimum.
+                    status, body = 429, {'error': 'answer_global_ceiling'}
+                return super().reply(status, body, retry_after)
+
+        return Upstream
+
+
+def managed_health_exit(binary, home):
+    config_root = home / '.config/agmi'
+    config_root.mkdir(parents=True, mode=0o700)
+    fixture = ManagedWaitFixture(str(binary), config_root)
+    fixture.answered = True
+    fixture.answer_response, fixture.retry_after = 'backoff', 120
+
+    def health(*args):
+        output = subprocess.run([str(binary), '--json', 'health', *args], capture_output=True,
+                                text=True, timeout=15, check=False)
+        return output.returncode, json.loads(output.stdout)
+
+    def managed_status(expected, result):
+        output = run(['systemctl', '--user', 'start', 'agmi-health.service'], success=result == 'success')
+        assert property_value('agmi-health.service', 'Result') == result, output
+        assert property_value('agmi-health.service', 'ExecMainStatus') == str(expected), output
+
+    try:
+        run([str(binary), 'install', '--binary', str(binary), '--sha256', digest(binary)])
+        run([str(binary), 'resume'])
+        systemctl('start', 'agmi.service')
+        fixture.wait(lambda: health()[0] == 0, 'managed fixture never observed healthy idle')
+        managed_status(0, 'success')
+        with fixture.lock:
+            fixture.epoch += 1
+            fixture.answered = False
+        fixture.wait(lambda: len(fixture.writes) == 1, 'refused answer did not reach the fixture')
+        fixture.wait(lambda: any(row['state'] == 'retry' for row in fixture.operations('answer')),
+                     'fixture refusal did not establish a retained retry')
+        code, ordinary = health()
+        assert code == 1 and ordinary['data']['healthy'] is False, ordinary
+        code, managed = health('--managed-exit')
+        assert code == 3 and managed['ok'] is False and managed['data']['healthy'] is False, managed
+        managed_status(3, 'success')
+        run([str(binary), 'pause'])
+        code, paused = health('--managed-exit')
+        assert code == 1 and 'participation_paused' in paused['data']['issues'], paused
+        managed_status(1, 'exit-code')
+        assert len(fixture.writes) == 1
+        print('PASS installed health unit: healthy 0, known wait 3, independent pause 1', flush=True)
+    finally:
+        try:
+            loaded = [unit for unit in UNITS if property_value(unit, 'LoadState') != 'not-found']
+            if loaded:
+                systemctl('stop', *loaded)
+        finally:
+            fixture.close()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('binary', type=pathlib.Path)
-    parser.add_argument('--suite', choices=('current', 'retained-rollback', 'seamless',
+    parser.add_argument('--suite', choices=('current', 'managed-health', 'retained-rollback', 'seamless',
                         'seamless-maintenance', 'seamless-config-only', 'future-refusal',
                         'future-recovery', 'compatibility', 'compatibility-no-selection',
                         'compatibility-auto', 'published010', 'published011', 'after-reboot'),
@@ -1073,6 +1230,9 @@ def main():
     os.environ['XDG_CACHE_HOME'] = str(home / '.cache')
     run(['systemctl', '--user', 'set-environment', 'AGMI_UPDATE_CHECKS=0',
          f'XDG_CACHE_HOME={home / ".cache"}'])
+    if args.suite == 'managed-health':
+        managed_health_exit(binary, home)
+        return
     if args.suite == 'retained-rollback':
         retained_rollback(binary, args.old_binary.resolve(strict=True) if args.old_binary else None,
                           args.old_sha256, home)

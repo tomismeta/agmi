@@ -286,13 +286,19 @@ class HermesContract(unittest.TestCase):
             compression_enabled=False, codex_responses_native_compaction=False, skip_mcp_refresh=True))
         self.assertIn(b'native diagnostic', result.stderr)
 
+    def assert_prelaunch_refusal(self, result, code):
+        self.assertEqual(result.returncode, code)
+        self.assertEqual(json.loads(result.stdout), {
+            'ok': False, 'status': 'error', 'runId': self.payload['invocation_id'],
+            'error': {'kind': 'hermes_refused_before_call'},
+        })
+
     def test_bootstrap_rejection_does_not_import_or_execute(self):
         for bootstrap in ('', "sys.path.insert(0, 'relative')", self.bootstrap * 2,
                           f'sys.path.insert(0, str({str(self.native)!r}))', 'invalid syntax !'):
             with self.subTest(bootstrap=bootstrap):
                 result, events = self.invoke(bootstrap=bootstrap)
-                self.assertEqual(result.returncode, 78)
-                self.assertEqual(result.stdout, b'')
+                self.assert_prelaunch_refusal(result, 78)
                 self.assertEqual(events, [])
 
     def test_auth_and_route_checks_precede_agent_creation(self):
@@ -307,8 +313,7 @@ class HermesContract(unittest.TestCase):
         for case, runtime, code in cases:
             with self.subTest(case=case, runtime=runtime):
                 result, events = self.invoke(case, runtime=runtime)
-                self.assertEqual(result.returncode, code)
-                self.assertEqual(result.stdout, b'')
+                self.assert_prelaunch_refusal(result, code)
                 self.assertEqual([e['event'] for e in events], ['bootstrap', 'resolve'])
 
     def test_required_embedding_signatures(self):
@@ -321,8 +326,7 @@ class HermesContract(unittest.TestCase):
                 shutil.rmtree(self.native / '__pycache__', ignore_errors=True)
                 (self.native / 'run_agent.py').write_text(source)
                 result, events = self.invoke()
-                self.assertEqual(result.returncode, 78)
-                self.assertEqual(result.stdout, b'')
+                self.assert_prelaunch_refusal(result, 78)
                 self.assertEqual([e['event'] for e in events], ['bootstrap'])
 
     def test_agent_isolation_rejections_and_cleanup(self):
@@ -330,8 +334,7 @@ class HermesContract(unittest.TestCase):
                      'agent_route', 'agent_reasoning', 'initial_session', 'constructor_exception'):
             with self.subTest(case=case):
                 result, events = self.invoke(case)
-                self.assertEqual(result.returncode, 78)
-                self.assertEqual(result.stdout, b'')
+                self.assert_prelaunch_refusal(result, 78)
                 names = [e['event'] for e in events]
                 self.assertNotIn('run', names)
                 expected = ['db_close'] if case == 'constructor_exception' else ['agent_close', 'db_close']
@@ -524,7 +527,7 @@ class OpenclawContract(unittest.TestCase):
         self.assert_native_call(payload, self.invoke(payload, wire))
         # One trailing JSON whitespace byte is valid JSON but exceeds the wire budget.
         result = self.invoke(payload, wire + b' ')
-        self.assertEqual(result.returncode, 78)
+        self.assertEqual(result.returncode, 1)
         self.assertFalse(self.trace.exists(), 'oversized input must not reach the native Gateway')
         self.assertEqual(json.loads(result.stdout), dict(ok=False, status='error', error={'kind': 'exception'}))
 

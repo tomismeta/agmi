@@ -145,6 +145,15 @@ pub(crate) fn guard_managed_run(config_path: &Path) -> Result<()> {
     native::guard_managed_run(config_path)
 }
 
+#[cfg(unix)]
+pub(crate) fn guard_managed_recovery(
+    config_path: &Path,
+    root: &Path,
+    pending: Option<&crate::lifecycle::update_state::Record>,
+) -> Result<()> {
+    native::guard_managed_recovery(config_path, root, pending)
+}
+
 /// Read-only identity of the selected release, not the possibly stale caller.
 pub(crate) struct InstalledIdentity {
     pub manifest: String,
@@ -1081,54 +1090,63 @@ mod native {
             .to_owned())
     }
     fn checksums(release: &Path) -> Result<String> {
+        let hash = digest(regular(&release.join("agmi"))?)?;
+        release_checksums(release, &hash)
+    }
+    fn release_checksums(release: &Path, binary_digest: &str) -> Result<String> {
+        use std::fmt::Write;
         let mut sums = String::new();
         for name in ARTIFACTS {
-            use std::fmt::Write;
-            writeln!(
-                &mut sums,
-                "{}  {name}",
-                digest(regular(&release.join(name))?)?
-            )?;
+            if name == "agmi" {
+                writeln!(&mut sums, "{binary_digest}  {name}")?;
+            } else {
+                writeln!(
+                    &mut sums,
+                    "{}  {name}",
+                    digest(regular(&release.join(name))?)?
+                )?;
+            }
         }
         Ok(sums)
     }
     fn validate_release(release: &Path, id: &str) -> Result<()> {
-        validate_release_metadata(release, id, false)
+        validate_release_metadata(release, id, false).map(drop)
     }
 
-    // Legacy metadata is inspection-only for the retained current release.
-    fn validate_release_metadata(release: &Path, id: &str, retained: bool) -> Result<()> {
+    fn verified_release_executable(release: &Path, id: &str, cancellable: bool) -> Result<File> {
         ensure!(valid_id(id), "invalid release identity");
         ensure!(
             fs::symlink_metadata(release)?.is_dir(),
             "release is not a directory"
         );
-        for name in ARTIFACTS.into_iter().chain(["SHA256SUMS"]) {
-            regular(&release.join(name))?;
-        }
+        let binary = regular(&release.join("agmi"))?;
         ensure!(
-            regular(&release.join("agmi"))?
-                .metadata()?
-                .permissions()
-                .mode()
-                & 0o111
-                != 0,
+            binary.metadata()?.permissions().mode() & 0o111 != 0,
             "release is not executable"
         );
-        let manifest = fs::read_to_string(release.join("MANIFEST"))?;
         ensure!(
-            checksums(release)?.trim_end_matches('\n')
-                == fs::read_to_string(release.join("SHA256SUMS"))?.trim_end_matches('\n'),
+            digest_cancellable(&binary, cancellable)? == id[2..],
+            "release executable changed"
+        );
+        Ok(binary)
+    }
+
+    // Legacy metadata is inspection-only for the retained current release.
+    fn validate_release_metadata(release: &Path, id: &str, retained: bool) -> Result<File> {
+        let binary = verified_release_executable(release, id, true)?;
+        let mut manifest = String::new();
+        regular(&release.join("MANIFEST"))?.read_to_string(&mut manifest)?;
+        let mut sums = String::new();
+        regular(&release.join("SHA256SUMS"))?.read_to_string(&mut sums)?;
+        ensure!(
+            release_checksums(release, &id[2..])?.trim_end_matches('\n')
+                == sums.trim_end_matches('\n'),
             "release checksums changed"
         );
         ensure!(
             metadata(&manifest, "release_id")? == id
                 && metadata(&manifest, "binary_sha256")? == &id[2..],
             "release identity mismatch"
-        );
-        ensure!(
-            digest(regular(&release.join("agmi"))?)? == id[2..],
-            "release executable changed"
         );
         ensure!(
             metadata(&manifest, "build_format")? == "1",
@@ -1170,7 +1188,7 @@ mod native {
                 == format!("{embedded}\nrelease_id={id}\nbinary_sha256={}", &id[2..]),
             "embedded identity mismatch"
         );
-        Ok(())
+        Ok(binary)
     }
     fn activation_schema(
         installed: &str,
@@ -1309,24 +1327,42 @@ mod native {
         }
     }
 
+    fn executable_fd_path(executable: &File) -> PathBuf {
+        PathBuf::from(format!("/proc/self/fd/{}", executable.as_raw_fd()))
+    }
+
+    fn same_executable(a: &fs::Metadata, b: &fs::Metadata) -> bool {
+        (a.dev(), a.ino()) == (b.dev(), b.ino())
+    }
+
+    fn bound_dispute_capable(binary: &Path, cancellable: bool) -> bool {
+        capture(
+            Command::new(binary).args(["build-info", "--installer-capabilities"]),
+            cancellable,
+        )
+        .is_ok_and(|probe| {
+            probe.status.success()
+                && probe.stdout == b"bound_dispute_fence=1\n"
+                && probe.stderr.is_empty()
+        })
+    }
+
+    fn selected_replay_fence_capable(executable: &File, cancellable: bool) -> bool {
+        // The already digest-verified inode may be this capable running image.
+        // In particular systemd startup needs no nested capability process.
+        fs::metadata("/proc/self/exe").is_ok_and(|running| {
+            executable
+                .metadata()
+                .is_ok_and(|selected| same_executable(&running, &selected))
+        }) || bound_dispute_capable(&executable_fd_path(executable), cancellable)
+    }
+
     fn incoming(binary: &Path, request: &Request<'_>) -> Result<Value> {
-        // Quiescence for live updates is established by the incoming writer.
-        // A pre-handoff journal read cannot prove a bound dispute won't be
-        // persisted while the source drains, even under a participation pause.
-        if matches!(request.action, "update" | "activate") && !request.stopped {
-            ensure!(
-                capture(
-                    Command::new(binary).args(["build-info", "--installer-capabilities"]),
-                    true,
-                )
-                .is_ok_and(|probe| {
-                    probe.status.success()
-                        && probe.stdout == b"bound_dispute_fence=1\n"
-                        && probe.stderr.is_empty()
-                }),
-                installer_preflight_error("stopped_update_required")
-            );
-        }
+        // Staging does not select an executable or transfer lifecycle authority.
+        ensure!(
+            request.action == "stage" || bound_dispute_capable(binary, true),
+            installer_preflight_error("target_replay_fence_required")
+        );
         let action = match request.action {
             "stage" => "install",
             "activate" => "update",
@@ -2370,16 +2406,37 @@ mod native {
             self.output.push_str("Activated without changing pause/admission, credentials, native harnesses, or journal history.\nAfter one-way state migration, use compatible releases, roll forward, or stop; never restore an older journal.\n");
             Ok(())
         }
-        fn service(&mut self, action: &str) -> Result<()> {
+        fn preflight_positive_service(&mut self) -> Result<PathBuf> {
+            self.failure = "release_invalid";
+            let selected = fs::read_link(self.root.join("current"))?;
+            let id = selected.to_str().context("invalid installed release")?;
+            let executable = validate_release_metadata(&self.root.join(id), id, false)?;
+            ensure!(
+                selected_replay_fence_capable(&executable, true),
+                installer_preflight_error("selected_replay_fence_required")
+            );
+            if let Some(record) = update_state::read(&self.root)? {
+                verified_pinned_executable(
+                    &self.root,
+                    &self.config,
+                    &record,
+                    &selected,
+                    Some(executable),
+                )?;
+            }
+            Ok(selected)
+        }
+
+        fn service(&mut self, action: &str, selected: Option<&Path>) -> Result<()> {
             self.phase = "service";
             self.failure = "service_failed";
             match action {
                 "stop" => self.stop_units(true)?,
                 "disable" => self.disable_autostart()?,
                 "start" | "restart" | "enable" => {
-                    let id = fs::read_link(self.root.join("current"))?;
-                    let id = id.to_str().context("invalid installed release")?;
-                    validate_release(&self.root.join(id), id)?;
+                    let id = selected
+                        .and_then(Path::to_str)
+                        .context("missing service preflight")?;
                     self.loaded(id)?;
                     self.control(&[action, "agmi.service", "agmi-health.timer"])?;
                     if action != "enable" {
@@ -2469,7 +2526,10 @@ mod native {
     }
 
     fn account_owned(path: &Path) -> Result<()> {
-        let metadata = fs::metadata(path)?;
+        account_owned_metadata(&fs::metadata(path)?)
+    }
+
+    fn account_owned_metadata(metadata: &fs::Metadata) -> Result<()> {
         ensure!(
             metadata.uid() == unsafe { libc::geteuid() }
                 && metadata.permissions().mode() & 0o022 == 0,
@@ -2714,7 +2774,7 @@ mod native {
             );
             Ok(())
         }
-        fn recover_update_definitions(&self) -> Result<()> {
+        fn recover_update_definitions(&self, verified_selected: Option<&Path>) -> Result<()> {
             let Some(record) = update_state::read(&self.root)? else {
                 return Ok(());
             };
@@ -2722,11 +2782,13 @@ mod native {
                 return Ok(());
             }
             validate_update_payload(&record.payload)?;
-            validate_release_metadata(
-                &self.root.join(&record.header.source),
-                &record.header.source,
-                true,
-            )?;
+            if verified_selected != Some(Path::new(&record.header.source)) {
+                validate_release_metadata(
+                    &self.root.join(&record.header.source),
+                    &record.header.source,
+                    true,
+                )?;
+            }
             for (index, (unit, _, _)) in UNITS.iter().enumerate() {
                 let Some(target) = record.payload["definitions"][index].as_str() else {
                     continue;
@@ -3360,6 +3422,10 @@ mod native {
 
         fn managed_update(&mut self, id: &str, request: &Request<'_>) -> Result<()> {
             self.failure = "recovery_required";
+            ensure!(
+                digest(File::open("/proc/self/exe")?)? == id[2..],
+                "transaction must execute its pinned target"
+            );
             if let Some(record) = update_state::read(&self.root)? {
                 ensure!(
                     pending_update_target(&self.config)?.as_deref() == Some(id),
@@ -3433,10 +3499,6 @@ mod native {
                 "unknown update phase"
             );
             validate_release(&self.root.join(id), id)?;
-            ensure!(
-                digest(File::open(std::env::current_exe()?)?)? == id[2..],
-                "transaction must execute its pinned target"
-            );
             if phase == "complete" {
                 if record.cancelled {
                     return self.finish_cancelled_transaction(id);
@@ -3677,19 +3739,18 @@ mod native {
         Ok(Some(root))
     }
 
-    pub(super) fn pending_update_target(config_path: &Path) -> Result<Option<String>> {
-        let Some(root) = managed_root(config_path)? else {
-            return Ok(None);
-        };
-        let Some(record) = update_state::read(&root)? else {
-            return Ok(None);
-        };
+    fn verified_pinned_executable(
+        root: &Path,
+        config_path: &Path,
+        record: &Record,
+        selected: &Path,
+        verified_selected: Option<File>,
+    ) -> Result<File> {
         let h = &record.header;
         ensure!(
             h.config == fs::canonicalize(config_path)?,
             "update configuration identity changed"
         );
-        let selected = fs::read_link(root.join("current"))?;
         ensure!(
             selected == Path::new(&h.source) || selected == Path::new(&h.target),
             "selected release conflicts with pending update"
@@ -3700,12 +3761,11 @@ mod native {
             "pinned release is missing"
         );
         account_owned_ancestors(&release, &crate::store::account_home()?)?;
-        let binary = release.join("agmi");
-        account_owned(&binary)?;
-        ensure!(
-            digest_cancellable(regular(&binary)?, false)? == h.digest,
-            "pinned executable changed"
-        );
+        let executable = match verified_selected {
+            Some(executable) if selected == Path::new(&h.target) => executable,
+            _ => verified_release_executable(&release, &h.target, false)?,
+        };
+        account_owned_metadata(&executable.metadata()?)?;
         let mut manifest = String::new();
         regular(&release.join("MANIFEST"))?
             .take(16385)
@@ -3729,17 +3789,63 @@ mod native {
             format!("{:x}", Sha256::digest(embedded.as_bytes())) == h.embedded_sha256,
             "pinned embedded identity changed"
         );
-        Ok(Some(h.target.clone()))
+        Ok(executable)
+    }
+
+    pub(super) fn pending_update_target(config_path: &Path) -> Result<Option<String>> {
+        let Some(root) = managed_root(config_path)? else {
+            return Ok(None);
+        };
+        let Some(record) = update_state::read(&root)? else {
+            return Ok(None);
+        };
+        let selected = fs::read_link(root.join("current"))?;
+        verified_pinned_executable(&root, config_path, &record, &selected, None)?;
+        Ok(Some(record.header.target))
+    }
+
+    fn selected_runtime_executable(root: &Path, selected: &Path) -> Result<File> {
+        let id = selected.to_str().context("invalid selected release")?;
+        ensure!(valid_id(id), "invalid selected release");
+        let release = root.join(id);
+        account_owned(&release)?;
+        let executable = verified_release_executable(&release, id, false)?;
+        account_owned_metadata(&executable.metadata()?)?;
+        Ok(executable)
+    }
+
+    fn require_runtime_replay_fence(executable: &File) -> Result<()> {
+        ensure!(
+            selected_replay_fence_capable(executable, false),
+            crate::lifecycle::selected_replay_fence_error()
+        );
+        Ok(())
+    }
+
+    pub(super) fn guard_managed_recovery(
+        config_path: &Path,
+        root: &Path,
+        pending: Option<&Record>,
+    ) -> Result<()> {
+        let selected = fs::read_link(root.join("current"))?;
+        if let Some(record) = pending {
+            let pinned = verified_pinned_executable(root, config_path, record, &selected, None)?;
+            if selected == Path::new(&record.header.target) {
+                return require_runtime_replay_fence(&pinned);
+            }
+        }
+        require_runtime_replay_fence(&selected_runtime_executable(root, &selected)?)
     }
 
     pub(super) fn guard_managed_run(config_path: &Path) -> Result<()> {
         let Some(root) = managed_root(config_path)? else {
             return Ok(());
         };
+        let selected = fs::read_link(root.join("current"))?;
         let Some(record) = update_state::read(&root)? else {
-            return Ok(());
+            return require_runtime_replay_fence(&selected_runtime_executable(&root, &selected)?);
         };
-        pending_update_target(config_path)?;
+        let pinned = verified_pinned_executable(&root, config_path, &record, &selected, None)?;
         ensure!(
             record.header.payload_format == 1,
             "unsupported target update payload"
@@ -3753,9 +3859,13 @@ mod native {
             "pending update fences runtime startup"
         );
         ensure!(
-            fs::read_link(root.join("current"))? == Path::new(&record.header.target)
-                && digest_cancellable(File::open(std::env::current_exe()?)?, false)?
-                    == record.header.digest,
+            selected == Path::new(&record.header.target),
+            "only the pinned update target may start"
+        );
+        let running = File::open("/proc/self/exe")?;
+        ensure!(
+            same_executable(&running.metadata()?, &pinned.metadata()?)
+                || digest_cancellable(running, false)? == record.header.digest,
             "only the pinned update target may start"
         );
         Ok(())
@@ -4262,8 +4372,7 @@ mod native {
                 {
                     // Hash, capability probe and handoff all concern the same
                     // opened ELF, not a mutable MANIFEST or a reopened pathname.
-                    let pinned = PathBuf::from(format!("/proc/self/fd/{}", executable.as_raw_fd()));
-                    return incoming(&pinned, &request).map(Some);
+                    return incoming(&executable_fd_path(&executable), &request).map(Some);
                 }
             }
             let candidate = if let Some(expected) = request.digest {
@@ -4315,7 +4424,15 @@ mod native {
                 installation.failure = "manager_context_mismatch";
                 installation.manager_search_context()?;
             }
-            installation.lock = Some(installation.prepare(request.action != "stage")?);
+            let positive_service = request.action == "service"
+                && matches!(request.target, "start" | "restart" | "enable");
+            installation.lock =
+                Some(installation.prepare(request.action != "stage" && !positive_service)?);
+            // Check the selected executable while holding the installer lease,
+            // before cancelling saved intent or recovering unit definitions.
+            let selected = positive_service
+                .then(|| installation.preflight_positive_service())
+                .transpose()?;
             if request.action == "service"
                 && !installation
                     .lock
@@ -4326,7 +4443,8 @@ mod native {
                 record.cancelled = true;
                 update_state::save(&installation.root, &record)?;
             }
-            if let Some(pending) = pending_update_target(&installation.config)? {
+            if !positive_service && let Some(pending) = pending_update_target(&installation.config)?
+            {
                 let requested = request
                     .digest
                     .map(|hash| format!("r-{hash}"))
@@ -4338,7 +4456,7 @@ mod native {
             }
             if request.action != "stage" {
                 installation.failure = "manager_context_mismatch";
-                installation.recover_update_definitions()?;
+                installation.recover_update_definitions(selected.as_deref())?;
                 installation.manager_loaded_context()?;
             }
             if let Some(expected) = request.expected_release {
@@ -4359,7 +4477,7 @@ mod native {
                 installation.fresh()?;
             }
             if request.action == "service" {
-                installation.service(request.target)?;
+                installation.service(request.target, selected.as_deref())?;
                 return Ok(None);
             }
             let id = if let Some(record) = update_state::read(&installation.root)? {
@@ -5244,7 +5362,7 @@ esac
                     current.join(unit)
                 }
             };
-            installation.service("disable")?;
+            installation.service("disable", None)?;
             assert_eq!(
                 fs::read_link(installation.units.join(relative_unit))?,
                 relative_target
@@ -5268,7 +5386,7 @@ esac
                 if disable_fails {
                     fs::write(&failed, [])?;
                 }
-                assert!(installation.service("disable").is_err());
+                assert!(installation.service("disable", None).is_err());
                 assert_eq!(fs::read_link(&current)?, Path::new(&old_id));
                 let evidence = installation.evidence(false);
                 assert_eq!(evidence["failure_code"], "bootstrap_recovery_failed");

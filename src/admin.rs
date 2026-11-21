@@ -43,24 +43,97 @@ fn io_error() -> anyhow::Error {
         "Cannot read or persist administration files; a save may have completed. Reread config and guidance revisions before retrying.",
     )
 }
-fn conflict() -> anyhow::Error {
-    error(
-        "admin_revision_conflict",
-        "Revision conflict; read the current revision before retrying.",
-    )
+
+#[derive(Debug)]
+enum RevisionField {
+    ConfigFile,
+    GuidanceConfigFile,
+    GuidanceContent,
 }
+
+#[derive(Debug)]
+struct RevisionConflict {
+    field: RevisionField,
+    current_revision: String,
+    guidance: Option<(LaneId, &'static str)>,
+}
+
+impl std::fmt::Display for RevisionConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Revision conflict; read the current revision before retrying.")
+    }
+}
+
+impl std::error::Error for RevisionConflict {}
+
 pub fn error_code(error: &anyhow::Error) -> Option<&'static str> {
-    error.downcast_ref::<AdminError>().map(|error| error.0)
+    if error.is::<RevisionConflict>() {
+        Some("admin_revision_conflict")
+    } else {
+        error.downcast_ref::<AdminError>().map(|error| error.0)
+    }
 }
+
+/// Report only the revision observed during comparison and source-defined selectors.
+pub fn revision_conflict_details(error: &anyhow::Error) -> Option<Value> {
+    let conflict = error.downcast_ref::<RevisionConflict>()?;
+    let (flag, revision_field, refresh) = match conflict.field {
+        RevisionField::ConfigFile => ("--expected-revision", "file_revision", "config"),
+        RevisionField::GuidanceConfigFile => (
+            "--expected-config-revision",
+            "config_file_revision",
+            "guidance",
+        ),
+        RevisionField::GuidanceContent => ("--expected-revision", "guidance_revision", "guidance"),
+    };
+    let mut details = json!({
+        "flag": flag,
+        "revision_field": revision_field,
+        "current_revision": conflict.current_revision,
+        "refresh": refresh,
+    });
+    if let Some((kind, layer)) = conflict.guidance {
+        details["kind"] = json!(kind);
+        details["layer"] = json!(layer);
+    }
+    Some(details)
+}
+
 fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
-fn check_revision(expected: &str, actual: &str) -> Result<()> {
-    if expected != actual {
-        return Err(conflict());
+
+fn check_revision(
+    expected: &str,
+    actual: String,
+    field: RevisionField,
+    guidance: Option<(&str, &str)>,
+) -> Result<String> {
+    if expected == actual.as_str() {
+        return Ok(actual);
     }
-    Ok(())
+    // Direct admin callers need not have passed the CLI's selector validation.
+    let guidance = guidance.and_then(|(kind, layer)| {
+        let kind = match kind {
+            "answer" => LaneId::Answer,
+            "judge" => LaneId::Judge,
+            _ => return None,
+        };
+        let layer = match layer {
+            "core" => "core",
+            "user" => "user",
+            _ => return None,
+        };
+        Some((kind, layer))
+    });
+    Err(RevisionConflict {
+        field,
+        current_revision: actual,
+        guidance,
+    }
+    .into())
 }
+
 fn check_input(bytes: &[u8]) -> Result<()> {
     if bytes.len() > MAX_INPUT_BYTES {
         return Err(error(
@@ -639,8 +712,11 @@ pub fn show(path: &Path) -> Result<Value> {
     let _lock = DirectoryLock::acquire(&path, true)?;
     let bytes = config_bytes(&path)?;
     let config = parse(source_path, &bytes)?;
+    let revision = config.optional_revision().map_err(|_| invalid())?;
     Ok(json!({"config":config,"file_revision":digest(&bytes),
-        "revision":config.optional_revision().map_err(|_| invalid())?,"guidance_validation":"not_loaded",
+        "revision":revision,"effective_revision":revision,"guidance_validation":"not_loaded",
+        "guidance_assessment":"not_checked_by_config_show",
+        "guidance_note":"Guidance was not read by config show. Use config check to validate saved guidance; runtime application is unverified.",
         "configuration_state":"desired_saved","runtime_application":"unverified","fence_acknowledged":false}))
 }
 pub fn apply(
@@ -659,8 +735,12 @@ pub fn apply(
     let path = absolute_target(path)?;
     let _lock = DirectoryLock::acquire(&path, true)?;
     let old_bytes = config_bytes(&path)?;
-    let old_revision = digest(&old_bytes);
-    check_revision(expected_revision, &old_revision)?;
+    let old_revision = check_revision(
+        expected_revision,
+        digest(&old_bytes),
+        RevisionField::ConfigFile,
+        None,
+    )?;
     let old = parse(source_path, &old_bytes)?;
     mutation_fence(&old)?;
     let mut value = raw_config(&old_bytes)?;
@@ -675,9 +755,11 @@ pub fn apply(
     if !dry_run {
         persist(&path, &bytes)?;
     }
+    let candidate_file_revision = digest(&bytes);
     Ok(
-        json!({"saved":!dry_run,"dry_run":dry_run,"file_revision":if dry_run { old_revision.clone() } else { digest(&bytes) },
-        "previous_file_revision":old_revision,"candidate_file_revision":digest(&bytes),"revision":revision,
+        json!({"saved":!dry_run,"dry_run":dry_run,"file_revision":if dry_run { &old_revision } else { &candidate_file_revision },
+        "previous_file_revision":old_revision,"candidate_file_revision":candidate_file_revision,
+        "revision":revision,"effective_revision":revision,
         "runtime_applied":null,"runtime_application":"unverified",
         "fence_acknowledged":false,
         "note":"Saved desired configuration only, not a lane admission fence. Runtime status reports the effective loaded revision; dry-run validates a snapshot only."}),
@@ -768,7 +850,12 @@ pub fn guidance_set(
     let path = absolute_target(path)?;
     let lock = DirectoryLock::acquire(&path, true)?;
     let bytes = config_bytes(&path)?;
-    check_revision(expected_config_revision, &digest(&bytes))?;
+    let old_config_revision = check_revision(
+        expected_config_revision,
+        digest(&bytes),
+        RevisionField::GuidanceConfigFile,
+        Some((kind, layer)),
+    )?;
     let config = parse(source_path, &bytes)?;
     let _identity = identity_guard(&config, &config, dry_run)?;
     mutation_fence(&config)?;
@@ -780,7 +867,12 @@ pub fn guidance_set(
         .as_ref()
         .map(|b| digest(b))
         .unwrap_or_else(|| "missing".into());
-    check_revision(expected_guidance_revision, &old_revision)?;
+    let old_revision = check_revision(
+        expected_guidance_revision,
+        old_revision,
+        RevisionField::GuidanceContent,
+        Some((kind, layer)),
+    )?;
     let next_config = if configured {
         None
     } else {
@@ -802,16 +894,21 @@ pub fn guidance_set(
             persist(&path, next)?;
         }
     }
-    let current_config = if dry_run {
-        &bytes
+    let next_config_revision = next_config.as_deref().map(digest);
+    let candidate_config_revision = next_config_revision
+        .as_deref()
+        .unwrap_or(&old_config_revision);
+    let current_config_revision = if dry_run {
+        old_config_revision.as_str()
     } else {
-        next_config.as_ref().unwrap_or(&bytes)
+        candidate_config_revision
     };
+    let candidate_guidance_revision = digest(content_bytes);
     Ok(
         json!({"private":true,"kind":kind,"layer":layer,"saved":!dry_run,"dry_run":dry_run,
-        "guidance_revision":if dry_run { old_revision } else { digest(content_bytes) },
-        "candidate_guidance_revision":digest(content_bytes),"config_file_revision":digest(current_config),
-        "candidate_config_file_revision":digest(next_config.as_ref().unwrap_or(&bytes)),
+        "guidance_revision":if dry_run { &old_revision } else { &candidate_guidance_revision },
+        "candidate_guidance_revision":candidate_guidance_revision,"config_file_revision":current_config_revision,
+        "candidate_config_file_revision":candidate_config_revision,
         "configured":configured || !dry_run,"runtime_applied":null,"runtime_application":"unverified",
         "fence_acknowledged":false,
         "note":"Private guidance saved locally only; runtime status reports the effective loaded revision."}),

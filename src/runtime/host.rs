@@ -69,6 +69,7 @@ pub async fn recovery_resolve(
     txid: Option<&str>,
 ) -> Result<Value> {
     use crate::protocol::{RecoveryIdentifier, verify_recovery_identifier};
+    let _managed_control = crate::lifecycle::guard_managed_recovery_mutation(config_path)?;
     let config_guard = crate::admin::lock_config_directory(config_path)?;
     let config = Config::load_metadata(config_path)?;
     let (_account, mut store) = AccountLock::acquire(&config)?;
@@ -367,7 +368,8 @@ fn identity_read_failure(failure: crate::protocol::ReadFailure) -> HostedIdentit
         | ReadFailure::BodyInterrupted => HostedIdentityOutcome::Unavailable,
         ReadFailure::ResponseTooLarge
         | ReadFailure::InvalidJson
-        | ReadFailure::CredentialEchoRedacted => HostedIdentityOutcome::InvalidResponse,
+        | ReadFailure::CredentialEchoRedacted
+        | ReadFailure::BoundJobExpiryConflict => HostedIdentityOutcome::InvalidResponse,
     }
 }
 
@@ -395,6 +397,7 @@ fn classify_hosted_identity(config: &Config, response: &Response) -> HostedIdent
 /// A single runtime owns the account lock even when paused or read-only. The
 /// admission lock is separate so local control commands can close admission.
 pub async fn run(config_path: &Path, once: bool) -> Result<()> {
+    crate::lifecycle::guard_managed_run(config_path)?;
     let config_guard = crate::admin::lock_config_directory(config_path)?;
     let config = Config::load(config_path)?;
     config.validate()?;

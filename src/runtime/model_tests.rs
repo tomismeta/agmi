@@ -487,7 +487,6 @@ async fn shutdown_validates_delivered_omp_terminal_with_no_remaining_budget() {
     // A real child speaks RPC but stays alive after returning the terminal.
     // Shutdown owns validation even when its join deadline is already spent.
     const RPC: &str = r#"
-if [ "$1" = --version ]; then echo 19.0.1; exit 0; fi
 printf '%s\n' "$$" > "$marker"
 binding=$(sed -E 's/"(deadline_unix_ms|provider_discovery_cwd)":("[^"]*"|[0-9]+),?//g; s/,?\}$//' omp-bootstrap.json)
 reply() {

@@ -22,6 +22,53 @@ struct InspectionOperation {
     created_at: i64,
 }
 
+impl InspectionOperation {
+    fn read_key(&self, operation_id: i64) -> Option<ReadKey> {
+        Some(ReadKey::Operation {
+            operation_id,
+            binding_revision: self.binding_revision,
+            phase: if self.txid.is_some() {
+                reads::ReadPhase::Receipt
+            } else if self.job_id.is_some() {
+                reads::ReadPhase::Job
+            } else {
+                return None;
+            },
+        })
+    }
+
+    fn pollable(&self) -> bool {
+        matches!(
+            self.state.as_str(),
+            "queued" | "unknown" | "included_pending" | "confirmed"
+        )
+    }
+}
+
+struct PollFloors {
+    operation: i64,
+    local: i64,
+    server: i64,
+    retained: i64,
+    source: Option<i64>,
+    service: Option<i64>,
+    historical_missing: Option<i64>,
+    kind: &'static str,
+    gate: i64,
+}
+
+impl PollFloors {
+    fn projection(&self) -> Value {
+        let mut value = json!({"operation":self.operation,"local":self.local,"server":self.server,
+            "retained":self.retained,"historical_missing":self.historical_missing});
+        if let Some(source) = self.source {
+            value["source"] = json!(source);
+            value["service"] = json!(self.service);
+        }
+        value
+    }
+}
+
 impl Store {
     pub(super) fn reconciliation_provenance(
         &self,
@@ -178,6 +225,180 @@ impl Store {
         )))
     }
 
+    fn inspection_operation(&self, id: i64) -> Result<Option<InspectionOperation>> {
+        Ok(self.db.query_row(
+            "SELECT kind,work_key,state,job_id,txid,next_at,binding_revision,
+             CASE WHEN json_type(request,'$.solver.epoch')='integer'
+             AND json_extract(request,'$.solver.epoch')>=0 AND json_extract(request,'$.solver.kind')=kind
+             THEN json_extract(request,'$.solver.epoch') END,created_at FROM operations WHERE id=?1",
+            [id], |r| {
+                let kind = r.get_ref(0)?.as_str()?;
+                Ok(InspectionOperation {
+                    kind: LaneId::ALL.into_iter().find(|lane| lane.as_str() == kind)
+                        .ok_or(rusqlite::Error::InvalidQuery)?,
+                    key:r.get(1)?,state:r.get(2)?,job_id:r.get(3)?,txid:r.get(4)?,next_at:r.get(5)?,
+                    binding_revision:r.get(6)?,epoch:r.get(7)?,created_at:r.get(8)?,
+                })
+            },
+        ).optional()?)
+    }
+
+    fn exact_poll_read(&self, key: &ReadKey) -> Result<Value> {
+        let ReadKey::Operation {
+            operation_id,
+            binding_revision,
+            ..
+        } = key
+        else {
+            unreachable!("poll inspection requires an operation binding");
+        };
+        let (owner, purpose, resource, _) = self.read_parts(key)?;
+        let row = self.db.query_row(
+            "SELECT started_at,finished_at,status,last_success_at,in_flight,local_next_at,server_not_before,retained_conservative_floor,failures
+             FROM read_state WHERE owner=?1 AND purpose=?2 AND resource=?3 AND retired=0
+             AND operation_id=?4 AND binding_revision=?5",
+            params![owner, purpose, resource, operation_id, binding_revision],
+            |r| Ok(json!({"started_at":r.get::<_,Option<i64>>(0)?,"checked_at":r.get::<_,Option<i64>>(1)?,
+                "status":r.get::<_,Option<u16>>(2)?,"usable_at":r.get::<_,Option<i64>>(3)?,
+                "in_flight":r.get::<_,bool>(4)?,"local":r.get::<_,i64>(5)?,"server":r.get::<_,i64>(6)?,
+                "retained":r.get::<_,i64>(7)?,"failures":r.get::<_,u32>(8)?})),
+        ).optional()?;
+        Ok(row.unwrap_or(Value::Null))
+    }
+
+    /// Read-only mirror of the persisted reconciliation claim gates. Page
+    /// traversal, live slot availability and successful settlement are not forecast.
+    fn poll_floors(
+        &self,
+        config: &Config,
+        op: &InspectionOperation,
+        read: &Value,
+        decay: Option<(i64, i64)>,
+    ) -> Result<PollFloors> {
+        let local = read["local"].as_i64().unwrap_or(0);
+        let server = read["server"].as_i64().unwrap_or(0);
+        let retained = read["retained"].as_i64().unwrap_or(0);
+        let (source, service, basis) =
+            if let Some(remote) = op.txid.as_deref().or(op.job_id.as_deref()) {
+                let endpoint = if op.txid.is_some() {
+                    Endpoint::Receipt
+                } else {
+                    Endpoint::Job
+                };
+                let (source, basis, _) =
+                    Self::request_floor_in(&self.db, config, endpoint, Some(remote))?;
+                let recent = self
+                    .reconciliation_schedule(&format!("reconciliation:{}", op.kind.as_str()))?
+                    .0;
+                let fair = self
+                    .reconciliation_schedule(&format!("reconciliation:fair:{}", op.kind.as_str()))?
+                    .0;
+                let missing = op.txid.is_none()
+                    && read["status"] == 404
+                    && read["failures"].as_u64().is_some_and(|count| count >= 2);
+                let service = if missing {
+                    fair.max(
+                        self.reconciliation_schedule(&format!(
+                            "reconciliation:missing:{}",
+                            op.kind.as_str()
+                        ))?
+                        .0,
+                    )
+                } else {
+                    recent.min(fair)
+                };
+                (Some(source), Some(service), basis)
+            } else {
+                (None, None, None)
+            };
+        let source_kind = match basis {
+            Some("server_retry_after") => "server_restriction",
+            Some("local_unscoped_429_cooldown") => "local_backoff",
+            Some("retained_legacy_floor") => "retained_floor",
+            _ => "shared_restriction",
+        };
+        let (kind, time) = [
+            ("operation_poll", op.next_at),
+            ("local_backoff", local),
+            ("retained_floor", retained),
+            ("reconciliation_service", service.unwrap_or(0)),
+            (
+                "historical_missing_binding",
+                decay.map_or(0, |(next, _)| next),
+            ),
+            ("server_restriction", server),
+            (source_kind, source.unwrap_or(0)),
+        ]
+        .into_iter()
+        .max_by_key(|(_, time)| *time)
+        .expect("poll floors");
+        Ok(PollFloors {
+            operation: op.next_at,
+            local,
+            server,
+            retained,
+            source,
+            service,
+            historical_missing: decay.map(|(next, _)| next),
+            kind,
+            gate: time,
+        })
+    }
+
+    pub(super) fn bound_next_observation(
+        &self,
+        config: &Config,
+        id: i64,
+        context: &RemoteWorkContext,
+        at: i64,
+    ) -> Result<Value> {
+        let Some(op) = self.inspection_operation(id)? else {
+            return Ok(Value::Null);
+        };
+        let Some(key) = op.read_key(id) else {
+            return Ok(Value::Null);
+        };
+        if !op.pollable() {
+            return Ok(Value::Null);
+        }
+        let read = self.exact_poll_read(&key)?;
+        let decay = self.reconciliation_decay_at(id, context, at)?;
+        let floors = self.poll_floors(config, &op, &read, decay)?;
+        let in_flight = read["in_flight"] == true;
+        let not_before = (!in_flight && floors.gate > at).then_some(floors.gate);
+        let mut observation = json!({
+            "owner":op.kind, "purpose":if op.txid.is_some() {"receipt"} else {"job"},
+            "operation_id":id, "binding_revision":op.binding_revision,
+            "not_before":not_before, "floor_kind":not_before.map(|_| floors.kind),
+            "status":if in_flight {"in_flight"} else if not_before.is_some() {"waiting"} else {"eligible"},
+        });
+        if read["status"] == 404 {
+            let provenance = self
+                .reconciliation_provenance(id, op.binding_revision)?
+                .filter(|p| {
+                    p.first_observed_at >= 0
+                        && p.first_observed_at <= at
+                        && p.bound_since
+                            .is_none_or(|since| since >= 0 && since <= p.first_observed_at)
+                });
+            observation["http_status"] = json!(404);
+            observation["scope"] = json!(match context.nonblocking(&op.state, op.epoch, &op.key) {
+                Some(false) => "current",
+                Some(true) => "background",
+                None => "unassessed",
+            });
+            observation["historical_cadence_qualified"] = json!(decay.is_some());
+            observation["cadence_seconds"] = json!(decay.map(|(_, cadence)| cadence));
+            observation["binding_age_seconds"] = json!(
+                provenance
+                    .as_ref()
+                    .map(|p| at.saturating_sub(p.bound_since.unwrap_or(p.first_observed_at)))
+            );
+            observation["consecutive_404"] = json!(provenance.map(|p| p.consecutive_404));
+        }
+        Ok(observation)
+    }
+
     /// One caller-selected page; stable caller order, no raw remote/work identifiers.
     pub(crate) fn operation_inspection(
         &self,
@@ -186,32 +407,43 @@ impl Store {
         at: i64,
     ) -> Result<Vec<OperationInspection>> {
         validate_page(None, ids.len().max(1))?;
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let policy = self.diagnostic_runtime_policy()?;
+        let applied = if let Some(policy) = policy.as_ref() {
+            let (_, stored) = self.diagnostic_journal_identity()?;
+            Self::diagnostic_applied_config(config, &stored, Some(policy))?
+        } else {
+            None
+        };
+        let lane_revisions = policy
+            .as_ref()
+            .filter(|_| applied.is_some())
+            .map(|p| &p["lane_revisions"]);
+        let config = applied.as_ref().unwrap_or(config);
         let mut finite_totals: Option<[UncertaintyAccounting; LaneId::COUNT]> = None;
         let mut contexts: [Option<RemoteWorkContext>; LaneId::COUNT] =
             std::array::from_fn(|_| None);
         let mut result = Vec::with_capacity(ids.len());
         for id in ids {
-            let op:Option<InspectionOperation>=self.db.query_row(
-                "SELECT kind,work_key,state,job_id,txid,next_at,binding_revision,
-                 CASE WHEN json_type(request,'$.solver.epoch')='integer'
-                 AND json_extract(request,'$.solver.epoch')>=0 AND json_extract(request,'$.solver.kind')=kind
-                 THEN json_extract(request,'$.solver.epoch') END,created_at FROM operations WHERE id=?1",
-                [id],|r| {
-                    let kind=r.get_ref(0)?;
-                    let kind=kind.as_str().map_err(|_|rusqlite::Error::InvalidColumnType(0,"kind".into(),kind.data_type()))?;
-                    Ok(InspectionOperation {
-                        kind:LaneId::ALL.into_iter().find(|lane|lane.as_str()==kind).ok_or(rusqlite::Error::InvalidQuery)?,
-                        key:r.get(1)?,state:r.get(2)?,job_id:r.get(3)?,txid:r.get(4)?,next_at:r.get(5)?,
-                        binding_revision:r.get(6)?,epoch:r.get(7)?,created_at:r.get(8)?,
-                    })
-                }).optional()?;
-            let Some(op) = op else { continue };
+            let Some(op) = self.inspection_operation(*id)? else {
+                continue;
+            };
             let index = LaneId::ALL
                 .iter()
                 .position(|lane| *lane == op.kind)
                 .expect("known lane");
-            if contexts[index].is_none() {
-                let mut context = self.remote_observation_context(config, op.kind, at, true)?;
+            if contexts[index].is_none()
+                && let Some(lane_revisions) = lane_revisions
+            {
+                let mut context = self.remote_observation_context_with_revision(
+                    config,
+                    op.kind,
+                    at,
+                    true,
+                    lane_revisions[op.kind.as_str()].as_str(),
+                )?;
                 let policy = config.participation(op.kind);
                 let mut totals = if policy.mode == ParticipationMode::ParticipationFirst
                     && policy.max_unresolved_operations == CountLimit::Unbounded
@@ -233,12 +465,15 @@ impl Store {
                 context.set_admission_open(open);
                 contexts[index] = Some(context);
             }
-            let context = contexts[index].as_ref().expect("initialized context");
+            let context = contexts[index].as_ref();
             let epoch = op.epoch;
-            let historical = context.historical(epoch, &op.key);
+            let historical = context.is_some_and(|context| context.historical(epoch, &op.key));
             let scope = if historical {
                 "historical"
-            } else if context.nonblocking(&op.state, epoch, &op.key).is_some() {
+            } else if context
+                .and_then(|context| context.nonblocking(&op.state, epoch, &op.key))
+                .is_some()
+            {
                 "current"
             } else {
                 "not_assessed"
@@ -263,79 +498,18 @@ impl Store {
                 "first_observed_binding"
             };
             let created = op.created_at;
-            let key = if op.txid.is_some() || op.job_id.is_some() {
-                Some(ReadKey::Operation {
-                    operation_id: *id,
-                    binding_revision: op.binding_revision,
-                    phase: if op.txid.is_some() {
-                        reads::ReadPhase::Receipt
-                    } else {
-                        reads::ReadPhase::Job
-                    },
-                })
-            } else {
-                None
+            let key = op.read_key(*id);
+            let read = match &key {
+                Some(key) => self.exact_poll_read(key)?,
+                None => Value::Null,
             };
-            let read: Option<Value> = if let Some(key) = &key {
-                let (owner, purpose, resource, _) = self.read_parts(key)?;
-                self.db.query_row("SELECT started_at,finished_at,status,last_success_at,in_flight,local_next_at,server_not_before,retained_conservative_floor FROM read_state WHERE owner=?1 AND purpose=?2 AND resource=?3 AND retired=0",
-                    params![owner,purpose,resource], |r| Ok(json!({"started_at":r.get::<_,Option<i64>>(0)?,"checked_at":r.get::<_,Option<i64>>(1)?,"status":r.get::<_,Option<u16>>(2)?,"usable_at":r.get::<_,Option<i64>>(3)?,"in_flight":r.get::<_,bool>(4)?,"local":r.get::<_,i64>(5)?,"server":r.get::<_,i64>(6)?,"retained":r.get::<_,i64>(7)?}))).optional()?
-            } else {
-                None
-            };
-            let read = read.unwrap_or(Value::Null);
-            let decay = self.reconciliation_decay_at(*id, context, at)?;
-            let mut floors = json!({"operation":op.next_at,"local":read["local"].as_i64().unwrap_or(0),"server":read["server"].as_i64().unwrap_or(0),"retained":read["retained"].as_i64().unwrap_or(0)});
-            if let Some(key) = &key {
-                let endpoint = if op.txid.is_some() {
-                    Endpoint::Receipt
-                } else {
-                    Endpoint::Job
-                };
-                floors["source"] = json!(self.request_not_before(
-                    config,
-                    endpoint,
-                    op.txid.as_deref().or(op.job_id.as_deref())
-                )?);
-                let missing = op.txid.is_none()
-                    && read["status"] == 404
-                    && self.read_backoff(key)?.failures >= 2;
-                let recent = self
-                    .reconciliation_schedule(&format!("reconciliation:{}", op.kind.as_str()))?
-                    .0;
-                let fair = self
-                    .reconciliation_schedule(&format!("reconciliation:fair:{}", op.kind.as_str()))?
-                    .0;
-                floors["service"] = json!(if missing {
-                    fair.max(
-                        self.reconciliation_schedule(&format!(
-                            "reconciliation:missing:{}",
-                            op.kind.as_str()
-                        ))?
-                        .0,
-                    )
-                } else {
-                    recent.min(fair)
-                });
-            }
-            floors["historical_missing"] = json!(decay.map(|(next, _)| next));
-            let next = key
-                .as_ref()
-                .filter(|_| {
-                    matches!(
-                        op.state.as_str(),
-                        "queued" | "unknown" | "included_pending" | "confirmed"
-                    )
-                })
-                .map(|_| {
-                    floors
-                        .as_object()
-                        .unwrap()
-                        .values()
-                        .filter_map(Value::as_i64)
-                        .max()
-                        .unwrap_or(0)
-                });
+            let decay = context
+                .map(|context| self.reconciliation_decay_at(*id, context, at))
+                .transpose()?
+                .flatten();
+            let poll = self.poll_floors(config, &op, &read, decay)?;
+            let floors = poll.projection();
+            let next = (key.is_some() && op.pollable()).then_some(poll.gate);
             let reason = if matches!(op.state.as_str(), "completed" | "final" | "failed") {
                 "terminal_evidence"
             } else if op.state == "model_unknown" {

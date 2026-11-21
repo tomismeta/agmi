@@ -6,9 +6,10 @@ import { pathToFileURL } from 'node:url';
 
 const emit = process.stdout.write.bind(process.stdout);
 process.stdout.write = process.stderr.write.bind(process.stderr);
-let started = false;
 let reported = {};
+let requestedRunId;
 const DEADLINE_BEFORE_CALL = Symbol('local deadline before Gateway call');
+const UNSUPPORTED_SDK = Symbol('installed OpenClaw Gateway SDK unavailable');
 const identifier = value => typeof value === 'string' && /^[A-Za-z0-9_.:/-]{1,256}$/.test(value) ? value : null;
 // Match solver.rs: one more JSON escaping pass over the complete request
 // allowance, plus envelope/policy/model metadata. Do not reduce guidance/task limits.
@@ -24,22 +25,28 @@ try {
     input += chunk;
   }
   const request = JSON.parse(input);
-  const require = createRequire(process.argv[1]);
-  const { callGatewayFromCli } = await import(pathToFileURL(
-    require.resolve('openclaw/plugin-sdk/gateway-runtime')).href);
-  if (typeof callGatewayFromCli !== 'function') throw new Error('unsupported native API');
   const runId = identifier(request.invocation_id);
   if (!runId) throw new Error('missing native invocation identity');
+  requestedRunId = runId;
+  let callGatewayFromCli;
+  try {
+    const require = createRequire(process.argv[1]);
+    ({ callGatewayFromCli } = await import(pathToFileURL(
+      require.resolve('openclaw/plugin-sdk/gateway-runtime')).href));
+  } catch {
+    throw UNSUPPORTED_SDK;
+  }
+  // Check the actual installation that would make the call, not a version
+  // string from a launcher. The same loaded transport owns dispatch.
+  if (typeof callGatewayFromCli !== 'function') throw UNSUPPORTED_SDK;
   if (!Number.isSafeInteger(request.deadline_unix_ms)) throw new Error('invalid model deadline');
   // Admission, process startup and SDK loading all spend the same deadline.
   const remainingMs = request.deadline_unix_ms - Date.now();
   const remainingSeconds = Math.floor(remainingMs / 1000);
   // The agent accepts whole seconds. Zero may select a default, not a deadline.
   if (remainingSeconds < 1) {
-    reported = {runId};
     throw DEADLINE_BEFORE_CALL;
   }
-  started = true;
   // The inspected agent API exposes a single message, not a privileged policy
   // field. Rust combines policy and envelope here without claiming isolation.
   const response = await callGatewayFromCli('agent', {
@@ -100,8 +107,11 @@ try {
   // A disconnected CLI does not prove that shared-Gateway inference stopped.
   const localDeadline = error === DEADLINE_BEFORE_CALL;
   const kind = localDeadline ? 'deadline_before_call'
+    : error === UNSUPPORTED_SDK ? 'sdk_unavailable_before_call'
     : ['timeout', 'aborted', 'error_payload'].includes(error) ? error : 'exception';
-  emit(JSON.stringify({ok: false, status: 'error', ...reported, error: {kind}}) + '\n');
-  // Exit 81 is reserved for the local deadline check before a Gateway call.
-  process.exitCode = localDeadline ? 81 : started ? 1 : 78;
+  const localRefusal = localDeadline || error === UNSUPPORTED_SDK;
+  emit(JSON.stringify({ok: false, status: 'error', ...reported,
+    ...(localRefusal ? {runId: requestedRunId} : {}), error: {kind}}) + '\n');
+  // These two exit codes need the associated bound no-call envelope.
+  process.exitCode = localDeadline ? 81 : error === UNSUPPORTED_SDK ? 78 : 1;
 }

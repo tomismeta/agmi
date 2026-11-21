@@ -1,5 +1,5 @@
 use super::*;
-use crate::protocol::BOUND_JOB_EXPIRY_CONFLICT;
+use crate::protocol::{BOUND_JOB_EXPIRY_CONFLICT, ReadFailure};
 use crate::store::{LaneObservation, LaneObservationStamp};
 
 pub(in crate::runtime) struct ReadFlight {
@@ -66,7 +66,7 @@ impl Recovery {
             };
             let mut read = self.reads.swap_remove(index);
             let response = runtime.finish_read(&read.flight, result)?;
-            // Safety ingestion above is unconditional; local state is binding-key fenced.
+            // Safety floors are retained even when finish_read discards an obsolete response.
             if !runtime.store.read_current(&read.flight.key)? {
                 continue;
             }
@@ -331,36 +331,38 @@ impl HostAccess {
     ) -> Result<Option<Response>> {
         match result {
             Ok(hosted) => {
-                self.store.ingest_restrictions(&hosted.restrictions())?;
-                if !matches!(flight.key, ReadKey::Operation { .. })
-                    && !self.observation_current(flight)?
-                {
-                    self.store.cancel_read(&flight.key)?;
-                    return Ok(None);
+                let reconciliation = matches!(flight.key, ReadKey::Operation { .. });
+                let restrictions = hosted.restrictions();
+                if !reconciliation {
+                    self.store.ingest_restrictions(&restrictions)?;
+                    if !self.observation_current(flight)? {
+                        self.store.cancel_read(&flight.key)?;
+                        return Ok(None);
+                    }
                 }
                 let category = crate::protocol::failure_category(&hosted.response);
-                if matches!(flight.key, ReadKey::Operation { .. }) {
-                    let complete =
-                        hosted.response.read_failure.is_none() && hosted.response.body.is_object();
-                    let category = if hosted.context.endpoint == Endpoint::Job
-                        && hosted.response.status == 408
-                        && hosted.context.meta.owner.is_some_and(|kind| {
-                            matches!(
-                                classify_source(kind, &hosted.response, ResponseSource::BoundJob),
-                                Outcome::Unknown { reason } if reason == BOUND_JOB_EXPIRY_CONFLICT
-                            )
-                        }) {
-                        Some(BOUND_JOB_EXPIRY_CONFLICT)
-                    } else {
-                        category
+                if reconciliation {
+                    let complete = match hosted.response.read_failure {
+                        None => hosted.response.body.is_object(),
+                        // The decoder discarded all outcome candidates, but did
+                        // inspect a complete contradictory response.
+                        Some(ReadFailure::BoundJobExpiryConflict) => {
+                            hosted.context.endpoint == Endpoint::Job
+                                && hosted.response.status == 408
+                                && matches!(
+                                    hosted.context.meta.owner,
+                                    Some(LaneId::Answer | LaneId::Judge)
+                                )
+                        }
+                        Some(_) => false,
                     };
                     if !self.store.finish_reconciliation_read(
                         &flight.key,
-                        flight.authority_epoch,
-                        flight.sequence,
+                        (flight.authority_epoch, flight.sequence),
                         Some(hosted.response.status),
                         category,
                         complete,
+                        &restrictions,
                     )? {
                         return Ok(None);
                     }
@@ -393,11 +395,11 @@ impl HostAccess {
                     if matches!(flight.key, ReadKey::Operation { .. }) {
                         if !self.store.finish_reconciliation_read(
                             &flight.key,
-                            flight.authority_epoch,
-                            flight.sequence,
+                            (flight.authority_epoch, flight.sequence),
                             None,
                             Some(category.as_str()),
                             false,
+                            &[],
                         )? {
                             return Ok(None);
                         }
@@ -583,15 +585,18 @@ impl HostAccess {
             let binding = self.store.operation_binding(op)?;
             self.store.complete_reconciliation(&binding, op, event)?;
         } else if op.job_id.is_some() {
-            self.store.record_candidates(
-                op.id,
-                &serde_json::to_value(crate::protocol::response_candidates(response))?,
-            )?;
             let mut outcome = classify_source(op.kind, response, ResponseSource::BoundJob);
             if outcome == Outcome::Expired && self.store.job_expiry_conflict(op)? {
                 outcome = Outcome::Unknown {
                     reason: BOUND_JOB_EXPIRY_CONFLICT.into(),
                 };
+            }
+            let expiry_conflict = matches!(&outcome, Outcome::Unknown { reason } if reason == BOUND_JOB_EXPIRY_CONFLICT);
+            if !expiry_conflict {
+                self.store.record_candidates(
+                    op.id,
+                    &serde_json::to_value(crate::protocol::response_candidates(response))?,
+                )?;
             }
             // Only the known 202 pending shape may omit its already-bound job ID.
             // A malformed identifier or contradictory evidence is not a pending poll.
@@ -615,8 +620,7 @@ impl HostAccess {
             } else {
                 let mut evidence =
                     response_evidence(op.kind, ResponseSource::BoundJob, Some(response));
-                if matches!(&outcome, Outcome::Unknown { reason } if reason == BOUND_JOB_EXPIRY_CONFLICT)
-                {
+                if expiry_conflict {
                     evidence.reason = BOUND_JOB_EXPIRY_CONFLICT.into();
                 }
                 self.store
@@ -654,6 +658,42 @@ mod recovery_tests {
         runtime.store.operation(op.id).unwrap().unwrap()
     }
 
+    async fn capture_job_dispute(
+        runtime: &mut HostAccess,
+        listener: &tokio::net::TcpListener,
+        op: &Operation,
+        minimum: u64,
+    ) -> (ReadFlight, HostedResponse) {
+        let key = Store::operation_read_key(op).unwrap();
+        let job = op.job_id.as_deref().unwrap();
+        let mut flight = runtime
+            .launch_read(LaneId::Judge, key, Endpoint::Job, Some(job), None)
+            .unwrap()
+            .unwrap();
+        let (socket, path) = tokio::time::timeout(Duration::from_secs(5), accept(&listener))
+            .await
+            .unwrap();
+        assert!(path.contains(&format!("/api/job/{job}")));
+        reply(
+            socket,
+            408,
+            Some(minimum),
+            json!({"error":{"state":"expired","processed":true}}),
+        )
+        .await;
+        let completion = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(result) = flight.take() {
+                    break result.unwrap();
+                }
+                runtime.wake.notified().await;
+            }
+        })
+        .await
+        .unwrap();
+        (flight, completion)
+    }
+
     #[tokio::test]
     async fn expiry_dispute_is_durable_before_recovery_applies_the_response() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -663,55 +703,148 @@ mod recovery_tests {
         let db =
             rusqlite::Connection::open(runtime.config.state_dir.join("state.sqlite3")).unwrap();
         let original = seed(&mut runtime, &db, "disputed");
-        let key = Store::operation_read_key(&original).unwrap();
-        let mut flight = runtime
-            .launch_read(
-                LaneId::Judge,
-                key,
-                Endpoint::Job,
-                original.job_id.as_deref(),
-                None,
+        let (flight, completion) =
+            capture_job_dispute(&mut runtime, &listener, &original, u64::MAX).await;
+        let retained = || -> (bool, Option<u16>, Option<i64>, Option<u64>) {
+            db.query_row(
+                "SELECT r.in_flight,r.status,json_extract(e.policy,'$.bound_job_expiry_conflict_revision'),
+                        json_extract(e.policy,'$.reconciliation.active_request_sequence')
+                 FROM operations o JOIN read_state r ON r.operation_id=o.id
+                      JOIN operation_evidence e ON e.operation_id=o.id
+                 WHERE o.id=?1 AND o.binding_revision=?2 AND r.binding_revision=?2
+                       AND o.state=?3 AND o.job_id=?4 AND r.retired=0",
+                rusqlite::params![original.id, original.binding_revision, original.state, original.job_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap()
-            .unwrap();
-        let (socket, path) = tokio::time::timeout(Duration::from_secs(5), accept(&listener))
-            .await
-            .unwrap();
-        assert!(path.contains("/api/job/disputed"));
-        reply(
-            socket,
-            408,
-            None,
-            json!({"state":"expired","error":"job_expired","processed":true}),
+        };
+        let floor = || -> (Option<i64>, Option<i64>) {
+            db.query_row(
+                "SELECT MAX(server_minimum_seconds),MAX(not_before) FROM request_restrictions
+                 WHERE scope='account_authenticated' AND basis='server_retry_after' AND source='job'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        };
+        db.execute_batch(
+            "CREATE TRIGGER reject_disputed_read_finish BEFORE UPDATE OF finished_at ON read_state
+             WHEN OLD.in_flight=1 AND NEW.status=408
+               AND EXISTS(SELECT 1 FROM request_restrictions WHERE scope='account_authenticated'
+                          AND source='job' AND server_minimum_seconds=9223372036854775807)
+               AND EXISTS(SELECT 1 FROM operation_evidence WHERE operation_id=NEW.operation_id
+                          AND json_extract(policy,'$.bound_job_expiry_conflict_revision')=NEW.binding_revision)
+             BEGIN SELECT RAISE(ABORT,'fixture rejects read finish after floor and fence'); END;",
         )
-        .await;
-        let completion = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if let Some(result) = flight.take() {
-                    break result;
-                }
-                runtime.wake.notified().await;
-            }
-        })
-        .await
         .unwrap();
-        assert!(runtime.finish_read(&flight, completion).unwrap().is_some());
-        // Crash cut: no recovery_response or outcome transition has run.
-        // A separate reader must see both the consumed stamp and retry fence.
+        let error = runtime
+            .finish_read(&flight, Ok(completion.clone()))
+            .err()
+            .expect("read finish must fail after writing the floor and fence");
+        assert!(
+            error
+                .to_string()
+                .contains("fixture rejects read finish after floor and fence")
+        );
+        assert_eq!(floor(), (None, None));
+        assert_eq!(retained(), (true, None, None, Some(flight.sequence)));
+        db.execute_batch("DROP TRIGGER reject_disputed_read_finish")
+            .unwrap();
+        assert!(
+            runtime
+                .finish_read(&flight, Ok(completion))
+                .unwrap()
+                .is_some()
+        );
+        // Crash cut: a separate connection sees the completed read, fence and
+        // floor, before recovery_response or any outcome transition.
         drop(flight);
         drop(runtime);
-        let (status, in_flight, revision): (u16, bool, i64) = db
-            .query_row(
-                "SELECT r.status,r.in_flight,json_extract(e.policy,'$.bound_job_expiry_conflict_revision')
-                 FROM read_state r JOIN operation_evidence e ON e.operation_id=r.operation_id
-                 WHERE r.operation_id=?1 AND r.binding_revision=?2",
-                rusqlite::params![original.id, original.binding_revision],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
         assert_eq!(
-            (status, in_flight, revision),
-            (408, false, original.binding_revision)
+            retained(),
+            (false, Some(408), Some(original.binding_revision), None)
+        );
+        assert_eq!(floor(), (Some(i64::MAX), Some(i64::MAX)));
+    }
+
+    #[tokio::test]
+    async fn stale_expiry_dispute_only_retains_the_latest_saturated_floor() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = Config::default();
+        config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
+        let (_temp, mut runtime, _stop) = fixture_with(config);
+        let db =
+            rusqlite::Connection::open(runtime.config.state_dir.join("state.sqlite3")).unwrap();
+        let mut original = seed(&mut runtime, &db, "obsolete");
+        let minimum = i64::MAX - 1;
+        let (flight, completion) =
+            capture_job_dispute(&mut runtime, &listener, &original, minimum as u64).await;
+        original.txid = Some("d".repeat(64));
+        original.state = "included_pending".into();
+        runtime
+            .store
+            .seed_transition_for_test(&original, "fixture_advanced_binding")
+            .unwrap();
+        let retained = || -> String {
+            db.query_row(
+                "SELECT json_array(o.state,o.binding_revision,o.job_id,o.txid,r.status,r.failure_category,
+                                   r.in_flight,r.finished_at,e.policy,e.evidence)
+                 FROM operations o JOIN read_state r ON r.operation_id=o.id
+                      JOIN operation_evidence e ON e.operation_id=o.id
+                 WHERE o.id=?1 AND r.binding_revision=?2 AND o.binding_revision<>?2",
+                rusqlite::params![original.id, original.binding_revision],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        let floor = || -> (i64, i64, i64, String) {
+            db.query_row(
+                "SELECT not_before,server_minimum_seconds,observed_at,request_id FROM request_restrictions
+                 WHERE scope='account_authenticated' AND basis='server_retry_after' AND source='job'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap()
+        };
+        let binding = retained();
+        assert!(
+            runtime
+                .finish_read(&flight, Ok(completion.clone()))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            floor(),
+            (
+                i64::MAX,
+                minimum,
+                completion.observed_at,
+                completion.context.meta.request_id.clone(),
+            )
+        );
+        // Exercise both arrival orders for equally saturated deadlines.
+        let mut latest = completion.clone();
+        latest.observed_at += 1;
+        latest.context.meta.request_id.push_str(":later");
+        latest.response.retry_after_seconds = Some(u64::MAX);
+        let expected = (
+            i64::MAX,
+            i64::MAX,
+            latest.observed_at,
+            latest.context.meta.request_id.clone(),
+        );
+        assert!(runtime.finish_read(&flight, Ok(latest)).unwrap().is_none());
+        assert!(
+            runtime
+                .finish_read(&flight, Ok(completion))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(floor(), expected);
+        assert_eq!(
+            retained(),
+            binding,
+            "obsolete responses cannot write diagnostics or latch a dispute"
         );
     }
 

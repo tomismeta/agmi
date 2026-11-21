@@ -993,8 +993,8 @@ fn installer_outcome(
         || report["installation"]["status"] == "restoration_incomplete"
     {
         ("restoration_incomplete", "previous_intent_not_restored")
-    } else if report["installation"]["failure_code"] == "stopped_update_required" {
-        ("refused", "stopped_update_required")
+    } else if report["installation"]["failure_code"] == "target_replay_fence_required" {
+        ("refused", "target_replay_fence_required")
     } else if report["installation"]["failure_code"] == "migration_required"
         || report["migration"]["phase"] == "required"
     {

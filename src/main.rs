@@ -237,6 +237,9 @@ enum Command {
         /// Include complete retained diagnostic evidence.
         #[arg(long)]
         verbose: bool,
+        /// Exit 3 for a proven timed admission wait; intended for the managed health unit.
+        #[arg(long)]
+        managed_exit: bool,
         /// Stale heartbeat/observation limit; raised to the configured cycle timing floor.
         #[arg(long, default_value_t = 180, value_parser = clap::value_parser!(u64).range(1..))]
         stale_seconds: u64,
@@ -646,6 +649,14 @@ fn update_actions(data: &mut Value) {
         data["next_actions"] = cli_error::release_actions(data);
         return;
     }
+    if data["update"]["reason"] == "target_replay_fence_required" {
+        data["next_actions"] = json!([
+            cli_error::action(None, &["service", "status"], false),
+            {"kind":"instruction","authorization_required":false,
+                "message":"Choose a release that supports bound-job replay protection. The older release can be staged or inspected, but must not be selected or started against this journal."},
+        ]);
+        return;
+    }
     let commands: Vec<(&[&str], bool)> = match data["update"]["status"].as_str() {
         Some("migration_required" | "decision_required") => {
             vec![(&["config", "migrate", "preview", "--help"], false)]
@@ -909,14 +920,14 @@ fn discovery() -> Value {
         {"name":"run","network_reads":true,"model_calls":"active capabilities only","network_writes":"active capabilities and resumed state only","local_writes":true},
         {"name":"status","network_reads":false,"network_writes":false,"purpose":"local operational state, current blockers and separate retained risk; success means snapshot read, not healthy"},
         {"name":"reads","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":false,"purpose":"sanitized read progress, failure categories and retry deadlines"},
-        {"name":"health","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":false,"purpose":"local operational health for core and each lane; retained risk alone does not fail health; unhealthy exits nonzero"},
+        {"name":"health","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":false,"purpose":"local operational health for core and each lane; retained risk alone does not fail health; unhealthy exits nonzero; --managed-exit distinguishes a proven timed admission wait (3)"},
         {"name":"doctor","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":"only with --repair","confirmation_flag":"--repair","purpose":"local unattended/intervention diagnosis; --repair orchestrates existing guarded refusal recovery, preserving runtime intent; a restored runtime may resume its configured network/model work"},
         {"name":"config init","network_writes":false,"local_writes":true},
         {"name":"config show","network_writes":false,"local_writes":false},
-        {"name":"config check","network_writes":false,"local_writes":false},
+        {"name":"config check","network_writes":false,"local_writes":false,"purpose":"validate saved configuration and guidance; file_revision is the edit token, effective_revision includes guidance and is not an observation of the running controller"},
         {"name":"config state-path","network_writes":false,"local_writes":false,"purpose":"plain absolute state path without opening journal"},
         {"name":"config schema","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":false,"purpose":"setting types, defaults and immutable boundaries; no config required"},
-        {"name":"config apply","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":"unless --dry-run","purpose":"nested JSON merge patch on stdin; --expected-revision from config show.file_revision"},
+        {"name":"config apply","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":"unless --dry-run","purpose":"nested JSON merge patch on stdin; --expected-revision from config check.file_revision or config show.file_revision"},
         {"name":"config migrate preview","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":false,"private_output":true,"purpose":"JSON proposal on stdin; explicit per-lane caps/candidate for legacy sources, or {} for unchanged current-shape config with format-3 journal; requires stopped durable global pause; snapshot token binds target_journal_format","target_journal_format":agmi::journal::CURRENT_JOURNAL_FORMAT},
         {"name":"config migrate apply","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":true,"private_output":true,"purpose":"preview request JSON on stdin; --expected-token and, when required, matching --accept-risk-change token; converts only the token-bound target while stopped and remains paused"},
         {"name":"config migrate resume","network_reads":false,"network_writes":false,"model_calls":false,"local_writes":true,"purpose":"--state-dir and --expected-token; finishes only the exact sealed target; recognized historical target3 returns further_migration_required=true and requires separate 3-to-current preview/apply; never resumes participation or retargets evidence"},
@@ -997,11 +1008,8 @@ fn managed_control_mutation(command: &Command) -> bool {
                 | RecoveryCommand::Authorize { .. }
                 | RecoveryCommand::Revoke { .. },
         } => true,
-        Command::Recover {
-            command: RecoveryCommand::Resolve { refusal, apply, .. },
-        } => !refusal || apply.is_some(),
-        // Installation/service/repair owners take their own lease after delegation.
-        // Holding an outer lease would deadlock the incoming installer.
+        // Installer/service/repair and detached hosted recovery take their own leases.
+        // An outer lease would also block installer handoff.
         _ => false,
     }
 }
@@ -1043,14 +1051,22 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
             .into());
         }
     };
-    let _managed_control = if managed_control_mutation(&cli.command) {
+    let _managed_control = if matches!(
+        cli.command,
+        Command::Recover {
+            command: RecoveryCommand::Resolve {
+                refusal: true,
+                apply: Some(_),
+                ..
+            },
+        }
+    ) {
+        lifecycle::guard_managed_recovery_mutation(&path)?
+    } else if managed_control_mutation(&cli.command) {
         lifecycle::guard_managed_mutation(&path)?
     } else {
         None
     };
-    if matches!(cli.command, Command::Run { .. }) {
-        lifecycle::guard_managed_run(&path)?;
-    }
     match &cli.command {
         Command::Identity { command } => {
             return match command {
@@ -1322,6 +1338,18 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
             return Ok(("config", admin::show(&path)?));
         }
         Command::Config {
+            command: ConfigCommand::Check,
+        } => {
+            let (config, file_revision) = Config::load_with_file_revision(&path)?;
+            let effective_revision = config.revision()?;
+            return Ok((
+                "config_check",
+                json!({"valid":true,"file_revision":file_revision,
+                    "revision":effective_revision,"effective_revision":effective_revision,
+                    "network_verified":false,"auth_verified":false}),
+            ));
+        }
+        Command::Config {
             command:
                 ConfigCommand::Apply {
                     expected_revision,
@@ -1392,13 +1420,7 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
         } => Some(admin::lock_config_directory(&path)?),
         _ => None,
     };
-    let config = if matches!(
-        cli.command,
-        Command::Resume
-            | Command::Config {
-                command: ConfigCommand::Check
-            }
-    ) {
+    let config = if matches!(cli.command, Command::Resume) {
         Config::load(&path)
     } else {
         Config::load_metadata(&path)
@@ -1594,15 +1616,6 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
                 "lane_descriptors":agmi::capability::DESCRIPTORS,
                 "note":"Desired routes only; inspect status for effective loaded routes and operations for sourced native reports. Mine has no model or guidance route. No harness, authentication secret or guidance content is inspected."}),
         )),
-        Command::Config {
-            command: ConfigCommand::Check,
-        } => {
-            config.validate()?;
-            Ok((
-                "config_check",
-                json!({"valid":true,"revision":config.revision()?,"network_verified":false,"auth_verified":false}),
-            ))
-        }
         Command::BuildInfo { .. }
         | Command::Init { .. }
         | Command::Identity { .. }
@@ -1623,10 +1636,12 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
                 | ConfigCommand::Migrate { .. },
         }
         | Command::Config {
-            command: ConfigCommand::Init,
+            command: ConfigCommand::Init | ConfigCommand::Check,
         } => unreachable!(),
     }
 }
+
+const MANAGED_WAIT_EXIT: i32 = 3;
 
 #[tokio::main]
 async fn main() {
@@ -1812,6 +1827,16 @@ async fn main() {
                 "epoch" => data.get("refresh_ok").is_none_or(|value| value == true),
                 _ => true,
             };
+            let managed_wait = !ok
+                && kind == "health"
+                && matches!(
+                    cli.command,
+                    Command::Health {
+                        managed_exit: true,
+                        ..
+                    }
+                )
+                && health::managed_health_wait(&data);
             let verbose = matches!(
                 cli.command,
                 Command::Status { verbose: true }
@@ -1837,7 +1862,7 @@ async fn main() {
                 }
             }
             if !ok {
-                std::process::exit(1);
+                std::process::exit(if managed_wait { MANAGED_WAIT_EXIT } else { 1 });
             }
         }
         Err(error) => {

@@ -244,7 +244,8 @@ def run_case(agmi, omp, root, case, output, code, execution, outcome, *,
             call = provider.calls[0]
             assert (call["model"], call["reasoning"], call["toolChoice"]) == (MODEL, "low", "none")
             context = call["context"]
-            assert context["tools"] == [] and "No tools or external actions" in context["systemPrompt"]
+            policy = context["systemPrompt"]
+            assert context["tools"] == [] and len(policy) == 1 and "No tools or external actions" in policy[0]
             assert len(context["messages"]) == 1 and context["messages"][0]["role"] == "user"
             envelope = json.loads(context["messages"][0]["content"])
             request = envelope["request"]

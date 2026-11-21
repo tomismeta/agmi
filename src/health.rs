@@ -770,6 +770,87 @@ fn evaluate_evidence(options: Options, status: &Value, at: i64) -> Value {
     result
 }
 
+/// Classify a failed health check as a managed wait only when every issue
+/// is covered by that lane's own fresh, bounded automatic admission path.
+pub fn managed_health_wait(report: &Value) -> bool {
+    let Some(at) = report["checked_at"].as_i64() else {
+        return false;
+    };
+    let Some(issues) = report["issues"]
+        .as_array()
+        .filter(|issues| !issues.is_empty())
+    else {
+        return false;
+    };
+    if report["intervention"]["unattended"] != true
+        || report["intervention"]["controller"]["ready"] != true
+        || report["components"]["controller"]["state"] != "ok"
+        || report["hosted_identity_verified"] != true
+    {
+        return false;
+    }
+    let timed_reason = |reason: &Value| {
+        reason
+            .as_str()
+            .and_then(|reason| intervention::floor_kind(reason, &Value::Null))
+            .is_some()
+    };
+    let mut explained = [[None; 2]; LaneId::COUNT];
+    let mut aggregate_covered = false;
+    for (index, lane) in LANES.into_iter().enumerate() {
+        let component = &report["components"][lane];
+        let intervention = &report["work"][lane]["intervention"];
+        let admission = &report["participation"]["lanes"][lane];
+        let lane_blocked = component["mode"] == "active" && admission["allowed"] == false;
+        if intervention["resolution"] == "polling_not_guaranteed" {
+            return false;
+        }
+        if matches!(component["state"].as_str(), Some("ok" | "disabled")) && !lane_blocked {
+            continue;
+        }
+        let Some([reason]) = component["reasons"].as_array().map(Vec::as_slice) else {
+            return false;
+        };
+        let next = intervention["next_at"].as_i64().filter(|&next| next > at);
+        if component["mode"] != "active"
+            || component["state"] != "blocked"
+            || intervention["status"] != "automatic_recovery"
+            || intervention["reason"] != *reason
+            || intervention["next_action"] != "await_retry_eligibility"
+            || intervention["observation_fresh"] != true
+            || next.is_none()
+            || !timed_reason(reason)
+        {
+            return false;
+        }
+        explained[index][0] = reason.as_str();
+        if lane_blocked {
+            let reason = &admission["reason"];
+            let deadline = admission["not_before"]
+                .as_i64()
+                .max(admission["request_restriction_at"].as_i64());
+            if !timed_reason(reason)
+                || deadline.is_none_or(|until| until <= at || Some(until) > next)
+            {
+                return false;
+            }
+            aggregate_covered = true;
+            explained[index][1] = reason.as_str();
+        }
+    }
+    issues.iter().all(|issue| {
+        issue.as_str().is_some_and(|code| {
+            (code == "admission_blocked"
+                && aggregate_covered
+                && report["admission_blocked"] == true)
+                || explained
+                    .iter()
+                    .flatten()
+                    .any(|&candidate| candidate == Some(code))
+        })
+    })
+}
+
 fn operational_summary(report: &mut Value) {
     report["operational_now"] = report["operational"]["status"].clone();
     let historical = report["risk"]["historical_eligible_answers"].as_u64();
@@ -958,6 +1039,32 @@ pub fn compact_diagnostics(data: &mut Value) {
         }
         Value::Object(out)
     }
+    fn observation(out: &mut Value, source: &Value, truncated: &mut bool) {
+        for key in ["next_observation", "missing_observation"] {
+            let Some(value) = source.get(key).filter(|value| value.is_object()) else {
+                continue;
+            };
+            out[key] = fields(
+                value,
+                &[
+                    "status",
+                    "owner",
+                    "purpose",
+                    "operation_id",
+                    "binding_revision",
+                    "not_before",
+                    "floor_kind",
+                    "http_status",
+                    "scope",
+                    "historical_cadence_qualified",
+                    "cadence_seconds",
+                    "binding_age_seconds",
+                    "consecutive_404",
+                ],
+                truncated,
+            );
+        }
+    }
     fn admission(value: &Value, truncated: &mut bool) -> Value {
         let mut out = fields(value, ADMISSION, truncated);
         if let Some(blocker) = value.get("pre_intent_blocker") {
@@ -969,6 +1076,11 @@ pub fn compact_diagnostics(data: &mut Value) {
         }
         out
     }
+    fn verbose_command() -> Value {
+        json!({"kind":"instruction","authorization_required":false,
+            "message":"Use --verbose to see the full command for this configuration."})
+    }
+
     fn actions(value: &Value, truncated: &mut bool) -> Value {
         let Some(rows) = value.as_array() else {
             return json!([]);
@@ -979,19 +1091,35 @@ pub fn compact_diagnostics(data: &mut Value) {
         json!(
             rows.iter()
                 .take(4)
-                .map(|row| fields(
-                    row,
-                    &[
-                        "kind",
-                        "authorization_required",
-                        "message",
-                        "argv",
-                        "until",
-                        "clock",
-                        "evidence"
-                    ],
-                    truncated
-                ))
+                .map(|row| {
+                    let mut action = fields(
+                        row,
+                        &[
+                            "kind",
+                            "authorization_required",
+                            "message",
+                            "until",
+                            "clock",
+                            "evidence",
+                        ],
+                        truncated,
+                    );
+                    if row["kind"] == "command" {
+                        let argv = &row["argv"];
+                        if argv.as_array().is_some_and(|args| {
+                            (1..=8).contains(&args.len())
+                                && args
+                                    .iter()
+                                    .all(|arg| arg.as_str().is_some_and(|s| s.len() <= 160))
+                        }) {
+                            action["argv"] = argv.clone();
+                        } else {
+                            *truncated = true;
+                            return verbose_command();
+                        }
+                    }
+                    action
+                })
                 .collect::<Vec<_>>()
         )
     }
@@ -1040,6 +1168,9 @@ pub fn compact_diagnostics(data: &mut Value) {
         ],
         &mut truncated,
     );
+    if let Some(root_actions) = source.get("next_actions") {
+        out["next_actions"] = actions(root_actions, &mut truncated);
+    }
     const FINDING: &[&str] = &[
         "status",
         "state",
@@ -1085,6 +1216,8 @@ pub fn compact_diagnostics(data: &mut Value) {
         "completeness",
         "locally_judgeable",
         "observed_opportunities",
+        "eligible_candidates",
+        "assessment_reason",
     ];
     const ADMISSION: &[&str] = &[
         "allowed",
@@ -1256,6 +1389,11 @@ pub fn compact_diagnostics(data: &mut Value) {
         &mut truncated,
     );
     out["intervention"] = fields(&source["intervention"], FINDING, &mut truncated);
+    observation(
+        &mut out["intervention"],
+        &source["intervention"],
+        &mut truncated,
+    );
     for name in ["controller", "lanes"] {
         out["intervention"][name] = fields(
             &source["intervention"][name],
@@ -1322,15 +1460,23 @@ pub fn compact_diagnostics(data: &mut Value) {
             "assessment",
         ] {
             out["work"][lane][name] = fields(&source["work"][lane][name], FINDING, &mut truncated);
+            observation(
+                &mut out["work"][lane][name],
+                &source["work"][lane][name],
+                &mut truncated,
+            );
         }
         out["work"][lane]["model"] = fields(
             &source["work"][lane]["model"],
             &[
                 "operation_id",
                 "failure_category",
+                "grade_failure",
                 "current_route",
                 "current_runtime",
                 "budget_used",
+                "budget_limit",
+                "scope",
                 "unresolved_attempts",
                 "attempts",
                 "max_attempts",
@@ -1557,6 +1703,11 @@ pub fn compact_diagnostics(data: &mut Value) {
             for name in ["assessment", "retry", "admission", "background_recovery"] {
                 out["work"][lane][name] = json!({});
             }
+            observation(
+                &mut out["work"][lane]["background_recovery"],
+                &source["work"][lane]["background_recovery"],
+                &mut truncated,
+            );
             out["components"][lane] = fields(
                 &out["components"][lane],
                 &["state", "reasons", "mode", "observed_at", "age_seconds"],
@@ -1579,11 +1730,40 @@ pub fn compact_diagnostics(data: &mut Value) {
             if value.is_object()
                 && !matches!(
                     name.as_str(),
-                    "operational" | "risk" | "historical_uncertainty" | "intervention"
+                    "operational" | "risk" | "historical_uncertainty" | "intervention" | "work"
                 )
             {
                 *value = json!({});
             }
+        }
+        for lane in LANES {
+            let work = &source["work"][lane];
+            let mut intervention = fields(
+                &work["intervention"],
+                &[
+                    "status",
+                    "reason",
+                    "next_action",
+                    "next_at",
+                    "release_scope",
+                    "required_release",
+                    "release_truncated",
+                ],
+                &mut truncated,
+            );
+            observation(&mut intervention, &work["intervention"], &mut truncated);
+            let mut background = fields(
+                &work["background_recovery"],
+                &["count", "bound_count", "required_for_participation"],
+                &mut truncated,
+            );
+            observation(
+                &mut background,
+                &work["background_recovery"],
+                &mut truncated,
+            );
+            out["work"][lane] =
+                json!({"intervention":intervention,"background_recovery":background});
         }
         omitted.push("extended_details");
         truncated = true;
@@ -1598,6 +1778,9 @@ pub fn compact_diagnostics(data: &mut Value) {
                         end -= 1;
                     }
                     text.truncate(end);
+                }
+                Value::Object(object) if object.get("kind").is_some_and(|v| v == "command") => {
+                    *value = verbose_command();
                 }
                 Value::Array(rows) => {
                     rows.truncate(2);
@@ -1638,9 +1821,10 @@ fn work_complete(status: &Value, lane: &str, at: i64, stale: u64) -> bool {
     }
     let work = &status["work"][lane];
     if lane == "judge" {
-        assessment_fresh(&work["assessment"], at, stale)
-            && work["assessment"]["completeness"] == "complete"
-            && work["assessment"]["locally_judgeable"] == false
+        judge_inventory_fresh(status, at, stale)
+            && judge_inventory(&work["assessment"]) == JudgeInventory::Idle
+            && model_route_fault(&work["model"]).is_none()
+            && !judge_model_relevance_unknown(&work["model"])
             && !current_remote_work(status, lane)
             && !status["pending_work"]
                 .as_array()
@@ -1650,7 +1834,6 @@ fn work_complete(status: &Value, lane: &str, at: i64, stale: u64) -> bool {
                     row["kind"] == lane
                         && row.get("nonblocking_for_fresh_work") == Some(&Value::Null)
                 })
-            && judge_inventory_blocker(&work["assessment"]).is_none()
     } else {
         let observed = observation(status, lane);
         observation_fresh(status, lane, observed["observed_at"].as_i64(), at, stale) == Some(true)
@@ -1677,11 +1860,40 @@ fn push_issue(result: &mut Value, code: &str) {
     }
 }
 
-fn judge_inventory_blocker(assessment: &Value) -> Option<&'static str> {
-    if assessment["completeness"] != "complete" || assessment["locally_judgeable"] != false {
-        return None;
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JudgeInventory {
+    Unresolved,
+    Available,
+    Idle,
+    Blocked(&'static str),
+}
+
+/// The selection flag describes a selected row, not the entire inventory.
+/// Negative evidence needs a complete inventory with every candidate accounted for.
+pub(crate) fn judge_inventory(assessment: &Value) -> JudgeInventory {
+    if assessment["locally_judgeable"] == true {
+        return JudgeInventory::Available;
     }
-    [
+    if assessment["assessment_reason"] == "required_words_absent" {
+        return JudgeInventory::Unresolved;
+    }
+    if assessment["completeness"] != "complete" || assessment["locally_judgeable"] != false {
+        return JudgeInventory::Unresolved;
+    }
+    let observed = assessment["observed_opportunities"].as_u64();
+    if observed == Some(0)
+        && (assessment["excluded_work_truncated"] == true
+            || assessment["excluded_work"]
+                .as_array()
+                .is_some_and(|rows| !rows.is_empty()))
+    {
+        return JudgeInventory::Unresolved;
+    }
+    let eligible = assessment["eligible_candidates"].as_u64();
+    if eligible != Some(0) && !(eligible.is_none() && observed == Some(0)) {
+        return JudgeInventory::Unresolved;
+    }
+    let blocker = [
         ("assignment_read_backoff", "api_dependency_unavailable"),
         (
             "assignment_resource_restricted",
@@ -1702,7 +1914,71 @@ fn judge_inventory_blocker(assessment: &Value) -> Option<&'static str> {
     .into_iter()
     .find_map(|(key, reason)| {
         (assessment["exclusions"][key].as_u64().unwrap_or(0) > 0).then_some(reason)
-    })
+    });
+    if let Some(reason) = blocker {
+        return JudgeInventory::Blocked(reason);
+    }
+    let excluded = match assessment.get("exclusions") {
+        None => Some(0),
+        Some(value) => value.as_object().and_then(|counts| {
+            counts.iter().try_fold(0_u64, |total, (reason, value)| {
+                let count = value.as_u64()?;
+                if count > 0
+                    && !matches!(
+                        reason.as_str(),
+                        "already_attempted" | "configured_exclusion"
+                    )
+                {
+                    return None;
+                }
+                total.checked_add(count)
+            })
+        }),
+    };
+    if observed.is_some() && excluded == observed {
+        JudgeInventory::Idle
+    } else {
+        JudgeInventory::Unresolved
+    }
+}
+
+pub(crate) fn judge_model_relevance_unknown(model: &Value) -> bool {
+    model["scope"] == "unassessed_assignment"
+        && matches!(
+            model["state"].as_str(),
+            Some(
+                "model_unknown"
+                    | "superseded_model_unknown"
+                    | "abandoned_model"
+                    | "retry_model"
+                    | "prelaunch_failed"
+                    | "rejected"
+            )
+        )
+}
+
+fn judge_inventory_fresh(status: &Value, at: i64, stale: u64) -> bool {
+    status["lane_participation"]["judge"]["freshness"] != "stale"
+        && assessment_fresh(&status["work"]["judge"]["assessment"], at, stale)
+}
+
+pub(crate) fn model_route_fault(model: &Value) -> Option<&'static str> {
+    if model["current_route"] != true {
+        return None;
+    }
+    match model["failure_category"].as_str()? {
+        "native_auth_unavailable" => Some("model_authentication_failed"),
+        "native_api_unsupported"
+        | "native_route_mismatch"
+        | "executable_unavailable"
+        | "core_guidance_missing"
+        | "invalid_solver_setup"
+        | "unsupported_harness_version"
+        | "native_qualification_failed"
+        | "native_qualification_unavailable"
+        | "invalid_model_deadline" => Some("model_configuration_failed"),
+        _ => None,
+    }
 }
 
 fn current_remote_work(status: &Value, lane: &str) -> bool {
@@ -1800,10 +2076,7 @@ fn qualify_components(result: &mut Value, status: &Value, options: Options) {
             let at = result["checked_at"]
                 .as_i64()
                 .expect("health observation time");
-            if ["started_at", "last_success_at", "last_failure_at"]
-                .into_iter()
-                .any(|field| dependency[field].as_i64().is_some_and(|time| time > at))
-            {
+            if api::has_future_observation(dependency, at) {
                 push_issue(result, "clock_regressed");
             } else if intervention::read_failed(dependency)
                 && fresh(dependency["last_failure_at"].as_i64(), at, stale)
@@ -2137,6 +2410,7 @@ fn components(status: &Value, health: &Value, at: i64, stale: u64, options: Opti
         let evidence_at = observation.or(primary["observed_at"].as_i64());
         // Decide with borrowed codes; allocate each JSON component only once.
         let mut finding = ("unknown", "work_evidence_unavailable", evidence_at);
+        let mut concurrent_read_issue = None;
         if mode == Some("off") {
             finding = ("disabled", "capability_off", observed);
         } else if name == "judge" && observation.is_some_and(|time| time > at) {
@@ -2176,13 +2450,25 @@ fn components(status: &Value, health: &Value, at: i64, stale: u64, options: Opti
                         .unwrap_or("admission_blocked"),
                     evidence_at,
                 );
+                // An admission timer does not explain a separate failed discovery.
+                if intervention::floor_kind(finding.1, &work["admission"]["restriction_basis"])
+                    .is_some()
+                    && let Some(dependency) = api::discovery(status, name)
+                {
+                    concurrent_read_issue = if api::has_future_observation(dependency, at) {
+                        Some("clock_regressed")
+                    } else if primary["state"] == "degraded" {
+                        Some("api_dependency_unavailable")
+                    } else {
+                        None
+                    };
+                }
             } else if !read_only && admission.is_none() {
                 finding = ("unknown", "admission_evidence_unavailable", evidence_at);
             } else {
                 let complete = work_complete(status, name, at, stale);
                 let usable_observation = if name == "judge" {
-                    status["lane_participation"][name]["freshness"] != "stale"
-                        && assessment_fresh(&work["assessment"], at, stale)
+                    judge_inventory_fresh(status, at, stale)
                 } else {
                     observation_fresh(status, name, observation, at, stale) == Some(true)
                 };
@@ -2219,8 +2505,7 @@ fn components(status: &Value, health: &Value, at: i64, stale: u64, options: Opti
                     && work["phase"] == "observing"
                     && match name {
                         "judge" => {
-                            assessment_fresh(&work["assessment"], at, stale)
-                                && work["assessment"]["locally_judgeable"] == true
+                            judge_inventory(&work["assessment"]) == JudgeInventory::Available
                         }
                         "answer" => status["observations"][name]["answered"] == false,
                         _ => status["observations"][name]["epoch"].as_u64().is_some(),
@@ -2241,8 +2526,8 @@ fn components(status: &Value, health: &Value, at: i64, stale: u64, options: Opti
                 }
                 if !read_only
                     && name == "judge"
-                    && assessment_fresh(&work["assessment"], at, stale)
-                    && let Some(reason) = judge_inventory_blocker(&work["assessment"])
+                    && usable_observation
+                    && let JudgeInventory::Blocked(reason) = judge_inventory(&work["assessment"])
                 {
                     finding = (
                         if reason == "api_dependency_unavailable" {
@@ -2325,10 +2610,7 @@ fn components(status: &Value, health: &Value, at: i64, stale: u64, options: Opti
                     let Some(dependency) = dependency else {
                         continue;
                     };
-                    if ["started_at", "last_success_at", "last_failure_at"]
-                        .into_iter()
-                        .any(|field| dependency[field].as_i64().is_some_and(|time| time > at))
-                    {
+                    if api::has_future_observation(dependency, at) {
                         finding = ("unknown", "clock_regressed", evidence_at);
                         break;
                     }
@@ -2435,6 +2717,12 @@ fn components(status: &Value, health: &Value, at: i64, stale: u64, options: Opti
         if local.1 != finding.1 && !matches!(local.0, "ok" | "disabled") {
             row["reasons"].as_array_mut().unwrap().push(json!(local.1));
         }
+        if let Some(issue) = concurrent_read_issue
+            && issue != finding.1
+            && issue != local.1
+        {
+            row["reasons"].as_array_mut().unwrap().push(json!(issue));
+        }
         row["mode"] = json!(mode);
         row["admission"] = work["admission"].clone();
         row["control"] = status["lane_controls"][name].clone();
@@ -2447,6 +2735,51 @@ fn components(status: &Value, health: &Value, at: i64, stale: u64, options: Opti
 mod tests {
     use super::*;
     use crate::config::Mode;
+
+    #[test]
+    fn managed_health_never_uses_one_lane_wait_to_cover_another_fault() {
+        let mut report = json!({
+            "checked_at":100,"hosted_identity_verified":true,
+            "issues":["shared_server_restriction"],
+            "intervention":{"unattended":true,"controller":{"ready":true}},
+            "components":{"controller":{"state":"ok"},"answer":{"state":"disabled"},
+                "mine":{"state":"disabled"},"judge":{"state":"blocked","mode":"active",
+                    "reasons":["shared_server_restriction"]}},
+            "work":{"judge":{"intervention":{"status":"automatic_recovery",
+                "reason":"shared_server_restriction","next_action":"await_retry_eligibility",
+                "observation_fresh":true,"next_at":101}}}
+        });
+        assert!(managed_health_wait(&report));
+        report["components"]["answer"] = json!({"state":"unknown","mode":"active",
+            "reasons":["shared_server_restriction"]});
+        assert!(!managed_health_wait(&report));
+        report["components"]["answer"] = json!({"state":"disabled"});
+        report["issues"] = json!(["shared_server_restriction", "state_disk_space_low"]);
+        assert!(!managed_health_wait(&report));
+        report["issues"] = json!(["shared_server_restriction"]);
+        report["work"]["judge"]["intervention"]["next_at"] = json!(100);
+        assert!(!managed_health_wait(&report));
+
+        report["work"]["judge"]["intervention"]["next_at"] = json!(103);
+        report["admission_blocked"] = json!(true);
+        report["issues"] = json!([
+            "admission_blocked",
+            "shared_server_restriction",
+            "operation_backoff"
+        ]);
+        report["components"]["judge"]["reasons"] = json!(["operation_backoff"]);
+        report["work"]["judge"]["intervention"]["reason"] = json!("operation_backoff");
+        report["participation"]["lanes"]["judge"] =
+            json!({"allowed":false,"reason":"shared_server_restriction","not_before":102});
+        assert!(managed_health_wait(&report));
+        report["participation"]["lanes"]["judge"]["not_before"] = json!(104);
+        assert!(!managed_health_wait(&report));
+        report["participation"]["lanes"]["judge"]["not_before"] = json!(102);
+        report["participation"]["lanes"]["answer"] =
+            report["participation"]["lanes"]["judge"].take();
+        report["components"]["answer"] = json!({"state":"ok","mode":"active"});
+        assert!(!managed_health_wait(&report));
+    }
 
     pub(super) fn fixture() -> (Config, Options, Value) {
         let mut config = Config::default();

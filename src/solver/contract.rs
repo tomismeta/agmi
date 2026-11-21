@@ -219,6 +219,19 @@ codes!(NativeOutcome {
     NotStarted,
     Unknown
 });
+codes!(GradeFailure {
+    ExpectedObject,
+    InvalidFields,
+    AnswerNotNull,
+    ScoreMissing,
+    ScoreNotInteger,
+    ScoreOutOfRange,
+    ReasoningMissing,
+    ReasoningNotText,
+    ReasoningTooShort,
+    ReasoningTooLong,
+});
+
 codes!(EvidenceSource {
     NativeEnvelope,
     AdapterContract,
@@ -240,6 +253,8 @@ codes!(NativeReasonCode {
     CoreGuidanceMissing,
     ExecutableUnavailable,
     UnsupportedHarnessVersion,
+    NativeQualificationUnavailable,
+    NativeQualificationFailed,
     NativeWorkspaceUnavailable,
     NativeWorkspaceCapacity,
     NativeWorkspacePermission,
@@ -314,6 +329,8 @@ impl NativeReasonCode {
             Self::InvalidSolverSetup => "invalid_solver_setup",
             Self::ExecutableUnavailable => "executable_unavailable",
             Self::UnsupportedHarnessVersion => "unsupported_harness_version",
+            Self::NativeQualificationUnavailable => "native_qualification_unavailable",
+            Self::NativeQualificationFailed => "native_qualification_failed",
             Self::ModelDeadlineExceeded => "model_deadline_exceeded",
             Self::NativeEnvelopeInvalid => "native_envelope_invalid",
             Self::NativeProvenanceMismatch => "native_provenance_mismatch",
@@ -356,6 +373,8 @@ impl NativeReasonCode {
             "artifact_kind_mismatch" => Self::ArtifactKindMismatch,
             "executable_unavailable" => Self::ExecutableUnavailable,
             "unsupported_harness_version" => Self::UnsupportedHarnessVersion,
+            "native_qualification_unavailable" => Self::NativeQualificationUnavailable,
+            "native_qualification_failed" => Self::NativeQualificationFailed,
             "model_deadline_exceeded" => Self::ModelDeadlineExceeded,
             "native_envelope_invalid" => Self::NativeEnvelopeInvalid,
             "native_provenance_mismatch" => Self::NativeProvenanceMismatch,
@@ -417,6 +436,8 @@ pub struct NativeAttemptCompletion {
     pub execution: NativeExecution,
     pub outcome: NativeOutcome,
     pub reason_code: NativeReasonCode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grade_failure: Option<GradeFailure>,
     pub collected_at: Option<i64>,
     pub preflight_started_at: Option<i64>,
     pub inference_spawned_at: Option<i64>,

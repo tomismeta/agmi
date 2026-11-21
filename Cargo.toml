@@ -37,6 +37,10 @@ include = [
     "/SECURITY.md",
 ]
 
+[features]
+# Never enabled for source-package installs or distributed binaries.
+omp-go-fixture = []
+
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
