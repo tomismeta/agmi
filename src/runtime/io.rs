@@ -670,7 +670,7 @@ mod recovery_tests {
             .launch_read(LaneId::Judge, key, Endpoint::Job, Some(job), None)
             .unwrap()
             .unwrap();
-        let (socket, path) = tokio::time::timeout(Duration::from_secs(5), accept(&listener))
+        let (socket, path) = tokio::time::timeout(Duration::from_secs(5), accept(listener))
             .await
             .unwrap();
         assert!(path.contains(&format!("/api/job/{job}")));
