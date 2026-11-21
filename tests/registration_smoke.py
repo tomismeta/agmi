@@ -583,7 +583,8 @@ def separate_init(f):
         assert lane['mode'] == 'read_only'
         assert lane['timeouts']['read_http_seconds'] > 0
         assert lane['timeouts']['http_seconds'] > 0
-        assert lane['participation']['mode'] == 'strict'
+        assert lane['participation']['mode'] == 'participation_first'
+        assert lane['participation']['max_unresolved_operations'] == 'unbounded'
     assert not any(name in configured for name in ('solver', 'timeouts', 'schedule', 'participation'))
     before = snapshot(f.root)
     assert f.status()['stage'] == 'configured'
