@@ -1132,6 +1132,7 @@ pub(crate) fn safe_read_category(category: &str) -> &'static str {
         "redirect_refused" => "redirect_refused",
         "not_found" => "not_found",
         "request_timeout" => "request_timeout",
+        crate::protocol::BOUND_JOB_EXPIRY_CONFLICT => crate::protocol::BOUND_JOB_EXPIRY_CONFLICT,
         "gone" => "gone",
         "rate_limited" => "rate_limited",
         "request_rejected" => "request_rejected",
@@ -1253,7 +1254,7 @@ struct UncertaintyAccounting {
     own_total: u64,
     own_exempt: u64,
     own_blockers: Vec<i64>,
-    legacy_floor: bool,
+    restriction_basis: Option<&'static str>,
     eligible: u64,
     exempt: u64,
     historical: Vec<HistoricalAnswer>,
@@ -1937,6 +1938,7 @@ impl Store {
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         Self::recover_interrupted_model(&tx)?;
+        Self::recover_legacy_grade_abstention(&tx)?;
         tx.execute(
             "UPDATE read_state SET in_flight=0,finished_at=?1 WHERE in_flight!=0",
             [now()],
@@ -2023,9 +2025,13 @@ impl Store {
         retry: Option<(&Operation, bool)>,
     ) -> Result<i64> {
         let (state, request) = intent;
-        if !matches!(state, "generating" | "prepared") {
-            bail!("invalid initial operation state");
-        }
+        let event = match state {
+            "generating" | "prepared" => state,
+            "abstained" if kind == LaneId::Judge && retry.is_none() => {
+                "assignment_evidence_insufficient"
+            }
+            _ => bail!("invalid initial operation state"),
+        };
         let current = tx.query_row(
             "SELECT paused,generation FROM control WHERE singleton=1",
             [],
@@ -2092,7 +2098,7 @@ impl Store {
         }
         tx.execute(
             "INSERT INTO events(at,code,kind,operation_id) VALUES (?1,?2,?3,?4)",
-            params![now(), state, kind.as_str(), id],
+            params![now(), event, kind.as_str(), id],
         )?;
         // Prepared intent alone proves no model capture. An explicit captured
         // retry retains the original capture time (including unknown), never now.
@@ -2422,11 +2428,7 @@ impl Store {
                     ON CONFLICT(operation_id) DO UPDATE SET {column}=excluded.{column}"), params![op.id,now()])?;
             }
         }
-        Self::capture_work_revision(tx)?;
-        tx.execute(
-            "DELETE FROM events WHERE id <= (SELECT COALESCE(MAX(id),0)-2000 FROM events)",
-            [],
-        )?;
+        Self::capture_and_trim_transition_events(tx)?;
         Ok(binding_revision)
     }
 
@@ -2823,6 +2825,9 @@ impl Store {
         if config.mode(LaneId::Answer) != Mode::Active {
             return Ok(Some("capability_not_active"));
         }
+        if Self::answer_job_expiry_conflict_in(db, epoch)? {
+            return Ok(Some(crate::protocol::BOUND_JOB_EXPIRY_CONFLICT));
+        }
         let (attempts,accepted): (u32,bool) = db.query_row(
             "SELECT COUNT(CASE WHEN o.id!=COALESCE(?2,-1) THEN 1 END),
             COALESCE(MAX(o.txid IS NOT NULL OR o.state IN ('included_pending','confirmed','final')),0)
@@ -2907,7 +2912,7 @@ impl Store {
         }
         if accounting.retry_not_before > cutoff.at {
             return Some((
-                if accounting.legacy_floor {
+                if accounting.restriction_basis == Some("retained_legacy_floor") {
                     "retained_legacy_floor"
                 } else {
                     "shared_server_restriction"
@@ -3165,7 +3170,11 @@ impl Store {
     }
 
     pub(crate) fn attempted(&self, kind: LaneId, key: &str) -> Result<bool> {
-        Ok(self.db.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE kind=?1 AND work_key=?2 COLLATE NOCASE AND state NOT IN ('discarded','stale','prelaunch_failed','abandoned_model','retry_model','superseded_model_unknown'))",
+        Self::attempted_in(&self.db, kind, key)
+    }
+
+    fn attempted_in(db: &Connection, kind: LaneId, key: &str) -> Result<bool> {
+        Ok(db.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE kind=?1 AND work_key=?2 COLLATE NOCASE AND state NOT IN ('discarded','stale','prelaunch_failed','abandoned_model','retry_model','superseded_model_unknown'))",
             params![kind.as_str(),key], |r| r.get(0))?)
     }
 
@@ -3231,6 +3240,15 @@ impl Store {
             )
             .optional()?
             .unwrap_or(0))
+    }
+
+    fn capture_and_trim_transition_events(db: &Connection) -> Result<()> {
+        Self::capture_work_revision(db)?;
+        db.execute(
+            "DELETE FROM events WHERE id <= (SELECT COALESCE(MAX(id),0)-2000 FROM events)",
+            [],
+        )?;
+        Ok(())
     }
 
     fn capture_work_revision(db: &Connection) -> Result<()> {

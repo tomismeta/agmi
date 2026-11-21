@@ -9,7 +9,7 @@ use reqwest::{
     Client, Url,
     header::{HeaderValue, RETRY_AFTER},
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
@@ -21,6 +21,7 @@ use std::{
 pub mod reports;
 mod transport;
 use std::sync::atomic::{AtomicU64, Ordering};
+pub(crate) use transport::HostedIdentityBody;
 pub use transport::{
     EffectDeadline, HostedResponse, ReadDeadline, RequestContext, RequestMeta, RestrictionBasis,
     RestrictionEvidence, RestrictionScope,
@@ -76,6 +77,7 @@ impl EffectIntent {
     }
 }
 const HALT_MIDDLEWARE_ERROR: &str = "endpoint temporarily halted — API hardening in progress";
+pub(crate) const BOUND_JOB_EXPIRY_CONFLICT: &str = "bound_job_expiry_conflict";
 
 /// Bounded diagnostics only; these categories never establish a write outcome.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -445,7 +447,7 @@ impl Protocol {
         .await
     }
     /// Validate synchronously before the caller journals a possible network effect.
-    pub fn prepare_submission(
+    fn prepare_submission(
         &self,
         kind: LaneId,
         payload: &Value,
@@ -575,7 +577,8 @@ impl Protocol {
                 }
             }
         }
-        let Ok(body) = serde_json::from_slice::<Value>(&bytes) else {
+        let Ok(body) = decode_hosted_body(&bytes, context.endpoint, context.meta.owner, status)
+        else {
             return Ok(unavailable(ReadFailure::InvalidJson));
         };
         if let Some(key) = &key {
@@ -593,6 +596,123 @@ impl Protocol {
             retry_after_seconds: max_delay(header_delay, body_delay),
             read_failure: None,
         }))
+    }
+}
+
+fn decode_hosted_body(
+    bytes: &[u8],
+    endpoint: Endpoint,
+    owner: Option<LaneId>,
+    status: u16,
+) -> serde_json::Result<Value> {
+    if endpoint != Endpoint::Job
+        || status != 408
+        || !matches!(owner, Some(LaneId::Answer | LaneId::Judge))
+    {
+        return serde_json::from_slice(bytes);
+    }
+    let decoded: JobTimeoutBody = serde_json::from_slice(bytes)?;
+    if decoded.expiry_hint && decoded.duplicate_key {
+        // Preserve a complete, contradictory observation for the durable
+        // expiry fence, but discard all ambiguous fields and candidates.
+        return Ok(serde_json::json!({"code": BOUND_JOB_EXPIRY_CONFLICT}));
+    }
+    Ok(decoded.body)
+}
+
+struct JobTimeoutBody {
+    body: Value,
+    duplicate_key: bool,
+    expiry_hint: bool,
+}
+
+impl JobTimeoutBody {
+    fn plain(body: Value) -> Self {
+        Self {
+            body,
+            duplicate_key: false,
+            expiry_hint: false,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for JobTimeoutBody {
+    fn deserialize<D: de::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+
+        impl<'de> de::Visitor<'de> for Visitor {
+            type Value = JobTimeoutBody;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a JSON value")
+            }
+
+            fn visit_map<M: de::MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
+                let mut body = serde_json::Map::new();
+                let mut duplicate_key = false;
+                let mut expiry_hint = false;
+                while let Some((key, member)) = map.next_entry::<String, JobTimeoutBody>()? {
+                    // Inspect every occurrence before map insertion can replace it.
+                    // An object-valued error can also carry an expiry claim.
+                    expiry_hint |= match key.as_str() {
+                        "state" => member.body == "expired",
+                        "code" => member.body == "job_expired",
+                        "error" => member.body == "job_expired" || member.expiry_hint,
+                        _ => false,
+                    };
+                    duplicate_key |= member.duplicate_key | body.insert(key, member.body).is_some();
+                }
+                Ok(JobTimeoutBody {
+                    body: Value::Object(body),
+                    duplicate_key,
+                    expiry_hint,
+                })
+            }
+
+            fn visit_seq<S: de::SeqAccess<'de>>(self, mut seq: S) -> Result<Self::Value, S::Error> {
+                let mut body = Vec::new();
+                let mut duplicate_key = false;
+                while let Some(member) = seq.next_element::<JobTimeoutBody>()? {
+                    duplicate_key |= member.duplicate_key;
+                    body.push(member.body);
+                }
+                Ok(JobTimeoutBody {
+                    body: Value::Array(body),
+                    duplicate_key,
+                    expiry_hint: false,
+                })
+            }
+
+            fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+                Ok(JobTimeoutBody::plain(Value::Null))
+            }
+
+            fn visit_bool<E: de::Error>(self, value: bool) -> Result<Self::Value, E> {
+                Ok(JobTimeoutBody::plain(value.into()))
+            }
+
+            fn visit_i64<E: de::Error>(self, value: i64) -> Result<Self::Value, E> {
+                Ok(JobTimeoutBody::plain(value.into()))
+            }
+
+            fn visit_u64<E: de::Error>(self, value: u64) -> Result<Self::Value, E> {
+                Ok(JobTimeoutBody::plain(value.into()))
+            }
+
+            fn visit_f64<E: de::Error>(self, value: f64) -> Result<Self::Value, E> {
+                Ok(JobTimeoutBody::plain(value.into()))
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(JobTimeoutBody::plain(value.into()))
+            }
+
+            fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
+                Ok(JobTimeoutBody::plain(value.into()))
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
     }
 }
 
@@ -908,31 +1028,45 @@ fn unknown(reason: &str) -> Outcome {
     }
 }
 
+fn processing_evidence(body: &Value) -> bool {
+    body.get("ok") == Some(&Value::Bool(true))
+        || body.get("success") == Some(&Value::Bool(true))
+        || body.get("next_nonce").is_some()
+        || body.get("attested").is_some()
+        || body.get("processed").is_some_and(|value| value != false)
+        || matches!(
+            body.get("status").and_then(Value::as_str),
+            Some(
+                "accepted"
+                    | "queued"
+                    | "running"
+                    | "processing"
+                    | "processed"
+                    | "done"
+                    | "included"
+                    | "confirmed"
+                    | "final"
+                    | "completed"
+            )
+        )
+}
+
 pub fn classify_source(kind: LaneId, response: &Response, source: ResponseSource) -> Outcome {
     let body = &response.body;
     if response.read_failure.is_some() || !body.is_object() {
         return unknown("response_shape_unknown");
     }
-    let code = error_code(body);
-    if let (Some(code), Some(error)) = (
-        body.get("code").and_then(Value::as_str),
-        body.get("error").and_then(Value::as_str),
-    ) && code != error
-    {
-        return unknown("conflicting_error_codes");
-    }
+    let explicit_code = body.get("code").and_then(Value::as_str);
+    let explicit_error = body.get("error").and_then(Value::as_str);
+    let code = explicit_code.or(explicit_error);
+    let conflicting_codes = explicit_code
+        .zip(explicit_error)
+        .is_some_and(|(code, error)| code != error);
     let refused_submit = source == ResponseSource::Submit
         && (response.status == 429
             || (kind != LaneId::Mine
                 && response.status == 503
                 && matches!(code, Some("epoch_closing" | HALT_MIDDLEWARE_ERROR))));
-    if body.get("state").is_some_and(|state| !state.is_string()) {
-        return unknown(if refused_submit {
-            "contradictory_acceptance"
-        } else {
-            "job_state_unknown"
-        });
-    }
     let state = body.get("state").and_then(Value::as_str);
     let has_tx = ["id", "challenge_txid", "txid"]
         .iter()
@@ -942,6 +1076,41 @@ pub fn classify_source(kind: LaneId, response: &Response, source: ResponseSource
         .iter()
         .any(|field| body.get(field).is_some_and(|value| value != false))
         || matches!(state, Some("queued" | "running" | "processing"));
+    if kind != LaneId::Mine
+        && source == ResponseSource::BoundJob
+        && response.status == 408
+        && (explicit_code == Some(BOUND_JOB_EXPIRY_CONFLICT)
+            || [explicit_code, explicit_error].contains(&Some("job_expired")))
+    {
+        return if explicit_code == Some(BOUND_JOB_EXPIRY_CONFLICT)
+            || has_job
+            || state != Some("expired")
+            || ["code", "error"]
+                .iter()
+                .any(|field| body.get(field).is_some_and(|value| value != "job_expired"))
+            || has_tx
+            || accepting
+            || processing_evidence(body)
+            || ["ok", "success"]
+                .iter()
+                .any(|field| body.get(field).is_some_and(|value| value != false))
+            || body.get("status").is_some_and(|value| value != "expired")
+        {
+            unknown(BOUND_JOB_EXPIRY_CONFLICT)
+        } else {
+            Outcome::Expired
+        };
+    }
+    if conflicting_codes {
+        return unknown("conflicting_error_codes");
+    }
+    if body.get("state").is_some_and(|state| !state.is_string()) {
+        return unknown(if refused_submit {
+            "contradictory_acceptance"
+        } else {
+            "job_state_unknown"
+        });
+    }
     // Acceptance evidence wins over refusal hints. Contradictory evidence must
     // never authorize a new write, even for an otherwise known refusal code.
     if response.status == 202 || code == Some("duplicate_in_flight") {
@@ -977,26 +1146,7 @@ pub fn classify_source(kind: LaneId, response: &Response, source: ResponseSource
         // Every 429 rejects before enqueue/write, including hosted mining.
         // The identified halt middleware covers answer/judge routes only;
         // diagnostic halt flags alone do not identify that middleware.
-        if has_tx
-            || state.is_some()
-            || body.get("ok") == Some(&Value::Bool(true))
-            || body.get("success") == Some(&Value::Bool(true))
-            || body.get("next_nonce").is_some()
-            || body.get("attested").is_some()
-            || body.get("processed").is_some_and(|value| value != false)
-            || matches!(
-                body.get("status").and_then(Value::as_str),
-                Some(
-                    "accepted"
-                        | "queued"
-                        | "running"
-                        | "processing"
-                        | "done"
-                        | "included"
-                        | "completed"
-                )
-            )
-        {
+        if has_tx || state.is_some() || processing_evidence(body) {
             return unknown("contradictory_acceptance");
         }
         return Outcome::Retry {
@@ -1009,13 +1159,6 @@ pub fn classify_source(kind: LaneId, response: &Response, source: ResponseSource
         };
     }
     if kind != LaneId::Mine && !has_tx {
-        if source == ResponseSource::BoundJob
-            && response.status == 408
-            && code == Some("job_expired")
-            && state == Some("expired")
-        {
-            return Outcome::Expired;
-        }
         let rejected = match kind {
             LaneId::Answer => {
                 response.status == 409
@@ -2331,6 +2474,99 @@ mod tests {
             classify_source(LaneId::Answer, &expired, ResponseSource::BoundJob),
             Outcome::Expired
         );
+        for kind in [LaneId::Answer, LaneId::Judge] {
+            for indicator in [
+                json!({"processed":true}),
+                json!({"processed":"true"}),
+                json!({"next_nonce":7}),
+                json!({"code":"other_error","processed":true}),
+                json!({"ok":"true"}),
+                json!({"status":"completed"}),
+                json!({"status":"success"}),
+                json!({"code":true}),
+                json!({"accepted":true}),
+                json!({"success":true}),
+                json!({"job_id":"bound"}),
+                json!({"id":txid()}),
+            ] {
+                let mut body = indicator;
+                body["state"] = json!("expired");
+                body["error"] = json!("job_expired");
+                assert_eq!(
+                    classify_source(kind, &response(408, body), ResponseSource::BoundJob),
+                    unknown(BOUND_JOB_EXPIRY_CONFLICT)
+                );
+            }
+            let malformed = response(
+                408,
+                json!({"state":"expired","code":"job_expired","error":true}),
+            );
+            assert_eq!(
+                classify_source(kind, &malformed, ResponseSource::BoundJob),
+                unknown(BOUND_JOB_EXPIRY_CONFLICT)
+            );
+            let unprocessed = response(
+                408,
+                json!({"state":"expired","error":"job_expired","status":"expired","processed":false}),
+            );
+            assert_eq!(
+                classify_source(kind, &unprocessed, ResponseSource::BoundJob),
+                Outcome::Expired
+            );
+        }
+    }
+
+    #[test]
+    fn bound_expiry_rejects_duplicate_keys_in_raw_http_bodies() {
+        for kind in [LaneId::Answer, LaneId::Judge] {
+            for bytes in [
+                &br#"{"state":"expired","error":"job_expired","processed":true,"processed":false}"#[..],
+                br#"{"state":"expired","error":"job_expired","processed":true,"proces\u0073ed":false}"#,
+                br#"{"state":"done","state":"expired","code":"job_expired"}"#,
+                br#"{"state":"expired","error":"other_error","error":"job_expired"}"#,
+                br#"{"state":"expired","error":"job_expired","status":"processing","status":"expired"}"#,
+                br#"{"code":"job_expired","code":"duplicate_in_flight","job_id":"other-job"}"#,
+                br#"{"error":{"code":"job_expired","code":"other_error"}}"#,
+                br#"{"code":"job_expired","error":{"processed":true,"processed":false}}"#,
+                br#"{"state":"expired","error":"job_expired","metadata":[{"same":1,"same":1}]}"#,
+            ] {
+                let body = decode_hosted_body(bytes, Endpoint::Job, Some(kind), 408).unwrap();
+                // A complete object carries the conflict into the durable read fence.
+                assert!(body.is_object());
+                let observed = response(408, body);
+                assert_eq!(
+                    classify_source(kind, &observed, ResponseSource::BoundJob),
+                    unknown(BOUND_JOB_EXPIRY_CONFLICT),
+                    "{bytes:?}",
+                );
+                assert!(response_candidates(&observed).job_id.is_none());
+            }
+            for bytes in [
+                &br#"{"state":"expired","error":"job_expired"}"#[..],
+                br#"{"state":"expired","code":"job_expired","status":"expired","processed":false}"#,
+            ] {
+                let body = decode_hosted_body(bytes, Endpoint::Job, Some(kind), 408).unwrap();
+                assert_eq!(
+                    classify_source(kind, &response(408, body), ResponseSource::BoundJob),
+                    Outcome::Expired,
+                );
+            }
+        }
+
+        let duplicate =
+            br#"{"state":"expired","error":"job_expired","processed":true,"processed":false}"#;
+        for (endpoint, kind, status) in [
+            (Endpoint::Status, LaneId::Answer, 408),
+            (Endpoint::Grade, LaneId::Judge, 408),
+            (Endpoint::Job, LaneId::Answer, 200),
+            (Endpoint::Job, LaneId::Mine, 408),
+        ] {
+            let body = decode_hosted_body(duplicate, endpoint, Some(kind), status).unwrap();
+            assert_eq!(body["processed"], false);
+        }
+        let timeout = br#"{"error":"temporary","error":"request_timeout"}"#;
+        let body = decode_hosted_body(timeout, Endpoint::Job, Some(LaneId::Answer), 408).unwrap();
+        assert_eq!(body["error"], "request_timeout");
     }
 
     #[test]

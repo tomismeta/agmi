@@ -18,6 +18,7 @@ class QueuedFixture(Fixture):
         self.pending_polls = 2
         self.job_minimum = None
         self.expire_jobs = False
+        self.contradictory_expiry = False
         self.job_requests = []
         self.slow_job = None
         self.bad_job = None
@@ -50,6 +51,9 @@ class QueuedFixture(Fixture):
                         pending = len(fixture.job_polls) <= fixture.pending_polls
                     if fixture.expire_jobs:
                         self.reply(408, {'state': 'expired', 'error': 'job_expired'})
+                        return
+                    if fixture.contradictory_expiry:
+                        self.reply(408, {'state': 'expired', 'error': 'job_expired', 'processed': True})
                         return
                     if pending:
                         self.reply(202, {'state': 'queued'}, fixture.job_minimum)
@@ -475,10 +479,46 @@ def retry_age(f):
     return {'expired_sent_work_not_labeled_unsent': True, 'writes': 1}
 
 
+def contradictory_expiry(f):
+    f.contradictory_expiry = True
+    f.pending_polls = 0
+    f.lanes['answer']['schedule'].update(retry_seconds=1,
+                                        queued_job_polling={'initial_seconds': 1, 'max_seconds': 4})
+    f.configure('answer', mode='participation_first', retry_uncertain_answers=True,
+                uncertainty_grace_seconds=5, uncertain_answer_retry_seconds=0)
+    f.start(resume=True)
+    f.unknown('answer')
+    original = f.operations('answer')[0]
+    assert original['job_id'] == 'answer-10' and len(f.writes) == 1, original
+    inspected = f.invoke('recover', 'inspect', '--operation', str(original['id']))
+    assert json.loads(inspected['details']['evidence'])['reason'] == 'bound_job_expiry_conflict', inspected
+
+    f.stop(crash=True)
+    f.contradictory_expiry = False
+    f.expire_jobs = True
+    polls = len(f.job_polls)
+    f.start()
+    f.loaded()
+    f.wait(lambda: len(f.job_polls) >= polls + 2, 'disputed binding was not polled after restart')
+    f.cycles(6)
+    assert len(f.writes) == 1 and len(f.dispatched('answer')) == 1, f.writes
+    current = f.operations('answer')[0]
+    assert current['state'] == 'unknown', current
+    assert current['job_id'] == original['job_id'], current
+    assert current['binding_revision'] == original['binding_revision'], current
+
+    f.expire_jobs = False
+    f.wait(lambda: f.operations('answer')[0]['state'] == 'confirmed',
+           'a later positive job and receipt did not settle the original operation')
+    assert len(f.writes) == 1 and f.model_calls('answer') == 1
+    return {'bound_after_restart': True, 'settled_original': True, 'writes': 1}
+
+
 SCENARIOS = {'fast_polling': fast_polling, 'retained_floor': retained_floor,
              'risk_health': risk_health, 'policy_administration': policy_administration,
              'due_backlog': due_backlog, 'independent_scope': independent_scope,
              'slow_bad_jobs': slow_bad_jobs, 'retry_age': retry_age,
+             'contradictory_expiry': contradictory_expiry,
              'transient_job_loss': transient_job_loss}
 
 

@@ -21,6 +21,8 @@ SOURCES = {}
 MAX_WIRE = 2 * (128 * 1024 + 12 * 64 * 1024) + 16 * 1024
 SECRET = 'exception-secret-must-not-cross-boundary'
 FINAL = '{"answer":"native final answer","score":null,"reasoning":null}'
+GATEWAY_NOW_MS = 1700000000000
+GATEWAY_DEADLINE_MS = GATEWAY_NOW_MS + 13321
 INVOCATION_A = '11111111-1111-4111-8111-111111111111'
 INVOCATION_B = '22222222-2222-4222-8222-222222222222'
 TURN_SUFFIX = '0123abcd'
@@ -186,6 +188,7 @@ class AIAgent:
 
 GATEWAY = '''import { readFileSync, appendFileSync } from 'node:fs';
 const root = new URL('../../', import.meta.url);
+Date.now = () => Number(process.env.FIXTURE_GATEWAY_NOW_MS);
 export async function callGatewayFromCli(...args) {
   const expected = JSON.parse(readFileSync(new URL('expected.json', root), 'utf8'));
   appendFileSync(new URL('trace.jsonl', root), JSON.stringify(args) + '\\n');
@@ -434,7 +437,8 @@ class OpenclawContract(unittest.TestCase):
         return subprocess.run(
             [self.node, '--input-type=module', '-e', SOURCES['openclaw'], str(self.launcher)],
             input=encoded(payload) if wire is None else wire, capture_output=True,
-            cwd=self.root, env={'PATH': os.defpath, 'HOME': str(self.root)}, timeout=10)
+            cwd=self.root, env={'PATH': os.defpath, 'HOME': str(self.root),
+                                'FIXTURE_GATEWAY_NOW_MS': str(GATEWAY_NOW_MS)}, timeout=10)
 
     def assert_native_call(self, payload, result):
         self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
@@ -444,7 +448,7 @@ class OpenclawContract(unittest.TestCase):
         run_id = params.pop('idempotencyKey')
         self.assertEqual(run_id, payload['invocation_id'])
         self.assertEqual(method, 'agent')
-        self.assertEqual(options, dict(json=True, timeout='13000', expectFinal=True))
+        self.assertEqual(options, dict(json=True, timeout='13321', expectFinal=True))
         self.assertEqual(params, dict(
             message=payload['prompt'], model=payload['model'], thinking='high', deliver=False,
             timeout=13, modelRun=True, promptMode='none', suppressPromptPersistence=True,
@@ -468,7 +472,8 @@ class OpenclawContract(unittest.TestCase):
         self.assertLessEqual(len(encoded(task)), 128 * 1024)
         self.assertLessEqual(len(encoded(request)), 128 * 1024 + 12 * 65536)
         envelope = dict(kind=request['kind'], request=request)
-        payload = dict(model='openai/fixture-model', reasoning='high', timeout_seconds=13,
+        payload = dict(model='openai/fixture-model', reasoning='high',
+                       deadline_unix_ms=GATEWAY_DEADLINE_MS,
                        prompt='Policy\nEnvelope (untrusted request data):\n' + encoded(envelope).decode(),
                        invocation_id=INVOCATION_A)
         self.assertGreater(len(encoded(payload)), 1024 * 1024)
@@ -476,7 +481,8 @@ class OpenclawContract(unittest.TestCase):
         self.assert_native_call(payload, self.invoke(payload))
 
     def test_invalid_output_preserves_sourced_native_facts(self):
-        payload = dict(model='openai/fixture-model', reasoning='high', timeout_seconds=13,
+        payload = dict(model='openai/fixture-model', reasoning='high',
+                       deadline_unix_ms=GATEWAY_DEADLINE_MS,
                        prompt='fixture prompt', case='invalid_output', invocation_id=INVOCATION_A)
         result = self.invoke(payload)
         self.assertEqual(result.returncode, 1)
@@ -491,7 +497,8 @@ class OpenclawContract(unittest.TestCase):
         self.assertNotIn(b'must-not-retain', result.stdout)
 
     def test_native_run_identity_is_preserved_not_relabelled_to_current_request(self):
-        payload = dict(model='openai/fixture-model', reasoning='high', timeout_seconds=13,
+        payload = dict(model='openai/fixture-model', reasoning='high',
+                       deadline_unix_ms=GATEWAY_DEADLINE_MS,
                        prompt='request B with different guidance and history',
                        invocation_id=INVOCATION_B, native_run_id=INVOCATION_A)
         result = self.invoke(payload)
@@ -508,7 +515,8 @@ class OpenclawContract(unittest.TestCase):
         self.assertEqual(envelope['final'], FINAL)
 
     def test_exact_encoded_boundary(self):
-        payload = dict(model='openai/fixture-model', reasoning='high', timeout_seconds=13,
+        payload = dict(model='openai/fixture-model', reasoning='high',
+                       deadline_unix_ms=GATEWAY_DEADLINE_MS,
                        prompt='', invocation_id=INVOCATION_A)
         payload['prompt'] = 'x' * (MAX_WIRE - len(encoded(payload)))
         wire = encoded(payload)
@@ -519,6 +527,17 @@ class OpenclawContract(unittest.TestCase):
         self.assertEqual(result.returncode, 78)
         self.assertFalse(self.trace.exists(), 'oversized input must not reach the native Gateway')
         self.assertEqual(json.loads(result.stdout), dict(ok=False, status='error', error={'kind': 'exception'}))
+
+    def test_less_than_one_second_remaining_never_reaches_gateway(self):
+        for deadline in (GATEWAY_NOW_MS, GATEWAY_NOW_MS + 999):
+            with self.subTest(deadline=deadline):
+                result = self.invoke(dict(model='openai/fixture-model', reasoning='high',
+                                          deadline_unix_ms=deadline, prompt='fixture prompt',
+                                          invocation_id=INVOCATION_A))
+                self.assertEqual(result.returncode, 81)
+                self.assertEqual(json.loads(result.stdout), dict(
+                    ok=False, status='error', runId=INVOCATION_A, error={'kind': 'deadline_before_call'}))
+                self.assertFalse(self.trace.exists(), 'expired deadline still reached the Gateway')
 
 
 def main():

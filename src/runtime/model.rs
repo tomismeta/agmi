@@ -3,7 +3,8 @@ use crate::runtime::answer::AnswerInputMatch;
 use crate::runtime::judge::GradeInputMatch;
 use crate::solver::contract::*;
 use crate::solver::{
-    InferenceStart, PendingLaunch, PreflightCompletion, PreflightStart, start_preflight,
+    InferenceStart, PendingLaunch, PreflightCompletion, PreflightStart, ReceivedInference,
+    start_preflight,
 };
 use crate::store::ModelProducerDraft;
 
@@ -16,7 +17,7 @@ enum Stage {
     Admitting,
     Running {
         task: tokio::task::JoinHandle<()>,
-        result: oneshot::Receiver<NativeCompletion>,
+        result: oneshot::Receiver<ReceivedInference>,
     },
 }
 struct ModelWork {
@@ -40,6 +41,7 @@ impl Drop for ModelWork {
 #[derive(Default)]
 struct ModelSlot {
     work: Option<ModelWork>,
+    setup_rejected: bool,
 }
 #[derive(Default)]
 pub(in crate::runtime) struct AnswerModelSlot(ModelSlot);
@@ -138,12 +140,25 @@ impl ModelSlot {
         {
             return Ok(false);
         }
-        let model = host.config.model(kind).context("model route missing")?;
-        let selection = ModelSelection::new(model)?;
-        let timeout = host
+        let setup = host
             .config
-            .model_seconds(kind)
-            .context("model deadline missing")?;
+            .model(kind)
+            .zip(host.config.model_seconds(kind))
+            .and_then(|(model, timeout)| {
+                let selection = ModelSelection::new(model).ok()?;
+                Some((model, timeout, selection))
+            });
+        let Some((model, timeout, selection)) = setup else {
+            // There is no valid producer to journal, and no discovery or inference started.
+            // Keep a bounded, lane-local diagnostic without committing or charging an attempt.
+            if !self.setup_rejected {
+                host.store
+                    .event(NativeReasonCode::InvalidSolverSetup.as_str(), Some(kind))?;
+                self.setup_rejected = true;
+            }
+            return Ok(false);
+        };
+        self.setup_rejected = false;
         let count = host.store.attempt_count(kind, key)?;
         let mut wire = request.request().clone();
         wire.id = digest(format!("{}:attempt:{}", wire.id, count + 1));
@@ -296,7 +311,7 @@ impl ModelSlot {
                 }
             },
             Stage::Running { result, .. } => match result.try_recv() {
-                Ok(completion) => Some(completion),
+                Ok(received) => Some(received.finish()),
                 Err(oneshot::error::TryRecvError::Empty) => None,
                 Err(oneshot::error::TryRecvError::Closed) => {
                     Some(Self::interrupted(work, true, None))
@@ -407,7 +422,7 @@ impl ModelSlot {
                 let (sender, result) = oneshot::channel();
                 let wake = Arc::clone(&host.wake);
                 let task = tokio::spawn(async move {
-                    let _ = sender.send(flight.collect().await);
+                    let _ = sender.send(flight.receive().await);
                     wake.notify_one();
                 });
                 work.stage = Stage::Running { task, result };
@@ -578,6 +593,7 @@ impl ModelSlot {
         host: &mut HostAccess,
         deadline: tokio::time::Instant,
     ) -> Result<()> {
+        // Drain any published completion without advancing pending work.
         self.collect(host)?;
         let Some(mut work) = self.work.take() else {
             return Ok(());
@@ -591,7 +607,8 @@ impl ModelSlot {
             }
             Stage::Pending | Stage::Admitting => {}
         }
-        // An assembled terminal result wins over conservative cancellation classification.
+        // Published omp evidence is checked here, on the same owner that
+        // classifies interruption. Process cleanup cannot erase that evidence.
         let completion = match &mut work.stage {
             Stage::Preflight { result, .. } => match result.try_recv() {
                 Ok(PreflightCompletion::Finished(completion)) => completion,
@@ -603,6 +620,7 @@ impl ModelSlot {
             },
             Stage::Running { result, .. } => result
                 .try_recv()
+                .map(ReceivedInference::finish)
                 .unwrap_or_else(|_| Self::interrupted(&work, true, Some(cancelled))),
             _ => Self::interrupted(&work, running, None),
         };
@@ -724,3 +742,81 @@ impl HostAccess {
 #[cfg(test)]
 #[path = "model_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+    use crate::config::Harness;
+    use crate::runtime::host::tests::{fixture_with, identity_fixture, observation, task_request};
+
+    #[test]
+    fn malformed_omp_reload_retains_the_last_route_and_recovers_when_corrected() {
+        let (_temp, mut host, _stop) = fixture_with(Config::default());
+        let previous = host.config.revision().unwrap();
+        let mut candidate = host.config.clone();
+        candidate.capabilities.answer.model.harness = Harness::Omp;
+        candidate.capabilities.answer.model.executable = "omp".into();
+        std::fs::write(&host.config_path, toml::to_string(&candidate).unwrap()).unwrap();
+        host.reload().unwrap();
+        assert!(host.reload_blocked);
+        assert_eq!(host.config.revision().unwrap(), previous);
+
+        candidate.capabilities.answer.model.model = "fixture/namespace/model".into();
+        candidate.capabilities.answer.model.reasoning = "max".into();
+        std::fs::write(&host.config_path, toml::to_string(&candidate).unwrap()).unwrap();
+        host.reload().unwrap();
+        assert!(!host.reload_blocked);
+        assert_eq!(
+            host.config.revision().unwrap(),
+            candidate.revision().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_model_setup_records_a_lane_event_without_an_attempt() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = Config::default();
+        config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
+        config.capabilities.answer.mode = Mode::Active;
+        config.capabilities.judge.mode = Mode::Active;
+        let route = &mut config.capabilities.answer.model;
+        route.harness = Harness::Omp;
+        route.model = "fixture/namespace/model".into();
+        // A native setup bound remains defensive even after config parsing succeeded.
+        route.executable = "x".repeat(4097).into();
+        let (_temp, mut host, _stop) = fixture_with(config);
+        identity_fixture(&mut host, &listener).await;
+        let observed = observation(&host, LaneId::Answer);
+        let mut slot = AnswerModelSlot::default();
+        for _ in 0..2 {
+            let task = AnswerTask::new(task_request(&host, LaneId::Answer)).unwrap();
+            assert!(
+                !host
+                    .begin_answer_model(
+                        &mut slot,
+                        task,
+                        "fingerprint".into(),
+                        "8:invalid",
+                        None,
+                        &observed,
+                    )
+                    .unwrap()
+            );
+        }
+        assert!(!slot.occupied());
+        assert!(host.active(LaneId::Judge).unwrap());
+        let db = rusqlite::Connection::open(host.config.state_dir.join("state.sqlite3")).unwrap();
+        let count: i64 = db
+            .query_row("SELECT count(*) FROM operations", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+        let diagnostics: i64 = db
+            .query_row(
+                "SELECT count(*) FROM events WHERE code=?1 AND kind='answer' AND operation_id IS NULL",
+                [NativeReasonCode::InvalidSolverSetup.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(diagnostics, 1);
+    }
+}

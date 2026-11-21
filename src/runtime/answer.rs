@@ -443,6 +443,88 @@ mod tests {
         assert_eq!(producer.preflight_admission.lane_control_revision, 7);
     }
 
+    #[tokio::test]
+    async fn newer_challenge_releases_ready_slot_for_targeted_refresh() {
+        use crate::runtime::host::tests::{fixture_with, observation, store};
+        use crate::store::{LaneObservation, LaneObservationStamp};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = crate::config::Config::default();
+        config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
+        config.capabilities.answer.mode = Mode::Active;
+        let (_temp, mut runtime, _stop) = fixture_with(config);
+        let lane = LaneId::Answer;
+        let (challenge, _, _, _) = inputs();
+        let input =
+            serde_json::to_value(runtime.challenge_input(lane, &challenge).unwrap()).unwrap();
+        let observed = observation(&runtime, lane);
+        let journal = store(&mut runtime);
+        // Only the targeted refresh should run, not the ordinary read.
+        journal.defer(lane, 3600).unwrap();
+        let mut op = journal
+            .seed_operation_for_test(
+                lane,
+                "8:original",
+                "prepared",
+                &input,
+                journal.control().unwrap(),
+                &observed.stamp.lane_config_revision,
+            )
+            .unwrap();
+        let payload = json!({"answer":"captured"});
+        op.payload = Some(payload.clone());
+        journal.seed_transition_for_test(&op, "prepared").unwrap();
+        let binding = journal.operation_binding(&op).unwrap();
+        let apply = |journal: &crate::store::Store, sequence, answered| {
+            assert!(
+                journal
+                    .observe_lane(
+                        lane,
+                        LaneObservationStamp {
+                            authority_epoch: observed.stamp.authority_epoch,
+                            generation: observed.stamp.account_generation,
+                            request_sequence: sequence,
+                            started_at: 1,
+                            completed_at: 1,
+                        },
+                        LaneObservation {
+                            epoch: challenge.epoch,
+                            answered,
+                            fingerprint: &challenge.fingerprint,
+                            challenge: &json!({"answered":answered}),
+                        },
+                        &observed.stamp,
+                    )
+                    .unwrap()
+            );
+        };
+        apply(journal, 1, false);
+        let mut answer = AnswerLane {
+            ready: Some(
+                runtime
+                    .answer_ready(
+                        crate::protocol::AnswerIntent::new(&payload).unwrap(),
+                        binding,
+                        observed.clone(),
+                    )
+                    .unwrap(),
+            ),
+            ..AnswerLane::default()
+        };
+        apply(store(&mut runtime), 2, false);
+        answer.plan(&mut AnswerServices::new(&mut runtime)).unwrap();
+        assert!(answer.ready.is_some());
+        assert!(answer.read.is_none());
+
+        apply(store(&mut runtime), 3, true);
+        answer.plan(&mut AnswerServices::new(&mut runtime)).unwrap();
+        assert!(answer.ready.is_none());
+        assert!(matches!(
+            answer.read.as_ref().and_then(|read| read.target.as_ref()),
+            Some(Target::Prepared(current)) if current.id == op.id
+        ));
+    }
+
     #[test]
     fn pending_and_prepared_answer_share_every_challenge_field_and_mine_answer_policy() {
         for changed in [

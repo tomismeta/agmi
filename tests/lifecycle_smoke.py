@@ -42,9 +42,8 @@ def safe(text):
 class LifecycleFixture(Fixture):
     def __init__(self, binary, root):
         self.identity_reads = []
-        self.identity_backoff_once = False
-        self.identity_retry_at = None
-        self.identity_backoff_at = None
+        self.identity_read_times = []
+        self.identity_response_once = None
         super().__init__(binary, root)
 
     def handler(self):
@@ -57,13 +56,12 @@ class LifecycleFixture(Fixture):
                     key = self.headers.get('X-Api-Key')
                     with fixture.lock:
                         fixture.identity_reads.append(key)
-                        if fixture.identity_backoff_once:
-                            fixture.identity_backoff_once = False
-                            fixture.identity_backoff_at = time.monotonic()
-                            self.reply(503, {'ok': False}, retry_after=1)
-                            return
-                        if fixture.identity_backoff_at is not None:
-                            fixture.identity_retry_at = time.monotonic()
+                        fixture.identity_read_times.append(time.monotonic())
+                        response = fixture.identity_response_once
+                        fixture.identity_response_once = None
+                    if response is not None:
+                        self.reply(*response)
+                        return
                     if key not in SECRETS or key == REJECTED:
                         self.reply(401, {'ok': False})
                         return
@@ -201,13 +199,56 @@ def init(f):
         failure = json.loads(output)['error']
         assert failure['code'] == code and failure['details']['reason'] == reason, output
         assert snapshot(f.root) == before and not target.exists()
-    f.identity_backoff_once = True
-    target = f.root / 'rate-limited'
-    output = f.cli(target / 'config.toml', f.init_args(target) + ['--key-stdin'], OLD, succeeds=False)
-    failure = json.loads(output)['error']
-    assert failure['code'] == 'identity_verification_backoff'
-    assert failure['details']['http_status'] == 503 and failure['details']['retry_after_seconds'] == 1
-    assert not target.exists()
+    for i, chain_id in enumerate((None, 17, '', 'invalid chain', 'different-chain')):
+        target = f.root / f'chain-evidence-{i}'
+        expected = (
+            ('credential_identity_unverified', 'account_or_chain_mismatch')
+            if chain_id == 'different-chain'
+            else ('identity_verification_unavailable', 'identity_response_invalid')
+        )
+        f.identity_response_once = (200, {'address': f.address, 'chain_id': chain_id})
+        before = snapshot(f.root)
+        count = len(f.identity_reads)
+        output = f.cli(target / 'config.toml', f.init_args(target) + ['--key-stdin'], OLD, succeeds=False)
+        error = json.loads(output)['error']
+        assert (error['code'], error['details']['reason']) == expected, safe(output)
+        assert error['details']['transient'] is False
+        assert len(f.identity_reads) == count + 1
+        assert snapshot(f.root) == before and not target.exists()
+    for name, status, header, server_wait, local_wait, basis, mode in (
+        ('server-minimum', 503, 1, 1, None, 'server_retry_after', 'stdin'),
+        ('bare-cooldown', 429, None, None, 30, 'local_unscoped429_cooldown', 'file'),
+        ('malformed-minimum', 429, 'invalid', None, 30, 'local_unscoped429_cooldown', 'stdin'),
+    ):
+        target = f.root / name
+        key_args = ['--api-key-file', str(f.key)] if mode == 'file' else ['--key-stdin']
+        f.identity_response_once = (status, {'ok': False}, header)
+        count = len(f.identity_reads)
+        before = snapshot(f.root)
+        output = f.cli(target / 'config.toml', f.init_args(target) + key_args,
+                       OLD if mode == 'stdin' else None, succeeds=False)
+        error = json.loads(output)['error']
+        assert error['code'] == 'identity_verification_backoff'
+        details = error['details']
+        assert details['http_status'] == status and details['transient'] is True
+        assert details['retry_after_seconds'] == server_wait
+        assert details['local_cooldown_seconds'] == local_wait and details['retry_basis'] == basis
+        assert 'no credential was saved' in error['message'].lower()
+        assert len(f.identity_reads) == count + 1 and f.identity_reads[-1] == OLD
+        assert snapshot(f.root) == before and not target.exists()
+    target = f.root / 'access-forbidden'
+    f.identity_response_once = (403, {'error': OLD})
+    count = len(f.identity_reads)
+    before = snapshot(f.root)
+    output = f.cli(target / 'config.toml', f.init_args(target) + ['--api-key-file', str(f.key)], succeeds=False)
+    error = json.loads(output)['error']
+    assert error['code'] == 'credential_access_forbidden'
+    assert error['details']['http_status'] == 403 and error['details']['reason'] == 'permission_denied'
+    assert error['details']['transient'] is False and 'permissions' in error['message']
+    assert 'does not prove the key is invalid' in error['message']
+    assert 'no credential was saved' in error['message'].lower()
+    assert len(f.identity_reads) == count + 1
+    assert snapshot(f.root) == before and not target.exists()
     f.key.chmod(0o644)
     try:
         target = f.root / 'public-key'
@@ -261,7 +302,8 @@ def invalid_init(f):
         assert json.loads(output)['error']['code'] == 'initialization_invalid'
 
 
-def terminal(f, target, interrupt=None, discover=False, retry=False, accept=True):
+def terminal(f, target, interrupt=None, discover=False, retry=None, accept=True,
+             retry_accept=True, expected_error=None):
     master, slave = pty.openpty()
     original = termios.tcgetattr(slave)
     output = bytearray()
@@ -287,17 +329,20 @@ def terminal(f, target, interrupt=None, discover=False, retry=False, accept=True
             args += ['--key-prompt']
         child = subprocess.Popen([f.binary, '--json', '--config', str(target / 'config.toml'), *args],
                                  stdin=slave, stdout=slave, stderr=slave, env=f.env)
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + 10 + (retry[0] if retry and retry_accept else 0)
         await_prompt(b'(nothing will echo): ')
         prompt_flags = termios.tcgetattr(slave)[3]
         hidden = not (prompt_flags & termios.ECHO)
         os.write(master, OLD.encode() + (b'\n' if interrupt is None else b''))
         if interrupt is not None:
             child.send_signal(interrupt)
-        elif retry:
+        elif retry is not None:
             await_prompt(b'Retry verification without re-entering the key?')
-            os.write(master, b'y\n')
-        if interrupt is None and discover:
+            assert not termios.tcgetattr(slave)[3] & termios.ECHO, 'retry consent echoed input'
+            seconds, source = retry
+            assert f'Earliest retry: {seconds}s ({source}).'.encode() in output, safe(output.decode())
+            os.write(master, b'y\n' if retry_accept else b'\n')
+        if interrupt is None and discover and expected_error is None:
             await_prompt(b'Save paused configuration for this account?')
             assert b'Verifying the key with MinePOA' in output
             assert b'Verified public account: poa1' in output
@@ -318,14 +363,22 @@ def terminal(f, target, interrupt=None, discover=False, retry=False, accept=True
             f'hidden input leaked; echo_disabled={hidden}; terminal_restored=True; '
             f'original_lflag={original[3]}; prompt_lflag={prompt_flags}; '
             f'exit={child.returncode}; transcript={safe(text)!r}')
-        assert (child.returncode == 0) == (interrupt is None and accept), safe(text)
+        succeeded = interrupt is None and accept and expected_error is None
+        assert (child.returncode == 0) == succeeded, safe(text)
         assert hidden, 'prompt left echo enabled'
-        if interrupt is None and accept:
+        assert text.count('(nothing will echo): ') == 1, 'credential was requested again'
+        assert text.count('Retry verification without re-entering the key?') == int(retry is not None)
+        if expected_error is not None:
+            envelope = next(json.loads(line) for line in text.splitlines() if line.startswith('{"'))
+            assert envelope['error']['code'] == expected_error, safe(text)
+            assert 'no credential was saved' in envelope['error']['message'].lower(), safe(text)
+        if succeeded:
             assert (target / 'credential').read_text() == OLD
             assert '"identity_verified":true' in text.replace(' ', '')
+            assert not (target / 'state/state.sqlite3').exists()
             private_tree(target)
         else:
-            assert not target.exists(), 'cancelled input created onboarding files'
+            assert not target.exists(), 'verification failure or cancelled input created onboarding files'
     finally:
         signal.signal(signal.SIGHUP, signal.SIG_IGN)
         os.close(master)
@@ -339,22 +392,41 @@ def isolated_terminal(f, target, interrupt=None, **options):
     # Controlling-terminal fork must not run in the threaded HTTP process.
     payload = dict(binary=f.binary, target=str(target), args=f.init_args(target),
                    interrupt=interrupt, options=options)
+    retry = options.get('retry')
+    wait = retry[0] if retry and options.get('retry_accept', True) else 0
     result = subprocess.run([sys.executable, __file__, '--terminal-worker'],
                             input=json.dumps(payload), text=True, capture_output=True,
-                            timeout=20, env=f.env)
+                            timeout=20 + wait, env=f.env)
     assert result.returncode == 0, safe(result.stdout + result.stderr)
 
 
 def prompt(f):
     isolated_terminal(f, f.root / 'prompt')
-    before = len(f.identity_reads)
-    f.identity_backoff_once = True
-    isolated_terminal(f, f.root / 'discover', discover=True, retry=True)
-    assert f.identity_reads[before:] == [OLD, OLD], 'retry did not reuse the original key exactly once'
-    assert f.identity_retry_at - f.identity_backoff_at >= 1, 'retry ignored the server floor'
+    for name, response, retry in (
+        ('discover', (503, {'ok': False}, 1), (1, 'server Retry-After')),
+        ('bare-retry', (429, {'ok': False}), (30, 'local cooldown, not a server Retry-After')),
+    ):
+        before = len(f.identity_reads)
+        f.identity_response_once = response
+        isolated_terminal(f, f.root / name, discover=name == 'discover', retry=retry)
+        assert f.identity_reads[before:] == [OLD, OLD], 'retry did not reuse the original key exactly once'
+        first, second = f.identity_read_times[before:]
+        assert second - first >= retry[0], 'retry ignored the reported floor'
     discovered = f.cli(f.root / 'discover/config.toml', ['config', 'show'])['config']
     assert discovered['network']['address'] == f.address
     isolated_terminal(f, f.root / 'decline', discover=True, accept=False)
+    for name, response, options, code in (
+        ('decline-retry', (429, {'ok': False}),
+         {'retry': (30, 'local cooldown, not a server Retry-After'), 'retry_accept': False},
+         'identity_verification_backoff'),
+        ('over-budget', (503, {'ok': False}, 300), {}, 'identity_verification_backoff'),
+        ('permission-denied', (403, {'ok': False}), {}, 'credential_access_forbidden'),
+    ):
+        before = len(f.identity_reads)
+        f.identity_response_once = response
+        isolated_terminal(f, f.root / name, expected_error=code, **options)
+        assert f.identity_reads[before:] == [OLD], 'verification retried without bounded consent'
+    assert not f.writes and not f.reads, 'onboarding did more than identity GETs'
 
 
 def signals(f):
@@ -391,8 +463,12 @@ def rotate(f):
     before = snapshot(f.root)
     writes = len(f.writes)
     failures = []
-    for token in (WRONG, ECHO):
+    for token, response in ((WRONG, None), (ECHO, None), (NEW, (403, {'ok': False})),
+                            (NEW, (429, {'ok': False}))):
+        f.identity_response_once = response
+        count = len(f.identity_reads)
         f.cli(f.config, ['credentials', 'rotate', '--key-stdin'], token, succeeds=False)
+        assert len(f.identity_reads) == count + 1, 'rotation retried verification'
         current = snapshot(f.root)
         changed = [name for name in before.keys() | current.keys()
                    if before.get(name) != current.get(name)]

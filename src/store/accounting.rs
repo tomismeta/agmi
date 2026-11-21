@@ -90,10 +90,10 @@ pub(super) fn apply_floor(
     lane: LaneId,
     result: &mut UncertaintyAccounting,
 ) -> Result<()> {
-    let (floor, legacy, scope) =
+    let (floor, basis, scope) =
         Store::request_floor_in(db, config, reads::effect_endpoint(lane), None)?;
     result.retry_not_before = floor;
-    result.legacy_floor = legacy;
+    result.restriction_basis = basis;
     result.restriction_scope = scope;
     Ok(())
 }
@@ -281,7 +281,7 @@ impl AccountingReadSnapshot {
                 }
             }
             result.retry_not_before = base.retry_not_before;
-            result.legacy_floor = base.legacy_floor;
+            result.restriction_basis = base.restriction_basis;
             result.restriction_scope = base.restriction_scope.clone();
             result.history_evaluated = true;
             result
@@ -402,6 +402,9 @@ pub(super) fn risk_decision_with(
     }
     if op.kind == LaneId::Answer {
         let Some(epoch) = epoch else { return Ok(None) };
+        if retry_of.is_some() && Store::answer_job_expiry_conflict_in(db, epoch)? {
+            return Ok(None);
+        }
         let pattern = format!("{epoch}:%");
         let (attempts, accepted, uncertain): (u32, bool, bool) = db.query_row(
                 "SELECT COUNT(*),COALESCE(MAX(o.txid IS NOT NULL OR o.state IN ('included_pending','confirmed','final')),0),
@@ -442,6 +445,26 @@ pub(super) fn risk_decision_with(
 }
 
 impl Store {
+    pub(crate) fn job_expiry_conflict(&self, op: &Operation) -> Result<bool> {
+        Ok(self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM operation_evidence WHERE operation_id=?1
+             AND json_extract(policy,'$.bound_job_expiry_conflict_revision')=?2)",
+            params![op.id, op.binding_revision],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub(super) fn answer_job_expiry_conflict_in(db: &Connection, epoch: u64) -> Result<bool> {
+        Ok(db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM operations o JOIN operation_evidence e ON e.operation_id=o.id
+             WHERE o.kind='answer' AND o.work_key>=?1 AND o.work_key<?2
+               AND o.state IN ('queued','unknown') AND o.job_id IS NOT NULL AND o.txid IS NULL
+               AND json_extract(e.policy,'$.bound_job_expiry_conflict_revision')=o.binding_revision)",
+            params![format!("{epoch}:"), format!("{epoch};")],
+            |row| row.get(0),
+        )?)
+    }
+
     pub(crate) fn preparation_allowed(
         &self,
         config: &Config,
@@ -551,7 +574,7 @@ mod tests {
             "historical":a.historical,"blockers":a.blockers,"writing":a.writing,
             "retry_not_before":a.retry_not_before,"grace_until":a.grace_until,
             "retry_grace_until":a.retry_grace_until,"restriction_scope":a.restriction_scope,
-            "retry_origin_floor":a.retry_origin_floor,"legacy_floor":a.legacy_floor})
+            "retry_origin_floor":a.retry_origin_floor,"legacy_floor":a.restriction_basis == Some("retained_legacy_floor")})
     }
 
     #[test]

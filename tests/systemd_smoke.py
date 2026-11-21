@@ -47,6 +47,7 @@ import time
 import tomllib
 
 from participation_smoke import ANSWER, Fixture
+from queued_polling_smoke import QueuedFixture
 
 UNITS = ('agmi.service', 'agmi-health.service', 'agmi-health.timer')
 
@@ -926,12 +927,141 @@ def published_upgrade(binary, old, expected_hash, home):
             print(f'Additional fixture cleanup failure: {error}', file=sys.stderr)
 
 
+def retained_rollback(binary, old, expected_hash, home):
+    assert old is not None and expected_hash and digest(old) == expected_hash
+    before = embedded_manifest(old)
+    now = embedded_manifest(binary)
+    assert before['commit'] == '55fd89710edf4ccacc968a5f2662eac5a11a6704'
+    assert before['journal_schema'] == now['journal_schema'] == '4'
+    # Old readers require exactly the same v1 manifest fields. The capability
+    # is announced by a separate command on the same digest-bound executable.
+    assert before.keys() == now.keys()
+    probe = ['build-info', '--installer-capabilities']
+    run([str(old), *probe], success=False)
+    supported = run([str(binary), *probe])
+    assert supported.stdout == 'bound_dispute_fence=1\n' and not supported.stderr
+    config_root = home / '.config/agmi'
+    config_root.mkdir(parents=True, mode=0o700)
+    fixture = QueuedFixture(str(binary), config_root)
+    fixture.contradictory_expiry = True
+    fixture.pending_polls = 0
+    fixture.lanes['answer']['schedule'].update(
+        retry_seconds=1, queued_job_polling=dict(initial_seconds=1, max_seconds=4))
+    fixture.configure('answer', mode='participation_first', retry_uncertain_answers=True,
+                      uncertainty_grace_seconds=5, uncertain_answer_retry_seconds=0)
+    releases = home / '.local/share/agmi/releases'
+    current_id = 'r-' + digest(binary)
+    old_id = 'r-' + expected_hash
+    previous = ('--binary', str(old), '--sha256', expected_hash)
+
+    def cli(*words, success=True):
+        result = run([str(binary), '--json', *words], success=success)
+        envelope = json.loads(result.stdout)
+        assert envelope['schema'] == 'agmi.cli.v1' and envelope['ok'] is success, envelope
+        return envelope['data']
+
+    try:
+        staged = cli('install', '--stage-only', *previous)
+        assert staged['installation']['staging'] == 'complete'
+        assert staged['installation']['activation'] == 'not_started'
+        assert digest(releases / old_id / 'agmi') == expected_hash
+        assert not (releases / 'current').is_symlink()
+        assert not fixture.database.exists()
+
+        cli('pause')
+        cli('install', '--binary', str(binary), '--sha256', current_id[2:])
+        cli('resume')
+        cli('service', 'start')
+        fixture.unknown('answer')
+        original, = fixture.dispatched('answer')
+        assert original['job_id'] == 'answer-10' and len(fixture.writes) == 1
+        inspected = cli('recover', 'inspect', '--operation', str(original['id']))
+        assert json.loads(inspected['details']['evidence'])['reason'] == 'bound_job_expiry_conflict'
+        pid = property_value('agmi.service', 'MainPID')
+        invocation = property_value('agmi.service', 'InvocationID')
+        assert digest(pathlib.Path(f'/proc/{pid}/exe')) == current_id[2:]
+
+        # A clean 408 after the conflict is just where the retained format-4
+        # runtime would have re-authorized retry on this very same binding.
+        with fixture.lock:
+            fixture.contradictory_expiry = False
+            fixture.expire_jobs = True
+            polls = len(fixture.job_polls)
+        old_manifest = releases / old_id / 'MANIFEST'
+        old_sums = releases / old_id / 'SHA256SUMS'
+        manifest_bytes, sum_bytes = old_manifest.read_bytes(), old_sums.read_bytes()
+        original_manifest_hash = digest(old_manifest)
+        try:
+            for selection in (previous, ('--release', old_id)):
+                if selection[0] == '--release':
+                    # A self-consistent mutable sidecar cannot authorize the old ELF.
+                    forged = manifest_bytes.replace(
+                        b'\nrelease_id=', b'\nbound_dispute_fence=1\nrelease_id=')
+                    old_entry = f'{original_manifest_hash}  MANIFEST'.encode()
+                    assert forged != manifest_bytes and old_entry in sum_bytes
+                    old_manifest.write_bytes(forged)
+                    new_entry = f'{digest(old_manifest)}  MANIFEST'.encode()
+                    old_sums.write_bytes(sum_bytes.replace(old_entry, new_entry))
+                refusal = cli('update', *selection, success=False)
+                assert refusal['update']['status'] == 'refused', refusal
+                evidence = refusal['installation']
+                assert evidence['failure_code'] == 'stopped_update_required', refusal
+                assert evidence['activation'] == evidence['staging'] == 'not_started'
+                assert os.readlink(releases / 'current') == current_id
+                assert property_value('agmi.service', 'MainPID') == pid
+                assert property_value('agmi.service', 'InvocationID') == invocation
+                assert active('agmi.service') and active('agmi-health.timer')
+                assert not (releases / '.update-state.json').exists()
+        finally:
+            old_manifest.write_bytes(manifest_bytes)
+            old_sums.write_bytes(sum_bytes)
+        fixture.wait(lambda: len(fixture.job_polls) >= polls + 2,
+                     'current invocation did not continue polling the disputed job')
+
+        # Offline recovery is explicit. Remove boot activation first; an older
+        # writer selected for maintenance must not run or restore activity.
+        cli('service', 'disable')
+        stopped = cli('update', '--release', old_id, '--stopped')
+        assert stopped['installation']['activation'] == 'loaded_verified'
+        assert os.readlink(releases / 'current') == old_id
+        assert all(not active(unit) for unit in UNITS)
+        assert property_value('agmi.service', 'MainPID') == '0'
+        assert all(property_value(unit, 'UnitFileState') in ('disabled', 'linked', 'linked-runtime')
+                   for unit in ('agmi.service', 'agmi-health.timer'))
+        restored = cli('update', '--release', current_id)
+        assert restored['installation']['activation'] == 'loaded_verified'
+        assert os.readlink(releases / 'current') == current_id
+        assert all(not active(unit) for unit in UNITS)
+        assert not (releases / '.update-state.json').exists()
+        retained, = fixture.dispatched('answer')
+        for field in ('id', 'state', 'job_id', 'binding_revision'):
+            assert retained[field] == original[field], retained
+        assert len(fixture.writes) == fixture.model_calls('answer') == 1
+        print('PASS authentic format4 writer refused for active retained and binary updates; stage-only and stopped recovery preserved', flush=True)
+    finally:
+        primary_failure = sys.exc_info()[0] is not None
+        try:
+            try:
+                loaded = [unit for unit in reversed(UNITS)
+                          if property_value(unit, 'LoadState') != 'not-found']
+                if loaded:
+                    systemctl('stop', *loaded)
+            finally:
+                fixture.close()
+        except Exception as error:
+            if not primary_failure:
+                raise
+            print(f'Additional fixture cleanup failure: {error}', file=sys.stderr)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('binary', type=pathlib.Path)
-    parser.add_argument('--suite', choices=('current', 'seamless', 'seamless-maintenance', 'seamless-config-only', 'future-refusal', 'future-recovery', 'compatibility', 'compatibility-no-selection', 'compatibility-auto', 'published010', 'published011', 'after-reboot'), default='current')
+    parser.add_argument('--suite', choices=('current', 'retained-rollback', 'seamless',
+                        'seamless-maintenance', 'seamless-config-only', 'future-refusal',
+                        'future-recovery', 'compatibility', 'compatibility-no-selection',
+                        'compatibility-auto', 'published010', 'published011', 'after-reboot'),
+                        default='current')
     parser.add_argument('--old-binary', type=pathlib.Path)
     parser.add_argument('--old-sha256')
     parser.add_argument('--future-binary', type=pathlib.Path)
@@ -943,6 +1073,10 @@ def main():
     os.environ['XDG_CACHE_HOME'] = str(home / '.cache')
     run(['systemctl', '--user', 'set-environment', 'AGMI_UPDATE_CHECKS=0',
          f'XDG_CACHE_HOME={home / ".cache"}'])
+    if args.suite == 'retained-rollback':
+        retained_rollback(binary, args.old_binary.resolve(strict=True) if args.old_binary else None,
+                          args.old_sha256, home)
+        return
     if args.suite in ('published010', 'published011'):
         published_upgrade(binary, args.old_binary.resolve(strict=True) if args.old_binary else None,
                           args.old_sha256, home)

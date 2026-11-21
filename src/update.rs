@@ -993,6 +993,8 @@ fn installer_outcome(
         || report["installation"]["status"] == "restoration_incomplete"
     {
         ("restoration_incomplete", "previous_intent_not_restored")
+    } else if report["installation"]["failure_code"] == "stopped_update_required" {
+        ("refused", "stopped_update_required")
     } else if report["installation"]["failure_code"] == "migration_required"
         || report["migration"]["phase"] == "required"
     {
@@ -1040,6 +1042,7 @@ fn installer_outcome(
             && !matches!(
                 status,
                 "migration_required"
+                    | "refused"
                     | "decision_required"
                     | "recovery_required"
                     | "restoration_incomplete"
@@ -1524,6 +1527,34 @@ async fn complete_discovery(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compiled_manifest_keeps_fixed_protocol_one_envelope() {
+        let manifest = include_str!(env!("AGMI_BUILD_MANIFEST_PATH"));
+        let published = format!("{manifest}binary_sha256={}\n", "a".repeat(64));
+        verify_embedded_identity(manifest, &published).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires staged Linux publisher assets in AGMI_UPDATE_TEST_ASSETS"]
+    async fn staged_release_passes_protocol_one_updater_verification() -> Result<()> {
+        let assets = std::path::PathBuf::from(
+            std::env::var_os("AGMI_UPDATE_TEST_ASSETS").context("missing staged release assets")?,
+        );
+        let manifest = std::fs::read_to_string(assets.join("BUILD-INFO.txt"))?;
+        let sums = std::fs::read_to_string(assets.join("SHA256SUMS"))?;
+        verify(manifest.as_bytes(), &checksum(&sums, "BUILD-INFO.txt")?)?;
+        let published = Identity::parse(&manifest, true)?;
+        let archive = assets.join(format!(
+            "agmi-v{}-{}.tar.gz",
+            published.version, published.target
+        ));
+        let directory = tempfile::tempdir()?;
+        let binary = directory.path().join("agmi");
+        extract(File::open(archive)?, &binary, &manifest, &published.digest)?;
+        embedded_identity(&binary, &manifest).await
+    }
 
     #[test]
     fn future_journal_keeps_fixed_embedded_protocol_one_envelope() {

@@ -65,12 +65,11 @@ pub struct ModelSelection {
 }
 impl ModelSelection {
     pub fn new(model: &ModelConfig) -> Result<Self> {
+        const INVALID_SETUP: SolverNotStarted = SolverNotStarted("invalid_solver_setup");
         let (provider, name) = match model.harness {
             Harness::Hermes => ("openai-codex", model.model.as_str()),
-            Harness::Openclaw | Harness::Omp => model
-                .model
-                .split_once('/')
-                .context("model route missing provider")?,
+            Harness::Openclaw => model.model.split_once('/').context(INVALID_SETUP)?,
+            Harness::Omp => model.omp_selection().map_err(|_| INVALID_SETUP)?,
         };
         ensure!(
             model.executable.as_os_str().len() <= 4096
@@ -78,28 +77,31 @@ impl ModelSelection {
                 && (model.harness == Harness::Omp
                     || (model.hermes_api_url.len() <= 2048
                         && !model.hermes_api_url.chars().any(char::is_control))),
-            "invalid native route"
+            INVALID_SETUP
         );
         ensure!(
-            safe_identifier(provider) && safe_identifier(name) && safe_identifier(&model.reasoning),
-            "invalid model selection"
+            model.harness == Harness::Omp
+                || (safe_identifier(provider)
+                    && safe_identifier(name)
+                    && safe_identifier(&model.reasoning)),
+            INVALID_SETUP
         );
         ensure!(
             model.harness != Harness::Openclaw || (provider == "openai" && !name.contains('/')),
-            "unsupported provider"
+            INVALID_SETUP
         );
         ensure!(
             model.harness == Harness::Omp || model.omp.is_none(),
-            "omp settings require the omp harness"
+            INVALID_SETUP
         );
         if let Some(omp) = &model.omp {
-            omp.validate()?;
+            omp.validate().context(INVALID_SETUP)?;
             ensure!(
                 omp.agent_dir
                     .iter()
                     .chain(omp.provider_discovery_cwd.iter())
                     .all(|path| path.is_absolute()),
-                "omp native paths must be resolved"
+                INVALID_SETUP
             );
         }
         Ok(Self {
@@ -485,6 +487,46 @@ mod tests {
         let selection: ModelSelection = serde_json::from_str(recorded).unwrap();
         let reconstructed = ModelSelection::new(&selection.config()).unwrap();
         assert_eq!(serde_json::to_string(&reconstructed).unwrap(), recorded);
+    }
+
+    #[test]
+    fn omp_selection_and_config_share_route_grammar_and_effort_vocabulary() {
+        let mut config = crate::config::Config::default();
+        let route = &mut config.capabilities.answer.model;
+        route.harness = Harness::Omp;
+        route.executable = "omp".into();
+        route.model = "openrouter/z-ai/glm-5.3:nitro".into();
+        for effort in ["off", "minimal", "low", "medium", "high", "xhigh", "max"] {
+            config.capabilities.answer.model.reasoning = effort.into();
+            config.validate().unwrap();
+            let selected = ModelSelection::new(&config.capabilities.answer.model).unwrap();
+            assert_eq!(selected.provider(), "openrouter");
+            assert_eq!(selected.model(), "z-ai/glm-5.3:nitro");
+            assert_eq!(selected.reasoning_effort(), effort);
+            assert_eq!(ModelSelection::new(&selected.config()).unwrap(), selected);
+        }
+        for (model, effort) in [
+            ("glm-5.3", "max"),
+            ("/glm-5.3", "max"),
+            ("fixture/", "max"),
+            ("fixture//glm-5.3", "max"),
+            ("fixture/namespace/model/", "max"),
+            ("fixture:alternate/glm-5.3", "max"),
+            ("fixture/glm 5.3", "max"),
+            ("fixture/glm-5.3?token=private-canary", "max"),
+            ("fixture/glm-5.3", "ultra"),
+            ("fixture/glm-5.3", "MAX"),
+        ] {
+            config.capabilities.answer.model.model = model.into();
+            config.capabilities.answer.model.reasoning = effort.into();
+            assert!(config.validate().is_err());
+            let error = ModelSelection::new(&config.capabilities.answer.model).unwrap_err();
+            assert_eq!(
+                NativeReasonCode::from_error(&error),
+                NativeReasonCode::InvalidSolverSetup
+            );
+            assert!(!format!("{error:?}").contains("private-canary"));
+        }
     }
 
     #[test]

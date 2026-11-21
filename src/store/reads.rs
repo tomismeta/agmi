@@ -1,6 +1,8 @@
 use super::*;
 use crate::endpoints::Endpoint;
-use crate::protocol::{RestrictionBasis, RestrictionEvidence, RestrictionScope};
+use crate::protocol::{
+    BOUND_JOB_EXPIRY_CONFLICT, RestrictionBasis, RestrictionEvidence, RestrictionScope,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -479,6 +481,22 @@ impl Store {
             };
             p.last_result_at = Some(now());
             p.last_status = status;
+            if complete
+                && !cancel
+                && status == Some(408)
+                && category == Some(BOUND_JOB_EXPIRY_CONFLICT)
+            {
+                // Commit the durable retry fence with the exact binding's consumed
+                // read stamp, before replaceable diagnostics or outcome bookkeeping.
+                tx.execute(
+                    "INSERT INTO operation_evidence(operation_id,policy)
+                     VALUES(?1,json_object('bound_job_expiry_conflict_revision',?2))
+                     ON CONFLICT(operation_id) DO UPDATE SET policy=json_set(
+                       COALESCE(operation_evidence.policy,'{}'), '$.bound_job_expiry_conflict_revision',?2)
+                     WHERE json_extract(operation_evidence.policy,'$.bound_job_expiry_conflict_revision') IS NOT ?2",
+                    params![operation_id, binding_revision],
+                )?;
+            }
         }
         p.active_request_sequence = None;
         self.save_reconciliation_provenance(*operation_id, &p)?;
@@ -831,7 +849,7 @@ impl Store {
         config: &Config,
         endpoint: Endpoint,
         resource: Option<&str>,
-    ) -> Result<(i64, bool, Option<String>)> {
+    ) -> Result<(i64, Option<&'static str>, Option<String>)> {
         let origin = reqwest::Url::parse(&config.network.base_url)?
             .origin()
             .ascii_serialization();
@@ -844,7 +862,7 @@ impl Store {
             endpoint.authenticated() || matches!(endpoint, Endpoint::Job | Endpoint::Receipt);
         Ok(db
             .query_row(
-                "SELECT not_before,basis='retained_legacy_floor',scope FROM (
+                "SELECT not_before,basis,scope FROM (
                     SELECT not_before,basis,scope FROM request_restrictions
                     WHERE authority=?1 AND origin=?2 AND scope='account_authenticated'
                         AND ?4 AND ((?3 AND effect_class) OR (NOT ?3 AND read_class))
@@ -869,7 +887,15 @@ impl Store {
                     target,
                     matches!(endpoint, Endpoint::Answer | Endpoint::Grade)
                 ],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| {
+                    let basis = match r.get_ref(1)?.as_str()? {
+                        "server_retry_after" => Some("server_retry_after"),
+                        "local_unscoped_429_cooldown" => Some("local_unscoped_429_cooldown"),
+                        "retained_legacy_floor" => Some("retained_legacy_floor"),
+                        _ => None,
+                    };
+                    Ok((r.get(0)?, basis, r.get(2)?))
+                },
             )
             .optional()?
             .unwrap_or_default())
@@ -1671,11 +1697,12 @@ impl Store {
         {
             return Ok(false);
         }
-        let previous: Option<(u64, bool)> = tx
+        let previous: Option<(u64, bool, bool)> = tx
             .query_row(
-                "SELECT epoch,answered FROM lane_observations WHERE lane=?1",
-                [lane.as_str()],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                "SELECT epoch,answered,authority_epoch=?2 AND generation=?3 AND fingerprint=?4
+                 FROM lane_observations WHERE lane=?1",
+                params![lane.as_str(), authority_epoch, generation, fingerprint],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
         let changed=tx.execute("INSERT INTO lane_observations SELECT ?1,?2,?3,?4,?5,?6,?7,?6,?8,?9,?10
@@ -1688,19 +1715,33 @@ impl Store {
             WHERE excluded.epoch>=epoch AND (excluded.authority_epoch!=authority_epoch OR
                 (excluded.authority_epoch=authority_epoch AND excluded.generation>=generation AND excluded.request_sequence>request_sequence))",
             params![lane.as_str(),authority_epoch,generation,request_sequence,started_at,completed_at,epoch,answered,fingerprint,serde_json::to_string(challenge)?])?;
-        tx.execute(
-            "INSERT OR IGNORE INTO lane_observation_evidence VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-            params![
-                lane.as_str(),
-                authority_epoch,
-                generation,
-                request_sequence,
-                completed_at,
-                epoch,
-                fingerprint,
-                changed == 1
-            ],
-        )?;
+        // Latest freshness and the epoch's original start stay in the
+        // lane-keyed snapshot. History keeps applied transitions, not every
+        // refresh of identical evidence, and one copy of each rejected shape.
+        // Existing historical rows and operation/accounting proof are untouched.
+        if changed == 1 && previous != Some((epoch, answered, true)) {
+            tx.execute(
+                "INSERT OR IGNORE INTO lane_observation_evidence VALUES (?1,?2,?3,?4,?5,?6,?7,1)",
+                params![
+                    lane.as_str(),
+                    authority_epoch,
+                    generation,
+                    request_sequence,
+                    completed_at,
+                    epoch,
+                    fingerprint
+                ],
+            )?;
+        } else if changed == 0 {
+            tx.execute(
+                "INSERT OR IGNORE INTO lane_observation_evidence
+                 SELECT ?1,?2,?3,?4,?5,?6,?7,0
+                 WHERE NOT EXISTS(SELECT 1 FROM lane_observation_evidence INDEXED BY lane_observation_rejected
+                    WHERE lane=?1 AND authority_epoch=?2 AND generation=?3
+                    AND epoch=?6 AND fingerprint=?7 AND applied=0)",
+                params![lane.as_str(), authority_epoch, generation, request_sequence, completed_at, epoch, fingerprint],
+            )?;
+        }
         if changed == 1 {
             let path = format!("$.challenge_provenance.{}", lane.as_str());
             if let Some(stamp) = admission {
@@ -1729,7 +1770,7 @@ impl Store {
                     params![completed_at, lane.as_str()],
                 )?;
             }
-            if previous != Some((epoch, answered)) {
+            if previous.map(|p| (p.0, p.1)) != Some((epoch, answered)) {
                 tx.execute(
                     "INSERT INTO events(at,code,kind) VALUES(?1,?2,?3)",
                     params![

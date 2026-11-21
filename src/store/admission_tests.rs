@@ -51,13 +51,65 @@ impl Fixture {
         }
     }
 
-    fn prepare(&mut self, lane: LaneId, epoch: u64) -> Ready {
-        let stamp = AdmissionStampSnapshot {
+    fn stamp(&self, lane: LaneId) -> AdmissionStampSnapshot {
+        AdmissionStampSnapshot {
             account_generation: self.store.control().unwrap().generation,
             lane_control_revision: self.store.lane_control(lane).unwrap().control_revision,
             authority_epoch: 1,
             lane_config_revision: self.config.lane_revision(lane).unwrap(),
-        };
+        }
+    }
+
+    fn observe(
+        &self,
+        lane: LaneId,
+        sequence: u64,
+        at: i64,
+        epoch: u64,
+        fingerprint: &str,
+        answered: bool,
+    ) -> bool {
+        let stamp = self.stamp(lane);
+        self.store
+            .observe_lane(
+                lane,
+                LaneObservationStamp {
+                    authority_epoch: stamp.authority_epoch,
+                    generation: stamp.account_generation,
+                    request_sequence: sequence,
+                    started_at: at,
+                    completed_at: at,
+                },
+                LaneObservation {
+                    epoch,
+                    answered,
+                    fingerprint,
+                    challenge: &json!({"epoch":epoch,"answered":answered}),
+                },
+                &stamp,
+            )
+            .unwrap()
+    }
+
+    fn grade_abstention(&mut self, assignment: &str, admit_before: Instant) -> Result<bool> {
+        let stamp = self.stamp(LaneId::Judge);
+        let gate = self
+            .gates
+            .iter()
+            .find(|gate| gate.lane_id() == LaneId::Judge)
+            .unwrap();
+        self.store.record_grade_abstention(
+            &self.config,
+            &self.account,
+            gate,
+            &stamp,
+            assignment,
+            admit_before,
+        )
+    }
+
+    fn prepare(&mut self, lane: LaneId, epoch: u64) -> Ready {
+        let stamp = self.stamp(lane);
         let gate = self
             .gates
             .iter()
@@ -73,7 +125,7 @@ impl Fixture {
                 PreparationInputs {
                     lane,
                     key: &format!("{epoch}:fairness"),
-                    request: &json!({"solver":{"epoch":epoch}}),
+                    request: &json!({"solver":{"epoch":epoch},"challenge_fingerprint":"fixture"}),
                     retry: None,
                     policy: &json!({}),
                 },
@@ -242,6 +294,274 @@ fn candidates(ready: &[Ready]) -> Vec<EffectCandidate<'_>> {
             due_at: item.due_at,
         })
         .collect()
+}
+
+#[test]
+fn newer_same_lane_challenge_vetoes_the_final_transaction() {
+    for (lane, epoch, fingerprint, answered) in [
+        (LaneId::Answer, 8, "fixture", false),
+        (LaneId::Answer, 7, "changed", false),
+        (LaneId::Answer, 7, "fixture", true),
+        (LaneId::Mine, 8, "fixture", false),
+        (LaneId::Mine, 7, "changed", false),
+    ] {
+        let mut fixture = Fixture::new();
+        fixture.store.runtime_state(&fixture.config, false).unwrap();
+        let ready = [fixture.prepare(lane, 7)];
+        assert!(fixture.observe(lane, 1, 10, 7, "fixture", false));
+        let selected = fixture.select(&ready).unwrap();
+        // The newer observation arrives after tentative selection, in the
+        // same wall-clock second. Dispatch must recheck the committed source.
+        assert!(fixture.observe(lane, 2, 10, epoch, fingerprint, answered));
+        assert_eq!(fixture.admit(&ready, selected).unwrap(), None);
+        assert_eq!(fixture.sequence(), 0);
+        assert_eq!(fixture.dispatch_events(), 0);
+        fixture.assert_round(&[]);
+        let durable = fixture
+            .store
+            .operation(ready[0].operation.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable.state, "prepared");
+        assert_eq!(durable.payload, ready[0].operation.payload);
+    }
+}
+
+#[test]
+fn matching_challenge_ignores_other_lanes_regressed_reads_and_partial_inventory() {
+    for lane in LaneId::ALL {
+        let mut fixture = Fixture::new();
+        fixture.store.runtime_state(&fixture.config, false).unwrap();
+        let ready = fixture.prepare(lane, 7);
+        if lane == LaneId::Judge {
+            fixture
+                .store
+                .record_lane_participation(
+                    lane,
+                    &ready.stamp,
+                    &json!({"completeness":"bounded_partial","observed_opportunities":0}),
+                )
+                .unwrap();
+        } else {
+            assert!(fixture.observe(lane, 1, 10, 7, "fixture", false));
+            assert!(fixture.observe(lane, 2, 11, 7, "fixture", lane == LaneId::Mine));
+            assert!(!fixture.observe(lane, 3, 12, 6, "old", true));
+        }
+        let other = if lane == LaneId::Answer {
+            LaneId::Mine
+        } else {
+            LaneId::Answer
+        };
+        assert!(fixture.observe(other, 1, 12, 9, "unrelated", true));
+        assert!(
+            !fixture
+                .store
+                .challenge_contradicts_ready(&ready.operation, &ready.stamp)
+                .unwrap()
+        );
+        assert_eq!(fixture.dispatch(&ready), 1);
+    }
+}
+
+#[test]
+fn local_grade_abstention_commits_terminal_state_event_and_policy_together() {
+    let mut fixture = Fixture::new();
+    let assignment = "b".repeat(64);
+    let expires = Instant::now() + Duration::from_secs(60);
+    assert!(
+        !fixture
+            .grade_abstention(&assignment, Instant::now())
+            .unwrap()
+    );
+    fixture
+        .store
+        .db
+        .execute_batch(
+            "CREATE TEMP TRIGGER reject_abstention_evidence BEFORE INSERT ON operation_evidence
+             BEGIN SELECT RAISE(ABORT,'fixture rejects abstention evidence'); END;",
+        )
+        .unwrap();
+    assert!(fixture.grade_abstention(&assignment, expires).is_err());
+    for query in [
+        "SELECT COUNT(*) FROM operations",
+        "SELECT COUNT(*) FROM operation_timing",
+        "SELECT COUNT(*) FROM operation_evidence",
+        "SELECT COUNT(*) FROM events WHERE operation_id IS NOT NULL",
+    ] {
+        assert_eq!(
+            fixture
+                .store
+                .db
+                .query_row(query, [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+    fixture
+        .store
+        .db
+        .execute_batch("DROP TRIGGER reject_abstention_evidence")
+        .unwrap();
+    assert!(fixture.grade_abstention(&assignment, expires).unwrap());
+    assert!(!fixture.grade_abstention(&assignment, expires).unwrap());
+    let (id, state, events, event): (i64, String, i64, String) = fixture
+        .store
+        .db
+        .query_row(
+            "SELECT o.id,o.state,COUNT(*),MIN(e.code) FROM operations o
+             JOIN events e ON e.operation_id=o.id GROUP BY o.id,o.state",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(state, "abstained");
+    assert_eq!(events, 1);
+    assert_eq!(event, "assignment_evidence_insufficient");
+    assert_eq!(
+        fixture.policy(id),
+        json!({"lane_revision":fixture.stamp(LaneId::Judge).lane_config_revision})
+    );
+    assert!(fixture.store.preparation(LaneId::Judge).unwrap().is_none());
+    assert_eq!(fixture.sequence(), 0);
+    assert_eq!(fixture.dispatch_events(), 0);
+    fixture.assert_round(&[]);
+}
+
+#[test]
+fn startup_repairs_only_exact_never_dispatched_grade_abstention() {
+    for (mutation, repair) in [
+        ("", true),
+        ("UPDATE operations SET request='{' WHERE id=?1", false),
+        ("UPDATE operations SET payload='{}' WHERE id=?1", false),
+        (
+            "UPDATE operations SET binding_revision=1 WHERE id=?1",
+            false,
+        ),
+        (
+            "UPDATE operations SET job_id='bound-job' WHERE id=?1",
+            false,
+        ),
+        (
+            "UPDATE operations SET revision=CAST(revision AS BLOB) WHERE id=?1",
+            false,
+        ),
+        (
+            "UPDATE operation_evidence SET dispatch_sequence=1 WHERE operation_id=?1",
+            false,
+        ),
+        (
+            "UPDATE operation_timing SET dispatch_started_at=1 WHERE operation_id=?1",
+            false,
+        ),
+        (
+            "UPDATE operation_evidence SET policy='{}' WHERE operation_id=?1",
+            false,
+        ),
+        ("DELETE FROM events WHERE operation_id=?1", false),
+        (
+            "INSERT INTO events(at,code,kind,operation_id) VALUES(1,'dispatch_intent','judge',?1)",
+            false,
+        ),
+    ] {
+        let mut fixture = Fixture::new();
+        let stamp = fixture.stamp(LaneId::Judge);
+        let assignment = "c".repeat(64);
+        let gate = fixture
+            .gates
+            .iter()
+            .find(|gate| gate.lane_id() == LaneId::Judge)
+            .unwrap();
+        let legacy = fixture
+            .store
+            .begin_preparation(
+                &fixture.config,
+                &fixture.account,
+                gate,
+                &stamp,
+                PreparationInputs {
+                    lane: LaneId::Judge,
+                    key: &assignment,
+                    request: &json!({"assignment":assignment,"local_abstention":"required_words_absent"}),
+                    retry: None,
+                    policy: &json!({"lane_revision":stamp.lane_config_revision}),
+                },
+            )
+            .unwrap()
+            .unwrap();
+        if !mutation.is_empty() {
+            fixture.store.db.execute(mutation, [legacy.id]).unwrap();
+        }
+        // Recover twice: do not repeat the terminal event or remove original
+        // provenance, and leave any possible dispatch fence intact.
+        fixture.store.recover().unwrap();
+        fixture.store.recover().unwrap();
+        let (state, completions): (String, i64) = fixture
+            .store
+            .db
+            .query_row(
+                "SELECT state,(SELECT COUNT(*) FROM events WHERE operation_id=?1
+                               AND code='assignment_evidence_insufficient') FROM operations WHERE id=?1",
+                [legacy.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            state,
+            if repair { "abstained" } else { "prepared" },
+            "{mutation}"
+        );
+        assert_eq!(completions, i64::from(repair), "{mutation}");
+        assert!(fixture.store.attempted(LaneId::Judge, &assignment).unwrap());
+        assert_eq!(fixture.sequence(), 0);
+    }
+}
+
+#[test]
+fn read_only_challenge_history_keeps_transitions_not_identical_polls() {
+    let lane = LaneId::Answer;
+    let fixture = Fixture::configured(|config| config.capabilities.answer.mode = Mode::ReadOnly);
+    fixture.store.runtime_state(&fixture.config, false).unwrap();
+    // Retain prior audit rows; the cutover only bounds new writes.
+    fixture
+        .store
+        .db
+        .execute(
+            "INSERT INTO lane_observation_evidence VALUES('answer',0,0,1,1,5,'legacy',1)",
+            [],
+        )
+        .unwrap();
+    for sequence in 1..=8 {
+        assert!(fixture.observe(lane, sequence, 10 + sequence as i64, 7, "fixture", false));
+    }
+    let snapshot = fixture.store.lane_observation(lane).unwrap().unwrap();
+    assert_eq!(snapshot["observed_at"], 18);
+    assert_eq!(snapshot["first_observed_at"], 11);
+    assert!(fixture.observe(lane, 9, 19, 7, "fixture", true));
+    assert!(fixture.observe(lane, 10, 20, 7, "alternative", true));
+    for sequence in 11..=18 {
+        assert!(!fixture.observe(lane, sequence, 10 + sequence as i64, 6, "old", true));
+    }
+    let snapshot = fixture.store.lane_observation(lane).unwrap().unwrap();
+    assert_eq!(snapshot["observed_at"], 20);
+    assert_eq!(snapshot["first_observed_at"], 11);
+    assert!(fixture.observe(lane, 19, 29, 8, "new-epoch", false));
+    let snapshot = fixture.store.lane_observation(lane).unwrap().unwrap();
+    assert_eq!(snapshot["first_observed_at"], 29);
+    assert_eq!(snapshot["request_sequence"], 19);
+    let mut statement = fixture
+        .store
+        .db
+        .prepare(
+            "SELECT request_sequence FROM lane_observation_evidence ORDER BY authority_epoch,request_sequence",
+        )
+        .unwrap();
+    let sequences: Vec<i64> = statement
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(sequences, [1, 1, 9, 10, 11, 19]);
+    assert_eq!(fixture.sequence(), 0);
 }
 
 #[test]

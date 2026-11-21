@@ -10,11 +10,15 @@ permissions:
 jobs:
   rust:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 55
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           persist-credentials: false
+          fetch-depth: 0
       - name: Install Rust
         run: rustup toolchain install 1.96.0 --profile minimal --component rustfmt --component clippy
       - name: Formatting
@@ -32,18 +36,116 @@ jobs:
             --output "$omp_dir/omp"
           printf '%s  %s\n' 6ceef04430851bb1050c6fda3af467412eb44a11df0a6ff8121fe601013c5415 "$omp_dir/omp" \
             | sha256sum --check
-          chmod 0700 "$omp_dir/omp"
+          chmod 0755 "$omp_dir/omp"
           python3 tests/omp_native_smoke.py --omp "$omp_dir/omp"
       - name: Behavior tests
         run: RUST_BACKTRACE=1 cargo +1.96.0 test --locked
       - name: Lints
         run: cargo +1.96.0 clippy --locked --all-targets -- -D warnings
+      - name: Build authentic format-4 rollback fixture
+        timeout-minutes: 8
+        run: |
+          baseline=55fd89710edf4ccacc968a5f2662eac5a11a6704
+          root="$RUNNER_TEMP/agmi-rollback"
+          mkdir -p "$root/source"
+          git archive "$baseline" | tar -x -C "$root/source"
+          printf '{"git":{"sha1":"%s"}}\n' "$baseline" > "$root/source/.cargo_vcs_info.json"
+          # Share already built native dependencies; the next step restores
+          # target/debug/agmi to the candidate build before any smoke tests.
+          cargo +1.96.0 build --locked --manifest-path "$root/source/Cargo.toml" \
+            --target-dir "$PWD/target" --bin agmi
+          install -m 0755 target/debug/agmi "$root/agmi"
+          "$root/agmi" build-info --manifest | grep -Fx "commit=$baseline"
+          digest=$(sha256sum "$root/agmi" | cut -d ' ' -f 1)
+          printf 'AGMI_ROLLBACK_BINARY=%s\nAGMI_ROLLBACK_SHA256=%s\n' "$root/agmi" "$digest" >> "$GITHUB_ENV"
       - name: Build binary
         run: cargo +1.96.0 build --locked
-      - name: Build release lifecycle binary
-        # These boundaries include repeated ELF hashing/copying; use shipped
-        # optimization rather than a large unoptimized debug executable.
-        run: cargo +1.96.0 build --release --locked
+      - name: Install pinned Linux release tools
+        run: |
+          rustup target add --toolchain 1.96.0 x86_64-unknown-linux-musl
+          cargo +1.96.0 install cargo-zigbuild --version 0.24.1 --locked
+          zig_dir=$(mktemp -d "$RUNNER_TEMP/agmi-zig.XXXXXXXX")
+          curl --fail --silent --show-error --location --proto '=https' \
+            https://ziglang.org/download/index.json --output "$zig_dir/index.json"
+          zig_url=$(jq --exit-status --raw-output '.["0.17.1"]["x86_64-linux"].tarball' "$zig_dir/index.json")
+          zig_sha=$(jq --exit-status --raw-output '.["0.17.1"]["x86_64-linux"].shasum' "$zig_dir/index.json")
+          [[ "$zig_url" = https://ziglang.org/download/0.17.1/* ]]
+          [[ "$zig_sha" =~ ^[0-9a-f]{64}$ ]]
+          curl --fail --silent --show-error --location --proto '=https' \
+            "$zig_url" --output "$zig_dir/zig.tar.xz"
+          printf '%s  %s\n' "$zig_sha" "$zig_dir/zig.tar.xz" | sha256sum --strict --check
+          tar -xJf "$zig_dir/zig.tar.xz" --strip-components=1 -C "$zig_dir"
+          printf '%s\n' "$zig_dir" >> "$GITHUB_PATH"
+
+          llvm_key="$RUNNER_TEMP/agmi-llvm.asc"
+          curl --fail --silent --show-error --location --proto '=https' \
+            https://apt.llvm.org/llvm-snapshot.gpg.key --output "$llvm_key"
+          fingerprint=$(gpg --batch --show-keys --with-colons "$llvm_key" \
+            | awk -F: '$1 == "pub" { primary=1; next } $1 == "fpr" && primary { print $10; primary=0 }')
+          test "$fingerprint" = 6084F3CF814B57C1CF12EFD515CF4D18AF4F7421
+          sudo install -m 0644 "$llvm_key" /usr/share/keyrings/agmi-llvm.asc
+          echo 'deb [signed-by=/usr/share/keyrings/agmi-llvm.asc] https://apt.llvm.org/noble/ llvm-toolchain-noble-22 main' \
+            | sudo tee /etc/apt/sources.list.d/agmi-llvm.list
+          sudo apt-get update -o Dir::Etc::sourcelist=sources.list.d/agmi-llvm.list -o Dir::Etc::sourceparts=-
+          llvm_version=$(apt-cache madison clang-22 \
+            | awk '$3 ~ /^(1:)?22\.1\.8([~+.-]|$)/ && $5 ~ /^https:\/\/apt\.llvm\.org\// { print $3; exit }')
+          test -n "$llvm_version"
+          sudo apt-get install -y --no-install-recommends \
+            "clang-22=$llvm_version" "lld-22=$llvm_version" "llvm-22=$llvm_version"
+          echo /usr/lib/llvm-22/bin >> "$GITHUB_PATH"
+      - name: Build Linux x64 musl release
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/agmi-linux-musl
+        run: bash tools/build-linux-musl.sh
+      - name: Stage and verify updater-selected assets
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/agmi-linux-musl
+        run: |
+          target=x86_64-unknown-linux-musl
+          binary="$CARGO_TARGET_DIR/$target/release/agmi"
+          root="$RUNNER_TEMP/agmi-release"
+          mkdir -p "$root"/{stage,assets,extracted,evidence}
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          archive="agmi-v$version-$target.tar.gz"
+          install -m 0755 "$binary" "$root/stage/agmi"
+          embedded="$root/embedded-build-info.txt"
+          "$root/stage/agmi" build-info --manifest > "$embedded"
+          manifest="$root/assets/BUILD-INFO.txt"
+          digest=$(sha256sum "$root/stage/agmi" | cut -d ' ' -f 1)
+          { cat "$embedded"; printf 'binary_sha256=%s\n' "$digest"; } > "$manifest"
+          grep -Fx "binary_sha256=$digest" "$manifest"
+          grep -Fx "package_version=$version" "$manifest"
+          grep -Fx "commit=$(git rev-parse HEAD)" "$manifest"
+          grep -Fx 'source_dirty=clean' "$manifest"
+          grep -Fx "target=$target" "$manifest"
+          grep -Fx 'profile=release' "$manifest"
+          grep -Fx 'build_format=1' "$manifest"
+          grep -Fx 'update_protocol=1' "$manifest"
+          provenance="$CARGO_TARGET_DIR/agmi-linux-musl-provenance.txt"
+          grep -Fx "binary_sha256=$digest" "$provenance"
+          cp "$provenance" "$root/evidence/ALLOCATOR-PROVENANCE.txt"
+          gzip -n -c "$CARGO_TARGET_DIR/agmi-linux-musl.map" > "$root/evidence/LINK-MAP.txt.gz"
+          install -m 0644 "$manifest" "$root/stage/BUILD-INFO.txt"
+          install -m 0644 LICENSE "$root/stage/LICENSE"
+          tar -C "$root/stage" --format=ustar --mtime=@0 --owner=0 --group=0 --numeric-owner \
+            -cf - agmi BUILD-INFO.txt LICENSE | gzip -n > "$root/assets/$archive"
+          (
+            cd "$root/assets"
+            sha256sum BUILD-INFO.txt "$archive" > SHA256SUMS
+            sha256sum --strict --check SHA256SUMS
+          )
+          test "$(tar -tzf "$root/assets/$archive")" = "$(printf 'agmi\nBUILD-INFO.txt\nLICENSE')"
+          tar -xzf "$root/assets/$archive" -C "$root/extracted"
+          cmp "$manifest" "$root/extracted/BUILD-INFO.txt"
+          printf '%s  %s\n' "$digest" "$root/extracted/agmi" | sha256sum --strict --check
+          "$root/extracted/agmi" build-info --manifest | cmp "$embedded" -
+          "$root/extracted/agmi" build-info --installer-capabilities \
+            | cmp - <(printf 'bound_dispute_fence=1\n')
+          AGMI_UPDATE_TEST_ASSETS="$root/assets" CARGO_TARGET_DIR="$PWD/target" \
+            cargo +1.96.0 test --locked --lib \
+            update::tests::staged_release_passes_protocol_one_updater_verification -- --exact --ignored
+          printf 'AGMI_PACKAGED_MUSL=%s\n' "$root/extracted/agmi" >> "$GITHUB_ENV"
       - name: CLI discovery
         run: ./target/debug/agmi commands --json
       - name: Lost-grade cold-restart safety
@@ -100,14 +202,32 @@ jobs:
           "$package_root/install/bin/agmi" build-info --manifest
           python3 tests/lifecycle_smoke.py "$package_root/install/bin/agmi" --scenario init
           python3 tests/lifecycle_smoke.py "$package_root/install/bin/agmi" --scenario prompt
-      - name: Isolated systemd release lifecycle
+      - name: Qualify source-package and release omp adapters and release setup
         run: |
           docker build -f tests/systemd_fixture.Dockerfile -t agmi-systemd-fixture tests
+          docker run --rm --init --network=none --tmpfs /tmp:exec,mode=1777 \
+            -v "$PWD/tests:/tests:ro" \
+            -v "$RUNNER_TEMP/agmi-package/install/bin/agmi:/input/agmi-source:ro" \
+            -v "$AGMI_PACKAGED_MUSL:/input/agmi:ro" \
+            -v "$RUNNER_TEMP/agmi-omp/omp:/input/omp:ro" \
+            --entrypoint /bin/sh agmi-systemd-fixture -ec '
+              runuser -u agmi-systemd-fixture -- \
+                python3 -u /tests/packaged_omp_smoke.py /input/agmi-source --omp /input/omp
+              runuser -u agmi-systemd-fixture -- \
+                python3 -u /tests/packaged_omp_smoke.py /input/agmi --omp /input/omp
+              runuser -u agmi-systemd-fixture -- \
+                python3 -u /tests/lifecycle_smoke.py /input/agmi --scenario init
+              runuser -u agmi-systemd-fixture -- \
+                python3 -u /tests/lifecycle_smoke.py /input/agmi --scenario prompt
+            '
+      - name: Isolated systemd release lifecycle
+        run: |
+          # Consume the extracted, verified archive bytes, never a rebuild.
           name="agmi-systemd-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           trap 'docker rm -f "$name" >/dev/null 2>&1 || true' EXIT
           docker run -d --name "$name" --privileged --cgroupns=private \
             --network=none --tmpfs /run --tmpfs /run/lock --tmpfs /tmp:exec,mode=1777 \
-            -v "$PWD:/src:ro" -v "$PWD/target/release/agmi:/input/agmi:ro" \
+            -v "$PWD:/src:ro" -v "$AGMI_PACKAGED_MUSL:/input/agmi:ro" \
             agmi-systemd-fixture
           timeout 60 docker exec "$name" sh -c \
             'until systemctl start user@17321.service; do sleep 1; done'
@@ -119,12 +239,43 @@ jobs:
             HOME=/home/agmi-systemd-fixture XDG_RUNTIME_DIR=/run/user/17321 \
             DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/17321/bus \
             python3 -u /src/tests/systemd_smoke.py /input/agmi
+      - name: Isolated systemd retained writer refusal
+        timeout-minutes: 5
+        run: |
+          name="agmi-rollback-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          trap 'docker rm -f "$name" >/dev/null 2>&1 || true' EXIT
+          docker run -d --name "$name" --privileged --cgroupns=private \
+            --network=none --tmpfs /run --tmpfs /run/lock --tmpfs /tmp:exec,mode=1777 \
+            -v "$PWD:/src:ro" -v "$AGMI_PACKAGED_MUSL:/input/agmi:ro" \
+            -v "$AGMI_ROLLBACK_BINARY:/input/agmi-old:ro" agmi-systemd-fixture
+          timeout 60 docker exec "$name" sh -c \
+            'until systemctl start user@17321.service; do sleep 1; done'
+          timeout 180 docker exec "$name" runuser -u agmi-systemd-fixture -- env \
+            HOME=/home/agmi-systemd-fixture XDG_RUNTIME_DIR=/run/user/17321 \
+            DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/17321/bus \
+            python3 -u /src/tests/systemd_smoke.py /input/agmi --suite retained-rollback \
+            --old-binary /input/agmi-old --old-sha256 "$AGMI_ROLLBACK_SHA256"
       - name: Isolated model workspace recovery
         run: |
           name="agmi-storage-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           trap 'docker rm -f "$name" >/dev/null 2>&1 || true' EXIT
           docker run -d --name "$name" --privileged --cgroupns=private \
             --network=none --tmpfs /run --tmpfs /run/lock --tmpfs /tmp:exec,mode=1777 \
-            -v "$PWD:/src:ro" -v "$PWD/target/release/agmi:/input/agmi:ro" \
+            -v "$PWD:/src:ro" -v "$AGMI_PACKAGED_MUSL:/input/agmi:ro" \
             agmi-systemd-fixture
           docker exec "$name" python3 -u /src/tests/storage_runtime_smoke.py /input/agmi
+      - name: Recheck qualified release bytes
+        run: |
+          cd "$RUNNER_TEMP/agmi-release/assets"
+          sha256sum --strict --check SHA256SUMS
+          digest=$(awk -F= '$1 == "binary_sha256" { print $2 }' BUILD-INFO.txt)
+          printf '%s  %s\n' "$digest" "$AGMI_PACKAGED_MUSL" | sha256sum --strict --check
+      - name: Upload qualified Linux x64 candidate and link evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: agmi-linux-x64-qualified
+          path: |
+            ${{ runner.temp }}/agmi-release/assets/
+            ${{ runner.temp }}/agmi-release/evidence/
+          if-no-files-found: error
+          compression-level: 0

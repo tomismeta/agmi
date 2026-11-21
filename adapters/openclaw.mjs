@@ -8,6 +8,7 @@ const emit = process.stdout.write.bind(process.stdout);
 process.stdout.write = process.stderr.write.bind(process.stderr);
 let started = false;
 let reported = {};
+const DEADLINE_BEFORE_CALL = Symbol('local deadline before Gateway call');
 const identifier = value => typeof value === 'string' && /^[A-Za-z0-9_.:/-]{1,256}$/.test(value) ? value : null;
 // Match solver.rs: one more JSON escaping pass over the complete request
 // allowance, plus envelope/policy/model metadata. Do not reduce guidance/task limits.
@@ -29,19 +30,28 @@ try {
   if (typeof callGatewayFromCli !== 'function') throw new Error('unsupported native API');
   const runId = identifier(request.invocation_id);
   if (!runId) throw new Error('missing native invocation identity');
+  if (!Number.isSafeInteger(request.deadline_unix_ms)) throw new Error('invalid model deadline');
+  // Admission, process startup and SDK loading all spend the same deadline.
+  const remainingMs = request.deadline_unix_ms - Date.now();
+  const remainingSeconds = Math.floor(remainingMs / 1000);
+  // The agent accepts whole seconds. Zero may select a default, not a deadline.
+  if (remainingSeconds < 1) {
+    reported = {runId};
+    throw DEADLINE_BEFORE_CALL;
+  }
   started = true;
   // The inspected agent API exposes a single message, not a privileged policy
   // field. Rust combines policy and envelope here without claiming isolation.
   const response = await callGatewayFromCli('agent', {
     json: true,
-    timeout: String(request.timeout_seconds * 1000),
+    timeout: String(remainingMs),
     expectFinal: true,
   }, {
     message: request.prompt,
     model: request.model,
     thinking: request.reasoning,
     deliver: false,
-    timeout: request.timeout_seconds,
+    timeout: remainingSeconds,
     modelRun: true,
     promptMode: 'none',
     suppressPromptPersistence: true,
@@ -88,7 +98,10 @@ try {
   }) + '\n');
 } catch (error) {
   // A disconnected CLI does not prove that shared-Gateway inference stopped.
-  const kind = ['timeout', 'aborted', 'error_payload'].includes(error) ? error : 'exception';
+  const localDeadline = error === DEADLINE_BEFORE_CALL;
+  const kind = localDeadline ? 'deadline_before_call'
+    : ['timeout', 'aborted', 'error_payload'].includes(error) ? error : 'exception';
   emit(JSON.stringify({ok: false, status: 'error', ...reported, error: {kind}}) + '\n');
-  process.exitCode = started ? 1 : 78;
+  // Exit 81 is reserved for the local deadline check before a Gateway call.
+  process.exitCode = localDeadline ? 81 : started ? 1 : 78;
 }

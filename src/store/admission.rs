@@ -199,6 +199,151 @@ impl Store {
         ))
     }
 
+    pub(crate) fn record_grade_abstention(
+        &mut self,
+        config: &Config,
+        account: &AccountAdmissionGuard,
+        lane: &LaneAdmissionGuard,
+        stamp: &AdmissionStampSnapshot,
+        key: &str,
+        admit_before: Instant,
+    ) -> Result<bool> {
+        ensure!(
+            lane.lane_id() == LaneId::Judge,
+            "abstention gate is not judge"
+        );
+        ensure!(
+            crate::protocol::valid_txid(key) && !key.bytes().any(|b| b.is_ascii_uppercase()),
+            "abstention assignment is not canonical"
+        );
+        self.continuity()?;
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if Instant::now() >= admit_before
+            || !Self::validate_admission_in(&tx, config, account, lane, stamp, None)?
+            || config.judging_assignment_excluded(key)
+            || Self::attempted_in(&tx, LaneId::Judge, key)?
+        {
+            return Ok(false);
+        }
+        let request = json!({"assignment":key,"local_abstention":"required_words_absent"});
+        let id = Self::begin_linked_in(
+            &tx,
+            LaneId::Judge,
+            key,
+            ("abstained", &request),
+            Control {
+                paused: false,
+                generation: stamp.account_generation,
+            },
+            &stamp.lane_config_revision,
+            None,
+        )?;
+        tx.execute(
+            "INSERT INTO operation_evidence(operation_id,policy) VALUES(?1,?2)",
+            params![
+                id,
+                json!({"lane_revision":stamp.lane_config_revision}).to_string()
+            ],
+        )?;
+        Self::capture_and_trim_transition_events(&tx)?;
+        Self::continuity_in(&tx, &self.binding, &self.writer_path, &self.database_file)?;
+        if Instant::now() >= admit_before {
+            return Ok(false);
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub(super) fn recover_legacy_grade_abstention(db: &Connection) -> Result<()> {
+        let at = now();
+        // Match the old begin_preparation commit, not a generic incomplete
+        // grade. Exact request and policy text also avoid parsing corrupt JSON.
+        let mut statement = db.prepare(
+            "UPDATE operations AS o SET state='abstained',updated_at=?1
+             WHERE kind='judge' AND state='prepared' AND binding_revision=0 AND next_at=0
+             AND payload IS NULL AND result IS NULL AND job_id IS NULL AND txid IS NULL
+             AND created_at=updated_at AND typeof(work_key)='text' AND typeof(revision)='text'
+             AND length(work_key)=64 AND work_key NOT GLOB '*[^0-9a-f]*'
+             AND request=json_object('assignment',CAST(work_key AS TEXT),'local_abstention','required_words_absent')
+             AND EXISTS(SELECT 1 FROM operation_evidence e WHERE e.operation_id=o.id
+                 AND e.policy=json_object('lane_revision',CAST(o.revision AS TEXT))
+                 AND e.model_deadline IS NULL AND e.http_deadline IS NULL
+                 AND e.dispatch_sequence IS NULL AND e.blocked_since IS NULL
+                 AND e.evidence IS NULL AND e.observed_at IS NULL AND e.safety_observed_at IS NULL
+                 AND e.resolution IS NULL AND e.model_attempt IS NULL)
+             AND EXISTS(SELECT 1 FROM operation_timing t WHERE t.operation_id=o.id
+                 AND t.retry_not_before=0 AND t.generation_started_at IS NULL
+                 AND t.model_captured_at IS NULL AND t.queued_since IS NULL AND t.dispatch_started_at IS NULL)
+             AND (SELECT COUNT(*)=1 AND MIN(e.code='prepared' AND e.kind='judge')=1
+                  FROM events e WHERE e.operation_id=o.id)
+             AND NOT EXISTS(SELECT 1 FROM operation_links l WHERE l.operation_id=o.id OR l.retry_of=o.id)
+             AND NOT EXISTS(SELECT 1 FROM operation_candidates c WHERE c.operation_id=o.id)
+             AND NOT EXISTS(SELECT 1 FROM read_state r WHERE r.operation_id=o.id)
+             AND NOT EXISTS(SELECT 1 FROM manual_grants g WHERE g.consumed_by=o.id)
+             AND NOT EXISTS(SELECT 1 FROM risk_admissions r WHERE r.operation_id=o.id OR r.retry_of=o.id)
+             AND NOT EXISTS(SELECT 1 FROM risk_historical_answers r WHERE r.operation_id=o.id OR r.accepted_answer_id=o.id)
+             AND NOT EXISTS(SELECT 1 FROM historical_answer_accounting_events h WHERE h.original_id=o.id OR h.accepted_answer_id=o.id)
+             RETURNING id",
+        )?;
+        let mut repaired = statement.query([at])?;
+        while let Some(row) = repaired.next()? {
+            db.execute(
+                "INSERT INTO events(at,code,kind,operation_id)
+                 VALUES(?1,'assignment_evidence_insufficient','judge',?2)",
+                params![at, row.get::<_, i64>(0)?],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn challenge_contradicts_ready(
+        &self,
+        op: &Operation,
+        stamp: &AdmissionStampSnapshot,
+    ) -> Result<bool> {
+        Self::challenge_contradicts_ready_in(&self.db, op, stamp)
+    }
+
+    fn challenge_contradicts_ready_in(
+        db: &Connection,
+        op: &Operation,
+        stamp: &AdmissionStampSnapshot,
+    ) -> Result<bool> {
+        // Challenge readiness is emitted only after its same-lane fetch has
+        // been applied. A comparable snapshot is therefore that observation
+        // or a newer one. Different authority/control/config is not proof;
+        // judge inventory is never part of this test.
+        if op.kind == LaneId::Judge {
+            return Ok(false);
+        }
+        Ok(db.query_row(
+            "WITH latest AS (
+                 SELECT o.lane,o.epoch,o.answered,o.fingerprint,o.generation,o.authority_epoch,o.request_sequence,
+                        json_extract(r.lane_participation,'$.challenge_provenance.'||o.lane) AS provenance
+                 FROM lane_observations o,runtime_state r WHERE o.lane=?1 AND r.singleton=1
+             )
+             SELECT EXISTS(SELECT 1 FROM latest WHERE generation=?2 AND authority_epoch=?3
+                 AND json_extract(provenance,'$.request_sequence')=request_sequence
+                 AND json_extract(provenance,'$.stamp.lane_control_revision')=?4
+                 AND json_extract(provenance,'$.stamp.lane_config_revision')=?5
+                 AND json_extract(provenance,'$.stamp.account_generation')=generation
+                 AND json_extract(provenance,'$.stamp.authority_epoch')=authority_epoch
+                 AND (epoch IS NOT ?6 OR fingerprint IS NOT ?7 OR (lane='answer' AND answered=1)))",
+            params![
+                op.kind.as_str(),
+                stamp.account_generation,
+                stamp.authority_epoch,
+                stamp.lane_control_revision,
+                stamp.lane_config_revision,
+                op.request["solver"]["epoch"].as_u64(),
+                op.request["challenge_fingerprint"].as_str(),
+            ],
+            |row| row.get(0),
+        )?)
+    }
+
     fn select_ready_effect_in(
         db: &Connection,
         config: &Config,
@@ -265,6 +410,10 @@ impl Store {
                 Some(&binding),
             )? {
                 exclusions[index] = Some("admission_stamp_changed");
+                continue;
+            }
+            if Self::challenge_contradicts_ready_in(db, op, candidate.stamp)? {
+                exclusions[index] = Some("challenge_observation_changed");
                 continue;
             }
             if Self::risk_decision_at(db, config, op, cutoff)?.is_none() {

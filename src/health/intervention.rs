@@ -126,39 +126,55 @@ fn blocker_evidence(detail: &Value) -> Value {
     })
 }
 
-/// Name the retained floor behind a store retry deadline. This labels the
-/// canonical reason; the deadline itself stays the store's `not_before`.
-fn floor_kind(reason: &str) -> Option<&'static str> {
+fn request_floor_kind(basis: &Value) -> &'static str {
+    match basis.as_str() {
+        Some("server_retry_after") => "server_restriction",
+        Some("local_unscoped_429_cooldown") => "local_backoff",
+        Some("retained_legacy_floor") => "retained_floor",
+        _ => "shared_restriction",
+    }
+}
+
+/// Label the wait selected from the persisted admission deadlines.
+fn floor_kind(reason: &str, basis: &Value) -> Option<&'static str> {
     match reason {
         "operation_retry_minimum" => Some("operation_minimum"),
         "operation_backoff" => Some("local_backoff"),
-        "shared_server_restriction" => Some("server_restriction"),
+        "shared_server_restriction" => Some(request_floor_kind(basis)),
         "retained_legacy_floor" => Some("retained_floor"),
         "account_uncertainty_grace" | "uncertain_answer_retry_delay" => Some("participation_grace"),
         _ => None,
     }
 }
 
-/// Last recorded outcome of the bound read, if any. A missing row means no
-/// usable evidence was retained; a 404 means the remote side reports the
-/// bound job unknown or expired while local polling continues. Server floors
-/// (the remote restriction and its retained copy) are reported separately
-/// from local backoff so an active server restriction reads differently from
-/// a local wait. Only deadlines still ahead of now are shown; expired floors
-/// stay on their own rows, never revived here.
-fn bound_evidence(dependency: Option<&Value>, at: i64) -> Value {
-    let Some(row) = dependency else {
-        return json!({"bound_missing": true, "bound_read_status": null,
-            "bound_read_category": null, "server_floor_at": null,
-            "local_retry_at": null});
-    };
+/// Keep sourced read restrictions distinct from local and legacy waits.
+/// The store's `next_at` remains the effective deadline.
+fn read_retry_evidence(row: &Value, at: i64) -> Value {
     let ahead = |field: &str| future(&row[field], at);
-    json!({"bound_missing": false,
-        "bound_read_status": row.get("status").cloned().unwrap_or(Value::Null),
-        "bound_read_category": row.get("failure_category").and_then(Value::as_str)
-            .map_or(Value::Null, |category| json!(crate::store::safe_read_category(category))),
-        "server_floor_at": ahead("server_not_before").max(ahead("retained_conservative_floor")),
-        "local_retry_at": ahead("local_next_at")})
+    let server = ahead("server_not_before").max(ahead("shared_server_not_before"));
+    let local = ahead("local_next_at").max(ahead("shared_local_not_before"));
+    let retained = ahead("retained_conservative_floor").max(ahead("shared_retained_not_before"));
+    let shared = ahead("shared_not_before").filter(|&floor| {
+        Some(floor)
+            > ahead("shared_server_not_before")
+                .max(ahead("shared_local_not_before"))
+                .max(ahead("shared_retained_not_before"))
+    });
+    json!({"server_floor_at":server,"local_retry_at":local,"retained_floor_at":retained,
+        "unattributed_shared_floor_at":shared})
+}
+
+fn bound_evidence(dependency: Option<&Value>, at: i64) -> Value {
+    let row = dependency.unwrap_or(&Value::Null);
+    let mut detail = read_retry_evidence(row, at);
+    detail["bound_missing"] = json!(dependency.is_none());
+    detail["bound_read_status"] = row["status"].clone();
+    detail["bound_read_category"] = json!(
+        row["failure_category"]
+            .as_str()
+            .map(crate::store::safe_read_category)
+    );
+    detail
 }
 
 fn read<'a>(status: &'a Value, name: &str, work: &Value, purpose: &str) -> Option<&'a Value> {
@@ -415,17 +431,26 @@ fn blocker<'a>(
         | "operation_retry_minimum"
         | "operation_backoff"
         | "uncertain_answer_retry_delay" => {
-            // The deadline is the store's own floor; the label only names
-            // which one so server restrictions read differently from local
-            // backoff. An expired floor is stale evidence, not a new wait.
-            let next = future(&detail["not_before"], at).or(future(&detail["next_at"], at));
-            let finding = match next {
-                Some(next) => Finding::automatic(reason, "await_retry_eligibility", Some(next)),
+            // The primary reason can be an earlier operation-level check.
+            // A later request restriction still prevents reaching eligibility.
+            let primary = future(&detail["not_before"], at).or(future(&detail["next_at"], at));
+            let request = future(&detail["request_restriction_at"], at);
+            match primary.max(request) {
+                Some(next) => {
+                    let basis = &detail["restriction_basis"];
+                    let kind = if request.is_some() && request >= primary {
+                        Some(request_floor_kind(basis))
+                    } else {
+                        floor_kind(reason, basis)
+                    };
+                    let finding = Finding::automatic(reason, "await_retry_eligibility", Some(next));
+                    if let Some(kind) = kind {
+                        finding.with("retry_floor", json!(kind))
+                    } else {
+                        finding
+                    }
+                }
                 None => Finding::unknown("retry_deadline_unavailable"),
-            };
-            match floor_kind(reason) {
-                Some(kind) => finding.with("retry_floor", json!(kind)),
-                None => finding,
             }
         }
         "uncertain_retry_disabled" | "answer_attempt_budget_exhausted" => {
@@ -437,6 +462,23 @@ fn blocker<'a>(
         }
         _ => return None,
     })
+}
+
+fn lane_observation_fresh(status: &Value, lane: &str, at: i64, stale: u64) -> Option<bool> {
+    if lane == "judge" {
+        Some(
+            status["lane_participation"][lane]["freshness"] != "stale"
+                && super::assessment_fresh(&status["work"][lane]["assessment"], at, stale),
+        )
+    } else {
+        super::observation_fresh(
+            status,
+            lane,
+            timestamp(&super::observation(status, lane)["observed_at"]),
+            at,
+            stale,
+        )
+    }
 }
 
 fn lane<'a>(
@@ -814,12 +856,27 @@ fn lane<'a>(
                         "observe_challenge"
                     },
                     timestamp(&row["next_at"]),
-                );
+                )
+                .with_all(read_retry_evidence(row, at));
             }
         }
     }
-    if matches!(phase, Some("answered" | "completed" | "included")) && !fresh(observed, at, stale) {
-        return Finding::automatic("completion_evidence_stale", "observe_challenge", next);
+    if matches!(phase, Some("answered" | "completed" | "included")) {
+        match lane_observation_fresh(status, name, at, stale) {
+            Some(false) => {
+                return Finding::automatic(
+                    "completion_evidence_stale",
+                    if name == "judge" {
+                        "observe_assignments"
+                    } else {
+                        "observe_challenge"
+                    },
+                    next.filter(|&deadline| deadline > at),
+                );
+            }
+            None => return Finding::unknown("effective_policy_unavailable"),
+            Some(true) => {}
+        }
     }
     if read_only {
         return Finding {
@@ -855,11 +912,7 @@ fn identity_work_retry_at(status: &Value, at: i64, stale: u64) -> Option<i64> {
                 }
                 Some("observing") => {
                     super::observation(status, name)["epoch"].as_u64().is_some()
-                        && fresh(
-                            timestamp(&super::observation(status, name)["observed_at"]),
-                            at,
-                            stale,
-                        )
+                        && lane_observation_fresh(status, name, at, stale) == Some(true)
                         && (name == "mine" || super::observation(status, name)["answered"] == false)
                 }
                 _ => false,
@@ -897,6 +950,7 @@ fn identity_recovery(status: &Value, at: i64, stale: u64) -> Option<Finding<'sta
             && let Some(next) = identity_work_retry_at(status, at, stale)
         {
             Finding::automatic(identity.reason(), "await_identity", Some(floor.max(next)))
+                .with_all(read_retry_evidence(row, at))
         } else {
             Finding::unknown(identity.reason())
         }
@@ -971,7 +1025,8 @@ pub(super) fn project(status: &Value, options: Options, at: i64) -> (Value, Valu
                 action: identity.action,
                 next_at: identity.next_at,
                 detail: finding.detail,
-            };
+            }
+            .with_all(identity.detail.clone());
         }
         if !work[name].is_object() {
             work[name] = json!({});
@@ -985,18 +1040,8 @@ pub(super) fn project(status: &Value, options: Options, at: i64) -> (Value, Valu
                     "revalidate_challenge" | "revalidate_assignment" | "await_retry_eligibility"
                 )
         );
-        let evidence_at = if name == "judge" {
-            timestamp(&work[name]["assessment"]["observed_at"])
-        } else {
-            timestamp(&super::observation(status, name)["observed_at"])
-        };
-        work[name]["intervention"]["observation_fresh"] = json!(lane_stale.map(|stale| {
-            if name == "judge" {
-                super::assessment_fresh(&work[name]["assessment"], at, stale)
-            } else {
-                fresh(evidence_at, at, stale)
-            }
-        }));
+        work[name]["intervention"]["observation_fresh"] =
+            json!(lane_stale.and_then(|stale| lane_observation_fresh(status, name, at, stale)));
     }
     let core = controller.value(observed, current);
     let mut root = core.clone();
@@ -1072,6 +1117,9 @@ pub(super) fn qualify_operational(report: &mut Value, status: &Value) {
                     && existing["status"] != "automatic_recovery" =>
             {
                 Some(Finding::blocked(reason, "inspect_operations"))
+            }
+            "work_evidence_unavailable" if existing["reason"] == "completion_evidence_stale" => {
+                None
             }
             _ if state == "unknown"
                 && matches!(
@@ -1167,7 +1215,7 @@ fn rank(status: &str) -> u8 {
 }
 
 fn select(root: &mut Value, finding: &Value) {
-    for field in ["status", "reason", "next_action", "next_at"] {
+    for field in ["status", "reason", "next_action", "next_at", "retry_floor"] {
         root[field] = finding[field].clone();
     }
 }
@@ -1606,6 +1654,35 @@ mod tests {
     }
 
     #[test]
+    fn diagnostics_wait_for_the_latest_admission_floor_and_report_its_source() {
+        let mut status = fixture();
+        block(
+            &mut status,
+            "answer",
+            "operation_backoff",
+            "operation",
+            &[],
+            0,
+        );
+        status["work"]["answer"]["admission"]["not_before"] = json!(10010);
+        for (basis, kind) in [
+            ("server_retry_after", "server_restriction"),
+            ("local_unscoped_429_cooldown", "local_backoff"),
+            ("retained_legacy_floor", "retained_floor"),
+            ("", "shared_restriction"),
+        ] {
+            let admission = &mut status["work"]["answer"]["admission"];
+            admission["request_restriction_at"] = json!(10020);
+            admission["restriction_basis"] = json!(basis);
+            let (work, _) = projection(&status);
+            let finding = &work["answer"]["intervention"];
+            assert_eq!(finding["reason"], "operation_backoff");
+            assert_eq!(finding["retry_floor"], kind);
+            assert_eq!(finding["next_at"], 10020);
+        }
+    }
+
+    #[test]
     fn model_uncertainty_budget_and_current_route_errors_remain_separate() {
         let mut status = fixture();
         status["work"]["answer"]["model"] = json!({"state":"model_unknown","budget_used":1,
@@ -1808,8 +1885,9 @@ mod tests {
         status["reads"] = json!([
             {"owner":"answer","purpose":"job","resource":"1:1","binding_revision":1,
                 "last_failure_at":9999,"status":404,"failure_category":"not_found",
-                "next_at":10030,"local_next_at":10020,"server_not_before":10040,
-                "retained_conservative_floor":0}
+                "next_at":10070,"local_next_at":10020,"server_not_before":10040,
+                "retained_conservative_floor":10050,"shared_local_not_before":10060,
+                "shared_server_not_before":10070,"shared_not_before":10070}
         ]);
         let intervention = projection(&status).0["answer"]["intervention"].clone();
         assert_eq!(intervention["status"], "automatic_recovery");
@@ -1818,9 +1896,10 @@ mod tests {
         assert_eq!(intervention["bound_missing"], false);
         assert_eq!(intervention["bound_read_status"], 404);
         assert_eq!(intervention["bound_read_category"], "not_found");
-        assert_eq!(intervention["server_floor_at"], 10040);
-        assert_eq!(intervention["local_retry_at"], 10020);
-        assert_eq!(intervention["next_at"], 10030);
+        assert_eq!(intervention["server_floor_at"], 10070);
+        assert_eq!(intervention["local_retry_at"], 10060);
+        assert_eq!(intervention["retained_floor_at"], 10050);
+        assert_eq!(intervention["next_at"], 10070);
     }
 
     #[test]
@@ -1838,7 +1917,7 @@ mod tests {
         let intervention = projection(&status).0["answer"]["intervention"].clone();
         assert_eq!(intervention["status"], "undetermined");
         assert_eq!(intervention["reason"], "retry_deadline_unavailable");
-        assert_eq!(intervention["retry_floor"], "server_restriction");
+        assert!(intervention["retry_floor"].is_null());
         assert!(intervention["next_at"].is_null());
     }
 

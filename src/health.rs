@@ -1065,6 +1065,8 @@ pub fn compact_diagnostics(data: &mut Value) {
         "retry_at",
         "server_floor_at",
         "local_retry_at",
+        "retained_floor_at",
+        "unattributed_shared_floor_at",
         "blocker_ids",
         "required_release",
         "release_scope",
@@ -1096,6 +1098,8 @@ pub fn compact_diagnostics(data: &mut Value) {
         "blocker_ids",
         "blocker_ids_truncated",
         "not_before",
+        "restriction_basis",
+        "request_restriction_at",
         "retained_uncertainty_nonblocking",
         "historical_eligible_count",
         "capacity_exempt_count",
@@ -2489,9 +2493,11 @@ mod tests {
             status["observations"][lane]["observed_at"] = json!(9881);
             status["lane_participation"][lane]["assessment"] =
                 json!({"observed_at":9881,"valid_until":10001});
+            let current = evaluate(&config, options, &status, 10000);
+            assert_eq!(current["components"][lane]["state"], "ok");
             assert_eq!(
-                evaluate(&config, options, &status, 10000)["components"][lane]["state"],
-                "ok"
+                current["work"][lane]["intervention"]["observation_fresh"],
+                true
             );
             status["observations"][lane]["observed_at"] = json!(9880);
             status["lane_participation"][lane]["assessment"] =
@@ -2499,11 +2505,18 @@ mod tests {
             let expired = evaluate(&config, options, &status, 10000);
             assert_eq!(expired["healthy"], false);
             assert_eq!(expired["components"][lane]["state"], "unknown");
+            let intervention = &expired["work"][lane]["intervention"];
+            assert_eq!(intervention["observation_fresh"], false);
+            assert_eq!(intervention["status"], "automatic_recovery");
+            assert_eq!(intervention["next_action"], "observe_challenge");
+            assert_eq!(expired["intervention"]["unattended"], true);
             status["effective_runtime"]["policy"]["capabilities"][lane]["schedule"]["observation_max_age_seconds"] =
                 json!(3600);
+            let after_policy_change = evaluate(&config, options, &status, 10000);
+            assert_eq!(after_policy_change["components"][lane]["state"], "unknown");
             assert_eq!(
-                evaluate(&config, options, &status, 10000)["components"][lane]["state"],
-                "unknown"
+                after_policy_change["work"][lane]["intervention"]["observation_fresh"],
+                false
             );
         }
     }

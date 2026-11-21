@@ -18,6 +18,21 @@ pub struct ExecutionDeadline {
     pub at: tokio::time::Instant,
     pub unix_seconds: i64,
 }
+
+impl ExecutionDeadline {
+    pub(super) fn unix_millis(self) -> u64 {
+        // Only the monotonic deadline controls local execution. For native
+        // bridges, project its remaining budget onto the wall clock without
+        // rounding up to another second or reusing a preflight duration.
+        let wall = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let remaining = self
+            .at
+            .saturating_duration_since(tokio::time::Instant::now());
+        u64::try_from(wall.saturating_add(remaining).as_millis()).unwrap_or(u64::MAX)
+    }
+}
 pub enum PreflightStart {
     Started(PreflightFlight),
     Finished(NativeCompletion),
@@ -46,6 +61,83 @@ pub struct InferenceFlight {
     child: OwnedChild,
     pending: PendingLaunch,
     spawned_at: i64,
+}
+
+pub(crate) struct ReceivedInference(Received);
+
+enum Received {
+    Finished(NativeCompletion),
+    Omp {
+        terminal: Result<omp::ReceivedTerminal>,
+        model: String,
+        request: NativeRequest,
+        evidence: NativeAttemptCompletion,
+    },
+}
+
+impl ReceivedInference {
+    pub(crate) fn finish(self) -> NativeCompletion {
+        match self.0 {
+            Received::Finished(completion) => completion,
+            Received::Omp {
+                terminal,
+                model,
+                request,
+                mut evidence,
+            } => {
+                // The receiving controller is the sole owner that can validate
+                // a delivered omp terminal or classify its absence on shutdown.
+                let envelope = terminal.and_then(|item| item.verify(model, &mut evidence.reported));
+                if !envelope.as_ref().is_err_and(execution_may_have_started) {
+                    evidence.cancellation.remote_run_stop = RemoteRunStop::NotRequested;
+                }
+                let result = envelope.and_then(|output| validated_result(&request, output));
+                inference_completion(result, evidence)
+            }
+        }
+    }
+}
+
+fn validated_result(
+    request: &NativeRequest,
+    (provider, model, run_id, output): (String, String, String, String),
+) -> Result<NativeArtifact> {
+    ensure!(
+        safe_identifier(&run_id),
+        NativeFailure("native_run_binding_mismatch")
+    );
+    let artifact = validate_artifact(&output, request.request())?;
+    Ok(NativeArtifact::validated(
+        request,
+        SolverResult {
+            answer: artifact.answer,
+            score: artifact.score,
+            reasoning: artifact.reasoning,
+            provider,
+            model,
+            run_id,
+        },
+    ))
+}
+
+fn inference_completion(
+    result: Result<NativeArtifact>,
+    mut facts: NativeAttemptCompletion,
+) -> NativeCompletion {
+    match result {
+        Ok(artifact) => {
+            facts.execution = NativeExecution::Completed;
+            facts.outcome = NativeOutcome::Captured;
+            facts.reason_code = NativeReasonCode::Captured;
+            facts.phase = NativePhase::ArtifactValidation;
+            facts.collected_at = Some(now());
+            NativeCompletion {
+                result: Ok(artifact),
+                evidence: facts,
+            }
+        }
+        Err(error) => failed(error, facts),
+    }
 }
 
 fn new_invocation_id() -> Result<String> {
@@ -110,19 +202,21 @@ fn failed(error: anyhow::Error, mut facts: NativeAttemptCompletion) -> NativeCom
             facts.outcome = NativeOutcome::Invalid;
         }
     }
-    if matches!(
-        code,
-        NativeReasonCode::ModelDeadlineExceeded
-            | NativeReasonCode::NativeProcessCancelled
-            | NativeReasonCode::HermesTimeout
-            | NativeReasonCode::HermesCancelled
-            | NativeReasonCode::OpenclawTimeout
-            | NativeReasonCode::OpenclawAborted
-    ) {
+    if facts.cancellation.local_process_stop == LocalProcessStop::NotRequested
+        && matches!(
+            code,
+            NativeReasonCode::ModelDeadlineExceeded
+                | NativeReasonCode::NativeProcessCancelled
+                | NativeReasonCode::HermesTimeout
+                | NativeReasonCode::HermesCancelled
+                | NativeReasonCode::OpenclawTimeout
+                | NativeReasonCode::OpenclawAborted
+        )
+    {
         facts.cancellation = CancellationEvidence {
             requested_at: (code == NativeReasonCode::ModelDeadlineExceeded).then(now),
             local_process_stop: LocalProcessStop::Unknown,
-            remote_run_stop: if facts.inference_spawned_at.is_some() {
+            remote_run_stop: if facts.execution == NativeExecution::Unknown {
                 RemoteRunStop::Unknown
             } else {
                 RemoteRunStop::NotRequested
@@ -219,6 +313,7 @@ impl PreflightFlight {
                 &mut self.child,
                 Vec::new(),
                 NativeProtocol::Discovery,
+                None,
                 &mut Default::default(),
             )
             .await?;
@@ -279,9 +374,12 @@ impl PreflightFlight {
                 NativeProtocol::Hermes => serde_json::to_vec(
                     &json!({"invocation_id":self.invocation_id,"model":self.model.model,"reasoning":self.model.reasoning,"hermes_api_url":self.model.hermes_api_url,"timeout_seconds":seconds,"policy":SECURITY_AND_OUTPUT,"prompt":self.prompt}),
                 )?,
-                NativeProtocol::Openclaw => {
-                    encode_openclaw_input(&self.model, seconds, &self.prompt, &self.invocation_id)?
-                }
+                NativeProtocol::Openclaw => encode_openclaw_input(
+                    &self.model,
+                    self.execution_deadline.unix_millis(),
+                    &self.prompt,
+                    &self.invocation_id,
+                )?,
                 NativeProtocol::Omp => {
                     let prepared = omp::prepare(
                         &self.model,
@@ -384,7 +482,11 @@ impl InferenceFlight {
     pub fn inference_spawned_at(&self) -> i64 {
         self.spawned_at
     }
-    pub async fn collect(mut self) -> NativeCompletion {
+    pub async fn collect(self) -> NativeCompletion {
+        self.receive().await.finish()
+    }
+
+    pub(crate) async fn receive(mut self) -> ReceivedInference {
         let mut facts = evidence(
             NativePhase::Inference,
             Some(self.pending.preflight_started_at),
@@ -392,7 +494,10 @@ impl InferenceFlight {
         );
         let deadline = self.pending.deadline;
         if deadline.at <= tokio::time::Instant::now() {
-            return failed(NativeFailure("model_deadline_exceeded").into(), facts);
+            return ReceivedInference(Received::Finished(failed(
+                NativeFailure("model_deadline_exceeded").into(),
+                facts,
+            )));
         }
         facts.reported.prompt_channel = Some(Reported {
             value: match self.pending.model.harness {
@@ -403,22 +508,29 @@ impl InferenceFlight {
             source: EvidenceSource::AdapterContract,
         });
         let p = &mut self.pending;
+        let input = std::mem::take(&mut p.input);
+        if matches!(p.protocol, NativeProtocol::Omp) {
+            let terminal = omp::collect(&mut self.child, input, deadline, &mut facts).await;
+            let PendingLaunch { model, request, .. } = self.pending;
+            return ReceivedInference(Received::Omp {
+                terminal,
+                model: model.model,
+                request,
+                evidence: facts,
+            });
+        }
         let operation = async {
-            let input = std::mem::take(&mut p.input);
-            let value: Value = if matches!(p.protocol, NativeProtocol::Omp) {
-                omp::collect(&mut self.child, input, deadline, &mut facts.reported).await?
-            } else {
-                let bytes = collect_native_evidence(
-                    &mut self.child,
-                    input,
-                    p.protocol,
-                    &mut facts.reported,
-                )
-                .await?;
-                serde_json::from_slice(&bytes)
-                    .map_err(|_| NativeFailure("native_envelope_invalid"))?
-            };
-            let (provider, model, run_id, output) = match p.model.harness {
+            let bytes = collect_native_evidence(
+                &mut self.child,
+                input,
+                p.protocol,
+                (p.model.harness == Harness::Openclaw).then_some(p.invocation_id.as_str()),
+                &mut facts.reported,
+            )
+            .await?;
+            let value = serde_json::from_slice(&bytes)
+                .map_err(|_| NativeFailure("native_envelope_invalid"))?;
+            let output = match p.model.harness {
                 Harness::Hermes => {
                     let result: HermesOutput = serde_json::from_value(value)
                         .map_err(|_| NativeFailure("native_envelope_invalid"))?;
@@ -468,42 +580,15 @@ impl InferenceFlight {
                         .to_owned();
                     (provider.to_owned(), p.model.model.clone(), run, output)
                 }
-                Harness::Omp => omp::result(&value, &p.model, &p.invocation_id)?,
+                Harness::Omp => unreachable!("omp terminal collected separately"),
             };
-            ensure!(
-                safe_identifier(&run_id),
-                NativeFailure("native_run_binding_mismatch")
-            );
-            let artifact = validate_artifact(&output, p.request.request())?;
-            Ok(NativeArtifact::validated(
-                &p.request,
-                SolverResult {
-                    answer: artifact.answer,
-                    score: artifact.score,
-                    reasoning: artifact.reasoning,
-                    provider,
-                    model,
-                    run_id,
-                },
-            ))
+            validated_result(&p.request, output)
         };
-        let result = tokio::time::timeout_at(deadline.at, operation).await;
+        let result = tokio::time::timeout_at(deadline.at, operation)
+            .await
+            .unwrap_or_else(|_| Err(NativeFailure("model_deadline_exceeded").into()));
         drop(self.child);
         drop(self.pending.scratch);
-        match result {
-            Ok(Ok(artifact)) => {
-                facts.execution = NativeExecution::Completed;
-                facts.outcome = NativeOutcome::Captured;
-                facts.reason_code = NativeReasonCode::Captured;
-                facts.phase = NativePhase::ArtifactValidation;
-                facts.collected_at = Some(now());
-                NativeCompletion {
-                    result: Ok(artifact),
-                    evidence: facts,
-                }
-            }
-            Ok(Err(error)) => failed(error, facts),
-            Err(_) => failed(NativeFailure("model_deadline_exceeded").into(), facts),
-        }
+        ReceivedInference(Received::Finished(inference_completion(result, facts)))
     }
 }

@@ -480,6 +480,157 @@ async fn committed_launch_with_stale_final_bounds_finishes_once_without_spawning
 
 #[cfg(unix)]
 #[tokio::test]
+async fn shutdown_validates_delivered_omp_terminal_with_no_remaining_budget() {
+    use crate::config::{Harness, OmpConfig};
+    use std::os::unix::fs::PermissionsExt;
+
+    // A real child speaks RPC but stays alive after returning the terminal.
+    // Shutdown owns validation even when its join deadline is already spent.
+    const RPC: &str = r#"
+if [ "$1" = --version ]; then echo 19.0.1; exit 0; fi
+printf '%s\n' "$$" > "$marker"
+binding=$(sed -E 's/"(deadline_unix_ms|provider_discovery_cwd)":("[^"]*"|[0-9]+),?//g; s/,?\}$//' omp-bootstrap.json)
+reply() {
+    IFS= read -r request || exit 1
+    printf '{"type":"response","id":"%s","command":"%s","success":true,"data":%s}\n' "$1" "$2" "$3"
+}
+entry() {
+    printf '{"id":"%s","type":"custom","customType":"agmi_omp_%s_v1","data":%s}' "$1" "$1" "$2"
+}
+echo '{"type":"ready","protocolVersion":1,"supportedProtocolVersions":[2],"maxFrameBytes":4096,"maxReassembledFrameBytes":4096}'
+reply negotiate negotiate_protocol '{"protocolVersion":2}'
+reply commands get_available_commands '{"commands":[{"name":"agmi-omp-once-v1"}]}'
+if [ "$refusal" = true ]; then
+    terminal=$(entry result "$binding"',"ok":false,"reason_code":"native_api_unsupported","stage":"startup"}')
+    reply ready-entries get_entries "{\"entries\":[$terminal]}"
+else
+    ready=$(entry ready "$binding}")
+    reply ready-entries get_entries "{\"entries\":[$ready]}"
+    reply once prompt null
+    echo '{"type":"prompt_result","id":"once","agentInvoked":false,"status":"completed"}'
+    dispatch=$(entry dispatch "$binding}")
+    terminal=$(entry result "$binding"',"ok":true,"native_provider":"fixture","native_model":"model","wire_model":null,"upstream_model":null,"upstream_provider":null,"output_phase":null,"output":"{\"answer\":\"A fixture result\",\"score\":null,\"reasoning\":null}"}')
+    reply terminal-entries get_entries "{\"entries\":[$dispatch,$terminal]}"
+fi
+exec sleep 60
+"#;
+    const KEY: &str = "8:shutdown-omp";
+    for refusal in [false, true] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = Config::default();
+        config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
+        config.capabilities.answer.mode = Mode::Active;
+        config.capabilities.answer.timeouts.model_seconds = 10;
+        let (temp, mut host, stop) = fixture_with(config);
+        let marker = temp.path().join("omp-pid");
+        let executable = temp.path().join("omp");
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nmarker='{}'\nrefusal={refusal}\n{RPC}",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let model = &mut host.config.capabilities.answer.model;
+        model.harness = Harness::Omp;
+        model.executable = executable;
+        model.model = "fixture/model".into();
+        model.omp = Some(OmpConfig {
+            provider_discovery_cwd: Some("/".into()),
+            ..Default::default()
+        });
+        std::fs::write(&host.config_path, toml::to_string(&host.config).unwrap()).unwrap();
+        host.reload().unwrap();
+        host.store.runtime_state(&host.config, false).unwrap();
+        identity_fixture(&mut host, &listener).await;
+
+        let observation = observation(&host, LaneId::Answer);
+        let mut slot = AnswerModelSlot::default();
+        let mut request = task_request(&host, LaneId::Answer);
+        request.words = vec!["fixture".into()];
+        request.min_chars = 1;
+        request.max_chars = 64;
+        assert!(
+            host.begin_answer_model(
+                &mut slot,
+                AnswerTask::new(request).unwrap(),
+                "fingerprint".into(),
+                KEY,
+                None,
+                &observation,
+            )
+            .unwrap()
+        );
+        let id = slot.0.work.as_ref().unwrap().op.id;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while slot.pending_work().is_none() {
+                slot.0.collect(&mut host).unwrap();
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let key = slot.pending_work().unwrap().key;
+        let revision = observation.stamp.lane_config_revision.clone();
+        slot.0
+            .launch_matched(&mut host, key, observation, revision)
+            .unwrap();
+        let Stage::Running { result, .. } = &slot.0.work.as_ref().unwrap().stage else {
+            panic!("omp inference collector missing");
+        };
+        // Leave the unverified terminal handoff on the channel for shutdown.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while result.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("omp worker did not deliver terminal evidence");
+        host.cancel_answer_model(&mut slot, tokio::time::Instant::now())
+            .await
+            .unwrap();
+        stop.send(true).unwrap();
+        host.shutdown().await.unwrap();
+
+        let op = host.store.operation(id).unwrap().unwrap();
+        let completion = &attempt(&host, id)["completion"];
+        if refusal {
+            assert_eq!(op.state, "prelaunch_failed");
+            assert_eq!(completion["reason_code"], "native_api_unsupported");
+            assert_eq!(completion["execution"], "not_started");
+        } else {
+            assert_eq!(op.state, "generated");
+            assert_eq!(op.result.unwrap()["answer"], "A fixture result");
+            assert_eq!(completion["reason_code"], "captured");
+            assert_eq!(completion["execution"], "completed");
+        }
+        assert!(completion["cancellation"]["requested_at"].is_i64());
+        assert_eq!(
+            completion["cancellation"]["remote_run_stop"],
+            "not_requested"
+        );
+        assert!(host.effect.is_none());
+        assert_eq!(host.store.attempt_count(LaneId::Answer, KEY).unwrap(), 1);
+        let pid: i32 = std::fs::read_to_string(marker)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            // SAFETY: this PID is the test's own child, and signal 0 only probes it.
+            while unsafe { libc::kill(pid, 0) } == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the stopped omp child was not reaped");
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn shutdown_native_cleanup_keeps_original_deadline_and_effect_gates() {
     use crate::runtime::host::tests::{accept, offer_mine, reply, request};
     use std::os::unix::fs::PermissionsExt;

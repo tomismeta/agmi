@@ -63,6 +63,9 @@ enum Command {
         /// Emit the raw installer manifest even with --json (explicit envelope exception).
         #[arg(long)]
         manifest: bool,
+        /// Emit the raw installer capability probe without loading configuration.
+        #[arg(long, conflicts_with = "manifest")]
+        installer_capabilities: bool,
     },
     /// Explicitly create a hosted identity, or inspect local registration evidence.
     Identity {
@@ -1664,8 +1667,18 @@ async fn main() {
             std::process::exit(2);
         }
     };
-    if matches!(cli.command, Command::BuildInfo { manifest: true }) {
+    if matches!(cli.command, Command::BuildInfo { manifest: true, .. }) {
         print!("{}", include_str!(env!("AGMI_BUILD_MANIFEST_PATH")));
+        return;
+    }
+    if matches!(
+        cli.command,
+        Command::BuildInfo {
+            installer_capabilities: true,
+            ..
+        }
+    ) {
+        println!("bound_dispute_fence=1");
         return;
     }
     if let Command::Completions { shell } = &cli.command {
@@ -2006,11 +2019,9 @@ mod tests {
         assert_eq!(compact["pending_work_count"], 1);
         assert_eq!(compact["reads_count"], 2);
         assert!(compact.get("pending_work").is_none());
-        assert!(
-            compact["work"]["answer"]["admission"]
-                .get("blocker_ids")
-                .is_none()
-        );
+        let admission = &compact["work"]["answer"]["admission"];
+        assert_eq!(admission["blocker_ids"], json!([1, 2]));
+        assert!(admission.get("historical_unknown_answers").is_none());
         assert_eq!(compact["work"]["answer"]["admission"]["own_count"], 2000);
         assert!(full["pending_work"][0]["model_attempt"].is_object());
     }

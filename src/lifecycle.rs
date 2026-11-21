@@ -3,7 +3,7 @@
 use crate::{
     admin,
     config::Config,
-    protocol::{Protocol, ReadFailure, transport_failure},
+    protocol::{HostedIdentityBody, Protocol, ReadFailure, RestrictionBasis, transport_failure},
     store::{AccountAdmissionGuard, AccountLock, Store, admin_identity_initialized},
 };
 use anyhow::{Context, Result, ensure};
@@ -237,7 +237,7 @@ fn terminal_notice(message: &str) -> Result<()> {
 struct VerificationEvidence {
     http_status: Option<u16>,
     reason: &'static str,
-    retry_after_seconds: Option<u64>,
+    retry_minimum: Option<(u64, RestrictionBasis)>,
     transient: bool,
 }
 
@@ -250,9 +250,17 @@ impl std::error::Error for VerificationEvidence {}
 
 pub fn verification_details(error: &anyhow::Error) -> Option<Value> {
     let evidence = error.downcast_ref::<VerificationEvidence>()?;
+    let (retry_after_seconds, local_cooldown_seconds) = match evidence.retry_minimum {
+        Some((seconds, RestrictionBasis::ServerRetryAfter)) => (Some(seconds), None),
+        Some((seconds, RestrictionBasis::LocalUnscoped429Cooldown)) => (None, Some(seconds)),
+        None => (None, None),
+    };
     Some(json!({
         "reason":evidence.reason,"http_status":evidence.http_status,
-        "retry_after_seconds":evidence.retry_after_seconds,"transient":evidence.transient,
+        "retry_after_seconds":retry_after_seconds,
+        "local_cooldown_seconds":local_cooldown_seconds,
+        "retry_basis":evidence.retry_minimum.map(|(_, basis)| basis),
+        "transient":evidence.transient,
     }))
 }
 
@@ -265,7 +273,7 @@ fn verification_error(
 }
 
 async fn verify_once(protocol: &Protocol, config: &Config) -> Result<String> {
-    let response = protocol
+    let hosted = protocol
         .get(
             crate::endpoints::Endpoint::Identity,
             None,
@@ -294,23 +302,29 @@ async fn verify_once(protocol: &Protocol, config: &Config) -> Result<String> {
                 VerificationEvidence {
                     http_status: None,
                     reason: transport_failure(&error).as_str(),
-                    retry_after_seconds: None,
+                    retry_minimum: None,
                     transient: true,
                 },
             )
-        })?
-        .response;
+        })?;
+    let retry_minimum = hosted.authenticated_retry_minimum();
+    let response = &hosted.response;
     let evidence = |reason, transient| VerificationEvidence {
         http_status: Some(response.status),
         reason,
-        retry_after_seconds: response.retry_after_seconds,
+        retry_minimum,
         transient,
     };
     let (code, message, facts) = match response.status {
-        401 | 403 => (
+        401 => (
             "credential_rejected",
-            "MinePOA refused authentication. Check that this is the hosted API key for this network.",
+            "MinePOA refused authentication. Check that this is the hosted API key for this network. No credential was saved.",
             evidence("authentication_refused", false),
+        ),
+        403 => (
+            "credential_access_forbidden",
+            "MinePOA denied access. Check key permissions, the selected network, and upstream access restrictions. A 403 alone does not prove the key is invalid. No credential was saved.",
+            evidence("permission_denied", false),
         ),
         429 | 503 => (
             "identity_verification_backoff",
@@ -333,36 +347,23 @@ async fn verify_once(protocol: &Protocol, config: &Config) -> Result<String> {
                     ),
                 ));
             }
-            if ["ok", "success"].iter().all(|field| {
-                response
-                    .body
-                    .get(field)
-                    .is_none_or(|v| v.as_bool() == Some(true))
-            }) && let Some(address) = response
-                .body
-                .get("address")
-                .and_then(Value::as_str)
-                .filter(|address| crate::config::valid_address(address))
-            {
-                if (config.network.address.is_empty() || config.network.address == address)
-                    && response
-                        .body
-                        .get("chain_id")
-                        .is_none_or(|v| v.as_str() == Some(config.network.chain.as_str()))
-                {
-                    return Ok(address.to_owned());
-                }
-                return Err(verification_error(
+            let expected_address = config.network.address.as_str();
+            match response.hosted_identity_body(
+                (!expected_address.is_empty()).then_some(expected_address),
+                &config.network.chain,
+            ) {
+                HostedIdentityBody::Verified(address) => return Ok(address.to_owned()),
+                HostedIdentityBody::Mismatch => (
                     "credential_identity_unverified",
                     "The key belongs to a different account or chain. No credential was saved.",
                     evidence("account_or_chain_mismatch", false),
-                ));
+                ),
+                HostedIdentityBody::Invalid => (
+                    "identity_verification_unavailable",
+                    "MinePOA did not return a usable identity response; no credential was saved.",
+                    evidence("identity_response_invalid", false),
+                ),
             }
-            (
-                "identity_verification_unavailable",
-                "MinePOA did not return a usable identity response; no credential was saved.",
-                evidence("identity_response_invalid", false),
-            )
         }
         _ => (
             "identity_verification_unavailable",
@@ -399,21 +400,33 @@ async fn verify(config: &Config, bytes: &[u8], interactive: bool) -> Result<Stri
         && let Some(facts) = error.downcast_ref::<VerificationEvidence>()
         && facts.transient
     {
-        // Keep the key in this process only. Never shorten a server minimum or
-        // let an unbounded upstream wait tie up an interactive terminal.
-        let wait = facts.retry_after_seconds.unwrap_or(0);
+        // Keep the key in this process only. Never shorten either the server
+        // minimum or the local bare-429 cooldown to fit the interactive budget.
+        let wait = facts.retry_minimum.map_or(0, |(seconds, _)| seconds);
         if wait <= config.identity.read_http_seconds {
+            let retry_at = tokio::time::Instant::now() + std::time::Duration::from_secs(wait);
             let message = error
                 .downcast_ref::<LifecycleError>()
                 .expect("typed verification error");
             terminal_notice(message.message)?;
+            if let Some((seconds, basis)) = facts.retry_minimum {
+                let source = match basis {
+                    RestrictionBasis::ServerRetryAfter => "server Retry-After",
+                    RestrictionBasis::LocalUnscoped429Cooldown => {
+                        "local cooldown, not a server Retry-After"
+                    }
+                };
+                terminal_notice(&format!("Earliest retry: {seconds}s ({source})."))?;
+            }
             let reply = hidden_line(
                 "Retry verification without re-entering the key? Type y and press Enter [y/N]: ",
             )?;
             if reply.eq_ignore_ascii_case(b"y") {
-                if wait > 0 {
-                    terminal_notice(&format!("Waiting {wait} seconds before retrying…"))?;
-                    tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                let remaining = retry_at.saturating_duration_since(tokio::time::Instant::now());
+                if !remaining.is_zero() {
+                    let seconds = remaining.as_secs() + u64::from(remaining.subsec_nanos() != 0);
+                    terminal_notice(&format!("Waiting {seconds} seconds before retrying…"))?;
+                    tokio::time::sleep_until(retry_at).await;
                 }
                 terminal_notice("Retrying MinePOA identity verification…")?;
                 return verify_once(&protocol, config).await;
@@ -796,6 +809,7 @@ pub(crate) fn installer_evidence(value: Option<&Value>) -> Value {
                 "installer_busy",
                 "update_in_progress",
                 "legacy_install_lock",
+                "stopped_update_required",
                 "decision_required",
                 "recovery_required",
                 "restoration_incomplete",

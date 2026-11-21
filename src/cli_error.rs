@@ -274,6 +274,7 @@ pub(crate) fn execution(error: &Error, config: Option<&Path>) -> Value {
         | "identity_verification_prerequisite"
         | "credential_identity_unverified"
         | "credential_rejected"
+        | "credential_access_forbidden"
         | "initialization_cancelled"
         | "identity_verification_backoff"
         | "identity_verification_unavailable" => &["init", "--help"],
@@ -287,7 +288,7 @@ pub(crate) fn execution(error: &Error, config: Option<&Path>) -> Value {
         if value["details"]["transient"] == true {
             value["next_actions"] = json!([{
                 "kind":"instruction","authorization_required":true,
-                "message":"Retry the command after any reported server wait. You can reuse the existing API key file; do not rotate a key because of a transport or server error."
+                "message":"Retry the command after any reported server minimum or local cooldown. You can reuse the existing API key file; do not rotate a key because of a transport or server error."
             }]);
         }
     }
@@ -1029,6 +1030,27 @@ fn print_diagnostic_verdict(kind: &str, data: &Value) {
     );
 }
 
+fn retry_floor_label(detail: &Value) -> Option<&'static str> {
+    match detail["retry_floor"].as_str()? {
+        "server_restriction" => Some("server retry restriction"),
+        "shared_restriction" => Some("shared retry restriction (source unknown)"),
+        "local_backoff" => Some("local retry backoff"),
+        "retained_floor" => Some("retained retry restriction"),
+        "operation_minimum" => Some("operation retry minimum"),
+        "participation_grace" => Some("participation grace period"),
+        _ => None,
+    }
+}
+
+fn intervention_reason(detail: &Value) -> &str {
+    let reason = detail["reason"].as_str().unwrap_or("evidence_unavailable");
+    if reason == "shared_server_restriction" {
+        retry_floor_label(detail).unwrap_or("shared retry restriction (source unknown)")
+    } else {
+        reason
+    }
+}
+
 fn print_core_row(data: &Value) {
     let component = &data["components"]["controller"];
     let root = &data["intervention"];
@@ -1043,7 +1065,7 @@ fn print_core_row(data: &Value) {
     println!(
         "; {} ({})",
         intervention_label(&root["status"]),
-        root["reason"].as_str().unwrap_or("evidence_unavailable")
+        intervention_reason(root)
     );
     if let Some(gate) = inspection_gate(data) {
         println!("Shared prerequisite: {gate}; lane recovery paths remain conditional.");
@@ -1062,12 +1084,7 @@ fn print_lane_row(data: &Value, lane: &str) {
         intervention_label(&intervention["status"])
     );
     if intervention["status"] != "none_required" {
-        print!(
-            " ({})",
-            intervention["reason"]
-                .as_str()
-                .unwrap_or("evidence_unavailable")
-        );
+        print!(" ({})", intervention_reason(intervention));
     }
     if let Some(state) = state {
         print!("; {state}");
@@ -1100,22 +1117,36 @@ fn print_lane_row(data: &Value, lane: &str) {
     {
         print!("; next_at={at}");
     }
-    match intervention["retry_floor"].as_str() {
-        Some("server_restriction") => print!("; server retry restriction"),
-        Some("local_backoff") => print!("; local retry backoff"),
-        Some("retained_floor") => print!("; retained retry restriction"),
-        Some("operation_minimum") => print!("; operation retry minimum"),
-        Some("participation_grace") => print!("; participation grace period"),
-        _ => {}
+    if intervention["reason"] != "shared_server_restriction"
+        && let Some(label) = retry_floor_label(intervention)
+    {
+        print!("; {label}");
     }
-    if let Some(at) = intervention["server_floor_at"].as_i64() {
-        print!("; server floor={at}");
-    }
-    if let Some(at) = intervention["local_retry_at"].as_i64() {
-        print!("; local retry={at}");
+    for (field, label) in [
+        ("server_floor_at", "server floor"),
+        ("local_retry_at", "local retry"),
+        ("retained_floor_at", "retained floor"),
+        (
+            "unattributed_shared_floor_at",
+            "shared floor (source unknown)",
+        ),
+    ] {
+        if let Some(at) = intervention[field].as_i64() {
+            print!("; {label}={at}");
+        }
     }
     if intervention["resolution"] == "polling_not_guaranteed" {
-        print!("; at least one bound read returned 404; polling continues, outcome unknown");
+        print!("; at least one bound read returned 404");
+        if intervention["status"] == "automatic_recovery"
+            && matches!(
+                intervention["next_action"].as_str(),
+                Some("read_job" | "read_receipt" | "await_reconciliation")
+            )
+        {
+            print!("; polling continues, outcome unknown");
+        } else {
+            print!("; outcome unknown");
+        }
     }
     if let Some(ids) = intervention["blocker_ids"]
         .as_array()
@@ -1384,6 +1415,9 @@ pub(crate) fn human_error(error: &Value) {
     }
     if let Some(seconds) = error["details"]["retry_after_seconds"].as_u64() {
         eprintln!("Retry after: {seconds}s");
+    }
+    if let Some(seconds) = error["details"]["local_cooldown_seconds"].as_u64() {
+        eprintln!("Local cooldown: {seconds}s (not a server Retry-After)");
     }
     if let Some(recovery) = error["details"]["bootstrap_recovery"].as_object() {
         eprintln!(

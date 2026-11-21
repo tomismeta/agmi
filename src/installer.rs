@@ -257,7 +257,6 @@ mod native {
     use crate::store::migration::{self, UpgradeKind};
     type InstallLock = update_state::Lease;
     use sha2::{Digest, Sha256};
-    #[cfg(target_os = "linux")]
     use std::os::fd::AsRawFd;
     use std::{
         ffi::CString,
@@ -993,7 +992,7 @@ mod native {
     fn digest(file: File) -> Result<String> {
         digest_cancellable(file, true)
     }
-    fn digest_cancellable(mut file: File, cancellable: bool) -> Result<String> {
+    fn digest_cancellable(mut file: impl Read, cancellable: bool) -> Result<String> {
         let mut hasher = Sha256::new();
         let mut buffer = [0_u8; 65536];
         loop {
@@ -1311,6 +1310,23 @@ mod native {
     }
 
     fn incoming(binary: &Path, request: &Request<'_>) -> Result<Value> {
+        // Quiescence for live updates is established by the incoming writer.
+        // A pre-handoff journal read cannot prove a bound dispute won't be
+        // persisted while the source drains, even under a participation pause.
+        if matches!(request.action, "update" | "activate") && !request.stopped {
+            ensure!(
+                capture(
+                    Command::new(binary).args(["build-info", "--installer-capabilities"]),
+                    true,
+                )
+                .is_ok_and(|probe| {
+                    probe.status.success()
+                        && probe.stdout == b"bound_dispute_fence=1\n"
+                        && probe.stderr.is_empty()
+                }),
+                installer_preflight_error("stopped_update_required")
+            );
+        }
         let action = match request.action {
             "stage" => "install",
             "activate" => "update",
@@ -4237,14 +4253,17 @@ mod native {
             }
             if request.action == "activate" {
                 let target = installation.root.join(request.target).join("agmi");
+                let executable = regular(&target)?;
                 ensure!(
-                    digest_cancellable(regular(&target)?, false)? == request.target[2..],
+                    digest_cancellable(&executable, false)? == request.target[2..],
                     "retained target executable changed"
                 );
-                if digest_cancellable(File::open(std::env::current_exe()?)?, false)?
-                    != request.target[2..]
+                if digest_cancellable(File::open("/proc/self/exe")?, false)? != request.target[2..]
                 {
-                    return incoming(&target, &request).map(Some);
+                    // Hash, capability probe and handoff all concern the same
+                    // opened ELF, not a mutable MANIFEST or a reopened pathname.
+                    let pinned = PathBuf::from(format!("/proc/self/fd/{}", executable.as_raw_fd()));
+                    return incoming(&pinned, &request).map(Some);
                 }
             }
             let candidate = if let Some(expected) = request.digest {

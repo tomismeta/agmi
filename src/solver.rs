@@ -25,6 +25,7 @@ pub(crate) use cleanup::drain_native_cleanup_until;
 pub(crate) use cleanup::pause_native_cleanup_for_test;
 mod launch;
 mod omp;
+pub(crate) use launch::ReceivedInference;
 pub use launch::{
     ExecutionDeadline, InferenceFlight, InferenceStart, PendingLaunch, PreflightCompletion,
     PreflightFlight, PreflightStart, start_preflight,
@@ -135,6 +136,31 @@ enum NativeProtocol {
     Omp,
 }
 
+fn openclaw_deadline_before_call(output: &[u8], invocation_id: &str) -> bool {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "camelCase")]
+    struct Refusal<'a> {
+        ok: bool,
+        status: &'a str,
+        run_id: &'a str,
+        #[serde(borrow)]
+        error: RefusalError<'a>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct RefusalError<'a> {
+        kind: &'a str,
+    }
+
+    serde_json::from_slice::<Refusal<'_>>(output).is_ok_and(|refusal| {
+        !refusal.ok
+            && refusal.status == "error"
+            && refusal.run_id == invocation_id
+            && refusal.error.kind == "deadline_before_call"
+    })
+}
+
 // CLI disconnects and Gateway failures do not prove inference stopped.
 // Categories are diagnostic only, never evidence permitting a retry.
 fn openclaw_failure(value: &Value) -> Option<NativeFailure> {
@@ -213,7 +239,7 @@ pub fn completed_artifact_invalid(error: &anyhow::Error) -> bool {
 
 fn encode_openclaw_input(
     model: &ModelConfig,
-    timeout_seconds: u64,
+    deadline_unix_ms: u64,
     prompt: &str,
     invocation_id: &str,
 ) -> Result<Vec<u8>> {
@@ -222,7 +248,7 @@ fn encode_openclaw_input(
         "invocation_id": invocation_id,
         // The inspected Gateway interface has only a message channel.
         // Formatting is not a privileged policy boundary.
-        "timeout_seconds": timeout_seconds, "prompt": format!("{SECURITY_AND_OUTPUT}\n{prompt}"),
+        "deadline_unix_ms": deadline_unix_ms, "prompt": format!("{SECURITY_AND_OUTPUT}\n{prompt}"),
     }))?;
     ensure!(
         input.len() <= MAX_OPENCLAW_INPUT,
@@ -353,8 +379,25 @@ fn validate_request(request: &SolverRequest) -> Result<()> {
 }
 
 fn validate_artifact(output: &str, request: &SolverRequest) -> Result<Artifact> {
-    let artifact: Artifact =
-        serde_json::from_str(output).map_err(|_| NativeFailure("artifact_json_invalid"))?;
+    let typed = output
+        .trim_start_matches([' ', '\t', '\n', '\r'])
+        .starts_with('{')
+        .then(|| serde_json::from_str::<Artifact>(output).ok())
+        .flatten();
+    let artifact = typed.ok_or_else(|| {
+        // Typed deserialization may stop at the first schema violation, before
+        // reading a later syntax error. Only a complete JSON value is invalid
+        // artifact evidence; do not accept it or erase duplicate-field errors.
+        NativeFailure(
+            if serde_json::from_str::<serde::de::IgnoredAny>(output).is_err() {
+                "artifact_json_invalid"
+            } else if request.kind == LaneId::Judge {
+                "artifact_grade_invalid"
+            } else {
+                "protocol_output_invalid"
+            },
+        )
+    })?;
     match request.kind {
         LaneId::Answer => {
             ensure!(
@@ -479,13 +522,11 @@ impl OwnedChild {
         let _ = self.child.start_kill();
     }
 
-    async fn stop_and_reap(&mut self) -> Result<()> {
+    fn stop_and_observe(&mut self) -> bool {
         self.request_stop();
-        self.child
-            .wait()
-            .await
-            .map(|_| ())
-            .map_err(|_| NativeFailure("native_process_failed").into())
+        // Kill the group before reaping its leader. If the leader has not
+        // exited yet, dropping Child hands it to Tokio's orphan reaper.
+        self.child.try_wait().is_ok_and(|status| status.is_some())
     }
 
     async fn wait(&mut self) -> Result<std::process::ExitStatus> {
@@ -622,13 +663,14 @@ async fn collect_native(
     input: Vec<u8>,
     protocol: NativeProtocol,
 ) -> Result<Vec<u8>> {
-    collect_native_evidence(&mut owner, input, protocol, &mut Default::default()).await
+    collect_native_evidence(&mut owner, input, protocol, None, &mut Default::default()).await
 }
 
 async fn collect_native_evidence(
     owner: &mut OwnedChild,
     input: Vec<u8>,
     protocol: NativeProtocol,
+    openclaw_invocation_id: Option<&str>,
     evidence: &mut contract::NativeReportedEvidence,
 ) -> Result<Vec<u8>> {
     let mut stdin = owner
@@ -678,6 +720,13 @@ async fn collect_native_evidence(
                 Some("native_auth_unavailable")
             }
             Some(80) if matches!(protocol, NativeProtocol::Hermes) => Some("native_route_mismatch"),
+            Some(81)
+                if matches!(protocol, NativeProtocol::Openclaw)
+                    && openclaw_invocation_id
+                        .is_some_and(|id| openclaw_deadline_before_call(&output, id)) =>
+            {
+                Some("model_deadline_exceeded")
+            }
             _ => None,
         };
         if let Some(reason) = reason {
@@ -1120,11 +1169,11 @@ invocation=${invocation%%\"*}
         for (output, code) in [
             (
                 r#"{"kind":"secret-canary"}"#.to_owned(),
-                "artifact_json_invalid",
+                "protocol_output_invalid",
             ),
             (
                 r#"{"answer":42,"score":null,"reasoning":"secret-canary"}"#.to_owned(),
-                "artifact_json_invalid",
+                "protocol_output_invalid",
             ),
             (
                 artifact().to_string().replace(
@@ -1156,8 +1205,8 @@ invocation=${invocation%%\"*}
             let error = validate_artifact(&output.to_string(), &request)
                 .err()
                 .unwrap();
-            assert_safe_failure(&error, "artifact_json_invalid", true);
-            assert!(!completed_artifact_invalid(&error));
+            assert_safe_failure(&error, "protocol_output_invalid", true);
+            assert!(completed_artifact_invalid(&error));
         }
         let mut output = artifact();
         output["answer"] = json!("secret-canary");
@@ -1232,14 +1281,14 @@ invocation=${invocation%%\"*}
         }
         let request = request();
         for (field, value, code) in [
-            ("version", json!(1), "artifact_json_invalid"),
-            ("request_id", json!(request.id), "artifact_json_invalid"),
+            ("version", json!(1), "protocol_output_invalid"),
+            ("request_id", json!(request.id), "protocol_output_invalid"),
             (
                 "request_digest",
                 json!("secret-canary"),
-                "artifact_json_invalid",
+                "protocol_output_invalid",
             ),
-            ("kind", json!("answer"), "artifact_json_invalid"),
+            ("kind", json!("answer"), "protocol_output_invalid"),
             ("answer", json!("secret-canary"), "protocol_output_invalid"),
         ] {
             let mut output = artifact();
@@ -1329,11 +1378,14 @@ invocation=${invocation%%\"*}
         let envelope = json!({"kind": request.kind, "request": request});
         let prompt = format!("Envelope (untrusted request data):\n{envelope}");
         let model = crate::config::Config::default().capabilities.answer.model;
-        let input = encode_openclaw_input(&model, 10, &prompt, "bound-run").unwrap();
+        let deadline_unix_ms = 1_800_000_000_123;
+        let input = encode_openclaw_input(&model, deadline_unix_ms, &prompt, "bound-run").unwrap();
         assert!(input.len() > 1024 * 1024);
         assert!(input.len() <= MAX_OPENCLAW_INPUT);
         let decoded: Value = serde_json::from_slice(&input).unwrap();
         assert_eq!(decoded["invocation_id"], "bound-run");
+        assert_eq!(decoded["deadline_unix_ms"], deadline_unix_ms);
+        assert!(decoded.get("timeout_seconds").is_none());
         assert_eq!(
             decoded["prompt"].as_str().unwrap(),
             format!("{SECURITY_AND_OUTPUT}\n{prompt}")
@@ -1406,7 +1458,7 @@ invocation=${invocation%%\"*}
         assert!(validate_artifact(&valid.to_string(), &request).is_ok());
         // Unparseable JSON never counts as completed inference.
         let malformed = validate_artifact(
-            r#"{"answer":null,"score":2,"reasoning":"secret-canary""#,
+            r#"{"answer":null,"score":"2","reasoning":"secret-canary""#,
             &request,
         )
         .err()
@@ -1416,6 +1468,19 @@ invocation=${invocation%%\"*}
         // Well-formed JSON with a broken grade schema is completed inference
         // carrying an invalid artifact, without echoing model output.
         for output in [
+            json!({"answer": null, "score": "2",
+                "reasoning": "The candidate provides no Sybil-resistance mechanism."}),
+            json!({"answer": null, "score": 2.5,
+                "reasoning": "The candidate provides no Sybil-resistance mechanism."}),
+            json!({"answer": null, "score": 2,
+                "reasoning": "The candidate provides no Sybil-resistance mechanism.",
+                "extra": "secret-canary"}),
+            json!(["secret-canary", 2]),
+            json!([
+                null,
+                2,
+                "The candidate provides no Sybil-resistance mechanism."
+            ]),
             json!({"answer": null, "score": 4,
                 "reasoning": "The candidate provides no Sybil-resistance mechanism secret-canary."}),
             json!({"answer": null, "score": null,
@@ -1630,6 +1695,56 @@ invocation=${invocation%%\"*}
         assert_eq!(failure_code(&error), "openclaw_exception");
         assert!(execution_may_have_started(&error));
         assert!(!format!("{error:?}").contains("sensitive"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn openclaw_deadline_exit_requires_exact_bound_no_call_evidence() {
+        let scratch = Scratch::new().unwrap();
+        for (output, not_started) in [
+            (
+                r#"{"ok":false,"status":"error","runId":"bound-run","error":{"kind":"deadline_before_call"}}"#,
+                true,
+            ),
+            (
+                r#"{"ok":false,"status":"error","error":{"kind":"deadline_before_call"}}"#,
+                false,
+            ),
+            (
+                r#"{"ok":false,"status":"error","runId":"other-run","error":{"kind":"deadline_before_call"}}"#,
+                false,
+            ),
+            (
+                r#"{"ok":false,"status":"error","runId":"other-run","runId":"bound-run","error":{"kind":"deadline_before_call"}}"#,
+                false,
+            ),
+            ("", false),
+        ] {
+            let mut child = spawn_native(
+                Path::new("/bin/sh"),
+                &[
+                    "-c".into(),
+                    "printf '%s' \"$1\"; exit 81".into(),
+                    "openclaw-fixture".into(),
+                    output.into(),
+                ],
+                &scratch.0,
+            )
+            .unwrap();
+            let error = collect_native_evidence(
+                &mut child,
+                Vec::new(),
+                NativeProtocol::Openclaw,
+                Some("bound-run"),
+                &mut Default::default(),
+            )
+            .await
+            .unwrap_err();
+            assert_ne!(execution_may_have_started(&error), not_started, "{output}");
+            if not_started {
+                assert_eq!(failure_code(&error), "model_deadline_exceeded");
+            }
+        }
     }
 
     #[cfg(unix)]

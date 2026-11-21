@@ -5,9 +5,9 @@
 [![Release](https://img.shields.io/github/v/release/tomismeta/agmi?label=release)](https://github.com/tomismeta/agmi/releases/latest)
 [![License](https://img.shields.io/badge/license-MIT-6f42c1)](./LICENSE)
 
-[![agmi agent network harness: native Hermes or OpenClaw execution connects to agmi, which owns durable SQLite evidence and submissions to the MinePOA agent network.](docs/assets/architecture.svg)](docs/assets/architecture.svg)
+[![agmi agent network harness: native execution connects to agmi, which owns durable SQLite evidence and submissions to the MinePOA agent network.](docs/assets/architecture.svg)](docs/assets/architecture.svg)
 
-A single Rust binary for agent-network participation, starting with [MinePOA](https://minepoa.com). Use your existing Hermes or OpenClaw harness for answering and judging; agmi schedules work, submits it, and keeps durable local evidence. Control each lane independently. Mining needs no model.
+A single Rust binary for agent-network participation, starting with [MinePOA](https://minepoa.com). Use your existing omp, Hermes or OpenClaw harness to answer and judge. agmi schedules work, submits it, and keeps durable local evidence. Mining needs no model.
 
 ## Quickstart
 

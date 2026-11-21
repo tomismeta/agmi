@@ -117,6 +117,13 @@ it is not a general rule that all 4xx/5xx responses prove nonexecution.
 Acceptance indicators or contradictory response fields prevent this shortcut.
 Generic 503, 502/504, interrupted responses and timeouts remain uncertain.
 Job/receipt lookup errors never establish rejection of the original submission.
+A bound `408 job_expired` permits retry only when it contains no evidence
+of processing or acceptance. Contradictory evidence keeps the original job
+bound after restart; a later expiry alone cannot clear it. Same-epoch answer
+retries stop for that dispute, but the controller can keep polling and settle
+the original operation when authoritative evidence arrives.
+An older runtime does not honor this retained dispute fence. If a disputed
+job is still open, keep the older controller stopped and roll forward.
 Retained server minima still apply, including an earlier one-hour `Retry-After`;
 maintenance prose or an expected server fix does not shorten them.
 
@@ -291,7 +298,7 @@ Configuration failures include a bounded `details.reason` and, where known, a so
 
 ### Atomic capability migration
 
-Version 0.2.0 uses unversioned per-lane configuration and journal format 4. **v0.1.0 and v0.1.1 use global-shaped configuration and journal format 2.** Inspect actual configuration, journal, authority and migration seal rather than inferring compatibility from a version label. This is a permanent explicit cutover, not a legacy-bot importer. Preserve private backups for investigation; never restore older state to regain availability.
+Versions 0.2.0 and 0.3.0 use unversioned per-lane configuration and journal format 4. **v0.1.0 and v0.1.1 use global-shaped configuration and journal format 2.** Inspect actual configuration, journal, authority and migration seal rather than inferring compatibility from a version label. This is a permanent explicit cutover, not a legacy-bot importer. Preserve private backups for investigation; never restore older state to regain availability.
 
 Plain managed `update` verifies the incoming target before maintenance, captures durable original intent, stops cleanly when needed, and performs supported canonical policy-preserving conversion. It then verifies local configuration/authority/process structure and restores independent runtime/timer activity, boot enablement and global pause intent. A necessary pause can advance generation and invalidate stale grants/captures; accounting and uncertain history are never reset. Missing policy choices, changed/unproven risk and initial authority adoption remain explicit decisions.
 
@@ -404,7 +411,7 @@ An `initialization_invalid` error identifies a rejected initialization field bef
 
 A `credential_format_invalid` error is local: credential parsing failed before any verification request or onboarding write. Paste only the hosted `pk_` key, without surrounding quotes, whitespace, extra lines or terminal escape sequences. This is not a server rejection of the account/key. Input is never included in the error; network/client preparation failures remain separate.
 
-`credential_rejected` means the server refused authentication; `credential_identity_unverified` means the identity did not match the expected account or chain. `identity_verification_backoff` and transport or upstream failures do not establish whether a key is valid. Interactive setup offers one verification retry without re-entering the key and respects the reported wait; retry later if instructed. Noninteractive setup returns structured failure evidence without retrying. No failed or declined check saves configuration or replaces a key.
+`credential_rejected` means authentication was refused. `credential_access_forbidden` means access was denied: check permissions and network access policy rather than assuming the key is invalid. `credential_identity_unverified` requires a well-formed identity for a different account or chain. Malformed identity data and temporary failures do not establish a mismatch or whether the key is valid. Interactive setup can offer one bounded retry without re-entering the key: honor `Retry-After`, or the local 30-second cooldown when a bare 429 omits it. Noninteractive setup reports the wait without retrying. No failed or declined check saves configuration or replaces a key.
 
 For a brand-new account, `agmi identity create --label my-agent` is a nonmutating plan. Registration requires separate explicit approval and a verified proof-of-work algorithm:
 
@@ -455,7 +462,29 @@ Unsupported native contracts fail explicitly; a matching product name alone does
 
 `capabilities.answer.model.hermes_api_url` and `capabilities.judge.model.hermes_api_url` independently declare the expected authenticated Hermes URL, defaulted from [`defaults/model.toml`](../defaults/model.toml). It must match the native authentication route; changing it never silently redirects a native key. OpenClaw resolves its endpoint through its existing Gateway configuration.
 
-For omp, install the official binary separately with `curl -fsSL https://omp.sh/install | sh`, then run `~/.local/bin/omp` and authenticate through omp as the service OS account. No source checkout, npm SDK, external Bun/Node runtime or permanent plugin installation is required. Other omp versions fail qualification rather than silently changing the adapter contract.
+Install the [pinned standalone omp release](https://github.com/can1357/oh-my-pi/releases/tag/v19.0.1)
+and verify its SHA-256 before making it executable:
+
+```sh
+(
+  set -eu
+  case "$(uname -s)/$(uname -m)" in
+    Linux/x86_64) asset=omp-linux-x64; digest=6ceef04430851bb1050c6fda3af467412eb44a11df0a6ff8121fe601013c5415 ;;
+    Darwin/arm64) asset=omp-darwin-arm64; digest=2fe420bbd00f81899816e51cbeeb9593afa59d9368d62c9d3e78535d540e32f6 ;;
+    *) printf '%s\n' 'Select the matching standalone asset and verify its published SHA-256 before running it.' >&2; exit 2 ;;
+  esac
+  tmp=$(mktemp)
+  trap 'rm -f "$tmp"' EXIT
+  curl --proto '=https' --proto-redir '=https' -fsSL \
+    "https://github.com/can1357/oh-my-pi/releases/download/v19.0.1/$asset" -o "$tmp"
+  printf '%s  %s\n' "$digest" "$tmp" | shasum -a 256 --check
+  mkdir -p "$HOME/.local/bin"
+  install -m 0755 "$tmp" "$HOME/.local/bin/omp"
+  "$HOME/.local/bin/omp" --version
+)
+```
+
+Authenticate in omp as the service OS account. No source checkout, npm SDK, external Bun/Node runtime or permanent plugin installation is required. Other omp versions fail qualification rather than silently changing the adapter contract.
 
 Either model lane can independently use:
 
@@ -483,6 +512,17 @@ The omp adapter performs version-only preflight, waits for final admission, then
 Native profile/provider factories remain trusted executable code, and the outer shell can initialize native facilities: this is tool-free direct inference, not a sandbox against startup side effects or opaque remote agent/tool behavior. Native endpoint-routing settings are passed explicitly; tools and configured fallback chains are not requested, returned tool calls fail, and unsupported exact reasoning-off fails closed. Host invocation/effort evidence is labeled adapter-owned, not provider-issued attestation. Native auth refresh/retries/cache writes remain native behavior; one logical attempt is not a hard HTTP-call or monetary cap. Killing the owned process does not prove remote cancellation, and possible execution remains charged.
 
 Known agent/workflow transports `cursor-agent` and `gitlab-duo-agent` are refused before streaming: an empty supplied tool list does not disable their built-in workflow/tool capabilities. This is an API-capability fence, not a provider-name blacklist; ordinary direct-inference APIs and the supported Factory Droid controls remain independent.
+
+The omp bridge distinguishes the requested catalog route from reported served
+identity. It rejects reported contradictions and does not infer an identity
+when the provider omits one. It consumes unambiguous final text, or ordinary
+unphased text for providers that do not label output. OpenRouter's `online`
+web-search variant and known intrinsic search models on either direct or
+routed APIs are not qualified.
+The native `compat.extraBody` setting may provide finite numeric sampling
+tuning only. It cannot replace agmi's model, prompt, reasoning, or tool
+policy. The effective outbound model must still match the catalog's wire route.
+An Anthropic pause or unrecognized stop is not a final answer.
 
 Run `python3 tests/omp_native_smoke.py --omp /absolute/path/to/omp` for isolated default-binary/loopback acceptance. It uses temporary profiles and fixture credentials, not the operator's native login. Real authenticated provider acceptance remains separate.
 
@@ -567,10 +607,21 @@ thresholds, not a full health check. `health` names the selected readiness scope
 `doctor` additionally reports repair eligibility/outcome. Default output retains
 operational essentials rather than duplicating full evidence trees; use
 `agmi --json status --verbose` (or `health --verbose` / `doctor --verbose`) for detailed evidence.
+Readiness and intervention use the same evidence expiry. A stale completion can
+leave health degraded while the controller refreshes it automatically.
 Nonblocking historical uncertainty is still reported as risk, not as a current
 new-work blocker, under finite as well as unbounded policy. Current actions take
 precedence over background reconciliation. Shell-rendered actions preserve the selected configuration path.
-Where retained evidence identifies blocking local operation IDs, use `agmi operations list` to inspect them. A bound evidence read returning 404 does not prove the original submission failed or that another poll will settle it. Keep the unresolved outcome; distinguish a retained server restriction from local retry backoff before deciding whether to wait or investigate.
+Where retained evidence identifies blocking local operation IDs, use `agmi operations list` to inspect them. A bound evidence read returning 404 does not prove the original submission failed or that another poll will settle it. A scheduled poll is not permission to replay.
+
+In diagnostic JSON, `retry_floor` identifies the latest recorded admission wait;
+`next_at` cannot precede an active request restriction just because an operation
+backoff expires sooner. The existing `shared_server_restriction` reason code
+can also describe a local or unattributed restriction. For read waits,
+`server_floor_at`, `local_retry_at`, and `retained_floor_at` distinguish server
+minima, local delays, and conservative legacy floors.
+`unattributed_shared_floor_at` reports a later shared floor without reliable
+source evidence. This does not change when the controller retries.
 Accepted/included work awaiting finality is also background follow-up when the canonical policy permits fresh participation. Its age alone does not make an open lane unhealthy. Same-work uncertainty, unavailable fresh evidence and actual admission fences still do. Model-failure diagnostics come from immutable model completion, not a later receipt or protocol error.
 Exit codes retain distinct purposes: `status` succeeds when its snapshot is read;
 `health` succeeds when its selected operational checks pass; `doctor` succeeds
@@ -817,7 +868,9 @@ proof that an old snapshot is current.
 
 Missing or unsafe unanchored lock evidence reports `authority_incomplete`, not an adoptable first-anchor state. Do not delete or recreate locks to make adoption pass.
 
-Retained binaries are rollback candidates only when journal compatibility matches. Older binaries must not write current format-4 journals; roll forward or stop, never rewind state. Staging checks artifact/retention space plus a 256 MiB journal/WAL reserve without pruning history. There is no automatic release pruning: protect the selected release, releases still used by live processes, pinned update source/target/definitions and validated compatible recovery artifacts. Age, directory count or unavailable process observation cannot prove a release is unused. Never delete the permanent installer/account lease files, pending transaction, journal/WAL, credentials or unknown outcomes to free space. Any cleanup needs a separate owner-verified inventory and authorization.
+Retained binaries are rollback candidates only when journal compatibility matches. For an active handoff the digest-verified target must report `bound_dispute_fence=1` via `build-info --installer-capabilities`; this is separate from the v1 release manifest. Otherwise the update is refused (`stopped_update_required`). The target can still be staged or selected with `--stopped`, which does not restore runtime or timer activity. `--stopped` preserves existing boot enablement; use `agmi service disable` first if the target must remain disabled after reboot. Do not restart a writer that lacks the fence with unresolved disputed jobs; roll forward or stop, never rewind state.
+
+Staging checks artifact/retention space plus a 256 MiB journal/WAL reserve without pruning history. There is no automatic release pruning: protect the selected release, releases still used by live processes, pinned update source/target/definitions and validated compatible recovery artifacts. Age, directory count or unavailable process observation cannot prove a release is unused. Never delete the permanent installer/account lease files, pending transaction, journal/WAL, credentials or unknown outcomes to free space. Any cleanup needs a separate owner-verified inventory and authorization.
 
 The example uses control-group cleanup, restrictive umask, private temporary files and restart-on-failure. The service manager owns private model scratch at `%t/agmi` (normally `/run/user/<uid>/agmi`); each native child uses its own private invocation workspace as `TMPDIR`. Foreground execution retains the OS-selected temporary root. Runtime storage can be memory-backed and capacity-limited; do not put update archives or durable state there. Explicit start-rate limits also count manual service starts. `TimeoutStopSec=infinity` prevents systemd truncating captured deadlines; agmi bounds shutdown, but a shutdown bug still needs operator intervention.
 
@@ -1012,13 +1065,28 @@ cargo install --path "$package_root/agmi-$version" --locked --root "$package_roo
 
 `cargo package` verifies the packaged build; the separate temporary install checks the extracted source workflow without replacing the normal CLI. Keep `.cargo_vcs_info.json` with the extracted sources. `--allow-dirty` records dirty source rather than certifying a clean release; omit it for a clean release candidate. `build.rs` only derives labels and hashes embedded assets: it never installs, authenticates or provisions. It uses the package's own Git checkout, or Cargo's JSON VCS metadata when outside that checkout, and never an enclosing repository's identity. Neither source labels nor packaged files are signed provenance.
 
-The explicit package allowlist includes Rust sources, both native adapters, defaults, guidance, unit templates and public documentation. Shell installers, tests, private inputs and generated artifacts are not shipped. Inspect the actual list and archive as part of the secret audit.
+The explicit package allowlist includes Rust sources, all three native adapters, defaults, guidance, unit templates and public documentation. Shell installers, tests, private inputs and generated artifacts are not shipped. Inspect the actual list and archive as part of the secret audit.
 
 The process fixture also supports `--harness hermes` for its Python-only fake native transport; this does not require Node.js or a real Hermes account. Native authentication still needs separate real-harness acceptance.
 
 `python3 tests/native_bridge_smoke.py` executes the actual embedded Python and Node bridges against isolated native API substitutes. It covers authentication-route checks, isolation settings, policy delivery, failure cleanup and encoded input limits without live credentials. This is separate from the scheduler fixtures' fake inference transports.
 
-CI also runs `tests/systemd_smoke.py` inside the disposable image defined by `tests/systemd_fixture.Dockerfile`. The container owns its user manager, home and units; it has no external network or host home/bus/cgroup mounts. This exercises real install/update/retained-release activation and post-switch failure cleanup. Do not run this fixture against a production user's services.
+Linux CI builds the native-musl candidate with `bash tools/build-linux-musl.sh`
+using Rust 1.96.0, Zig 0.17.1, cargo-zigbuild 0.24.1 and LLVM 22.1.8. The script
+verifies that the final ELF links its allocator from Rust's musl archive and
+emits a link map and digest-bound provenance. CI verifies the shipped archive
+with the production updater verifier, then runs `tests/packaged_omp_smoke.py`
+with the extracted source-package binary and the exact binary extracted from
+the updater archive. The pinned standalone omp connects only to loopback fixtures.
+Keep the checked archive, `BUILD-INFO.txt`, `SHA256SUMS` and allocator evidence
+together; a fresh rebuild is a different candidate.
+
+CI also runs `tests/systemd_smoke.py` on the extracted Linux release binary in
+the disposable image defined by `tests/systemd_fixture.Dockerfile`. The
+container owns its user manager, home and units; it has no external network or
+host home/bus/cgroup mounts. This exercises real install/update/retained-release
+activation and post-switch failure cleanup. Do not run this fixture against a
+production user's services.
 
 Automated-update acceptance also exercised checksum-verified published v0.1.0 and
 v0.1.1 journal-2 clients through the documented verified-new-CLI bootstrap,

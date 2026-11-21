@@ -297,6 +297,46 @@ pub struct ModelConfig {
     #[serde(skip)]
     pub(crate) guidance: Arc<str>,
 }
+pub(crate) enum OmpSelectionError {
+    Route,
+    Effort,
+    ToolEnabled,
+}
+
+impl ModelConfig {
+    /// Validate local syntax only. The pinned omp runtime owns catalog lookup, model-specific
+    /// effort support and authentication. Split only the provider prefix; IDs may be namespaced.
+    pub(crate) fn omp_selection(&self) -> std::result::Result<(&str, &str), OmpSelectionError> {
+        let id_char = |byte: u8| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte);
+        let (provider, model) = self.model.split_once('/').ok_or(OmpSelectionError::Route)?;
+        if self.model.len() > 256
+            || provider.is_empty()
+            || !provider.bytes().all(id_char)
+            || !model.split('/').all(|segment| {
+                !segment.is_empty() && segment.bytes().all(|byte| id_char(byte) || byte == b':')
+            })
+        {
+            return Err(OmpSelectionError::Route);
+        }
+        if provider == "openrouter"
+            && model
+                .split(':')
+                .skip(1)
+                .any(|modifier| modifier.eq_ignore_ascii_case("online"))
+        {
+            return Err(OmpSelectionError::ToolEnabled);
+        }
+        // Local wire vocabulary of the qualified bridge (omp 19.0.1).
+        if !matches!(
+            self.reasoning.as_str(),
+            "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+        ) {
+            return Err(OmpSelectionError::Effort);
+        }
+        Ok((provider, model))
+    }
+}
+
 impl std::fmt::Debug for ModelConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ModelConfig")
@@ -1020,6 +1060,23 @@ impl Config {
             (LaneId::Judge, &self.capabilities.judge.model),
         ] {
             if model.harness == Harness::Omp {
+                model.omp_selection().map_err(|error| match error {
+                    OmpSelectionError::Route => ConfigDiagnostic::model(
+                        kind,
+                        "model",
+                        "Omp requires a provider/model route with nonempty identifier segments.",
+                    ),
+                    OmpSelectionError::Effort => ConfigDiagnostic::model(
+                        kind,
+                        "reasoning",
+                        "Omp reasoning must be off, minimal, low, medium, high, xhigh or max.",
+                    ),
+                    OmpSelectionError::ToolEnabled => ConfigDiagnostic::model(
+                        kind,
+                        "model",
+                        "Omp's OpenRouter online modifier enables web search and is not supported.",
+                    ),
+                })?;
                 if let Some(omp) = &model.omp {
                     omp.validate().map_err(|_| {
                         ConfigDiagnostic::model(kind, "omp", "Invalid omp native route.")
@@ -1030,28 +1087,41 @@ impl Config {
                     model.omp.is_none(),
                     ConfigDiagnostic::model(kind, "omp", "Omp settings require the omp harness.")
                 );
-                let api_url = reqwest::Url::parse(&model.hermes_api_url).map_err(|_| {
-                    ConfigDiagnostic::model(kind, "hermes_api_url", "Invalid Hermes API URL.")
-                })?;
-                ensure!(
-                    model.hermes_api_url.len() <= 2048
-                        && !model
-                            .hermes_api_url
-                            .chars()
-                            .any(|c| c.is_whitespace() || c.is_control())
-                        && !model.hermes_api_url.contains('\\')
-                        && api_url.scheme() == "https"
-                        && api_url.username().is_empty()
-                        && api_url.password().is_none()
-                        && api_url.query().is_none()
-                        && api_url.fragment().is_none(),
-                    ConfigDiagnostic::model(
-                        kind,
-                        "hermes_api_url",
-                        "Hermes API URL requires HTTPS without credentials, query or fragment."
-                    )
-                );
+                for (field, value) in [("model", &model.model), ("reasoning", &model.reasoning)] {
+                    ensure!(
+                        !value.trim().is_empty()
+                            && value.len() <= 256
+                            && !value.chars().any(char::is_control),
+                        ConfigDiagnostic::model(
+                            kind,
+                            field,
+                            "Model and reasoning settings must be nonempty, at most 256 bytes and contain no control characters."
+                        )
+                    );
+                }
             }
+            // The URL is present in saved config and diagnostics even when the harness ignores it.
+            let api_url = reqwest::Url::parse(&model.hermes_api_url).map_err(|_| {
+                ConfigDiagnostic::model(kind, "hermes_api_url", "Invalid Hermes API URL.")
+            })?;
+            ensure!(
+                model.hermes_api_url.len() <= 2048
+                    && !model
+                        .hermes_api_url
+                        .chars()
+                        .any(|c| c.is_whitespace() || c.is_control())
+                    && !model.hermes_api_url.contains('\\')
+                    && api_url.scheme() == "https"
+                    && api_url.username().is_empty()
+                    && api_url.password().is_none()
+                    && api_url.query().is_none()
+                    && api_url.fragment().is_none(),
+                ConfigDiagnostic::model(
+                    kind,
+                    "hermes_api_url",
+                    "Hermes API URL requires HTTPS without credentials, query or fragment."
+                )
+            );
             if check_guidance_paths {
                 for (layer, path) in [
                     ("user", &model.guidance_file),
@@ -1079,18 +1149,6 @@ impl Config {
                 !model.executable.as_os_str().is_empty(),
                 ConfigDiagnostic::model(kind, "executable", "Model executable is empty.")
             );
-            for (field, value) in [("model", &model.model), ("reasoning", &model.reasoning)] {
-                ensure!(
-                    !value.trim().is_empty()
-                        && value.len() <= 256
-                        && !value.chars().any(char::is_control),
-                    ConfigDiagnostic::model(
-                        kind,
-                        field,
-                        "Model and reasoning settings must be nonempty, at most 256 bytes and contain no control characters."
-                    )
-                );
-            }
         }
         for kind in LaneId::ALL {
             let schedule = self.schedule(kind);
@@ -2356,6 +2414,65 @@ mod tests {
     }
 
     #[test]
+    fn omp_harness_transition_requires_a_qualified_route_and_local_effort() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let config = Config {
+            state_dir: directory.path().join("state"),
+            ..Config::default()
+        };
+        let before = toml::to_string(&config).unwrap();
+        std::fs::write(&path, &before).unwrap();
+        let revision = crate::admin::file_revision(&path).unwrap();
+        for patch in [
+            br#"{"capabilities":{"answer":{"model":{"harness":"omp","executable":"omp"}}}}"#.as_slice(),
+            br#"{"capabilities":{"answer":{"model":{"harness":"omp","executable":"omp","model":"opencode-go/glm-5.3","reasoning":"ultra"}}}}"#.as_slice(),
+            br#"{"capabilities":{"answer":{"model":{"harness":"omp","executable":"omp","model":"openrouter/vendor/model:free:online","reasoning":"low"}}}}"#.as_slice(),
+        ] {
+            assert!(crate::admin::apply(&path, &revision, patch, false).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        }
+        let patch = br#"{"capabilities":{"answer":{"model":{"harness":"omp","executable":"omp","model":"opencode-go/glm-5.3","reasoning":"max"}}}}"#;
+        crate::admin::apply(&path, &revision, patch, false).unwrap();
+        let model = Config::load(&path).unwrap().capabilities.answer.model;
+        assert_eq!(model.omp_selection().ok(), Some(("opencode-go", "glm-5.3")));
+        assert_eq!(model.reasoning, "max");
+    }
+
+    #[test]
+    fn dormant_hermes_api_url_is_rejected_before_config_is_projected() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let mut config = Config::default();
+        config.capabilities.judge.model.harness = Harness::Omp;
+        config.capabilities.judge.model.model = "fixture/namespace/model".into();
+        for url in [
+            "https://user:private-canary@fixture.invalid/path",
+            "https://fixture.invalid/path?token=private-canary",
+            "https://fixture.invalid/path#private-canary",
+        ] {
+            config.capabilities.judge.model.hermes_api_url = url.into();
+            std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+            for error in [
+                Config::load(&path).unwrap_err(),
+                Config::load_metadata(&path).unwrap_err(),
+            ] {
+                let diagnostic = error.downcast_ref::<ConfigDiagnostic>().unwrap();
+                assert_eq!(diagnostic.field, Some("hermes_api_url"));
+                assert_eq!(diagnostic.kind, Some(LaneId::Judge));
+                assert!(!format!("{error:?}").contains("private-canary"));
+                assert!(
+                    !serde_json::to_string(diagnostic)
+                        .unwrap()
+                        .contains("private-canary")
+                );
+            }
+            let show_error = crate::admin::show(&path).unwrap_err();
+            assert!(!format!("{show_error:?}").contains("private-canary"));
+        }
+    }
+
+    #[test]
     fn omp_native_route_changes_retire_only_its_producer() {
         let mut original = Config::default();
         original.capabilities.answer.model.harness = Harness::Omp;
@@ -2388,7 +2505,7 @@ mod tests {
             assert_ne!(changed.producer_revision(LaneId::Answer).unwrap(), answer);
             assert_eq!(changed.producer_revision(LaneId::Judge).unwrap(), judge);
         }
-        original.capabilities.answer.model.hermes_api_url = "unused by omp".into();
+        original.capabilities.answer.model.hermes_api_url = "https://unused.invalid".into();
         assert_eq!(original.producer_revision(LaneId::Answer).unwrap(), answer);
     }
 

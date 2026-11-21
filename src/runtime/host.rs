@@ -2,9 +2,9 @@ use crate::capability::LaneId;
 use crate::config::{Config, Mode};
 use crate::endpoints::Endpoint;
 use crate::protocol::{
-    Assignment, Challenge, EffectDeadline, HostedResponse, Outcome, Protocol, ReadDeadline,
-    RequestMeta, Response, ResponseSource, classify_source, has_required_words, parse_challenge,
-    response_evidence, transport_failure, valid_grade_reasoning,
+    Assignment, Challenge, EffectDeadline, HostedIdentityBody, HostedResponse, Outcome, Protocol,
+    ReadDeadline, RequestMeta, Response, ResponseSource, classify_source, has_required_words,
+    parse_challenge, response_evidence, transport_failure, valid_grade_reasoning,
 };
 use crate::solver::{SolverRequest, SolverResult};
 use crate::store::{
@@ -372,6 +372,8 @@ fn identity_read_failure(failure: crate::protocol::ReadFailure) -> HostedIdentit
 }
 
 fn classify_hosted_identity(config: &Config, response: &Response) -> HostedIdentityOutcome {
+    // Either HTTP refusal still fences effects, independently of the
+    // distinction between authentication and permission in read diagnostics.
     if matches!(response.status, 401 | 403) {
         return HostedIdentityOutcome::AuthenticationFailed;
     }
@@ -381,40 +383,13 @@ fn classify_hosted_identity(config: &Config, response: &Response) -> HostedIdent
     if let Some(failure) = response.read_failure {
         return identity_read_failure(failure);
     }
-    if !(200..300).contains(&response.status)
-        || ["ok", "success"].iter().any(|field| {
-            response
-                .body
-                .get(field)
-                .is_some_and(|value| value.as_bool() != Some(true))
-        })
-    {
+    if !(200..300).contains(&response.status) {
         return HostedIdentityOutcome::InvalidResponse;
     }
-    let Some(address) = response
-        .body
-        .get("address")
-        .and_then(Value::as_str)
-        .filter(|address| crate::config::valid_address(address))
-    else {
-        return HostedIdentityOutcome::InvalidResponse;
-    };
-    // The hosted API may omit chain_id; malformed values are not mismatch proof.
-    let chain = match response.body.get("chain_id") {
-        Some(value) => match value
-            .as_str()
-            .filter(|chain| crate::config::safe_segment(chain, 64))
-        {
-            Some(chain) => Some(chain),
-            None => return HostedIdentityOutcome::InvalidResponse,
-        },
-        None => None,
-    };
-    if address != config.network.address || chain.is_some_and(|chain| chain != config.network.chain)
-    {
-        HostedIdentityOutcome::IdentityMismatch
-    } else {
-        HostedIdentityOutcome::Verified
+    match response.hosted_identity_body(Some(&config.network.address), &config.network.chain) {
+        HostedIdentityBody::Verified(_) => HostedIdentityOutcome::Verified,
+        HostedIdentityBody::Invalid => HostedIdentityOutcome::InvalidResponse,
+        HostedIdentityBody::Mismatch => HostedIdentityOutcome::IdentityMismatch,
     }
 }
 /// A single runtime owns the account lock even when paused or read-only. The

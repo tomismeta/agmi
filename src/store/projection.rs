@@ -642,6 +642,8 @@ impl Store {
                 Some("operation_retry_minimum"|"operation_backoff"|"generation_changed"|"request_eligibility")=>"operation",
                 Some("shared_server_restriction"|"retained_legacy_floor")=>accounting.restriction_scope.as_deref().unwrap_or("account"),
                 _=>"account"},
+            "restriction_basis":if accounting.retry_not_before > cutoff.at { accounting.restriction_basis } else { None },
+            "request_restriction_at":(accounting.retry_not_before > cutoff.at).then_some(accounting.retry_not_before),
             "blocker_ids":blockers,"required_release":required_release,"not_before":blocker.and_then(|b|b.1),
             "blocker_ids_truncated":(if lane{accounting.active()}else{accounting.total})>blockers.len() as u64,
             "next_at":blocker.and_then(|b|b.1),"own_count":accounting.active(),"own_limit":policy.max_unresolved_operations,
@@ -687,12 +689,17 @@ impl Store {
         )?
         .origin()
         .ascii_serialization();
-        let shared: i64 = self.db.query_row(
-            "SELECT COALESCE(MAX(not_before),0) FROM request_restrictions
-            WHERE authority=?1 AND origin=?2 AND scope='account_authenticated' AND read_class=1",
-            params![authority, origin],
-            |r| r.get(0),
-        )?;
+        let (shared, shared_server, shared_local, shared_retained): (i64, i64, i64, i64) =
+            self.db.query_row(
+                "SELECT COALESCE(MAX(not_before),0),
+                COALESCE(MAX(CASE WHEN basis='server_retry_after' THEN not_before END),0),
+                COALESCE(MAX(CASE WHEN basis='local_unscoped_429_cooldown' THEN not_before END),0),
+                COALESCE(MAX(CASE WHEN basis='retained_legacy_floor' THEN not_before END),0)
+                FROM request_restrictions
+                WHERE authority=?1 AND origin=?2 AND scope='account_authenticated' AND read_class=1",
+                params![authority, origin],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )?;
         let mut stmt=self.db.prepare("SELECT owner,purpose,resource,operation_id,binding_revision,remote_resource,retired,
             failures,in_flight,started_at,finished_at,last_http_success_at,last_success_at,last_failure_at,failure_category,status,
             local_next_at,server_not_before,retained_conservative_floor FROM read_state r WHERE retired=0
@@ -717,6 +724,8 @@ impl Store {
                 "last_failure_at":r.get::<_,Option<i64>>(13)?,"failure_category":category.as_deref().map(safe_read_category),
                 "status":r.get::<_,Option<u16>>(15)?,"local_next_at":local,"server_not_before":server,
                 "retained_conservative_floor":legacy,"shared_not_before":shared,
+                "shared_server_not_before":shared_server,"shared_local_not_before":shared_local,
+                "shared_retained_not_before":shared_retained,
                 "next_at":next,"due_in_seconds":next.saturating_sub(now()).max(0)}))
         })?.collect::<std::result::Result<Vec<_>,_>>()?;
         let truncated = rows.len() > 256;
@@ -1129,6 +1138,8 @@ impl Store {
                 }
                 lane["retry"] = json!({"original_operation_id":original.id,"policy_eligible":blocker.is_none(),
                         "reason":retry_reason,"next_at":retry_at,
+                        "restriction_basis":lane["admission"]["restriction_basis"],
+                        "request_restriction_at":lane["admission"]["request_restriction_at"],
                         "next_action":if blocker.is_none(){"revalidate_challenge"}else{"await_retry_eligibility"},
                         "requires_fresh_eligibility":true,"manual_authorized":self.manual_authorized(kind,epoch)?});
             }

@@ -1,4 +1,5 @@
 use super::*;
+use crate::protocol::BOUND_JOB_EXPIRY_CONFLICT;
 use crate::store::{LaneObservation, LaneObservationStamp};
 
 pub(in crate::runtime) struct ReadFlight {
@@ -341,6 +342,18 @@ impl HostAccess {
                 if matches!(flight.key, ReadKey::Operation { .. }) {
                     let complete =
                         hosted.response.read_failure.is_none() && hosted.response.body.is_object();
+                    let category = if hosted.context.endpoint == Endpoint::Job
+                        && hosted.response.status == 408
+                        && hosted.context.meta.owner.is_some_and(|kind| {
+                            matches!(
+                                classify_source(kind, &hosted.response, ResponseSource::BoundJob),
+                                Outcome::Unknown { reason } if reason == BOUND_JOB_EXPIRY_CONFLICT
+                            )
+                        }) {
+                        Some(BOUND_JOB_EXPIRY_CONFLICT)
+                    } else {
+                        category
+                    };
                     if !self.store.finish_reconciliation_read(
                         &flight.key,
                         flight.authority_epoch,
@@ -574,7 +587,12 @@ impl HostAccess {
                 op.id,
                 &serde_json::to_value(crate::protocol::response_candidates(response))?,
             )?;
-            let outcome = classify_source(op.kind, response, ResponseSource::BoundJob);
+            let mut outcome = classify_source(op.kind, response, ResponseSource::BoundJob);
+            if outcome == Outcome::Expired && self.store.job_expiry_conflict(op)? {
+                outcome = Outcome::Unknown {
+                    reason: BOUND_JOB_EXPIRY_CONFLICT.into(),
+                };
+            }
             // Only the known 202 pending shape may omit its already-bound job ID.
             // A malformed identifier or contradictory evidence is not a pending poll.
             let pending = response.status == 202
@@ -595,14 +613,14 @@ impl HostAccess {
                 self.store
                     .complete_reconciliation(&binding, op, "job_pending")?;
             } else {
-                self.store.record_evidence(
-                    op.id,
-                    &serde_json::to_value(response_evidence(
-                        op.kind,
-                        ResponseSource::BoundJob,
-                        Some(response),
-                    ))?,
-                )?;
+                let mut evidence =
+                    response_evidence(op.kind, ResponseSource::BoundJob, Some(response));
+                if matches!(&outcome, Outcome::Unknown { reason } if reason == BOUND_JOB_EXPIRY_CONFLICT)
+                {
+                    evidence.reason = BOUND_JOB_EXPIRY_CONFLICT.into();
+                }
+                self.store
+                    .record_evidence(op.id, &serde_json::to_value(evidence)?)?;
                 if !matches!(outcome, Outcome::Unknown { .. }) {
                     self.store.safety_observed(op.id)?;
                 }
@@ -634,6 +652,67 @@ mod recovery_tests {
             rusqlite::params![job, op.id],
         ).unwrap();
         runtime.store.operation(op.id).unwrap().unwrap()
+    }
+
+    #[tokio::test]
+    async fn expiry_dispute_is_durable_before_recovery_applies_the_response() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = Config::default();
+        config.network.base_url = format!("http://{}", listener.local_addr().unwrap());
+        let (_temp, mut runtime, _stop) = fixture_with(config);
+        let db =
+            rusqlite::Connection::open(runtime.config.state_dir.join("state.sqlite3")).unwrap();
+        let original = seed(&mut runtime, &db, "disputed");
+        let key = Store::operation_read_key(&original).unwrap();
+        let mut flight = runtime
+            .launch_read(
+                LaneId::Judge,
+                key,
+                Endpoint::Job,
+                original.job_id.as_deref(),
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        let (socket, path) = tokio::time::timeout(Duration::from_secs(5), accept(&listener))
+            .await
+            .unwrap();
+        assert!(path.contains("/api/job/disputed"));
+        reply(
+            socket,
+            408,
+            None,
+            json!({"state":"expired","error":"job_expired","processed":true}),
+        )
+        .await;
+        let completion = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(result) = flight.take() {
+                    break result;
+                }
+                runtime.wake.notified().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(runtime.finish_read(&flight, completion).unwrap().is_some());
+        // Crash cut: no recovery_response or outcome transition has run.
+        // A separate reader must see both the consumed stamp and retry fence.
+        drop(flight);
+        drop(runtime);
+        let (status, in_flight, revision): (u16, bool, i64) = db
+            .query_row(
+                "SELECT r.status,r.in_flight,json_extract(e.policy,'$.bound_job_expiry_conflict_revision')
+                 FROM read_state r JOIN operation_evidence e ON e.operation_id=r.operation_id
+                 WHERE r.operation_id=?1 AND r.binding_revision=?2",
+                rusqlite::params![original.id, original.binding_revision],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (status, in_flight, revision),
+            (408, false, original.binding_revision)
+        );
     }
 
     fn schedule(db: &rusqlite::Connection, name: &str) -> (i64, i64, bool) {

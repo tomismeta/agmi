@@ -1,14 +1,18 @@
 # Changelog
 
-## Unreleased
+## Unreleased (0.3.0)
 
 - **Fleet-aligned onboarding:** new configurations save unbounded `participation_first`, bounded uncertain-model and answer retries, per-epoch mining, and fleet discovery, queued-job and timeout settings. Lanes still start read-only. Existing configurations and omitted-field defaults are unchanged.
 - **Private credential diagnostics:** distinguish locally rejected hosted-key formatting from network/client preparation failures before verification. Report bounded format guidance without echoing input, sending a verification request or creating onboarding files; accepted credential formats and identity checks are unchanged.
-- **First-run setup:** `agmi init` privately reads one hosted API key, verifies it, and asks before saving a discovered public account. An explicit address is validated before key entry. One interactive retry honors reported server backoff without re-pasting the key. File, stdin and nonmutating dry runs remain available.
+- **First-run setup:** `agmi init` privately verifies one hosted key and asks before saving a discovered public account. An explicit address is validated before key entry. Interactive retry honors server and local cooldowns without asking for the key again; a 403 does not imply an invalid key. File, stdin and nonmutating dry runs remain available.
 - **Operator diagnostics:** expose the local operations blocking admission, distinguish server retry floors from local backoff, and report a bound 404 as unresolved polling rather than eventual settlement. Invalid grades and failed native streams have distinct, secret-safe failure codes and unchanged retry accounting.
-- **Release checks:** CI qualifies pinned standalone omp against a loopback provider and exercises the packaged CLI's terminal prompt. An authenticated provider check and supervised canary remain separate release gates.
-- **Native inference deadline ownership:** retain one original deadline in pending launch state and reuse it during collection. Remove redundant flight storage flagged by Rust 1.96 Clippy without adding heap indirection or changing admission, timeout or cleanup semantics.
+- **Status and doctor:** use the readiness freshness deadline for intervention, distinguish recorded server minima from local and legacy waits, and separate a bound 404 from whether polling is currently scheduled. Admission, retry timing and unresolved outcomes are unchanged.
+- **Bound job recovery:** atomically retain contradictory expiry evidence with the original job binding. Later expiry or restart cannot manufacture retry authority; authoritative polling can still settle the original operation. Older incompatible writers cannot be activated with service restoration.
+- **MinePOA recovery:** recheck authoritative lane observations at dispatch, atomically journal local judge abstentions, and bound repeated identical challenge observations while retaining accounting evidence.
+- **Release checks:** exercise packaged agmi through pinned standalone omp and verify the Linux archive's native-musl allocator. Authenticated provider acceptance and a supervised canary remain separate gates.
+- **Native inference deadlines:** retain the original local deadline through admission and collection; OpenClaw receives only the remaining time. The controller checks delivered omp terminal evidence during graceful shutdown without waiting for process reaping.
 - **Independent omp adapter:** support the separately installed standalone omp 19.0.1 binary through an invocation-only public SDK bridge. Preserve both guidance layers, native provider discovery/routing/auth ownership, original deadlines, host binding and conservative accounting; no omp fork, bundled executable, permanent plugin, cross-adapter dependency or automatic authentication/install.
+- **omp route and output integrity:** validate route syntax and effort without replacing native catalog/auth ownership. Reject request overrides that could change the model, prompt, reasoning, or tool policy, and reject contradictory served identities and nonfinal artifacts. Distinguish proven startup refusal, invalid artifacts and uncertain execution.
 - **Branding and operator documentation:** introduce the compact agmi architecture hero and agent network harness branding; align README, CLI and package/service descriptions without changing participation or upgrade behavior.
 
 ## 0.2.0

@@ -18,7 +18,10 @@ pub(super) fn initialize_query_indexes(db: &Connection) -> Result<()> {
          AND payload IS NULL AND job_id IS NULL AND txid IS NULL;
          CREATE INDEX IF NOT EXISTS operations_model_retry_fair ON operations(kind,id DESC)
          WHERE state IN ('rejected','model_unknown')
-         AND payload IS NULL AND job_id IS NULL AND txid IS NULL;",
+         AND payload IS NULL AND job_id IS NULL AND txid IS NULL;
+         CREATE INDEX IF NOT EXISTS lane_observation_rejected
+         ON lane_observation_evidence(lane,authority_epoch,generation,epoch,fingerprint)
+         WHERE applied=0;",
     )?;
     Ok(())
 }

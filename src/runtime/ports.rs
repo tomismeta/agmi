@@ -93,7 +93,13 @@ impl HostAccess {
         ready: &ReadyEffect,
     ) -> Result<bool> {
         self.scoped_binding(lane, &ready.op)?;
-        self.ready_current(ready)
+        // Drop a contradicted offer so the lane's targeted refresh can
+        // revalidate or retire its durable preparation. A matching snapshot
+        // does not require rebuilding its already-prepared artifact.
+        Ok(self.ready_current(ready)?
+            && !self
+                .store
+                .challenge_contradicts_ready(&ready.op, &ready.observation.stamp)?)
     }
     fn validate_read(&self, lane: LaneId, flight: &ReadFlight) -> Result<()> {
         let owned = match &flight.key {
@@ -415,33 +421,17 @@ impl HostAccess {
         self.reload()?;
         if !self.active(LaneId::Judge)?
             || !self.scoped_observation_current(LaneId::Judge, observation)?
-            || self.assignment_excluded(&assignment.id)
-            || self.store.attempted(LaneId::Judge, &assignment.id)?
         {
             return Ok(false);
         }
-        let stamp = self.admission_stamp(LaneId::Judge)?;
-        let Some(mut op) = self.store.begin_preparation(
+        self.store.record_grade_abstention(
             &self.config,
             &account,
             &lane,
-            &stamp,
-            PreparationInputs {
-                lane: LaneId::Judge,
-                key: &assignment.id,
-                request: &json!({"assignment":assignment.id,"local_abstention":"required_words_absent"}),
-                retry: None,
-                policy: &json!({"lane_revision":stamp.lane_config_revision}),
-            },
-        )?
-        else {
-            return Ok(false);
-        };
-        let binding = self.store.operation_binding(&op)?;
-        op.state = "abstained".into();
-        self.store
-            .complete_preparation(&binding, &op, "assignment_evidence_insufficient")?;
-        Ok(true)
+            &observation.stamp,
+            &assignment.id,
+            observation.admit_before,
+        )
     }
     pub(in crate::runtime) fn assignment_blocker(&self, id: &str) -> Result<Option<&'static str>> {
         if self.assignment_excluded(id) {

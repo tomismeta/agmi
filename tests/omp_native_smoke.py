@@ -38,14 +38,17 @@ class Endpoint(http.server.BaseHTTPRequestHandler):
         size = int(self.headers["Content-Length"])
         assert size <= MAX_LOGICAL
         body = json.loads(self.rfile.read(size))
-        self.server.calls.append((self.path, body))
-        if self.path == "/capture":
+        path = self.path.split("?", 1)[0]
+        self.server.calls.append((path, body))
+        if path == "/capture":
             if self.server.behavior == "stall":
                 time.sleep(2)
             data = encoded({"output": ANSWER, "tool": self.server.behavior == "tool",
                             "stream_error": self.server.behavior == "stream-error",
                             "overflow": self.server.behavior == "overflow",
-                            "native_model": "fallback" if self.server.behavior == "identity" else None})
+                            "native_model": "fallback" if self.server.behavior == "identity" else None,
+                            "upstream_model": {"served": "fixture/model", "served-other": "fixture/served-other"}.get(self.server.behavior),
+                            "phase_behavior": self.server.behavior})
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
@@ -55,14 +58,71 @@ class Endpoint(http.server.BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError):
                 pass
             return
-        assert self.path == "/v1/chat/completions", self.path
-        assert self.server.behavior == "normal"
-        chunk = {"id": "loopback", "object": "chat.completion.chunk", "model": body["model"],
-                 "choices": [{"index": 0, "delta": {"role": "assistant", "content": ANSWER},
-                              "finish_reason": None}]}
-        stop = {"id": "loopback", "object": "chat.completion.chunk", "model": body["model"],
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
-        data = b"data: " + encoded(chunk) + b"\n\ndata: " + encoded(stop) + b"\n\ndata: [DONE]\n\n"
+        if path == "/v1/responses":
+            phase = self.server.behavior
+            assert phase in ("wire-phase-final", "wire-phase-commentary"), phase
+            response = {"id": "resp_fixture", "object": "response", "model": body["model"]}
+            events = [{"type": "response.created", "response": {**response, "status": "in_progress"}}]
+            items = []
+            texts = (
+                (("commentary", "NOT_ARTIFACT"), ("final_answer", ANSWER))
+                if phase == "wire-phase-final" else (("commentary", ANSWER),)
+            )
+            for index, (text_phase, text) in enumerate(texts):
+                item = {"id": f"msg_fixture_{index}", "type": "message", "role": "assistant", "phase": text_phase}
+                items.append({**item, "status": "completed", "content": [
+                    {"type": "output_text", "text": text, "annotations": []}
+                ]})
+                events.extend([
+                    {"type": "response.output_item.added", "output_index": index,
+                     "item": {**item, "status": "in_progress", "content": []}},
+                    {"type": "response.output_item.done", "output_index": index, "item": items[-1]},
+                ])
+            events.append({"type": "response.completed", "response": {
+                **response, "status": "completed", "output": items,
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            }})
+            data = b"".join(b"data: " + encoded(event) + b"\n\n" for event in events)
+        elif path == "/v1/messages":
+            stop_reason = self.server.behavior.removeprefix("anthropic-")
+            delta = {"stop_sequence": "fixture-stop" if stop_reason == "stop_sequence" else None}
+            if stop_reason != "missing":
+                delta["stop_reason"] = None if stop_reason == "null" else stop_reason
+            events = [
+                {"type": "message_start", "message": {
+                    "id": "msg_fixture", "type": "message", "role": "assistant", "model": body["model"],
+                    "content": [], "stop_reason": None, "stop_sequence": None,
+                    "usage": {"input_tokens": 1, "output_tokens": 0},
+                }},
+                {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+                {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": ANSWER}},
+                {"type": "content_block_stop", "index": 0},
+                {"type": "message_delta", "delta": delta, "usage": {"output_tokens": 1}},
+                {"type": "message_stop"},
+            ]
+            data = b"".join(b"event: " + event["type"].encode() + b"\ndata: " + encoded(event) + b"\n\n"
+                            for event in events)
+        else:
+            assert path == "/v1/chat/completions", self.path
+            if self.server.behavior == "effort-rejected" and body.get("reasoning_effort") == "low":
+                data = encoded({"error": {"type": "invalid_request_error", "param": "reasoning_effort",
+                                          "message": "Unsupported reasoning_effort 'low'. Supported values are: 'medium'."}})
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
+            assert self.server.behavior in ("normal", "wire-model-change", "wire-model-omitted", "effort-rejected")
+            chunk = {"id": "loopback", "object": "chat.completion.chunk",
+                     "choices": [{"index": 0, "delta": {"role": "assistant", "content": ANSWER},
+                                  "finish_reason": None}]}
+            stop = {"id": "loopback", "object": "chat.completion.chunk",
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+            if self.server.behavior != "wire-model-omitted":
+                stop["model"] = body["model"]
+                chunk["model"] = "fixture/served-other" if self.server.behavior == "wire-model-change" else body["model"]
+            data = b"data: " + encoded(chunk) + b"\n\ndata: " + encoded(stop) + b"\n\ndata: [DONE]\n\n"
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Content-Length", str(len(data)))
@@ -87,8 +147,9 @@ export default function(pi) {
     thinking:{efforts:["low","high"],requiresEffort:true}, input:["text"],
     cost:{input:0,output:0,cacheRead:0,cacheWrite:0},contextWindow:32768,maxTokens:4096};
   pi.registerProvider(__PROVIDER__, {
-    baseUrl:__URL__+"/v1", apiKey:"fixture-not-a-secret", api:__API__,
-    models:[model,{...model,id:"fixture/plain",reasoning:false,thinking:undefined}],
+    baseUrl:__URL__+(__API__==="anthropic-messages"?"":"/v1"), apiKey:"fixture-not-a-secret", api:__API__,
+    models:[model,{...model,id:"fixture/plain",reasoning:false,thinking:undefined},
+      ...["fixture/model:free:online","perplexity/sonar","sonar","gpt-5-search-api"].map(id=>({...model,id}))],
     ...(__CUSTOM__ ? {streamSimple:(model,context,options)=>{
       const stream=createAssistantMessageEventStream();
       (async()=>{
@@ -105,6 +166,23 @@ export default function(pi) {
             content:data.tool?[{type:"toolCall",id:"bad",name:"profile_canary",arguments:{}}]:[{type:"text",text:data.output}],
             stopReason:data.tool?"toolUse":"stop",timestamp:Date.now(),
             usage:{input:0,output:1,cacheRead:0,cacheWrite:0,totalTokens:1,cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0}}};
+          if (data.upstream_model) {
+            message.upstreamModel=data.upstream_model;
+            message.upstreamProvider="fixture-upstream";
+          }
+          const phaseText=(phase,text,id=phase)=>({type:"text",text,
+            textSignature:JSON.stringify({v:1,id,phase})});
+          switch(data.phase_behavior) {
+            case "commentary": message.content=[phaseText("commentary",data.output)]; break;
+            case "partial": message.content=[phaseText("partial_answer",data.output)]; break;
+            case "phase-final": message.content=[phaseText("commentary","NOT_ARTIFACT"),
+              phaseText("partial_answer","ALSO_NOT_ARTIFACT"),phaseText("final_answer",data.output)]; break;
+            case "phase-ambiguous": message.content=[{type:"text",text:data.output},
+              phaseText("final_answer",data.output)]; break;
+            case "phase-out-of-order": message.content=[phaseText("final_answer",data.output),
+              phaseText("partial_answer","incomplete follow-on")]; break;
+            case "stop-conflict": message.stopReason="length"; break;
+          }
           if(data.overflow) {
             // Avoid the SDK repetition guard so the bridge's byte limit is reached.
             const output=Array.from({length:4097},(_,index)=>
@@ -117,7 +195,8 @@ export default function(pi) {
             }
             message.content=[{type:"text",text:output}];
           }
-          stream.push({type:"done",reason:message.stopReason,message});stream.end(message);
+          stream.push({type:"done",reason:data.phase_behavior==="stop-conflict"?"stop":message.stopReason,message});
+          stream.end(message);
         } catch (cause) {
           appendFileSync(__CANARY__+".transport-error",String(cause).slice(0,1024));
           const error={role:"assistant",api:model.api,provider:model.provider,model:model.id,content:[],
@@ -229,7 +308,9 @@ class Rpc:
 
 def run_case(binary, bridge, root, server, name, provider="openrouter", effort="low",
              behavior="normal", mutate=None, expected=None, duplicate=False, model_id="fixture/model",
-             argument_override=None, profile="fixture", native_defaults=False, agent_api=None, expected_calls=1):
+             argument_override=None, profile="fixture", native_defaults=False, agent_api=None, expected_calls=1,
+             startup_refusal=False, openrouter_variant="floor", shell_model_id=None, extra_body=None,
+             wire_mode=None, wire_id=None):
     case = root / name
     home = case / "home"
     # Explicit native profile and isolated HOME; no inherited auth/config/env.
@@ -239,9 +320,20 @@ def run_case(binary, bridge, root, server, name, provider="openrouter", effort="
         directory.mkdir(parents=True)
     canary = case / "canary"
     url = f"http://127.0.0.1:{server.server_port}"
+    if extra_body is not None or wire_mode is not None:
+        model = dict(id=model_id, name="Configured fixture", reasoning=effort != "off", input=["text"],
+                     contextWindow=32768, maxTokens=4096,
+                     cost=dict(input=0, output=0, cacheRead=0, cacheWrite=0))
+        (agent / "models.yml").write_text(json.dumps({"providers": {provider: {
+            "baseUrl": url + "/v1", "apiKey": "fixture-not-a-secret", "api": "openai-completions",
+            "compat": ({"extraBody": extra_body} if extra_body is not None else {"wireModelIdMode": wire_mode}),
+            "models": [model],
+        }}}))
     for location, route, custom in (("extensions/ordinary.ts", "ordinary-fixture", False),
                                     ("hooks/pre/provider.ts", "openrouter", True),
                                     ("extensions/antigravity.ts", "google-antigravity", True)):
+        if (extra_body is not None or wire_mode is not None) and route == provider:
+            continue
         source = FACTORY.replace("__CANARY__", json.dumps(str(canary))).replace("__URL__", json.dumps(url))
         source = source.replace("__PROVIDER__", json.dumps(route)).replace("__CUSTOM__", str(custom and not (agent_api and route == provider)).lower())
         api = agent_api if agent_api and route == provider else ("fixture-" + route if custom else "openai-completions")
@@ -249,7 +341,7 @@ def run_case(binary, bridge, root, server, name, provider="openrouter", effort="
         (agent / location).write_text(source)
     config = agent / "config.yml"
     config.write_text("retry:\n  modelFallback: false\n" if native_defaults else
-                      "providers:\n  openrouterVariant: floor\n  antigravityEndpoint: sandbox\nretry:\n  modelFallback: false\n")
+                      f"providers:\n  openrouterVariant: {openrouter_variant}\n  antigravityEndpoint: sandbox\nretry:\n  modelFallback: false\n")
     sentinel = agent / "sessions" / "preserve.txt"
     sentinel.write_text("session sentinel\n")
     (agent / "SYSTEM.md").write_text("OUTER_SYSTEM_CANARY_MUST_NOT_ENTER_CONTEXT")
@@ -269,7 +361,7 @@ def run_case(binary, bridge, root, server, name, provider="openrouter", effort="
                                                        "providers": {"cacheWarming": "off"}}))
     flags = ["--mode", "rpc", "--no-ui", "--no-session", "--no-tools", "--no-lsp", "--no-pty", "--no-skills",
              "--no-rules", "--no-context-files", "--no-prewalk", "--no-title",
-             "--model", f"{provider}/{model_id}", "--thinking", effort,
+             "--model", f"{provider}/{shell_model_id or model_id}", "--thinking", effort,
              "--trusted-extension", str(scratch / "omp.ts"), "--config", str(scratch / "omp-overlay.json")]
     if profile:
         flags.extend(["--profile", profile])
@@ -288,10 +380,11 @@ def run_case(binary, bridge, root, server, name, provider="openrouter", effort="
         assert COMMAND in [c["name"] for c in commands["commands"]], commands
         entries = rpc.request("get_entries")["entries"]
         startup = [e for e in entries if e.get("customType") == "agmi_omp_ready_v1"]
-        if expected == "native_api_unsupported" and (effort in ("max", "off") or agent_api):
+        if startup_refusal:
             assert not startup
             terminal = [e["data"] for e in entries if e.get("customType") == "agmi_omp_result_v1"]
-            assert len(terminal) == 1 and terminal[0]["reason_code"] == expected, terminal
+            assert terminal == [{**binding, "ok": False, "stage": "startup", "reason_code": expected}], terminal
+            assert not any(e.get("customType") == "agmi_omp_dispatch_v1" for e in entries), entries
             assert len(server.calls) == count
             return
         assert len(startup) == 1 and startup[0]["data"] == binding, entries
@@ -313,13 +406,23 @@ def run_case(binary, bridge, root, server, name, provider="openrouter", effort="
         assert all(terminal[k] == v for k, v in binding.items()), terminal
         if expected:
             detail = Path(str(canary) + ".transport-error")
-            assert not terminal["ok"] and terminal["reason_code"] == expected, (terminal, detail.read_text() if detail.exists() else None)
+            assert not terminal["ok"] and terminal["reason_code"] == expected, (name, terminal, detail.read_text() if detail.exists() else None)
             assert "fixture private provider error" not in json.dumps(terminal)
             if behavior == "identity":
                 assert terminal["native_model"] == "fallback" and terminal["native_provider"] == provider, terminal
+            if behavior == "wire-model-change":
+                assert terminal["native_model"] == model_id and terminal["wire_model"] == "fixture/served-other", terminal
+            if behavior == "served-other":
+                assert terminal["native_model"] == model_id and terminal["upstream_model"] == "fixture/served-other", terminal
         else:
             assert terminal["ok"] and terminal["output"] == ANSWER, terminal
             assert terminal["native_provider"] == provider and terminal["native_model"] == model_id
+            phase = "final_answer" if behavior in ("phase-final", "wire-phase-final") else None
+            assert terminal["output_phase"] == phase, terminal
+            expected_wire = (wire_id or model_id) if provider == "ordinary-fixture" and behavior != "wire-model-omitted" else None
+            assert terminal["wire_model"] == expected_wire, terminal
+            assert terminal["upstream_model"] == ("fixture/model" if behavior == "served" else None), terminal
+            assert terminal["upstream_provider"] == ("fixture-upstream" if behavior == "served" else None), terminal
         if duplicate:
             calls = len(server.calls)
             assert rpc.prompt(f"/{COMMAND} {argument}")["agentInvoked"] is False
@@ -338,17 +441,21 @@ def run_case(binary, bridge, root, server, name, provider="openrouter", effort="
                 options = captured["options"]
                 assert options["reasoning"] == effort and options["toolChoice"] == "none"
                 assert options["disableServerSideFallback"] is True and not options.get("fallbacks")
-                assert options.get("openrouterVariant") == (None if native_defaults else "floor")
+                expected_variant = None if native_defaults or openrouter_variant == "online" else openrouter_variant
+                assert options.get("openrouterVariant") == expected_variant
                 assert options["antigravityEndpointMode"] == ("auto" if native_defaults else "sandbox")
                 assert options["sessionId"] == binding["invocation_id"]
             else:
-                assert not captured.get("tools") and captured.get("tool_choice") in (None, "none")
-                assert captured["model"] == model_id
+                assert not captured.get("tools"), captured
+                assert captured.get("tool_choice") in (None, "none", {"type": "none"}), captured
+                if extra_body is not None:
+                    assert all(captured[key] == value for key, value in extra_body.items()), captured
+                assert captured["model"] == (wire_id or model_id)
                 if effort == "off":
                     assert captured.get("reasoning_effort") in (None, "none"), captured
                 else:
                     assert captured["reasoning_effort"] == effort
-                wire = json.dumps(captured["messages"])
+                wire = json.dumps(captured["input"] if path == "/v1/responses" else captured["messages"])
                 assert "USER_GUIDANCE_LAYER" in wire and "CORE_GUIDANCE_LAYER" in wire
             assert "OUTER_SYSTEM_CANARY" not in json.dumps(captured)
             assert "OUTER_RULE_CANARY" not in json.dumps(captured)
@@ -378,18 +485,70 @@ def main():
             run_case(binary, bridge, root, server, "hook-routing-once", duplicate=True)
             run_case(binary, bridge, root, server, "default-profile", profile=None, native_defaults=True)
             run_case(binary, bridge, root, server, "ordinary-wire", provider="ordinary-fixture")
+            run_case(binary, bridge, root, server, "ordinary-no-effort-fallback", provider="ordinary-fixture",
+                     behavior="effort-rejected", expected="native_api_unsupported")
+            run_case(binary, bridge, root, server, "ordinary-native-wire-namespace", provider="ordinary-fixture",
+                     effort="off", model_id="fixture/plain", wire_mode="cline-pass", wire_id="cline-pass/fixture/plain")
             run_case(binary, bridge, root, server, "ordinary-exact-off", provider="ordinary-fixture",
                      effort="off", model_id="fixture/plain")
             run_case(binary, bridge, root, server, "native-paused-provider", provider="google-antigravity",
                      expected="native_failure", expected_calls=0)
-            run_case(binary, bridge, root, server, "unsupported-effort", effort="max", expected="native_api_unsupported")
-            run_case(binary, bridge, root, server, "exact-off-refusal", effort="off", expected="native_api_unsupported")
+            run_case(binary, bridge, root, server, "unsupported-effort", effort="max",
+                     expected="native_api_unsupported", startup_refusal=True)
+            run_case(binary, bridge, root, server, "exact-off-refusal", effort="off",
+                     expected="native_api_unsupported", startup_refusal=True)
             for api in ("cursor-agent", "gitlab-duo-agent"):
-                run_case(binary, bridge, root, server, api, agent_api=api, expected="native_api_unsupported")
+                run_case(binary, bridge, root, server, api, agent_api=api,
+                         expected="native_api_unsupported", startup_refusal=True)
+            run_case(binary, bridge, root, server, "online-variant", openrouter_variant="online",
+                     expected="native_api_unsupported", startup_refusal=True)
+            run_case(binary, bridge, root, server, "online-unrelated-route", provider="ordinary-fixture",
+                     openrouter_variant="online")
+            for model_id in ("fixture/model:free:online", "perplexity/sonar"):
+                # The outer CLI can interpret colon suffixes as selector syntax.
+                # Start the inert shell on a known model to exercise the
+                # invocation bootstrap's independent catalog and tool fence.
+                run_case(binary, bridge, root, server, "tool-enabled-" + model_id.replace("/", "-").replace(":", "-"),
+                         model_id=model_id, shell_model_id="fixture/model",
+                         expected="native_api_unsupported", startup_refusal=True)
+            for model_id in ("sonar", "gpt-5-search-api"):
+                run_case(binary, bridge, root, server, "direct-search-" + model_id,
+                         provider="ordinary-fixture", model_id=model_id,
+                         expected="native_api_unsupported", startup_refusal=True)
+            run_case(binary, bridge, root, server, "plain-router-model-variant", openrouter_variant="exacto")
+            for key, value in (("model", "fixture/served-other"), ("plugins", [{"id": "web"}]),
+                               ("messages", [{"role": "user", "content": "replacement"}]),
+                               ("reasoning_effort", "max")):
+                run_case(binary, bridge, root, server, "override-" + key,
+                         provider="ordinary-fixture", model_id="fixture/plain", effort="off",
+                         extra_body={key: value}, expected="native_api_unsupported", startup_refusal=True)
+            run_case(binary, bridge, root, server, "safe-tuning", provider="ordinary-fixture",
+                     model_id="fixture/plain", effort="off", extra_body={"temperature": 0.3})
             run_case(binary, bridge, root, server, "wrong-binding", mutate=lambda b: b.update(selection_digest="0" * 64), expected="native_run_binding_mismatch")
             run_case(binary, bridge, root, server, "wrong-digest", mutate=lambda b: b.update(request_json=b["request_json"] + " "), expected="native_run_binding_mismatch", duplicate=True)
             run_case(binary, bridge, root, server, "tool-refusal", behavior="tool", expected="native_api_unsupported")
             run_case(binary, bridge, root, server, "native-identity-mismatch", behavior="identity", expected="native_provenance_mismatch")
+            run_case(binary, bridge, root, server, "known-upstream-model", behavior="served")
+            run_case(binary, bridge, root, server, "wrong-upstream-model", behavior="served-other",
+                     expected="native_provenance_mismatch")
+            run_case(binary, bridge, root, server, "ordinary-wire-model-change", provider="ordinary-fixture",
+                     behavior="wire-model-change", expected="native_provenance_mismatch")
+            run_case(binary, bridge, root, server, "ordinary-wire-model-omitted", provider="ordinary-fixture",
+                     behavior="wire-model-omitted")
+            run_case(binary, bridge, root, server, "final-phase-only", behavior="phase-final")
+            run_case(binary, bridge, root, server, "responses-final-phase-only", behavior="wire-phase-final",
+                     provider="ordinary-fixture", agent_api="openai-responses", effort="off", model_id="fixture/plain")
+            run_case(binary, bridge, root, server, "responses-commentary-only", behavior="wire-phase-commentary",
+                     provider="ordinary-fixture", agent_api="openai-responses", effort="off", model_id="fixture/plain",
+                     expected="native_api_unsupported")
+            for reason in ("end_turn", "stop_sequence", "pause_turn", "unrecognized_stop", "missing", "null"):
+                behavior = "anthropic-" + reason
+                run_case(binary, bridge, root, server, behavior, behavior=behavior,
+                         provider="ordinary-fixture", agent_api="anthropic-messages",
+                         effort="off", model_id="fixture/plain",
+                         expected=None if reason in ("end_turn", "stop_sequence") else "native_api_unsupported")
+            for behavior in ("commentary", "partial", "phase-ambiguous", "phase-out-of-order", "stop-conflict"):
+                run_case(binary, bridge, root, server, behavior, behavior=behavior, expected="native_api_unsupported")
             run_case(binary, bridge, root, server, "malformed-command", argument_override="%%%",
                      expected="native_run_binding_mismatch", duplicate=True)
             run_case(binary, bridge, root, server, "output-overflow", behavior="overflow", expected="native_output_limit")

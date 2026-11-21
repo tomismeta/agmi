@@ -106,6 +106,55 @@ pub enum RestrictionBasis {
     ServerRetryAfter,
     LocalUnscoped429Cooldown,
 }
+
+pub(crate) enum HostedIdentityBody<'a> {
+    Verified(&'a str),
+    Invalid,
+    Mismatch,
+}
+
+impl Response {
+    /// A complete successful identity body may omit its chain, but a supplied
+    /// chain must be valid before any account or chain mismatch is established.
+    pub(crate) fn hosted_identity_body(
+        &self,
+        expected_address: Option<&str>,
+        expected_chain: &str,
+    ) -> HostedIdentityBody<'_> {
+        use crate::config::{safe_segment, valid_address};
+        use HostedIdentityBody::*;
+
+        if ["ok", "success"].iter().any(|field| {
+            self.body
+                .get(field)
+                .is_some_and(|value| value.as_bool() != Some(true))
+        }) {
+            return Invalid;
+        }
+        let Some(address) = self
+            .body
+            .get("address")
+            .and_then(serde_json::Value::as_str)
+            .filter(|address| valid_address(address))
+        else {
+            return Invalid;
+        };
+        let chain = match self.body.get("chain_id") {
+            Some(value) => match value.as_str().filter(|chain| safe_segment(chain, 64)) {
+                Some(chain) => Some(chain),
+                None => return Invalid,
+            },
+            None => None,
+        };
+        if expected_address.is_some_and(|expected| address != expected)
+            || chain.is_some_and(|chain| chain != expected_chain)
+        {
+            Mismatch
+        } else {
+            Verified(address)
+        }
+    }
+}
 #[derive(Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum RestrictionProvenance {
@@ -184,23 +233,29 @@ impl RestrictionEvidence {
 }
 
 impl HostedResponse {
+    /// Account-associated retry evidence also applies to an in-memory
+    /// onboarding check, which has no journal. Anonymous public responses do
+    /// not establish an account restriction, even if they have a retry hint.
+    pub(crate) fn authenticated_retry_minimum(&self) -> Option<(u64, RestrictionBasis)> {
+        if !self.context.authenticated {
+            return None;
+        }
+        match self.response.retry_after_seconds {
+            Some(delay) => Some((delay, RestrictionBasis::ServerRetryAfter)),
+            None if self.response.status == 429 => {
+                Some((30, RestrictionBasis::LocalUnscoped429Cooldown))
+            }
+            None => None,
+        }
+    }
+
     /// Only assembled bodies establish the queued-response exception. Invalid
     /// or interrupted bodies retain headers but never invent narrower scope.
     pub fn restrictions(&self) -> Vec<RestrictionEvidence> {
         let response = &self.response;
-        let (delay, basis, policy) = match response.retry_after_seconds {
-            Some(delay) => (delay, RestrictionBasis::ServerRetryAfter, None),
-            None if response.status == 429 && self.context.authenticated => (
-                30,
-                RestrictionBasis::LocalUnscoped429Cooldown,
-                Some("agmi.local_bare_429_cooldown.v1".to_owned()),
-            ),
-            None => return Vec::new(),
-        };
-        // No source-backed origin-wide minima for anonymous public routes.
-        if !self.context.authenticated {
+        let Some((delay, basis)) = self.authenticated_retry_minimum() else {
             return Vec::new();
-        }
+        };
         let queued_resource = self.queued_resource();
         let provenance = if queued_resource.is_some() && self.context.endpoint.is_effect() {
             RestrictionProvenance::QueuedSubmission
@@ -238,7 +293,8 @@ impl HostedResponse {
                 .observed_at
                 .saturating_add(i64::try_from(delay).unwrap_or(i64::MAX)),
             server_minimum_seconds: response.retry_after_seconds,
-            policy,
+            policy: (basis == RestrictionBasis::LocalUnscoped429Cooldown)
+                .then(|| "agmi.local_bare_429_cooldown.v1".to_owned()),
             provenance,
         }]
     }
@@ -391,11 +447,12 @@ mod tests {
         );
         response.completed_at = 999;
         assert_eq!(response.restrictions()[0].not_before, 130);
-        assert!(
-            observed(Endpoint::ExplorerTx, Value::Null, 429, None)
-                .restrictions()
-                .is_empty()
-        );
+        for delay in [None, Some(9)] {
+            let anonymous = observed(Endpoint::ExplorerTx, Value::Null, 429, delay);
+            assert_eq!(anonymous.response.retry_after_seconds, delay);
+            assert_eq!(anonymous.authenticated_retry_minimum(), None);
+            assert!(anonymous.restrictions().is_empty());
+        }
     }
 
     #[test]

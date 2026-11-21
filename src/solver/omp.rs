@@ -30,19 +30,11 @@ pub(super) fn check_version(bytes: &[u8]) -> Result<()> {
 }
 
 fn selection(model: &ModelConfig) -> Result<(String, String, String)> {
-    let (provider, name) = model
-        .model
-        .split_once('/')
-        .context(SolverNotStarted("invalid_solver_setup"))?;
-    ensure!(
-        safe_identifier(provider) && safe_identifier(name) && safe_identifier(&model.reasoning),
-        SolverNotStarted("invalid_solver_setup")
-    );
-    let digest = format!(
-        "{:x}",
-        Sha256::digest(serde_json::to_vec(&ModelSelection::new(model)?)?)
-    );
-    Ok((provider.into(), name.into(), digest))
+    let selection = ModelSelection::new(model)?;
+    let provider = selection.provider().to_owned();
+    let name = selection.model().to_owned();
+    let digest = format!("{:x}", Sha256::digest(serde_json::to_vec(&selection)?));
+    Ok((provider, name, digest))
 }
 
 fn private_file(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -117,7 +109,7 @@ pub(super) fn prepare(
         "protocol":1, "invocation_id":invocation_id, "request_digest":request_digest,
         "selection_digest":selection_digest, "provider":provider, "model":name,
         "reasoning_effort":model.reasoning, "provider_discovery_cwd":discovery,
-        "deadline_unix_ms":deadline.unix_seconds.saturating_mul(1000)
+        "deadline_unix_ms":deadline.unix_millis()
     });
     let mut body = json!({
         "protocol":1, "invocation_id":invocation_id, "request_digest":request_digest,
@@ -223,17 +215,19 @@ pub(super) fn spawn(
     spawn_owned(command)
 }
 
+const BINDING_KEYS: [&str; 7] = [
+    "protocol",
+    "invocation_id",
+    "request_digest",
+    "selection_digest",
+    "provider",
+    "model",
+    "reasoning_effort",
+];
+
 fn binding(value: &Value, expected: &Value) -> Result<()> {
     ensure!(value.is_object(), NativeFailure("native_envelope_invalid"));
-    for key in [
-        "protocol",
-        "invocation_id",
-        "request_digest",
-        "selection_digest",
-        "provider",
-        "model",
-        "reasoning_effort",
-    ] {
+    for key in BINDING_KEYS {
         ensure!(
             value.get(key).is_some() && value.get(key) == expected.get(key),
             NativeFailure("native_run_binding_mismatch")
@@ -260,31 +254,52 @@ fn entries(data: &Value) -> Result<&[Value]> {
 
 fn ready_entry(data: &Value, expected: &Value) -> Result<String> {
     let mut ready = None;
+    let mut refusal = None;
     for entry in entries(data)? {
         if entry["type"] == "custom" && entry["customType"] == READY {
             ensure!(
-                ready.is_none(),
+                ready.is_none() && refusal.is_none(),
                 NativeFailure("native_run_binding_mismatch")
             );
             binding(&entry["data"], expected)?;
             ready = entry["id"].as_str();
         } else if entry["type"] == "custom" && entry["customType"] == TERMINAL {
-            binding(&entry["data"], expected)?;
+            let terminal = &entry["data"];
+            binding(terminal, expected)?;
             ensure!(
-                entry["data"]["ok"] == false,
+                ready.is_none() && refusal.is_none(),
+                NativeFailure("native_run_binding_mismatch")
+            );
+            // Only this exact phase can prove no inference request was sent.
+            // Inspect the whole snapshot: a ready, dispatch, message, or
+            // second result anywhere in it invalidates the refusal proof.
+            let reason = terminal_failure(terminal).0;
+            ensure!(
+                terminal["ok"] == false
+                    && terminal["stage"] == "startup"
+                    && terminal
+                        .as_object()
+                        .is_some_and(|data| data.len() == BINDING_KEYS.len() + 3)
+                    && matches!(
+                        reason,
+                        "native_api_unsupported" | "native_failure" | "model_deadline_exceeded"
+                    ),
                 NativeFailure("native_envelope_invalid")
             );
-            return Err(terminal_failure(&entry["data"]).into());
+            refusal = Some(reason);
         } else {
             ensure!(
-                entry["type"] != "message"
-                    && !(entry["type"] == "custom"
-                        && entry["customType"]
-                            .as_str()
-                            .is_some_and(|s| s.starts_with("agmi_omp_"))),
+                entry["type"].is_string()
+                    && entry["type"] != "message"
+                    && !entry["customType"]
+                        .as_str()
+                        .is_some_and(|s| s.starts_with("agmi_omp_")),
                 NativeFailure("native_envelope_invalid")
             );
         }
+    }
+    if let Some(reason) = refusal {
+        return Err(SolverNotStarted(reason).into());
     }
     ready
         .map(str::to_owned)
@@ -332,18 +347,27 @@ fn terminal_entry<'a>(
         NativeFailure("native_envelope_invalid")
     );
     binding(&last["data"], expected)?;
+    ensure!(
+        last["data"].get("stage").is_none(),
+        NativeFailure("native_envelope_invalid")
+    );
     let terminal = &last["data"];
-    let report = |key| {
-        terminal[key]
-            .as_str()
-            .filter(|value| safe_identifier(value))
-            .map(|value| Reported {
-                value: value.to_owned(),
-                source: EvidenceSource::NativeEnvelope,
-            })
+    let report = |key: &str, source| -> Result<Option<Reported<String>>> {
+        match terminal.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(value)) if safe_identifier(value) => Ok(Some(Reported {
+                value: value.clone(),
+                source,
+            })),
+            _ => Err(NativeFailure("native_envelope_invalid").into()),
+        }
     };
-    evidence.provider = report("native_provider");
-    evidence.model = report("native_model");
+    // SDK provider/model name the catalog route. Do not turn a requested
+    // model echo into evidence of which model the provider actually served.
+    evidence.provider = report("native_provider", EvidenceSource::AdapterContract)?;
+    evidence.model = report("wire_model", EvidenceSource::NativeEnvelope)?;
+    evidence.winner_model = report("upstream_model", EvidenceSource::NativeEnvelope)?;
+    evidence.winner_provider = report("upstream_provider", EvidenceSource::NativeEnvelope)?;
     evidence.run_id = terminal["invocation_id"].as_str().map(|value| Reported {
         value: value.to_owned(),
         source: EvidenceSource::AdapterContract,
@@ -367,9 +391,21 @@ fn terminal_entry<'a>(
         NativeFailure("native_provenance_mismatch")
     );
     ensure!(
-        terminal["output"]
-            .as_str()
-            .is_some_and(|s| s.len() <= MAX_OUTPUT),
+        matches!(terminal.get("output_phase"), Some(Value::Null))
+            || terminal["output_phase"] == "final_answer",
+        NativeFailure("native_envelope_invalid")
+    );
+    ensure!(
+        ["wire_model", "upstream_model", "upstream_provider"]
+            .iter()
+            .all(|&key| terminal.get(key).is_some()),
+        NativeFailure("native_envelope_invalid")
+    );
+    let output = terminal["output"]
+        .as_str()
+        .context(NativeFailure("native_envelope_invalid"))?;
+    ensure!(
+        output.len() <= MAX_OUTPUT,
         NativeFailure("native_output_limit")
     );
     Ok(terminal)
@@ -391,12 +427,61 @@ async fn drain_stderr(mut reader: impl AsyncRead + Unpin) -> Result<()> {
     }
 }
 
+pub(super) struct ReceivedTerminal {
+    entries: Value,
+    binding: Value,
+    startup: bool,
+}
+
+impl ReceivedTerminal {
+    fn new(entries: Value, mut binding: Value, startup: bool) -> Self {
+        if let Some(body) = binding.as_object_mut() {
+            body.retain(|key, _| BINDING_KEYS.contains(&key.as_str()));
+        }
+        Self {
+            entries,
+            binding,
+            startup,
+        }
+    }
+
+    pub(super) fn verify(
+        mut self,
+        model: String,
+        reported: &mut NativeReportedEvidence,
+    ) -> Result<(String, String, String, String)> {
+        if self.startup {
+            ready_entry(&self.entries, &self.binding)?;
+            return Err(NativeFailure("native_envelope_invalid").into());
+        }
+        terminal_entry(&self.entries, &self.binding, reported)?;
+        // Move the checked native value without re-encoding.
+        let terminal = self
+            .entries
+            .get_mut("entries")
+            .and_then(Value::as_array_mut)
+            .and_then(|entries| entries.last_mut())
+            .and_then(|entry| entry.get_mut("data"))
+            .context(NativeFailure("native_envelope_invalid"))?;
+        let take = |value: &mut Value, key| match value[key].take() {
+            Value::String(text) => Ok(text),
+            _ => Err(NativeFailure("native_envelope_invalid")),
+        };
+        Ok((
+            take(terminal, "provider")?,
+            model,
+            take(terminal, "invocation_id")?,
+            take(terminal, "output")?,
+        ))
+    }
+}
+
 pub(super) async fn collect(
     owner: &mut OwnedChild,
     input: Vec<u8>,
     deadline: ExecutionDeadline,
-    evidence: &mut NativeReportedEvidence,
-) -> Result<Value> {
+    facts: &mut NativeAttemptCompletion,
+) -> Result<ReceivedTerminal> {
     use base64::Engine as _;
     let operation = async {
         ensure!(
@@ -456,6 +541,14 @@ pub(super) async fn collect(
                 &json!({"id":"ready-entries","type":"get_entries"}),
             )
             .await?;
+            if initial["entries"]
+                .as_array()
+                .is_some_and(|entries| entries.iter().any(|entry| entry["customType"] == TERMINAL))
+            {
+                // Do not dispatch after a potential startup refusal. Only the
+                // controller validates the bound terminal and classifies it.
+                return Ok(ReceivedTerminal::new(initial, body, true));
+            }
             let cursor = ready_entry(&initial, &body)?;
             body["timeout_ms"] = json!(remaining_ms(deadline)?);
             let bytes =
@@ -478,21 +571,13 @@ pub(super) async fn collect(
             .await?;
             ensure!(receipt.is_null(), NativeFailure("native_envelope_invalid"));
             rpc::local_completion(&mut reader, "once").await?;
-            let mut final_entries = rpc::exchange(
+            let final_entries = rpc::exchange(
                 &mut writer,
                 &mut reader,
                 &json!({"id":"terminal-entries","type":"get_entries","since":cursor}),
             )
             .await?;
-            terminal_entry(&final_entries, &body, evidence)?;
-            // Move the validated native value; do not serialize and parse it again.
-            let terminal = final_entries
-                .get_mut("entries")
-                .and_then(Value::as_array_mut)
-                .and_then(|entries| entries.last_mut())
-                .and_then(|entry| entry.get_mut("data"))
-                .context(NativeFailure("native_envelope_invalid"))?;
-            Ok::<_, anyhow::Error>(terminal.take())
+            Ok(ReceivedTerminal::new(final_entries, body, false))
         };
         tokio::pin!(conversation);
         let drain = drain_stderr(stderr);
@@ -502,47 +587,28 @@ pub(super) async fn collect(
             drained = &mut drain => { drained?; conversation.await }
         }
     };
-    let outcome = tokio::time::timeout_at(deadline.at, operation).await;
-    // No second grace period: the owner's drop path remains the cancellation fallback.
-    let stopped = tokio::time::timeout_at(deadline.at, owner.stop_and_reap()).await;
-    let terminal = outcome.map_err(|_| NativeFailure("model_deadline_exceeded"))??;
-    stopped.map_err(|_| NativeFailure("model_deadline_exceeded"))??;
-    Ok(terminal)
-}
-
-pub(super) fn result(
-    value: &Value,
-    model: &ModelConfig,
-    invocation_id: &str,
-) -> Result<(String, String, String, String)> {
-    let (provider, name, selection_digest) =
-        selection(model).map_err(|_| NativeFailure("native_provenance_mismatch"))?;
-    ensure!(
-        value["protocol"] == 1
-            && value["invocation_id"] == invocation_id
-            && value["selection_digest"] == selection_digest,
-        NativeFailure("native_run_binding_mismatch")
-    );
-    ensure!(
-        value["ok"] == true
-            && value["provider"] == provider
-            && value["model"] == name
-            && value["reasoning_effort"] == model.reasoning
-            && value["native_provider"] == provider
-            && value["native_model"] == name
-            && value.get("reason_code").is_none(),
-        NativeFailure("native_provenance_mismatch")
-    );
-    let output = value["output"]
-        .as_str()
-        .filter(|s| s.len() <= MAX_OUTPUT)
-        .context(NativeFailure("native_output_limit"))?;
-    Ok((
-        provider,
-        model.model.clone(),
-        invocation_id.into(),
-        output.into(),
-    ))
+    let outcome = match tokio::time::timeout_at(deadline.at, operation).await {
+        Ok(outcome) if tokio::time::Instant::now() < deadline.at => outcome,
+        _ => Err(NativeFailure("model_deadline_exceeded").into()),
+    };
+    let requested_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .try_into()
+        .unwrap_or(i64::MAX);
+    // Stop the owned group without delaying terminal delivery for process reaping.
+    let stopped = owner.stop_and_observe();
+    facts.cancellation = CancellationEvidence {
+        requested_at: Some(requested_at),
+        local_process_stop: if stopped {
+            LocalProcessStop::Observed
+        } else {
+            LocalProcessStop::Unknown
+        },
+        remote_run_stop: RemoteRunStop::Unknown,
+    };
+    outcome
 }
 
 #[cfg(test)]
@@ -575,6 +641,76 @@ mod tests {
         assert_eq!(failure_code(&error), "native_run_binding_mismatch");
     }
     #[test]
+    fn only_a_unique_startup_refusal_without_contradictions_proves_no_dispatch() {
+        let e = expected();
+        let mut terminal = e.clone();
+        terminal["ok"] = json!(false);
+        terminal["reason_code"] = json!("native_api_unsupported");
+        terminal["stage"] = json!("startup");
+        let refusal = entry("refused", TERMINAL, terminal.clone());
+        let error = ready_entry(&json!({"entries":[refusal.clone()]}), &e).unwrap_err();
+        assert_eq!(failure_code(&error), "native_api_unsupported");
+        assert!(!execution_may_have_started(&error));
+
+        let mut wrong = terminal.clone();
+        wrong["request_digest"] = json!("wrong");
+        let mut not_startup = terminal.clone();
+        not_startup.as_object_mut().unwrap().remove("stage");
+        let mut claimed_output = terminal;
+        claimed_output["output"] = json!("not a refusal");
+        for entries in [
+            json!([refusal.clone(), entry("dispatch", DISPATCH, e.clone())]),
+            json!([entry("ready", READY, e.clone()), refusal.clone()]),
+            json!([refusal.clone(), entry("ready", READY, e.clone())]),
+            json!([refusal,{"id":"message","type":"message"}]),
+            json!([entry("wrong", TERMINAL, wrong)]),
+            json!([entry("without-stage", TERMINAL, not_startup)]),
+            json!([entry("with-output", TERMINAL, claimed_output)]),
+        ] {
+            let error = ready_entry(&json!({"entries":entries}), &e).unwrap_err();
+            assert!(execution_may_have_started(&error));
+        }
+    }
+
+    #[test]
+    fn requires_phase_and_explicit_unknown_served_identity() {
+        let expected = expected();
+        let mut terminal = expected.clone();
+        terminal["ok"] = json!(true);
+        terminal["native_provider"] = json!("provider");
+        terminal["native_model"] = json!("model/name");
+        terminal["output"] = json!("artifact");
+        terminal["output_phase"] = Value::Null;
+        terminal["wire_model"] = Value::Null;
+        terminal["upstream_model"] = Value::Null;
+        terminal["upstream_provider"] = Value::Null;
+        let response = |terminal| {
+            json!({"entries":[
+                entry("dispatch",DISPATCH,expected.clone()),
+                entry("terminal",TERMINAL,terminal)
+            ]})
+        };
+        let mut evidence = NativeReportedEvidence::default();
+        terminal_entry(&response(terminal.clone()), &expected, &mut evidence).unwrap();
+        assert_eq!(
+            evidence.provider.unwrap().source,
+            EvidenceSource::AdapterContract
+        );
+        assert!(evidence.model.is_none() && evidence.winner_model.is_none());
+
+        let mut no_identity = terminal.clone();
+        no_identity.as_object_mut().unwrap().remove("wire_model");
+        let mut commentary = terminal;
+        commentary["output_phase"] = json!("commentary");
+        for bad in [no_identity, commentary] {
+            let error =
+                terminal_entry(&response(bad), &expected, &mut Default::default()).unwrap_err();
+            assert_eq!(failure_code(&error), "native_envelope_invalid");
+            assert!(execution_may_have_started(&error));
+        }
+    }
+
+    #[test]
     fn requires_dispatch_then_one_terminal_and_sanitizes_native_failure() {
         let e = expected();
         let mut terminal = e.clone();
@@ -601,14 +737,17 @@ mod tests {
         terminal["ok"] = json!(false);
         terminal["reason_code"] = json!("native_provenance_mismatch");
         terminal["native_provider"] = json!("provider");
-        terminal["native_model"] = json!("fallback");
+        terminal["native_model"] = json!("model/name");
+        terminal["wire_model"] = json!("model/name");
+        terminal["upstream_model"] = json!("fallback");
         let data = json!({"entries":[entry("dispatch",DISPATCH,expected.clone()),entry("terminal",TERMINAL,terminal)]});
         let mut evidence = NativeReportedEvidence::default();
         assert_eq!(
             failure_code(&terminal_entry(&data, &expected, &mut evidence).unwrap_err()),
             "native_provenance_mismatch"
         );
-        assert_eq!(evidence.model.unwrap().value, "fallback");
+        assert_eq!(evidence.model.unwrap().value, "model/name");
+        assert_eq!(evidence.winner_model.unwrap().value, "fallback");
         assert_eq!(
             evidence.reasoning_effort.unwrap().source,
             EvidenceSource::AdapterContract
@@ -735,10 +874,27 @@ mod tests {
     fn selection_and_result_require_exact_route_effort_and_host_invocation() {
         let model = model();
         let (provider, name, digest) = selection(&model).unwrap();
-        let value = json!({"protocol":1,"invocation_id":"invocation","selection_digest":digest,"ok":true,
-            "provider":provider,"model":name,"reasoning_effort":"high","native_provider":"provider","native_model":"model/name","output":"artifact"});
+        let binding = json!({"protocol":1,"invocation_id":"invocation","selection_digest":digest,
+            "request_digest":"sample","provider":provider,"model":name,"reasoning_effort":"high"});
+        let mut value = binding.clone();
+        value.as_object_mut().unwrap().extend(
+            json!({"ok":true,"native_provider":"provider","native_model":"model/name","output":"artifact",
+                "wire_model":null,"upstream_model":null,"upstream_provider":null,"output_phase":null})
+                .as_object().unwrap().clone(),
+        );
+        let check = |terminal| {
+            ReceivedTerminal::new(
+                json!({"entries":[
+                    {"id":"dispatch","type":"custom","customType":DISPATCH,"data":binding},
+                    {"id":"terminal","type":"custom","customType":TERMINAL,"data":terminal},
+                ]}),
+                binding.clone(),
+                false,
+            )
+            .verify(model.model.clone(), &mut Default::default())
+        };
         assert_eq!(
-            result(&value, &model, "invocation").unwrap(),
+            check(value.clone()).unwrap(),
             (
                 "provider".into(),
                 "provider/model/name".into(),
@@ -749,11 +905,12 @@ mod tests {
         let mut wrong = value.clone();
         wrong["native_model"] = json!("fallback");
         assert_eq!(
-            failure_code(&result(&wrong, &model, "invocation").unwrap_err()),
+            failure_code(&check(wrong).unwrap_err()),
             "native_provenance_mismatch"
         );
+        value["invocation_id"] = json!("other");
         assert_eq!(
-            failure_code(&result(&value, &model, "other").unwrap_err()),
+            failure_code(&check(value).unwrap_err()),
             "native_run_binding_mismatch"
         );
         let mut changed = model.clone();
