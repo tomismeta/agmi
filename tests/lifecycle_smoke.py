@@ -553,12 +553,25 @@ def installer(f):
             assert error['details']['activation'] == 'not_started'
             candidate.chmod(0o700)
             error = failed_update(['--binary', str(candidate), '--sha256', digest])
+            assert error['stage'] == 'preflight'
+            assert error['activation'] == 'not_started'
+            assert error['failure_code'] == 'target_replay_fence_required', error
+
+            capable = (
+                '#!/bin/sh\n'
+                'if [ "$1" = build-info ] && [ "$2" = --installer-capabilities ]; then\n'
+                "  printf '%s\\n' bound_dispute_fence=1\n"
+                '  exit 0\n'
+                'fi\n')
+            candidate.write_text(capable + f"printf '%s\\n' '{ECHO}' >&2\nexit 7\n")
+            digest = hashlib.sha256(candidate.read_bytes()).hexdigest()
+            error = failed_update(['--binary', str(candidate), '--sha256', digest])
             assert error['stage'] == 'unknown'
             assert error['activation'] == 'unknown'
             assert error['service'] == 'unknown'
             assert error['failure_code'] == 'unknown'
             candidate.write_text(
-                "#!/bin/sh\nprintf '%s\\n' '" + json.dumps({
+                capable + "printf '%s\\n' '" + json.dumps({
                     'schema': 'agmi.cli.v1', 'error': {'code': 'installer_failed',
                     'details': {'failure_code': ECHO, 'stage': ECHO,
                                 'service': ECHO, 'activation': ECHO}}})
