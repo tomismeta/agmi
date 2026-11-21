@@ -386,6 +386,9 @@ async fn validate_settings(executable: &Path, home: &Path) -> Result<()> {
             .is_some_and(
                 |settings| settings.iter().all(|(key, entry)| match key.as_str() {
                     "modelRoles" | "update" | "setupVersion" => true,
+                    // Native OMP may report nested settings as separate dotted keys.
+                    "update.auto" => entry["value"].is_boolean(),
+                    "retry.enabled" | "retry.modelFallback" => entry["value"] == false,
                     "retry" => entry["value"]
                         .as_object()
                         .is_some_and(|retry| retry.iter().all(|(name, value)| matches!(

@@ -168,6 +168,10 @@ def exercise(fixture, server, native, expect_refusal, production, judge_only):
     scratch.mkdir(mode=0o700)
     models = home / '.omp/agent/models.yml'
     models.parent.mkdir(parents=True)
+    # Exercise the stock settings shape Agmigo actually uses. OMP may return
+    # these settings grouped or as dotted keys, depending on the executable.
+    (models.parent / 'config.yml').write_text(
+        'update:\n  auto: true\nretry:\n  enabled: false\n  modelFallback: false\n')
     origin = f'http://127.0.0.1:{server.server_port}'
     profile(models, origin)
     # agmigo's default OMP profile coexists with ambient Pi extensions.

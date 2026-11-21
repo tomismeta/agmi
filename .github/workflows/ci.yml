@@ -42,6 +42,7 @@ jobs:
           # Reproducible test inputs, not runtime version requirements.
           fetch_omp 18.22.2 80a692c5adb9c71124bb11e77bd7edb3cf8fbbab6980db3206dcb6a4cb2905b5
           fetch_omp 19.0.1 6ceef04430851bb1050c6fda3af467412eb44a11df0a6ff8121fe601013c5415
+          fetch_omp 19.1.0 be2b45c437b623e15c29b1f8c98aacb842f92118196454b5e9eed884359e9a01
           python3 tests/omp_native_smoke.py --omp "$omp_dir/omp-19.0.1"
       - name: Behavior tests
         run: RUST_BACKTRACE=1 cargo +1.96.0 test --locked
@@ -243,7 +244,7 @@ jobs:
               for model in glm-5.3 kimi-k3; do
                 runuser -u agmi-systemd-fixture -- \
                   python3 -u /tests/omp_go_qualification_smoke.py /input/agmi-go-fixture \
-                    --omp /input/omp/omp-19.0.1 --judge-only --model "$model"
+                    --omp /input/omp/omp-19.1.0 --judge-only --model "$model"
               done
               runuser -u agmi-systemd-fixture -- \
                 python3 -u /tests/lifecycle_smoke.py /input/agmi --scenario init

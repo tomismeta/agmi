@@ -17,6 +17,7 @@
 - **Native attempt accounting:** Hermes must emit an invocation-bound refusal to prove inference did not start. A bare exit cannot refund possibly started work.
 - **Independent omp adapter:** use the separately installed standalone omp executable through an invocation-only SDK bridge, without a runtime version pin. For OpenCode Go, synthetic qualification uses a private loopback; installed builds send tasks only to the stock HTTPS endpoint after checking the final request and native Bearer. An incompatible replacement fails before sending a production prompt. No omp fork, bundled executable, permanent plugin, cross-adapter dependency or automatic authentication/install.
 - **omp route and output integrity:** validate route syntax and effort without replacing native catalog/auth ownership. Reject request overrides, contradictory served identities and nonfinal artifacts. Direct and Factory Anthropic stops must come from the artifact’s response; delegated Chat Completions cannot renegotiate effort. Distinguish proven startup refusal, invalid artifacts and uncertain execution.
+- **OpenCode Go qualification:** accept OMP’s dotted spelling for known safe global settings alongside the grouped spelling. Unknown settings and enabled retry or fallback still fail before inference.
 - **Branding and operator documentation:** introduce the compact agmi architecture hero and agent network harness branding; align README, CLI and package/service descriptions without changing participation or upgrade behavior.
 
 ## 0.2.0
