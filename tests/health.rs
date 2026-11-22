@@ -1025,6 +1025,48 @@ fn required_missing_binding_is_not_limited_to_the_read_page() {
         background["work"]["answer"]["required_missing_observation"],
         Value::Null
     );
+
+    db.execute("DELETE FROM operations WHERE id=?1", [selected])
+        .unwrap();
+    db.execute("DELETE FROM read_state WHERE resource LIKE 'fixture-%'", [])
+        .unwrap();
+    db.execute(
+        "UPDATE operations SET work_key='1:older',request='{\"solver\":{\"epoch\":1}}'
+        WHERE id=?1",
+        [missing],
+    )
+    .unwrap();
+    let origin = reqwest::Url::parse(&config.network.base_url)
+        .unwrap()
+        .origin()
+        .ascii_serialization();
+    let authority = format!("{}\n{}", config.network.chain, config.network.address);
+    db.execute("INSERT INTO request_restrictions
+        (authority,origin,scope,target,basis,not_before,observed_at,request_id,source,read_class,effect_class)
+        VALUES(?1,?2,'answer_judge_effects','','server_retry_after',?3,?4,'fixture','server',0,1)",
+        params![authority, origin, at+180, at]).unwrap();
+    let mut report =
+        agmi::health::local_status(&config.state_dir.join("config.toml"), &config, at).unwrap();
+    assert_eq!(report["work"]["answer"]["operation_id"], missing);
+    assert!(
+        report["reads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["operation_id"] == missing && row["status"] == 404)
+    );
+    report["process_observation"] =
+        serde_json::json!({"state":"observed_match","owner":"managed","run_mode":"continuous"});
+    agmi::health::enrich_status(&mut report, agmi::health::Options::default(), at);
+    assert_eq!(
+        report["issues"],
+        serde_json::json!(["admission_blocked", "shared_server_restriction"])
+    );
+    assert!(
+        agmi::health::managed_health_wait(&report),
+        "{}",
+        report["intervention"]
+    );
 }
 
 fn diagnostic_health(config: &Config) -> Value {

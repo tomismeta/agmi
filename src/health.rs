@@ -2174,6 +2174,9 @@ fn qualify_components(result: &mut Value, status: &Value, options: Options) {
         if current
             && let Some(dependency) = api::bound(status, &status["work"][name])
             && matches!(dependency["purpose"].as_str(), Some("job" | "receipt"))
+            // Bound 404s already use the causal, page-independent decision
+            // above. Selection for display does not make a receipt required.
+            && dependency["status"] != 404
         {
             let stale = cycle_floor(status, name)
                 .unwrap_or(0)
