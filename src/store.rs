@@ -1302,6 +1302,47 @@ impl Store {
         )?)
     }
 
+    /// Identity of the database file actually read by this store: the
+    /// authoritative content id from the open connection plus the file object
+    /// identity observed around the open. Diagnostics must match a process
+    /// bracket against this identity, never against a path heartbeat alone.
+    /// Missing file identity reports nulls and never grants attribution.
+    ///
+    /// On unix the identity is verified against the actual open handle at
+    /// projection time, not just the open-time stat: the bundled unix VFS
+    /// reports whether the path was renamed, moved, deleted, or replaced
+    /// since this connection opened it (SQLITE_FCNTL_HAS_MOVED), and the live
+    /// path must still resolve to the pinned file object. An unavailable
+    /// handle answer or any mismatch fails closed instead of attributing a
+    /// different database. The content id is selected on this same handle, so
+    /// callers holding the snapshot transaction across the projection keep
+    /// the rows and the identity describing one view.
+    pub(crate) fn journal_identity(&self) -> Result<Value> {
+        let (database_id, _) = self.database_identity()?;
+        #[cfg(unix)]
+        let (device, inode) = match &self.database_file {
+            Some((path, expected)) => {
+                use std::os::unix::fs::MetadataExt;
+                let mut moved: std::os::raw::c_int = 0;
+                self.db
+                    .file_control(Some("main"), rusqlite::FileControl::HasMoved(&mut moved))
+                    .context("journal handle identity unavailable")?;
+                if moved != 0 {
+                    bail!("journal moved since open; reread local state");
+                }
+                let current = fs::symlink_metadata(path)?;
+                if !same_journal_file(&current, expected) {
+                    bail!("journal replaced since open; reread local state");
+                }
+                (Some(expected.dev()), Some(expected.ino()))
+            }
+            None => (None, None),
+        };
+        #[cfg(not(unix))]
+        let (device, inode): (Option<u64>, Option<u64>) = (None, None);
+        Ok(json!({"database_id": database_id, "device": device, "inode": inode}))
+    }
+
     fn check_config_identity(&self, config: &Config) -> Result<()> {
         let stored: String = self.db.query_row(
             "SELECT identity FROM control WHERE singleton=1",
@@ -1544,7 +1585,7 @@ impl Store {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("database opening lock poisoned"))?;
             Connection::open_with_flags(
-                path,
+                &path,
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
                     | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
             )?
@@ -1557,11 +1598,21 @@ impl Store {
         if version != CURRENT_JOURNAL_FORMAT {
             bail!("unsupported state schema; stop the runtime and use explicit migration");
         }
+        // Pin the file object actually opened: a path swap between the
+        // pre-open stat and the first read must fail closed, never attribute
+        // the bracket to a different database.
+        let reopened = fs::symlink_metadata(&path)?;
+        #[cfg(unix)]
+        {
+            if !same_journal_file(&metadata, &reopened) {
+                bail!("journal replaced during open; reread local state");
+            }
+        }
         let store = Self {
             db,
             binding: None,
             writer_path: None,
-            database_file: None,
+            database_file: Some((path, reopened)),
         };
         store.check_binding(config)?;
         validate_required_lane_state(&store.db)?;
@@ -5219,6 +5270,63 @@ mod tests {
             ..Config::default()
         };
         (temp, config)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_identity_fails_closed_on_swapped_clone_with_matching_id() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let (_temp, config) = fixture();
+        let db_path = config.state_dir.join("state.sqlite3");
+        // Initialized journal; the read handle stays open across the swap.
+        drop(Store::open(&config).unwrap());
+        let store = Store::read_only(&config).unwrap().unwrap();
+        let (database_id, _) = store.database_identity().unwrap();
+        let identity = store.journal_identity().unwrap();
+        assert_eq!(identity["database_id"].as_str(), Some(database_id.as_str()));
+        let pinned = identity["inode"].as_u64().unwrap();
+        assert_eq!(
+            pinned,
+            fs::symlink_metadata(&db_path).unwrap().ino(),
+            "identity must describe the file actually opened"
+        );
+        // Byte-identical clone with a tweaked non-authority row: the swap
+        // keeps the same authority content id on a different file object.
+        let clone_path = fs::canonicalize(&config.state_dir)
+            .unwrap()
+            .join("state.clone.sqlite3");
+        fs::copy(&db_path, &clone_path).unwrap();
+        {
+            let clone = Connection::open_with_flags(
+                &clone_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            )
+            .unwrap();
+            clone
+                .execute("INSERT INTO events(at,code) VALUES(1,'identity_probe')", [])
+                .unwrap();
+            let clone_id: String = clone
+                .query_row(
+                    "SELECT database_id FROM authority WHERE singleton=1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(clone_id, database_id);
+        }
+        fs::set_permissions(&clone_path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::rename(&clone_path, &db_path).unwrap();
+        // The open handle still reads the original snapshot, but the live
+        // path resolves elsewhere: attribution must fail closed, never claim
+        // the clone under the original identity.
+        assert!(store.journal_identity().is_err());
+        // A fresh open pins the replacement instead of inheriting the pin.
+        drop(store);
+        let reopened = Store::read_only(&config).unwrap().unwrap();
+        let identity = reopened.journal_identity().unwrap();
+        assert_eq!(identity["database_id"].as_str(), Some(database_id.as_str()));
+        assert_ne!(identity["inode"].as_u64().unwrap(), pinned);
     }
 
     fn append_follow_events(store: &Store, count: i64) {

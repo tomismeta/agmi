@@ -640,7 +640,21 @@ fn update_decision_guidance(data: &Value) -> Option<&'static str> {
     }
 }
 
-fn update_actions(data: &mut Value) {
+fn update_actions(data: &mut Value, config: Option<&Path>) {
+    if data["repair"]["receipt_status"] == "unavailable" {
+        // Keep the child's structured observations, but do not turn them back
+        // into mutation or wait guidance while the repair outcome is unknown.
+        data["next_actions"] = json!([
+            {"kind":"instruction","disposition":"inspect","authorization_required":false,
+                "message":"Repair receipt unavailable. Inspect local state before relying on this diagnosis. If repair may have run, do not infer rollback, no effect, or that it is safe to repeat."},
+            cli_error::action(config, &["status"], false),
+            cli_error::action(config, &["operations", "list"], false),
+        ]);
+        return;
+    }
+    if data["readiness"]["intervention"].is_object() {
+        cli_error::diagnostics(&mut data["readiness"], config);
+    }
     // Keep a specific continuation if an earlier layer already supplied one.
     if data["next_actions"].is_array() {
         return;
@@ -1763,11 +1777,8 @@ async fn main() {
             if matches!(kind, "health" | "status" | "doctor") {
                 cli_error::diagnostics(&mut data, action_config.as_deref());
             }
-            if kind == "update" && data["readiness"]["intervention"].is_object() {
-                cli_error::diagnostics(&mut data["readiness"], action_config.as_deref());
-            }
             if kind == "update" {
-                update_actions(&mut data);
+                update_actions(&mut data, action_config.as_deref());
             }
             if matches!(kind, "install" | "service") {
                 data["next_actions"] =
@@ -1907,7 +1918,7 @@ mod tests {
                 "release_advisory":{"availability":"available","freshness":"fresh",
                     "next_action":{"kind":kind,"argv":argv},"installability":"not_assessed"}
             });
-            update_actions(&mut report);
+            update_actions(&mut report, None);
             assert_eq!(
                 report["next_actions"],
                 json!([cli_error::action(
@@ -1925,11 +1936,61 @@ mod tests {
         for kind in ["use_install_owner", "unavailable"] {
             let mut report = json!({"update":{"check":true,"status":"unknown"},
                 "release_advisory":{"next_action":{"kind":kind}}});
-            update_actions(&mut report);
+            update_actions(&mut report, None);
             assert_eq!(report["next_actions"][0]["kind"], "instruction");
             assert_eq!(report["next_actions"][0]["authorization_required"], false);
             assert!(report["next_actions"][0]["argv"].is_null());
         }
+    }
+
+    #[test]
+    fn unavailable_update_repair_does_not_rebind_readiness_actions() {
+        let readiness = json!({
+            "checked_at":100,
+            "intervention":{"status":"operator_required","next_action":"resume",
+                "controller":{"owner":"managed","state":"running","run_mode":"continuous","ready":true}},
+            "work":{"judge":{"intervention":{"status":"automatic_recovery","next_at":120}}}
+        });
+        let mut report = json!({"update":{"status":"updated"},
+            "repair":{"receipt_status":"unavailable","outcome":"unknown"},
+            "readiness":readiness});
+
+        let mut complete = report.clone();
+        complete["repair"]["receipt_status"] = json!("complete");
+        update_actions(&mut complete, None);
+        assert_eq!(
+            complete["readiness"]["next_actions"][0]["argv"],
+            json!(["agmi", "resume"])
+        );
+        assert_eq!(
+            complete["readiness"]["work"]["judge"]["next_actions"][0]["kind"],
+            "wait"
+        );
+
+        let config = Path::new("/etc/agmi/operator.toml");
+        update_actions(&mut report, Some(config));
+        assert_eq!(report["readiness"], readiness);
+        let actions = report["next_actions"].as_array().unwrap();
+        assert_eq!(actions[0]["kind"], "instruction");
+        assert!(
+            actions[0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Repair receipt unavailable")
+        );
+        assert_eq!(
+            actions[1],
+            cli_error::action(Some(config), &["status"], false)
+        );
+        assert_eq!(
+            actions[2],
+            cli_error::action(Some(config), &["operations", "list"], false)
+        );
+        assert!(
+            actions
+                .iter()
+                .all(|action| action["disposition"] == "inspect")
+        );
     }
 
     #[test]
@@ -1941,7 +2002,7 @@ mod tests {
                 "migration":{"phase":if status == "migration_prepared" {"prepared"} else {"recovery_required"},
                     "release_id":release,"token":token,"risk_change_required":true,
                     "pending":status == "recovery_required"}});
-            update_actions(&mut report);
+            update_actions(&mut report, None);
             let action = report["next_actions"]
                 .as_array()
                 .unwrap()
@@ -1994,7 +2055,7 @@ mod tests {
                     "target_journal_format":if adoption {4} else {3},
                     "further_migration_required":!adoption,
                     "recovery_prerequisite":if adoption {Some("authority_adoption")} else {None}}});
-            update_actions(&mut report);
+            update_actions(&mut report, None);
             assert!(!migration_can_offer_activation(&report));
             let actions = report["next_actions"].as_array().unwrap();
             assert!(

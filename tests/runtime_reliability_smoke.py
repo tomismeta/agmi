@@ -307,7 +307,9 @@ def inventory_generation(f):
                           f.rows("SELECT * FROM read_state WHERE owner='judge' AND purpose='discovery' AND resource='assignments' AND retired=0")),
            'inventory response did not finish')
     f.stop()
-    assert f.status()['work']['judge']['assessment'] is None
+    assessment = f.status()['work']['judge']['assessment']
+    assert assessment['completeness'] == 'unavailable', assessment
+    assert assessment.get('observed_at') is None and assessment['eligible_candidates'] is None, assessment
     assert not f.writes and not f.model_calls('judge')
     return dict(pre_pause_inventory_discarded=True, writes=0)
 

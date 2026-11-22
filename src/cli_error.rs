@@ -1345,6 +1345,15 @@ fn print_lane_row(data: &Value, lane: &str) {
     {
         print!("; next_at={at}");
     }
+    let missing = work
+        .get("required_missing_observation")
+        .or_else(|| intervention.get("missing_observation"));
+    if let Some(missing) = missing
+        && observation["operation_id"] != missing["operation_id"]
+        && let Some(id) = missing["operation_id"].as_i64()
+    {
+        print!("; required read for local operation #{id} returned HTTP 404; outcome unknown");
+    }
     if intervention["reason"] != "shared_server_restriction"
         && let Some(label) = retry_floor_label(intervention)
     {
@@ -1570,7 +1579,15 @@ fn print_doctor_repairs(data: &Value) {
     let mut seen = Vec::<&str>::new();
     for key in ["eligible", "ineligible", "applied", "skipped"] {
         for row in repairs[key].as_array().into_iter().flatten() {
-            for field in ["reason", "evidence_limit"] {
+            if row["classification"] == "legacy_429_policy_refusal"
+                && !seen.contains(&"legacy_429_policy_refusal")
+            {
+                println!(
+                    "  {key}: legacy 429 policy refusal; original response body was not retained"
+                );
+                seen.push("legacy_429_policy_refusal");
+            }
+            for field in ["classification", "reason", "evidence_limit"] {
                 if let Some(value) = row[field].as_str()
                     && value != "eligible"
                     && !seen.contains(&value)

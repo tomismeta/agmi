@@ -729,6 +729,8 @@ fn diagnostic_reason(value: &Value) -> Option<&str> {
             "work_already_completed",
             "fresh_work_required",
             "capability_not_active",
+            "judge_cap_coverage_unproven",
+            "observed_judgments_already_settled",
             "model_attempts_exhausted_for_observed_work",
             "fresh_work_available",
             "current_epoch_completed",
@@ -822,10 +824,12 @@ fn safe_assessment(source: &Value) -> Value {
         "observed_at":nonnegative(&source["observed_at"]),
         "valid_until":nonnegative(&source["valid_until"]),
         "completeness":safe_enum(&source["completeness"],
-            &["complete", "bounded_partial", "partial", "expired", "stale", "unavailable", "unknown"], "unknown"),
+            &["complete", "single_challenge", "bounded_partial", "partial", "expired", "stale", "unavailable", "unknown"], "unknown"),
         "observed_opportunities":source["observed_opportunities"].as_u64(),
         "eligible_candidates":source["eligible_candidates"].as_u64(),
         "locally_judgeable":source["locally_judgeable"].as_bool(),
+        "locally_eligible":source["locally_eligible"].as_bool(),
+        "exclusion_reason":enum_member(&source["exclusion_reason"], &["already_answered"]),
         "capped_work_proven":source["capped_work_proven"].as_bool(),
         "assessment_reason":diagnostic_reason(&source["assessment_reason"]),
     });
@@ -904,7 +908,8 @@ fn safe_observation(row: &Value) -> Value {
         "binding_revision":nonnegative(&row["binding_revision"]),
         "not_before":nonnegative(&row["not_before"]),
         "floor_kind":enum_member(&row["floor_kind"], &["operation_poll", "reconciliation_service",
-            "server_retry_after", "local_read_backoff", "retained_legacy_floor", "identity_read"]),
+            "historical_missing_binding", "server_restriction", "local_backoff", "retained_floor",
+            "shared_restriction"]),
         "http_status":row["http_status"].as_u64().filter(|status| (100..=599).contains(status)),
         "scope":enum_member(&row["scope"], &["background", "current", "unassessed"]),
         "historical_cadence_qualified":row["historical_cadence_qualified"].as_bool(),
@@ -916,7 +921,7 @@ fn safe_observation(row: &Value) -> Value {
 
 // Do not relay opaque argv, paths, tokens, or child instructions. A known
 // command is copied as-is; stripping arguments could change its target.
-fn allowed_action_argv(argv: &Value, authorized: Option<bool>) -> bool {
+fn allowed_action_argv(argv: &Value, authorized: Option<bool>, inspection_only: bool) -> bool {
     let Some((program, args)) = argv.as_array().and_then(|args| args.split_first()) else {
         return false;
     };
@@ -924,14 +929,14 @@ fn allowed_action_argv(argv: &Value, authorized: Option<bool>) -> bool {
         && match args {
             [cmd] => match cmd.as_str() {
                 Some("status" | "health" | "reads" | "doctor") => true,
-                Some("resume" | "recover-model") => authorized == Some(true),
+                Some("resume" | "recover-model") => !inspection_only && authorized == Some(true),
                 _ => false,
             },
             [cmd, arg] => match (cmd.as_str(), arg.as_str()) {
                 (Some("operations"), Some("list"))
                 | (Some("config"), Some("show"))
                 | (Some("service"), Some("status")) => true,
-                (Some("doctor"), Some("--repair")) => authorized == Some(true),
+                (Some("doctor"), Some("--repair")) => !inspection_only && authorized == Some(true),
                 (Some("run"), Some("--help")) => authorized == Some(false),
                 _ => false,
             },
@@ -940,20 +945,26 @@ fn allowed_action_argv(argv: &Value, authorized: Option<bool>) -> bool {
         }
 }
 
-fn safe_actions(source: &Value) -> Value {
+fn safe_actions(source: &Value, inspection_only: bool) -> Value {
     let Some(actions) = source.as_array() else {
         return Value::Null;
     };
     Value::Array(actions.iter().take(8).filter_map(|row| {
         let kind = enum_member(&row["kind"], &["command", "instruction", "wait"])?;
         let authorized = row["authorization_required"].as_bool();
+        let allowed = kind == "command" && allowed_action_argv(&row["argv"], authorized, inspection_only);
+        if inspection_only && !(allowed && authorized == Some(false)) {
+            return None;
+        }
         let mut action = json!({
             "kind":kind,
-            "disposition":enum_member(&row["disposition"], &["inspect","wait","change_intent","repair"]),
+            "disposition":if inspection_only { Some("inspect") } else {
+                enum_member(&row["disposition"], &["inspect","wait","change_intent","repair"])
+            },
             "authorization_required":authorized,
         });
         match kind {
-            "command" if allowed_action_argv(&row["argv"], authorized) => action["argv"] = row["argv"].clone(),
+            "command" if allowed => action["argv"] = row["argv"].clone(),
             "command" => action["unavailable_reason"] = json!("child_argv_not_allowlisted"),
             "wait" => {
                 action["until"] = json!(nonnegative(&row["until"]));
@@ -1000,34 +1011,32 @@ fn repair_detail(row: &Value) -> Option<Value> {
 fn repair_receipt(data: &Value) -> Value {
     const DETAIL_LIMIT: usize = 256;
     let repairs = &data["repairs"];
-    let counts = repair_counts(repairs).unwrap_or_default();
-    let [eligible, _, applied, skipped] = counts;
+    let parsed_counts = repair_counts(repairs);
+    let counts = parsed_counts.unwrap_or_default();
     let failure = repairs["failure"]
         .as_str()
         .and_then(doctor::known_repair_reason);
+    // Success accounts for the entire frozen preview. A reported failure may
+    // have stopped early, so its exact observed counts can be incomplete.
+    let accounted = match counts {
+        [Some(eligible), Some(_), Some(applied), Some(skipped)]
+            if applied.checked_add(skipped) == Some(eligible)
+                && repairs["execution"] != "partial" =>
+        {
+            Some(if applied > 0 {
+                "applied"
+            } else if skipped > 0 {
+                "skipped"
+            } else {
+                "no_eligible_repairs"
+            })
+        }
+        _ => None,
+    };
     let observed = if data["repair_requested"] == true {
         match (data["repair_outcome"].as_str(), repairs.get("failure")) {
-            (Some("failed"), _) if failure.is_some() => Some("failed"),
-            (Some("applied"), Some(Value::Null))
-                if eligible
-                    .zip(applied)
-                    .is_some_and(|(eligible, applied)| applied > 0 && applied <= eligible) =>
-            {
-                Some("applied")
-            }
-            (Some("no_eligible_repairs"), Some(Value::Null))
-                if eligible == Some(0) && applied == Some(0) && skipped == Some(0) =>
-            {
-                Some("no_eligible_repairs")
-            }
-            (Some("skipped"), Some(Value::Null))
-                if applied == Some(0)
-                    && eligible
-                        .zip(skipped)
-                        .is_some_and(|(eligible, skipped)| skipped > 0 && skipped <= eligible) =>
-            {
-                Some("skipped")
-            }
+            (Some("failed"), _) if failure.is_some() && parsed_counts.is_some() => Some("failed"),
+            (Some(outcome), Some(Value::Null)) if accounted == Some(outcome) => accounted,
             _ => None,
         }
     } else {
@@ -1083,6 +1092,14 @@ fn repair_receipt(data: &Value) -> Value {
 // Only bounded structured readiness crosses the process boundary. In particular,
 // child stderr, raw reports, diagnostic messages and arbitrary strings never do.
 fn doctor_outcome(report: &mut Value, data: &Value, repair: bool, exited: bool) {
+    let mut inspection_only = false;
+    if repair {
+        report["repair"] = repair_receipt(data);
+        inspection_only = report["repair"]["receipt_status"] == "unavailable";
+        if report["repair"]["status"] == "failed" {
+            report["success"] = json!(false);
+        }
+    }
     let mut readiness = json!({"evidence":"local_only","source":"selected_executable"});
     for key in ["healthy", "attention_required", "initialized", "paused"] {
         if let Some(value) = data[key].as_bool() {
@@ -1182,7 +1199,7 @@ fn doctor_outcome(report: &mut Value, data: &Value, repair: bool, exited: bool) 
                 } else { Value::Null },
                 "findings":safe_findings(&work["findings"]),
                 "background_recovery":safe_background(&work["background_recovery"]),
-                "next_actions":safe_actions(&work["next_actions"]),
+                "next_actions":safe_actions(&work["next_actions"], inspection_only),
             });
             if legacy_identity
                 && (work["intervention"]["reason"] == "hosted_identity_unverified"
@@ -1206,14 +1223,8 @@ fn doctor_outcome(report: &mut Value, data: &Value, repair: bool, exited: bool) 
             }
         }
     }
-    readiness["next_actions"] = safe_actions(&data["next_actions"]);
+    readiness["next_actions"] = safe_actions(&data["next_actions"], inspection_only);
     report["readiness"] = readiness;
-    if repair {
-        report["repair"] = repair_receipt(data);
-        if report["repair"]["status"] == "failed" {
-            report["success"] = json!(false);
-        }
-    }
     // Doctor exits nonzero for unhealthy readiness too. That does not negate a
     // completed update/repair. A missing report, unlike unhealthy data, is failure.
     report["update"]["doctor_exit_success"] = json!(exited);
@@ -2639,14 +2650,101 @@ mod tests {
             for key in doctor::REPAIR_ARRAYS {
                 assert_eq!(repair[format!("{key}_count")], Value::Null);
             }
+            assert_eq!(repair["applied"][0]["operation_id"], 1);
         }
+    }
+
+    #[test]
+    fn successful_repair_requires_every_result_and_an_exact_total() {
+        for (outcome, counts, execution) in [
+            ("applied", [Some(5), Some(2), Some(1), Some(0)], "complete"),
+            ("skipped", [Some(5), Some(2), Some(0), Some(1)], "complete"),
+            ("applied", [Some(5), Some(2), Some(4), Some(2)], "complete"),
+            (
+                "applied",
+                [Some(u64::MAX), Some(0), Some(u64::MAX), Some(1)],
+                "complete",
+            ),
+            ("applied", [Some(5), Some(2), Some(1), None], "complete"),
+            ("applied", [Some(5), None, Some(1), Some(4)], "complete"),
+            ("applied", [Some(5), Some(2), Some(1), Some(4)], "partial"),
+            ("skipped", [Some(5), Some(2), Some(1), Some(4)], "complete"),
+        ] {
+            let [eligible, ineligible, applied, skipped] = counts;
+            let repair = repair_receipt(&json!({
+                "repair_requested":true,"repair_outcome":outcome,"repairs":{
+                    "failure":null,"execution":execution,"counts":{
+                        "eligible":eligible,"ineligible":ineligible,"applied":applied,"skipped":skipped
+                    }
+                }
+            }));
+            assert_eq!(repair["receipt_status"], "unavailable", "{repair}");
+            assert_eq!(repair["outcome"], "unknown");
+            assert_eq!(repair["applied_count"], json!(applied));
+            assert_eq!(repair["execution"], execution);
+        }
+    }
+
+    #[test]
+    fn unavailable_receipt_only_forwards_readiness_inspection() {
+        let actions = json!([
+            {"kind":"command","disposition":"inspect","argv":["agmi","resume"],"authorization_required":true},
+            {"kind":"command","disposition":"repair","argv":["agmi","doctor","--repair"],"authorization_required":true},
+            {"kind":"wait","until":120,"clock":"unix_seconds","authorization_required":false},
+            {"kind":"command","disposition":"inspect","argv":["agmi","operations","list"],"authorization_required":false},
+        ]);
+        let mut data = json!({"healthy":false,"repair_requested":true,"repair_outcome":"applied",
+            "repairs":{"failure":null,"eligible":[{"operation_id":7}],"applied":[{"operation_id":7}]},
+            "next_actions":actions,"intervention":{"status":"operator_required","next_action":"resume"},
+            "work":{"answer":{"next_actions":actions}}});
+        for counts in [
+            None,
+            Some(json!({"eligible":1,"ineligible":0,"applied":1})),
+            Some(json!({"eligible":1,"ineligible":0,"applied":"1","skipped":0})),
+            Some(json!({"eligible":5,"ineligible":0,"applied":1,"skipped":0})),
+        ] {
+            if let Some(counts) = counts {
+                data["repairs"]["counts"] = counts;
+            }
+            let mut report = json!({"success":true});
+            doctor_outcome(&mut report, &data, true, true);
+            assert_eq!(report["success"], false);
+            assert_eq!(report["repair"]["receipt_status"], "unavailable");
+            assert_eq!(report["repair"]["outcome"], "unknown");
+            assert_eq!(report["repair"]["applied"][0]["operation_id"], 7);
+            let readiness = &report["readiness"];
+            assert_eq!(readiness["intervention"]["status"], "operator_required");
+            let allowed = json!([actions[3]]);
+            assert_eq!(readiness["next_actions"], allowed);
+            assert_eq!(readiness["work"]["answer"]["next_actions"], allowed);
+        }
+    }
+
+    #[test]
+    fn read_observation_preserves_producer_floor_kind() {
+        for kind in [
+            "operation_poll",
+            "reconciliation_service",
+            "historical_missing_binding",
+            "server_restriction",
+            "local_backoff",
+            "retained_floor",
+            "shared_restriction",
+        ] {
+            let observation = safe_observation(&json!({"floor_kind":kind,"not_before":120}));
+            assert_eq!(observation["floor_kind"], kind);
+            assert_eq!(observation["not_before"], 120);
+        }
+        let observation = safe_observation(&json!({"floor_kind":"unrecognized"}));
+        assert!(observation["floor_kind"].is_null());
     }
 
     #[test]
     fn typed_readiness_keeps_independent_step_and_rejects_untyped_argv() {
         let data = json!({"healthy":false,"intervention":{"owner":"judge",
             "controller":{"owner":"managed","run_mode":"continuous","state":"running"}},
-            "work":{"judge":{"progress":"private-legacy-progress",
+            "work":{"answer":{"assessment":{"completeness":"single_challenge","observed_opportunities":1}},
+                "judge":{"progress":"private-legacy-progress",
                 "intent":{"requested_mode":"active","effective_mode":"read_only","configuration":"pending","paused":false},
                 "assessment":{"observed_at":20,"valid_until":80,"completeness":"complete",
                     "exclusions":{"model_budget_exhausted":3,"private-unknown":4}},
@@ -2671,6 +2769,9 @@ mod tests {
         assert_eq!(judge["continuation"]["condition"], "admission_fenced");
         assert_eq!(judge["automatic_step"]["target"], "preparation");
         assert_eq!(judge["automatic_step"]["not_before"], 40);
+        let answer_assessment = &readiness["work"]["answer"]["assessment"];
+        assert_eq!(answer_assessment["completeness"], "single_challenge");
+        assert_eq!(answer_assessment["observed_opportunities"], 1);
         assert_eq!(
             judge["assessment"]["exclusions"],
             json!({"model_budget_exhausted":3})
@@ -2814,8 +2915,9 @@ mod tests {
         doctor_outcome(
             &mut report,
             &json!({"healthy":false,"attention_required":true,"repair_requested":true,"repair_outcome":"failed",
-                "repairs":{"applied":[1],"counts":{"eligible":1,"ineligible":0,"applied":1,"skipped":0},
-                    "failure":"repair_runtime_restore_failed","restoration":{"verified":false}},"secret":"must_not_escape"}),
+                "repairs":{"applied":[{"operation_id":7}],"counts":{"eligible":5,"ineligible":0,"applied":1,"skipped":2},
+                    "failure":"repair_runtime_restore_failed","execution":"partial",
+                    "restoration":{"verified":false}},"secret":"must_not_escape"}),
             true,
             false,
         );
@@ -2823,6 +2925,13 @@ mod tests {
         assert_eq!(report["update"]["status"], "updated");
         assert_eq!(report["installation"]["activation"], "loaded_verified");
         assert_eq!(report["repair"]["applied_count"], 1);
+        assert_eq!(report["repair"]["applied"][0]["operation_id"], 7);
+        assert_eq!(report["repair"]["eligible_count"], 5);
+        assert_eq!(report["repair"]["skipped_count"], 2);
+        assert_eq!(report["repair"]["execution"], "partial");
+        assert_eq!(report["repair"]["restoration_verified"], false);
+        assert_eq!(report["repair"]["outcome"], "failed");
+        assert_eq!(report["repair"]["receipt_status"], "complete");
         assert_eq!(report["repair"]["reason"], "repair_runtime_restore_failed");
         doctor_outcome(
             &mut report,

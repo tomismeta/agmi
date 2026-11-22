@@ -231,6 +231,25 @@ fn bound_observation(work: &Value) -> Option<&Value> {
         .then_some(observed)
 }
 
+/// Keep the latest missing outcome bound to the operation it describes, even
+/// when a different operation or an admission timer wins the next-step vote.
+fn required_missing<'a>(status: &'a Value, name: &str, at: i64) -> Option<&'a Value> {
+    let mut selected = None;
+    for row in status["pending_work"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|row| row["kind"] == name && row["nonblocking_for_fresh_work"] == false)
+    {
+        if let Some(observation) = bound_observation(row)
+            && observation["http_status"] == 404
+        {
+            selected = earlier_observation(selected, observation, at);
+        }
+    }
+    selected
+}
+
 fn earlier_observation<'a>(
     current: Option<&'a Value>,
     new: &'a Value,
@@ -373,7 +392,7 @@ fn release_path<'a>(
     let mut uncertain = 0_u64;
     let mut authentication_blocked = false;
     let mut truncated_reads = false;
-    let mut polls_missing_evidence = false;
+    let mut missing = None;
     let mut selected = None;
     let mut dispatch_in_flight = false;
     for id in ids {
@@ -423,9 +442,12 @@ fn release_path<'a>(
                 .is_some_and(|deadline| at <= deadline.saturating_add(timing.shutdown as i64));
         if bound || dispatching {
             automatic += 1;
-            polls_missing_evidence |= bound && dependency.is_some_and(missing_remote_evidence);
             if let Some(observation) = bound_observation(row) {
-                polls_missing_evidence |= observation["http_status"] == 404;
+                if dependency.is_some_and(missing_remote_evidence)
+                    || observation["http_status"] == 404
+                {
+                    missing = earlier_observation(missing, observation, at);
+                }
                 selected = earlier_observation(selected, observation, at);
             } else if dispatching {
                 dispatch_in_flight = true;
@@ -450,8 +472,10 @@ fn release_path<'a>(
             Finding::automatic("bound_reconciliation_pending", "await_reconciliation", next)
                 .with_all(blocker_evidence(detail))
                 .with("next_observation", observation);
-        if polls_missing_evidence {
-            finding.with("resolution", json!("polling_not_guaranteed"))
+        if let Some(missing) = missing {
+            finding
+                .with("resolution", json!("polling_not_guaranteed"))
+                .with("missing_observation", missing.clone())
         } else {
             finding
         }
@@ -760,13 +784,19 @@ fn lane<'a>(
         if let Some(reason) = super::model_route_fault(model) {
             return Finding::blocked(reason, "review_model_configuration");
         }
-        if name == "judge"
-            && work["admission"]["allowed"] == true
-            && super::judge_inventory_fresh(status, at, stale)
-            && let Some(next) = future(&work["assessment"]["candidate_wait"]["not_before"], at)
-        {
-            let wait = &work["assessment"]["candidate_wait"];
-            let preparation = wait["target"] == "preparation";
+    }
+    let runnable_judgment = name == "judge"
+        && super::judge_inventory_fresh(status, at, stale)
+        && work["assessment"]["locally_judgeable"] == true;
+    if !read_only
+        && name == "judge"
+        && !runnable_judgment
+        && super::judge_inventory_fresh(status, at, stale)
+        && let Some(next) = future(&work["assessment"]["candidate_wait"]["not_before"], at)
+    {
+        let wait = &work["assessment"]["candidate_wait"];
+        let preparation = wait["target"] == "preparation";
+        if work["admission"]["allowed"] == true {
             return Finding::automatic(
                 if preparation {
                     "model_retry_backoff"
@@ -782,12 +812,33 @@ fn lane<'a>(
             )
             .with("candidate_wait", wait.clone());
         }
+        if preparation && super::lane_policy(status, name)["preparation"]["while_blocked"] == true {
+            return blocker(status, name, work, &work["admission"], at, stale, timing)
+                .unwrap_or_else(|| Finding::unknown("admission_recovery_unproven"))
+                .with("candidate_wait", wait.clone());
+        }
+    }
+    if !read_only
+        && name == "judge"
+        && !runnable_judgment
+        && work["admission"]["allowed"] == true
+        && work["assessment"]["excluded_work_truncated"] == true
+        && work["assessment"]["exclusions"]["model_budget_exhausted"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+    {
+        return Finding::unknown("judge_cap_coverage_unproven");
+    }
+    if !read_only && model.is_object() {
         // Assignment-specific failures do not fence other eligible judgments.
         // Only current-route setup/auth evidence applies across assignments.
         if ((name == "answer"
             && model["scope"] == "current_work"
             && lane_observation_fresh(status, name, at, stale) == Some(true))
-            || (name == "judge" && model["scope"] == "current_work" && !complete))
+            || (name == "judge"
+                && model["scope"] == "current_work"
+                && !complete
+                && !runnable_judgment))
             && matches!(
                 model["state"].as_str(),
                 Some(
@@ -869,6 +920,8 @@ fn lane<'a>(
             status: "none_required",
             reason: if work["assessment"]["capped_work_proven"] == true {
                 "model_attempts_exhausted_for_observed_work"
+            } else if super::settled_inventory(&work["assessment"]) {
+                "observed_judgments_already_settled"
             } else {
                 "no_eligible_assignments_observed"
             },
@@ -1154,6 +1207,10 @@ pub(super) fn project(status: &Value, options: Options, at: i64) -> (Value, Valu
         }
         work[name]["progress"] = json!(finding.progress);
         work[name]["intervention"] = finding.value(observed, current);
+        if let Some(missing) = required_missing(status, name, at) {
+            work[name]["required_missing_observation"] = missing.clone();
+            work[name]["intervention"]["required_missing_outcome"] = json!(true);
+        }
         work[name]["intervention"]["requires_fresh_eligibility"] = json!(
             status["work"][name]["retry"]["requires_fresh_eligibility"] == true
                 || matches!(
@@ -1322,7 +1379,7 @@ fn select(root: &mut Value, finding: &Value) {
     for field in ["status", "reason", "next_action", "next_at", "retry_floor"] {
         root[field] = finding[field].clone();
     }
-    for field in ["next_observation", "resolution"] {
+    for field in ["next_observation", "missing_observation", "resolution"] {
         if let Some(value) = finding.get(field) {
             root[field] = value.clone();
         } else if let Some(root) = root.as_object_mut() {
@@ -1691,6 +1748,28 @@ mod tests {
         let next = &work["answer"]["intervention"]["next_observation"];
         assert_eq!(next["status"], "no_safe_binding");
         assert!(next["purpose"].is_null());
+    }
+
+    #[test]
+    fn earlier_healthy_poll_does_not_borrow_a_different_operations_404() {
+        let mut status = fixture();
+        status["pending_work"] = json!([queued(1, "judge"), queued(2, "judge")]);
+        status["pending_work"][1]["bound_observation"]["not_before"] = json!(10060);
+        status["pending_work"][1]["bound_observation"]["http_status"] = json!(404);
+        block(
+            &mut status,
+            "answer",
+            "account_uncertainty",
+            "account",
+            &[1, 2],
+            2,
+        );
+        let (work, root) = projection(&status);
+        let answer = &work["answer"]["intervention"];
+        assert_eq!(answer["next_observation"]["operation_id"], 1);
+        assert_eq!(answer["missing_observation"]["operation_id"], 2);
+        assert_eq!(answer["missing_observation"]["not_before"], 10060);
+        assert_eq!(root["unattended"], Value::Null);
     }
 
     #[test]

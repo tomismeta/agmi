@@ -438,11 +438,7 @@ impl HostAccess {
             return Ok(Some("configured_exclusion"));
         }
         if let Some(blocker) = self.model_retry_blocker(LaneId::Judge, id)? {
-            return Ok(Some(if self.store.settled_judgment(id)? {
-                "already_attempted"
-            } else {
-                blocker
-            }));
+            return Ok(Some(blocker));
         }
         if self.store.attempted(LaneId::Judge, id)? {
             return Ok(Some("already_attempted"));

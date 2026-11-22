@@ -801,10 +801,26 @@ mod native {
         Some((pid, start, image_metadata(&image)))
     }
 
-    #[cfg(target_os = "linux")]
+    /// The bracket is attributable only to the exact database the snapshot was
+    /// read from: same content id and same file object. A path heartbeat
+    /// match across a swap (including ABA) never grants autonomy.
+    #[cfg(any(target_os = "linux", test))]
+    fn journal_identity_matches(tuple: &Value, status: &Value) -> bool {
+        let database = tuple["database_id"].as_str().unwrap_or_default();
+        let identity = &status["journal_identity"];
+        !database.is_empty()
+            && Some(database) == identity["database_id"].as_str()
+            && tuple["journal_device"] == identity["device"]
+            && tuple["journal_inode"] == identity["inode"]
+            && !identity["device"].is_null()
+            && !identity["inode"].is_null()
+    }
+
+    #[cfg(any(target_os = "linux", test))]
     pub(super) fn matching_bracket(bracket: &Value, status: &Value) -> bool {
         !bracket["live_process"].is_null()
             && related_runtime_snapshot(&bracket["tuple"], status)
+            && journal_identity_matches(&bracket["tuple"], status)
             && bracket["tuple"]["paused"] == status["paused"]
             && bracket["tuple"]["stopped"] == status["controller_stopped"]
             && crate::capability::LaneId::NAMES.into_iter().all(|lane| {
@@ -1023,7 +1039,8 @@ mod native {
             "SELECT s.runtime_instance,s.effective_revision,s.controller_stopped,
              a.authority_epoch,c.generation,json_extract(p.policy,'$.process'),
              (SELECT json_group_object(lane,json_object('revision',control_revision,'paused',paused)) FROM lane_control),
-             c.paused
+             c.paused,
+             (SELECT database_id FROM authority WHERE singleton=1)
              FROM runtime_state s,runtime_authority a,control c,runtime_policy p
              WHERE s.singleton=1 AND a.singleton=1 AND c.singleton=1 AND p.singleton=1
              AND length(p.policy)<=1048576",
@@ -1038,13 +1055,16 @@ mod native {
                     r.get::<_, String>(5)?,
                     r.get::<_, String>(6)?,
                     r.get::<_, bool>(7)?,
+                    r.get::<_, String>(8)?,
                 ))
             },
         )?;
         ensure!(
             tuple.5.len() <= 16_384
                 && before.device == file.metadata()?.dev()
-                && before.inode == fs::symlink_metadata(&path)?.ino(),
+                && before.inode == fs::symlink_metadata(&path)?.ino()
+                && tuple.8.len() == 32
+                && tuple.8.bytes().all(|byte| byte.is_ascii_hexdigit()),
             "journal changed"
         );
         Ok(
@@ -1052,7 +1072,8 @@ mod native {
             "authority_epoch":tuple.3,"generation":tuple.4,
             "process":serde_json::from_str::<Value>(&tuple.5)?,
             "lane_controls":serde_json::from_str::<Value>(&tuple.6)?,
-            "journal_device":before.device,"journal_inode":before.inode,"paused":tuple.7}),
+            "journal_device":before.device,"journal_inode":before.inode,"paused":tuple.7,
+            "database_id":tuple.8}),
         )
     }
 
@@ -1072,6 +1093,7 @@ mod native {
                 && let Ok(config) = crate::config::Config::load_metadata(path)
                 && let Ok(tuple) = runtime_tuple(&config)
                 && related_runtime_snapshot(&tuple, status)
+                && journal_identity_matches(&tuple, status)
                 && tuple["stopped"] == false
                 && tuple["process"]["invocation_id"].is_null()
                 && let Some((pid, start, _)) = live_process(&tuple["process"])
@@ -1122,10 +1144,40 @@ mod native {
                     "snapshot rollover"
                 );
                 if matches!(before["ActiveState"].as_str(), "inactive" | "failed") {
-                    result.state = "stopped";
-                    result.reason = "managed_service_inactive";
-                    result.owner = "managed";
-                    result.run_mode = "unknown";
+                    // The canonical unit is down, but stopped still needs the
+                    // journal actually read: an attributable live foreground
+                    // writer is running, not managed/stopped.
+                    let config = crate::config::Config::load_metadata(path)?;
+                    let tuple = runtime_tuple(&config)?;
+                    ensure!(
+                        related_runtime_snapshot(&tuple, status),
+                        "unrelated runtime snapshot"
+                    );
+                    ensure!(
+                        journal_identity_matches(&tuple, status),
+                        "snapshot journal identity mismatch"
+                    );
+                    if tuple["stopped"] == false
+                        && tuple["process"]["invocation_id"].is_null()
+                        && let Some((live_pid, live_start, _)) = live_process(&tuple["process"])
+                    {
+                        result.state = "observed_match";
+                        result.reason = "matched_foreground_writer";
+                        result.evidence_scope = "recorded_local_writer_and_stable_process_identity";
+                        result.owner = "foreground";
+                        result.run_mode = super::snapshot_run_mode(status);
+                        result.pid = Some(live_pid);
+                        result.start_ticks = Some(live_start);
+                    } else {
+                        ensure!(
+                            tuple["stopped"] == true && live_process(&tuple["process"]).is_none(),
+                            "writer state unproven"
+                        );
+                        result.state = "stopped";
+                        result.reason = "managed_service_inactive";
+                        result.owner = "managed";
+                        result.run_mode = "unknown";
+                    }
                 }
                 return Ok(());
             }
@@ -1156,6 +1208,10 @@ mod native {
             ensure!(
                 related_runtime_snapshot(&tuple, status),
                 "unrelated runtime snapshot"
+            );
+            ensure!(
+                journal_identity_matches(&tuple, status),
+                "snapshot journal identity mismatch"
             );
             let identity_matches = policy["pid"].as_u64() == Some(u64::from(pid))
                 && policy["invocation_id"] == before["InvocationID"]
@@ -1208,11 +1264,12 @@ mod native {
             } else {
                 "stable_managed_invocation"
             };
-            // A verified canonical managed run is continuous; anything less
-            // than the full stable invocation leaves owner and mode unknown.
+            // Owner proves the stable managed invocation; run mode is proven
+            // separately from the persisted mode the writer recorded.
+            // Anything less leaves owner and mode unknown.
             if result.state == "observed_match" {
                 result.owner = "managed";
-                result.run_mode = "continuous";
+                result.run_mode = super::snapshot_run_mode(status);
             } else {
                 result.owner = "unknown";
                 result.run_mode = "unknown";
@@ -4975,6 +5032,56 @@ mod native {
             let garbage = json!({"effective_runtime":{"run_mode":"turbo"}});
             assert_eq!(crate::installer::snapshot_run_mode(&garbage), "unknown");
             assert_eq!(crate::installer::snapshot_run_mode(&json!({})), "unknown");
+        }
+
+        fn bracket_fixture() -> (Value, Value) {
+            let process = json!({"pid":1,"start_ticks":2,"run_mode":"continuous",
+                "runtime_instance":"ri","authority_epoch":7,"account_generation":3,
+                "invocation_id":null});
+            let lanes = json!({"answer":{"revision":5,"paused":0},
+                "judge":{"revision":6,"paused":0},"mine":{"revision":7,"paused":1}});
+            let tuple = json!({"runtime_instance":"ri","revision":"rev","stopped":false,
+                "authority_epoch":7,"generation":3,"process":process,
+                "lane_controls":lanes,"journal_device":11,"journal_inode":22,
+                "paused":false,"database_id":"ab".repeat(16)});
+            let status = json!({"paused":false,"controller_stopped":false,"generation":3,
+                "effective_runtime":{"revision":"rev","runtime_instance":"ri",
+                    "authority_epoch":7,"observed_at":1000,
+                    "policy":{"process":tuple["process"]}},
+                "lane_controls":{"answer":{"desired":{"control_revision":5,"paused":false}},
+                    "judge":{"desired":{"control_revision":6,"paused":false}},
+                    "mine":{"desired":{"control_revision":7,"paused":true}}},
+                "journal_identity":{"database_id":tuple["database_id"],
+                    "device":11,"inode":22}});
+            (tuple, status)
+        }
+
+        #[test]
+        fn bracket_must_match_the_database_actually_read() {
+            let (tuple, status) = bracket_fixture();
+            let live = json!([1, 2, {"device":11,"inode":22}]);
+            let bracket = json!({"tuple":tuple,"live_process":live});
+            assert!(matching_bracket(&bracket, &status));
+            // Same content, different database: a path swap (including ABA)
+            // never grants autonomy.
+            let mut swapped = status.clone();
+            swapped["journal_identity"]["database_id"] = json!("cd".repeat(16));
+            assert!(!matching_bracket(&bracket, &swapped));
+            // Same content id, different file object.
+            let mut relinked = status.clone();
+            relinked["journal_identity"]["inode"] = json!(23);
+            assert!(!matching_bracket(&bracket, &relinked));
+            // Snapshots without the read database identity prove nothing.
+            let mut unidentified = status.clone();
+            unidentified
+                .as_object_mut()
+                .unwrap()
+                .remove("journal_identity");
+            assert!(!matching_bracket(&bracket, &unidentified));
+            // Missing attribution still proves nothing even with identity.
+            let mut unattributed = bracket.clone();
+            unattributed["live_process"] = Value::Null;
+            assert!(!matching_bracket(&unattributed, &status));
         }
 
         fn observed_unit_fixture() -> Result<(tempfile::TempDir, PathBuf, String, PathBuf)> {

@@ -197,14 +197,20 @@ pub(crate) fn qualify_doctor(report: &mut Value, repairs: &Value) {
             finalize_readiness(report);
             sync_work_components(report);
         }
-        intervention::qualify_restoration(report);
+        if superseded
+            || report["intervention"]["controller"]["reason"] == "controller_stopped"
+            || LANES.iter().any(|lane| {
+                let work = &report["work"][*lane];
+                work["intervention"]["reason"] == "controller_stopped"
+                    || work["next_action"] == "start_controller"
+            })
+        {
+            intervention::qualify_restoration(report);
+        }
         let controller = &mut report["intervention"]["controller"];
         if controller["reason"] == reason {
             controller["state"] = json!("unknown");
             controller["run_mode"] = json!("unknown");
-            if report["intervention"]["unattended"] == true {
-                report["intervention"]["unattended"] = Value::Null;
-            }
         }
         for lane in LANES {
             let work = &mut report["work"][lane];
@@ -220,6 +226,9 @@ pub(crate) fn qualify_doctor(report: &mut Value, repairs: &Value) {
                     }
                 }
             }
+        }
+        if report["intervention"]["controller"].get("state").is_some() {
+            assessment::qualify_unattended(report);
         }
     }
     if !repairs["failure"].is_null() {
@@ -297,6 +306,9 @@ pub fn local_status(config_path: &Path, config: &Config, at: i64) -> Result<Valu
         crate::installer::observe_status_process(config_path, config, || {
             runtime::status_evidence(config)
         })?;
+    if let Some(object) = status.as_object_mut() {
+        object.remove("journal_identity");
+    }
     let process = serde_json::to_value(process)?;
     let selected = serde_json::to_value(crate::installer::observe_selected(config_path))?;
     status["process_identity"] = process["state"].clone();
@@ -832,7 +844,9 @@ pub fn managed_health_wait(report: &Value) -> bool {
         let intervention = &report["work"][lane]["intervention"];
         let admission = &report["participation"]["lanes"][lane];
         let lane_blocked = component["mode"] == "active" && admission["allowed"] == false;
-        if intervention["resolution"] == "polling_not_guaranteed" {
+        if intervention["resolution"] == "polling_not_guaranteed"
+            || report["work"][lane]["required_missing_observation"].is_object()
+        {
             return false;
         }
         if matches!(component["state"].as_str(), Some("ok" | "disabled")) && !lane_blocked {
@@ -1058,7 +1072,11 @@ pub fn compact_diagnostics(data: &mut Value) {
         Value::Object(out)
     }
     fn observation(out: &mut Value, source: &Value, truncated: &mut bool) {
-        for key in ["next_observation", "missing_observation"] {
+        for key in [
+            "next_observation",
+            "missing_observation",
+            "required_missing_observation",
+        ] {
             let Some(value) = source.get(key).filter(|value| value.is_object()) else {
                 continue;
             };
@@ -1084,6 +1102,7 @@ pub fn compact_diagnostics(data: &mut Value) {
         }
     }
     fn scoped_work(out: &mut Value, source: &Value, truncated: &mut bool) {
+        observation(out, source, truncated);
         for key in ["intent", "continuation", "automatic_step"] {
             if let Some(value) = source.get(key) {
                 out[key] = value.clone();
@@ -1104,6 +1123,8 @@ pub fn compact_diagnostics(data: &mut Value) {
                 "observed_opportunities",
                 "eligible_candidates",
                 "locally_judgeable",
+                "locally_eligible",
+                "exclusion_reason",
                 "assessment_reason",
                 "capped_work_proven",
             ],
@@ -1114,6 +1135,7 @@ pub fn compact_diagnostics(data: &mut Value) {
                 &source["assessment"]["exclusions"],
                 &[
                     "already_attempted",
+                    "already_settled",
                     "configured_exclusion",
                     "model_budget_exhausted",
                     "model_retry_cooldown",
@@ -1952,6 +1974,12 @@ fn sync_work_components(report: &mut Value) {
     }
 }
 
+fn settled_inventory(assessment: &Value) -> bool {
+    let settled = assessment["exclusions"]["already_settled"].as_u64();
+    settled.is_some_and(|count| count > 0)
+        && settled == assessment["observed_opportunities"].as_u64()
+}
+
 fn work_complete(status: &Value, lane: &str, at: i64, stale: u64) -> bool {
     if status["lane_participation"][lane]["freshness"] == "stale" {
         return false;
@@ -2122,6 +2150,20 @@ fn qualify_components(result: &mut Value, status: &Value, options: Options) {
                     result,
                     admission["reason"].as_str().unwrap_or("admission_blocked"),
                 );
+            }
+        }
+        if result["work"][name]["required_missing_observation"].is_object() {
+            push_issue(result, "api_dependency_unavailable");
+            let component = &mut result["components"][name];
+            if let Some(reasons) = component["reasons"].as_array_mut()
+                && !reasons
+                    .iter()
+                    .any(|reason| reason == "api_dependency_unavailable")
+            {
+                reasons.push(json!("api_dependency_unavailable"));
+            }
+            if component["state"] == "ok" {
+                component["state"] = json!("degraded");
             }
         }
         if current
@@ -2553,6 +2595,9 @@ fn components(status: &Value, health: &Value, at: i64, stale: u64, options: Opti
                             "answer" => "current_epoch_answered",
                             "judge" if work["assessment"]["capped_work_proven"] == true => {
                                 "model_attempts_exhausted_for_observed_work"
+                            }
+                            "judge" if settled_inventory(&work["assessment"]) => {
+                                "observed_judgments_already_settled"
                             }
                             "judge" => "no_eligible_assignments_observed",
                             _ => "current_epoch_completed",

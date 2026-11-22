@@ -50,7 +50,10 @@ pub(crate) fn judge_inventory(assessment: &Value) -> JudgeInventory {
                 continue;
             }
             let finding = match reason.as_str() {
-                "already_attempted" | "configured_exclusion" => continue,
+                "already_attempted" | "already_settled" | "configured_exclusion" => continue,
+                "model_budget_exhausted" if assessment["excluded_work_truncated"] == true => {
+                    return Unresolved;
+                }
                 "model_budget_exhausted" if assessment["capped_work_proven"] != true => {
                     (1, "model_attempt_budget_exhausted")
                 }
@@ -85,11 +88,19 @@ pub(crate) fn judge_inventory(assessment: &Value) -> JudgeInventory {
 }
 
 impl Store {
-    pub(crate) fn settled_judgment(&self, key: &str) -> Result<bool> {
+    fn settled_judgment(&self, key: &str) -> Result<bool> {
         Ok(self.db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM operations
-             WHERE kind='judge' AND work_key=?1 COLLATE NOCASE
-             AND state IN ('confirmed','final') AND txid IS NOT NULL)",
+            "SELECT EXISTS(
+               SELECT 1 FROM operations o
+               JOIN operation_evidence e ON e.operation_id=o.id
+               JOIN read_state r ON r.operation_id=o.id AND r.binding_revision=o.binding_revision
+               WHERE o.kind='judge' AND o.work_key=?1 COLLATE NOCASE
+               AND o.state IN ('confirmed','final') AND o.txid IS NOT NULL
+               AND e.dispatch_sequence IS NOT NULL AND e.safety_observed_at IS NOT NULL
+               AND r.owner='judge' AND r.purpose='receipt' AND r.remote_resource=o.txid
+               AND r.last_success_at IS NOT NULL
+               AND EXISTS(SELECT 1 FROM events WHERE operation_id=o.id AND kind='judge'
+                           AND code IN ('receipt_included','checkpoint_coverage_reported')))",
             [key],
             |row| row.get(0),
         )?)
@@ -98,9 +109,7 @@ impl Store {
     /// Qualify excluded work against the same snapshot as the inventory.
     /// Work keys never cross into the public witness.
     fn judge_work_evidence(&self, config: &Config, assessment: &mut Value, at: i64) -> Result<()> {
-        let caps = assessment["exclusions"]["model_budget_exhausted"]
-            .as_u64()
-            .unwrap_or(0);
+        let mut settled = Vec::new();
         let mut capped = 0;
         let mut step: Option<(i64, Option<i64>, &'static str, &'static str)> = None;
         if let Some(rows) = assessment["excluded_work"].as_array() {
@@ -113,6 +122,13 @@ impl Store {
                         .as_str()
                         .is_some_and(|prior| prior.eq_ignore_ascii_case(key))
                 }) {
+                    continue;
+                }
+                if let Some(reason) = row["reason"].as_str()
+                    && (reason == "already_attempted" || reason.starts_with("model_"))
+                    && self.settled_judgment(key)?
+                {
+                    settled.push(index);
                     continue;
                 }
                 let witness = match row["reason"].as_str() {
@@ -172,6 +188,29 @@ impl Store {
                 }
             }
         }
+        // Preserve runtime eligibility. Only the read-only histogram may
+        // replace an exclusion with positively matched settlement.
+        for index in settled {
+            let row = &mut assessment["excluded_work"][index];
+            let reason = row["reason"].take();
+            if let Some(reason) = reason.as_str()
+                && let Some(count) = assessment["exclusions"][reason]
+                    .as_u64()
+                    .filter(|count| *count > 0)
+            {
+                assessment["exclusions"][reason] = json!(count - 1);
+                let count = assessment["exclusions"]["already_settled"]
+                    .as_u64()
+                    .unwrap_or(0);
+                assessment["exclusions"]["already_settled"] = json!(count + 1);
+                assessment["excluded_work"][index]["reason"] = json!("already_settled");
+            } else {
+                assessment["excluded_work"][index]["reason"] = reason;
+            }
+        }
+        let caps = assessment["exclusions"]["model_budget_exhausted"]
+            .as_u64()
+            .unwrap_or(0);
         if caps > 0 {
             assessment["capped_work_proven"] =
                 json!(assessment["excluded_work_truncated"] == false && capped == caps);
@@ -1331,8 +1370,23 @@ impl Store {
                     now(),
                 );
             if config.preparation(kind).is_some() {
+                let answer_key = if kind == LaneId::Answer && context.fresh {
+                    epoch
+                        .zip(
+                            observation
+                                .as_ref()
+                                .and_then(|row| row["fingerprint"].as_str())
+                                .filter(|fingerprint| !fingerprint.is_empty()),
+                        )
+                        .map(|(epoch, fingerprint)| format!("{epoch}:{fingerprint}"))
+                } else {
+                    None
+                };
                 type ModelAttemptRow = (i64, String, String, Option<String>, String, Option<bool>);
-                let latest:Option<ModelAttemptRow>=self.db.query_row(
+                let answer_epoch = if kind == LaneId::Answer { epoch } else { None };
+                let query_latest =
+                    |work_key: Option<&str>| -> rusqlite::Result<Option<ModelAttemptRow>> {
+                        self.db.query_row(
                     "SELECT o.id,o.work_key,o.state,json_extract(e.model_attempt,'$.completion'),o.revision,
                      json_extract(e.model_attempt,'$.producer.preflight_admission.authority_epoch')=(SELECT authority_epoch FROM runtime_authority WHERE singleton=1)
                      FROM operations o LEFT JOIN operation_evidence e ON e.operation_id=o.id
@@ -1340,8 +1394,21 @@ impl Store {
                      AND (?3 IS NULL OR o.work_key=?3)
                      AND (e.model_attempt IS NOT NULL OR o.state IN ('model_unknown','superseded_model_unknown','abandoned_model','retry_model','prelaunch_failed','rejected'))
                      ORDER BY o.id DESC LIMIT 1",
-                    params![kind.as_str(),if kind==LaneId::Answer { epoch } else { None },if kind==LaneId::Judge { op.as_ref().map(|op|op.key.as_str()) } else { None }],
-                    |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional()?;
+                    params![kind.as_str(),answer_epoch,work_key],
+                    |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional()
+                    };
+                let latest = match kind {
+                    LaneId::Judge => query_latest(op.as_ref().map(|op| op.key.as_str()))?,
+                    _ => match answer_key
+                        .as_deref()
+                        .map(|key| query_latest(Some(key)))
+                        .transpose()?
+                        .flatten()
+                    {
+                        Some(matching) => Some(matching),
+                        None => query_latest(None)?,
+                    },
+                };
                 if let Some((id, key, state, completion, revision, current_runtime)) = latest {
                     let model_assessment =
                         self.model_retry_assessment(kind, &key, config, now())?;
@@ -1373,8 +1440,8 @@ impl Store {
                             .map(|current| revision == current)
                     );
                     model["scope"] = json!(if kind == LaneId::Answer {
-                        match context.scope.epoch.filter(|_| context.fresh) {
-                            Some(epoch) if key == epoch.to_string() => "current_work",
+                        match answer_key.as_deref() {
+                            Some(current) if key == current => "current_work",
                             Some(_) => "historical_epoch",
                             None => "unassessed_epoch",
                         }
@@ -1856,8 +1923,12 @@ impl Store {
             "lane_controls":lane_controls,"lane_participation":lane_participation,
             "observation":observed,"observations":observations,"legacy_observation":legacy,
             "epoch_evidence":epoch_evidence,
-            "reads":reads,"reads_truncated":reads_truncated,"request_restrictions":restrictions,"work":work,"pending":pending,"pending_work":pending_work});
+            "reads":reads,"reads_truncated":reads_truncated,"request_restrictions":restrictions,
+            "work":work,"pending":pending,"pending_work":pending_work});
         status["operations"] = json!(counts);
+        // Identity of the database actually read, from the same connection.
+        // Bracket attribution must match this, never a path heartbeat alone.
+        status["journal_identity"] = self.journal_identity()?;
         status["writer_authority"] = self.writer_authority_status()?;
         status["captured_work"] = json!(captured_work);
         status["last_event"] = json!(last_event);

@@ -73,9 +73,11 @@ fn intent<'a>(status: &'a Value, lane: &str) -> Intent<'a> {
     let effective = status["effective_runtime"]["revision"].as_str();
     let paused = status["paused"].as_bool();
     let lane_pause = status["lane_controls"][lane]["desired"]["paused"].as_bool();
+    let requested_mode = status["capabilities"][lane]["mode"].as_str();
+    let effective_mode = lane_mode(status, lane);
     Intent {
-        requested_mode: status["capabilities"][lane]["mode"].as_str(),
-        effective_mode: lane_mode(status, lane),
+        requested_mode,
+        effective_mode,
         paused: match (paused, lane_pause) {
             (Some(true), _) | (_, Some(true)) => Some(true),
             (Some(false), Some(false)) => Some(false),
@@ -89,6 +91,11 @@ fn intent<'a>(status: &'a Value, lane: &str) -> Intent<'a> {
             } else {
                 "pending"
             }
+        } else if requested_mode
+            .zip(effective_mode)
+            .is_some_and(|(requested, effective)| requested != effective)
+        {
+            "pending"
         } else {
             "unknown"
         },
@@ -121,16 +128,36 @@ fn independent_step<'a>(work: &'a Value, base: Step<'a>) -> Option<Step<'a>> {
             condition: Condition::None,
         });
     }
-    if !finding["candidate_wait"].is_null() {
-        return Some(base);
+    if let Some(wait) = finding.get("candidate_wait") {
+        let target = match wait["target"].as_str()? {
+            "preparation" => Target::Preparation,
+            "discovery" => Target::Discovery,
+            _ => return None,
+        };
+        return Some(Step {
+            state: State::WaitingAutomatically,
+            target: Some(target),
+            reason: wait["reason"].as_str()?,
+            not_before: wait["not_before"].as_i64(),
+            operation_id: wait["operation_id"].as_i64(),
+            condition: Condition::RetryEligibility,
+        });
     }
     if base
         .target
         .is_some_and(|target| matches!(target, Target::Reconciliation))
         && matches!(base.condition, Condition::PollOutcomeUnknown)
     {
+        let observation = &finding["next_observation"];
         return Some(Step {
             state: State::WaitingAutomatically,
+            not_before: observation["not_before"].as_i64(),
+            operation_id: observation["operation_id"].as_i64(),
+            condition: if observation["http_status"] == 404 {
+                Condition::PollOutcomeUnknown
+            } else {
+                Condition::RetryEligibility
+            },
             ..base
         });
     }
@@ -198,11 +225,14 @@ fn from_intervention<'a>(work: &'a Value, admission: &str) -> Step<'a> {
     if matches!(target, Target::Reconciliation)
         && matches!(condition, Condition::PollOutcomeUnknown)
     {
+        let missing = finding
+            .get("missing_observation")
+            .unwrap_or(&finding["next_observation"]);
         return Step {
             target: Some(target),
             reason,
-            not_before: finding["next_observation"]["not_before"].as_i64(),
-            operation_id: finding["next_observation"]["operation_id"].as_i64(),
+            not_before: missing["not_before"].as_i64(),
+            operation_id: missing["operation_id"].as_i64(),
             condition,
             ..Step::unknown(reason)
         };
@@ -281,9 +311,7 @@ pub(super) fn attach(report: &mut Value, status: &Value) {
     report["intervention"]["controller"]["owner"] = json!(owner);
     report["intervention"]["controller"]["run_mode"] = json!(run_mode);
     report["intervention"]["controller"]["state"] = json!(process_state);
-    if report["intervention"]["unattended"] == true && !continuous {
-        report["intervention"]["unattended"] = Value::Null;
-    }
+
     let at = report["checked_at"].as_i64().unwrap_or(i64::MAX);
     for lane in LANES {
         let intent = intent(status, lane);
@@ -314,6 +342,17 @@ pub(super) fn attach(report: &mut Value, status: &Value) {
         let actionable = (continuous && !inactive)
             .then(|| independent_step(work, base))
             .flatten();
+        if let Some(missing) = work.get("required_missing_observation")
+            && matches!(base.state, State::Ready | State::WaitingAutomatically)
+        {
+            base = Step {
+                target: Some(Target::Reconciliation),
+                operation_id: missing["operation_id"].as_i64(),
+                not_before: missing["not_before"].as_i64(),
+                condition: Condition::PollOutcomeUnknown,
+                ..Step::unknown("bound_reconciliation_pending")
+            };
+        }
         let continuation = if inactive {
             let reason = if intent.paused == Some(true) {
                 "participation_paused"
@@ -363,6 +402,12 @@ pub(super) fn attach(report: &mut Value, status: &Value) {
                 "not_before":observation["not_before"]}),
             );
         }
+        if let Some(missing) = work.get("required_missing_observation") {
+            findings.push(json!({"target":"reconciliation","state":"unknown",
+                "reason":"bound_reconciliation_pending","dependency":missing["purpose"],
+                "operation_id":missing["operation_id"],"binding_revision":missing["binding_revision"],
+                "http_status":404,"not_before":missing["not_before"]}));
+        }
         if let Some(count) = work["assessment"]["exclusions"]["model_budget_exhausted"]
             .as_u64()
             .filter(|n| *n > 0)
@@ -372,7 +417,10 @@ pub(super) fn attach(report: &mut Value, status: &Value) {
             findings.push(json!({"target":"current_inventory","state":"exhausted","reason":"model_attempt_budget_exhausted",
                 "count":count,"observed_at":work["assessment"]["observed_at"],"valid_until":work["assessment"]["valid_until"]}));
         }
-        if let Some(wait) = work["intervention"].get("candidate_wait") {
+        if let Some(wait) = work["assessment"].get("candidate_wait").filter(|wait| {
+            work["intervention"]["observation_fresh"] == true
+                && wait["not_before"].as_i64().is_some_and(|floor| floor > at)
+        }) {
             findings.push(json!({"target":wait["target"],"state":"waiting","reason":wait["reason"],
                 "not_before":wait["not_before"],"operation_id":wait["operation_id"],"dependency":wait["dependency"]}));
         }
@@ -392,12 +440,17 @@ pub(super) fn attach(report: &mut Value, status: &Value) {
         );
         let work = &mut report["work"][lane];
         let observation_fresh = work["intervention"]["observation_fresh"] == true;
-        if lane == "judge" {
+        if lane != "judge" {
+            work["assessment"] = status["lane_participation"][lane]["assessment"].clone();
+        }
+        {
             let assessment = &mut work["assessment"];
             if !assessment.is_object() {
                 *assessment = json!({});
             }
-            let completeness = if assessment["observed_at"].as_i64().is_none() {
+            let completeness = if assessment["observed_at"].as_i64().is_none()
+                || assessment["valid_until"].as_i64().is_none()
+            {
                 "unavailable"
             } else if assessment["valid_until"]
                 .as_i64()
@@ -409,7 +462,10 @@ pub(super) fn attach(report: &mut Value, status: &Value) {
             } else {
                 assessment["completeness"].as_str().unwrap_or("unavailable")
             };
-            let current = matches!(completeness, "complete" | "bounded_partial");
+            let current = matches!(
+                completeness,
+                "complete" | "bounded_partial" | "single_challenge"
+            );
             assessment["completeness"] = json!(completeness);
             if !current {
                 for key in [
@@ -417,6 +473,8 @@ pub(super) fn attach(report: &mut Value, status: &Value) {
                     "eligible_candidates",
                     "exclusions",
                     "locally_judgeable",
+                    "locally_eligible",
+                    "exclusion_reason",
                     "capped_work_proven",
                     "candidate_wait",
                 ] {
@@ -430,10 +488,20 @@ pub(super) fn attach(report: &mut Value, status: &Value) {
         work["automatic_step"] = serialized.2;
         work["findings"] = serialized.3;
     }
+    qualify_unattended(report);
+}
+
+pub(super) fn qualify_unattended(report: &mut Value) {
+    let controller = &report["intervention"]["controller"];
     if report["intervention"]["unattended"] == true
-        && LANES
-            .iter()
-            .any(|lane| report["work"][*lane]["continuation"]["state"] == "unknown")
+        && (controller["state"] != "running"
+            || controller["run_mode"] != "continuous"
+            || controller["ready"] != true
+            || LANES.iter().any(|lane| {
+                let work = &report["work"][*lane];
+                work["continuation"]["state"] == "unknown"
+                    || work["required_missing_observation"].is_object()
+            }))
     {
         report["intervention"]["unattended"] = Value::Null;
     }
@@ -467,6 +535,15 @@ mod tests {
             assert_eq!(
                 status["work"]["judge"]["intervention"]["status"],
                 "none_required"
+            );
+            let cleared = status["intervention"]["unattended"].clone();
+            super::super::qualify_doctor(
+                &mut status,
+                &json!({"restoration":{"verified":true,"runtime":"restored"}}),
+            );
+            assert_eq!(
+                status["intervention"]["unattended"], cleared,
+                "a restoration receipt is not live controller attribution"
             );
         }
     }

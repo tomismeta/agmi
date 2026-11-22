@@ -2152,6 +2152,37 @@ fn judge_model_failure_is_historical_only_with_current_complete_assignment_evide
 }
 
 #[test]
+fn answer_attempt_scope_prefers_the_current_fingerprint_over_a_newer_same_epoch_row() {
+    let (_dir, mut config, db, at) = initialized_health_fixture();
+    diagnostic_lane(
+        &mut config,
+        &db,
+        "answer",
+        agmi::config::CountLimit::Bounded(4),
+        at,
+    );
+    for (id, key) in [(1, "2:fixture"), (2, "2:other")] {
+        db.execute("INSERT INTO operations(id,kind,work_key,state,request,generation,revision,created_at,updated_at)
+            SELECT ?1,'answer',?2,'rejected','{\"solver\":{\"epoch\":2}}',generation,'fixture',?3,?3 FROM control",
+            rusqlite::params![id, key, at]).unwrap();
+    }
+    let result = diagnostic_health(&config);
+    assert_eq!(result["work"]["answer"]["model"]["operation_id"], 1);
+    assert_eq!(result["work"]["answer"]["model"]["scope"], "current_work");
+    db.execute(
+        "UPDATE lane_observations SET fingerprint='a-new-challenge' WHERE lane='answer'",
+        [],
+    )
+    .unwrap();
+    let result = diagnostic_health(&config);
+    assert_eq!(result["work"]["answer"]["model"]["operation_id"], 2);
+    assert_eq!(
+        result["work"]["answer"]["model"]["scope"],
+        "historical_epoch"
+    );
+}
+
+#[test]
 fn rejected_judge_attempts_at_cap_leave_distinct_work_open() {
     use agmi::config::CountLimit;
     use serde_json::json;
@@ -2223,6 +2254,41 @@ fn rejected_judge_attempts_at_cap_leave_distinct_work_open() {
     assert_eq!(judge["intervention"]["next_action"], "observe_assignments");
     assert_eq!(judge["intervention"]["next_at"], at + 60);
     assert!(!agmi::health::managed_health_wait(&mixed));
+    db.execute("UPDATE runtime_state SET lane_participation=json_set(lane_participation,
+        '$.judge.assessment.locally_judgeable',json('true'),'$.judge.assessment.eligible_candidates',1,
+        '$.judge.assessment.observed_opportunities',5)", []).unwrap();
+    let ready = diagnostic_health(&config);
+    assert_eq!(
+        ready["components"]["judge"]["reasons"][0],
+        "fresh_work_available"
+    );
+    assert_ne!(ready["work"]["judge"]["intervention"]["next_at"], at + 60);
+    assert!(
+        ready["work"]["judge"]["findings"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(
+                |row| row["dependency"] == "public_assignment_read" && row["not_before"] == at + 60
+            )
+    );
+
+    db.execute("UPDATE runtime_state SET lane_participation=json_set(lane_participation,
+        '$.judge.assessment.locally_judgeable',json('false'),'$.judge.assessment.eligible_candidates',0,
+        '$.judge.assessment.observed_opportunities',34,
+        '$.judge.assessment.exclusions.model_budget_exhausted',33,
+        '$.judge.assessment.excluded_work_truncated',json('true'))", []).unwrap();
+    db.execute("DELETE FROM read_state WHERE purpose='assignment'", [])
+        .unwrap();
+    let truncated = diagnostic_health(&config);
+    assert_ne!(
+        truncated["work"]["judge"]["intervention"]["status"],
+        "operator_required"
+    );
+    assert_eq!(
+        truncated["work"]["judge"]["assessment"]["capped_work_proven"],
+        false
+    );
 }
 
 #[test]
