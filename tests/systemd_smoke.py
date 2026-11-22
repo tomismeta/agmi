@@ -1209,6 +1209,15 @@ def managed_health_exit(binary, home):
         assert service['manager']['controller']['active'] == 'active', service
         assert service['manager']['health_probe']['result'] == 'exit-code', service
         assert service['manager']['health_probe']['exit_code'] == 1, service
+        # Pause changes durable intent immediately. Process attribution still
+        # requires the running controller to publish the new generation.
+        def pause_acknowledged():
+            rows = fixture.rows("""SELECT c.paused = 1 AND
+                json_extract(p.policy, '$.process.account_generation') = c.generation AS acknowledged
+                FROM control c JOIN runtime_policy p USING(singleton) WHERE c.singleton = 1""")
+            return bool(rows and rows[0]['acknowledged'])
+
+        fixture.wait(pause_acknowledged, 'running controller did not acknowledge the pause generation')
         status = json.loads(run([str(binary), '--json', 'status']).stdout)['data']
         controller = status['intervention']['controller']
         assert (controller['owner'], controller['run_mode'], controller['state']) == (
