@@ -1,6 +1,6 @@
 //! Explicit latest-stable discovery and verified handoff to the canonical installer.
 //! GitHub HTTPS authenticates the publisher origin; checksums are not signatures.
-use crate::{installer, lifecycle};
+use crate::{doctor, installer, lifecycle};
 use anyhow::{Context, Result, ensure};
 use reqwest::{Client, Url};
 use semver::Version;
@@ -25,7 +25,7 @@ const METADATA_LIMIT: usize = 2 * 1024 * 1024;
 const TEXT_LIMIT: usize = 64 * 1024;
 const ARCHIVE_LIMIT: usize = 128 * 1024 * 1024;
 const EXPANDED_LIMIT: u64 = 256 * 1024 * 1024;
-const CHILD_LIMIT: usize = 2 * 1024 * 1024;
+const CHILD_LIMIT: usize = doctor::DIAGNOSTIC_CHILD_LIMIT;
 const IDENTITY_FIELDS: &[&str] = &[
     "build_format",
     "package_version",
@@ -630,42 +630,134 @@ fn installed() -> Result<(installer::InstalledIdentity, Identity)> {
     Ok((current, identity))
 }
 
+fn enum_member<'a>(value: &'a Value, allowed: &[&str]) -> Option<&'a str> {
+    value.as_str().filter(|value| allowed.contains(value))
+}
+
 fn safe_enum(value: &Value, allowed: &[&str], fallback: &str) -> Value {
-    json!(
-        value
-            .as_str()
-            .filter(|value| allowed.contains(value))
-            .unwrap_or(fallback)
+    json!(enum_member(value, allowed).unwrap_or(fallback))
+}
+
+fn diagnostic_reason(value: &Value) -> Option<&str> {
+    enum_member(
+        value,
+        &[
+            "not_initialized",
+            "local_evidence_unavailable",
+            "identity_mismatch",
+            "api_routing_mismatch",
+            "config_reload_rejected",
+            "controller_stopped",
+            "clock_regressed",
+            "effective_policy_unavailable",
+            "controller_unobserved",
+            "controller_stale",
+            "controller_evidence_unavailable",
+            "controller_recent",
+            "bound_reconciliation_pending",
+            "reconciliation_evidence_unavailable",
+            "reconciliation_authentication_failed",
+            "unbound_uncertainty",
+            "capacity_evidence_unavailable",
+            "participation_policy_unavailable",
+            "manual_authorization_required",
+            "manual_authorization_unobserved",
+            "participation_disabled",
+            "retry_deadline_unavailable",
+            "uncertainty_grace",
+            "retained_retry_minimum",
+            "uncertain_answer_retry_delay",
+            "answer_attempt_budget_exhausted",
+            "generation_changed",
+            "effect_in_flight",
+            "admission_paused",
+            "hosted_identity_unverified",
+            "read_authentication_failed",
+            "read_authentication_evidence_stale",
+            "in_flight_outcome_overdue",
+            "hosted_identity_unobserved",
+            "no_eligible_assignments_observed",
+            "hosted_identity_authentication_failed",
+            "hosted_identity_mismatch",
+            "hosted_identity_unavailable",
+            "hosted_identity_invalid_response",
+            "hosted_identity_legacy_unknown",
+            "model_authentication_failed",
+            "model_configuration_failed",
+            "model_attempt_budget_exhausted",
+            "native_workspace_unavailable",
+            "native_workspace_capacity",
+            "native_workspace_permission",
+            "native_workspace_failure",
+            "admission_recovery_unproven",
+            "model_retry_eligible",
+            "model_uncertain",
+            "model_retry_unavailable",
+            "model_retry_evidence_unavailable",
+            "unbound_outcome_requires_evidence",
+            "admission_evidence_unavailable",
+            "read_outcome_overdue",
+            "read_in_flight",
+            "read_backoff",
+            "completion_evidence_stale",
+            "capability_read_only",
+            "capability_off",
+            "work_evidence_unavailable",
+            "effective_mode_unavailable",
+            "answer_retry_reserved",
+            "answer_retry_blocked",
+            "answer_retry_progress_unproven",
+            "runtime_restored_observation_pending",
+            "doctor_repair_unavailable",
+            "state_disk_space_low",
+            "config_changed_during_doctor",
+            "continuing_owner_unverified",
+            "fresh_evidence_required",
+            "api_dependency_unavailable",
+            "model_retry_backoff",
+            "model_uncertain_retry_disabled",
+            "model_uncertain_replacement_exhausted",
+            "model_preparation_reserved",
+            "required_words_absent",
+            "controller_running",
+            "participation_paused",
+            "account_uncertainty",
+            "lane_uncertainty",
+            "assignment_inventory_empty",
+            "assignment_inventory_settled",
+            "assignment_inventory_capped",
+            "work_already_completed",
+            "fresh_work_required",
+            "capability_not_active",
+            "model_attempts_exhausted_for_observed_work",
+            "fresh_work_available",
+            "current_epoch_completed",
+            "state_disk_space_unavailable",
+            "read_failed",
+            "assignment_access_unverified",
+            "lane_paused",
+            "no_automatic_capacity_release",
+            "operation_backoff",
+            "operation_retry_minimum",
+            "shared_server_restriction",
+            "current_work_outcome_unresolved",
+            "reconciliation_evidence_truncated",
+        ],
     )
+}
+
+fn nonnegative(value: &Value) -> Option<i64> {
+    value.as_i64().filter(|value| *value >= 0)
+}
+
+fn local_id(value: &Value) -> Option<i64> {
+    value.as_i64().filter(|value| *value > 0)
 }
 
 fn safe_intervention(value: &Value) -> Value {
     let mut result = json!({
         "status":safe_enum(&value["status"], &["none_required", "automatic_recovery", "operator_required", "undetermined"], "undetermined"),
-        "reason":safe_enum(&value["reason"], &[
-            "not_initialized", "local_evidence_unavailable", "identity_mismatch", "api_routing_mismatch",
-            "config_reload_rejected", "controller_stopped", "clock_regressed", "effective_policy_unavailable",
-            "controller_unobserved", "controller_stale", "controller_evidence_unavailable", "controller_recent",
-            "bound_reconciliation_pending", "reconciliation_evidence_unavailable", "reconciliation_authentication_failed",
-            "unbound_uncertainty", "capacity_evidence_unavailable", "participation_policy_unavailable",
-            "manual_authorization_required", "manual_authorization_unobserved", "participation_disabled",
-            "retry_deadline_unavailable", "uncertainty_grace", "retained_retry_minimum", "uncertain_answer_retry_delay",
-            "answer_attempt_budget_exhausted", "generation_changed", "effect_in_flight", "admission_paused",
-            "hosted_identity_unverified", "read_authentication_failed", "read_authentication_evidence_stale",
-            "in_flight_outcome_overdue", "hosted_identity_unobserved", "no_eligible_assignments_observed",
-            "hosted_identity_authentication_failed", "hosted_identity_mismatch",
-            "hosted_identity_unavailable", "hosted_identity_invalid_response", "hosted_identity_legacy_unknown",
-            "model_authentication_failed", "model_configuration_failed", "model_attempt_budget_exhausted",
-            "native_workspace_unavailable", "native_workspace_capacity",
-            "native_workspace_permission", "native_workspace_failure",
-            "admission_recovery_unproven", "model_retry_eligible", "model_uncertain", "model_retry_unavailable",
-            "model_retry_evidence_unavailable", "unbound_outcome_requires_evidence", "admission_evidence_unavailable",
-            "read_outcome_overdue", "read_in_flight", "read_backoff", "completion_evidence_stale",
-            "capability_read_only", "capability_off", "work_evidence_unavailable", "effective_mode_unavailable",
-            "answer_retry_reserved", "answer_retry_blocked", "answer_retry_progress_unproven",
-            "runtime_restored_observation_pending", "doctor_repair_unavailable", "state_disk_space_low",
-            "config_changed_during_doctor",
-        ], "activated_doctor_reason_unrecognized"),
+        "reason":diagnostic_reason(&value["reason"]).unwrap_or("activated_doctor_reason_unrecognized"),
         "next_action":safe_enum(&value["next_action"], &[
             "none", "inspect_local_evidence", "initialize_controller", "repair_config", "start_controller",
             "await_reconciliation", "review_credentials", "inspect_operations", "authorize",
@@ -674,20 +766,318 @@ fn safe_intervention(value: &Value) -> Value {
             "retry_model", "recover_model", "await_assignments", "await_challenge", "observe_assignments",
             "observe_challenge", "await_answer_retry", "inspect_answer_retry", "inspect_repair_failure",
             "inspect_state_filesystem", "await_identity",
-            "inspect_model_workspace",
+            "inspect_model_workspace", "await_model", "await_model_admission", "revalidate_launch_gate",
+            "revalidate_request", "revalidate_challenge", "revalidate_assignment",
         ], "inspect_local_evidence"),
         "evidence":"local_only"
     });
     for key in ["next_at", "observed_at"] {
-        result[key] = value[key]
-            .as_i64()
-            .filter(|time| *time >= 0)
-            .map_or(Value::Null, |time| json!(time));
+        result[key] = json!(nonnegative(&value[key]));
     }
     for key in ["unattended", "evidence_fresh", "observation_fresh", "ready"] {
         result[key] = value[key].as_bool().map_or(Value::Null, Value::Bool);
     }
+    if value["next_observation"].is_object() {
+        result["next_observation"] = safe_observation(&value["next_observation"]);
+    }
+    if value["resolution"] == "polling_not_guaranteed" {
+        result["resolution"] = value["resolution"].clone();
+    }
     result
+}
+
+const STEP_STATES: &[&str] = &[
+    "ready",
+    "waiting_automatically",
+    "needs_operator",
+    "intentionally_inactive",
+    "unknown",
+];
+const STEP_TARGETS: &[&str] = &[
+    "discovery",
+    "preparation",
+    "reconciliation",
+    "submission",
+    "none",
+];
+
+fn safe_continuation(source: &Value) -> Value {
+    let Some(state) = enum_member(&source["state"], STEP_STATES) else {
+        return json!({"state":"unknown","target":null,"reason":null,"not_before":null,
+            "operation_id":null,"condition":"unknown"});
+    };
+    json!({
+        "state":state,
+        "target":enum_member(&source["target"], STEP_TARGETS),
+        "reason":diagnostic_reason(&source["reason"]),
+        "not_before":nonnegative(&source["not_before"]),
+        "operation_id":local_id(&source["operation_id"]),
+        "condition":safe_enum(&source["condition"], &["fresh_work_required", "retry_eligibility",
+            "poll_outcome_unknown", "admission_fenced", "none", "unknown"], "unknown"),
+    })
+}
+
+fn safe_assessment(source: &Value) -> Value {
+    let mut assessment = json!({
+        "observed_at":nonnegative(&source["observed_at"]),
+        "valid_until":nonnegative(&source["valid_until"]),
+        "completeness":safe_enum(&source["completeness"],
+            &["complete", "bounded_partial", "partial", "expired", "stale", "unavailable", "unknown"], "unknown"),
+        "observed_opportunities":source["observed_opportunities"].as_u64(),
+        "eligible_candidates":source["eligible_candidates"].as_u64(),
+        "locally_judgeable":source["locally_judgeable"].as_bool(),
+        "capped_work_proven":source["capped_work_proven"].as_bool(),
+        "assessment_reason":diagnostic_reason(&source["assessment_reason"]),
+    });
+    if source["exclusions"].is_object() {
+        let mut exclusions = serde_json::Map::new();
+        for code in [
+            "already_attempted",
+            "already_settled",
+            "configured_exclusion",
+            "model_budget_exhausted",
+            "assignment_read_backoff",
+            "assignment_resource_restricted",
+            "model_uncertain_retry_disabled",
+            "model_uncertain_replacement_exhausted",
+            "model_preparation_reserved",
+            "model_retry_cooldown",
+        ] {
+            if let Some(count) = source["exclusions"][code].as_u64() {
+                exclusions.insert(code.into(), json!(count));
+            }
+        }
+        assessment["exclusions"] = Value::Object(exclusions);
+    }
+    assessment
+}
+
+fn safe_findings(source: &Value) -> Value {
+    let Some(items) = source["items"].as_array() else {
+        return Value::Null;
+    };
+    let projected: Vec<_> = items.iter().take(8).filter_map(|item| {
+        let target = enum_member(&item["target"], STEP_TARGETS).or_else(||
+            enum_member(&item["target"], &["lane", "current_inventory", "controller"]))?;
+        let state = enum_member(&item["state"], STEP_STATES).or_else(||
+            enum_member(&item["state"], &["blocked", "degraded", "healthy", "inactive", "exhausted", "fenced", "waiting"]))?;
+        let mut finding = json!({"target":target,"state":state,"reason":diagnostic_reason(&item["reason"]),
+            "operation_id":local_id(&item["operation_id"]),"count":item["count"].as_u64(),
+            "http_status":item["http_status"].as_u64().filter(|status| (100..=599).contains(status)),
+            "dependency":enum_member(&item["dependency"], &["model_attempt", "public_assignment_read",
+                "lane_discovery", "job", "receipt", "identity"])});
+        for key in ["observed_at", "valid_until", "not_before"] {
+            finding[key] = json!(nonnegative(&item[key]));
+        }
+        Some(finding)
+    }).collect();
+    let truncated = projected.len() < items.len() || source["truncated"] != false;
+    let mut result = json!({"truncated":truncated});
+    result["items"] = Value::Array(projected);
+    result
+}
+
+fn safe_background(source: &Value) -> Value {
+    let mut result = json!({
+        "count":source["count"].as_u64(),"bound_count":source["bound_count"].as_u64(),
+        "unbound_count":source["unbound_count"].as_u64(),
+        "required_for_participation":source["required_for_participation"].as_bool().filter(|flag| !*flag),
+        "next_action":enum_member(&source["next_action"], &["none", "await_reconciliation", "inspect_operations"]),
+        "next_at":nonnegative(&source["next_at"]),
+    });
+    for key in ["next_observation", "missing_observation"] {
+        let row = &source[key];
+        if row.is_object() {
+            result[key] = safe_observation(row);
+        }
+    }
+    result
+}
+
+fn safe_observation(row: &Value) -> Value {
+    json!({
+        "status":safe_enum(&row["status"], &["in_flight", "waiting", "eligible", "truncated",
+            "unavailable", "dispatch_in_flight", "not_assessed", "no_safe_binding", "authentication_failed"], "unknown"),
+        "owner":enum_member(&row["owner"], &["account", "answer", "judge", "mine"]),
+        "purpose":enum_member(&row["purpose"], &["identity", "job", "receipt"]),
+        "operation_id":local_id(&row["operation_id"]),
+        "binding_revision":nonnegative(&row["binding_revision"]),
+        "not_before":nonnegative(&row["not_before"]),
+        "floor_kind":enum_member(&row["floor_kind"], &["operation_poll", "reconciliation_service",
+            "server_retry_after", "local_read_backoff", "retained_legacy_floor", "identity_read"]),
+        "http_status":row["http_status"].as_u64().filter(|status| (100..=599).contains(status)),
+        "scope":enum_member(&row["scope"], &["background", "current", "unassessed"]),
+        "historical_cadence_qualified":row["historical_cadence_qualified"].as_bool(),
+        "cadence_seconds":row["cadence_seconds"].as_u64(),
+        "binding_age_seconds":row["binding_age_seconds"].as_u64(),
+        "consecutive_404":row["consecutive_404"].as_u64(),
+    })
+}
+
+// Do not relay opaque argv, paths, tokens, or child instructions. A known
+// command is copied as-is; stripping arguments could change its target.
+fn allowed_action_argv(argv: &Value, authorized: Option<bool>) -> bool {
+    let Some((program, args)) = argv.as_array().and_then(|args| args.split_first()) else {
+        return false;
+    };
+    program == "agmi"
+        && match args {
+            [cmd] => match cmd.as_str() {
+                Some("status" | "health" | "reads" | "doctor") => true,
+                Some("resume" | "recover-model") => authorized == Some(true),
+                _ => false,
+            },
+            [cmd, arg] => match (cmd.as_str(), arg.as_str()) {
+                (Some("operations"), Some("list"))
+                | (Some("config"), Some("show"))
+                | (Some("service"), Some("status")) => true,
+                (Some("doctor"), Some("--repair")) => authorized == Some(true),
+                (Some("run"), Some("--help")) => authorized == Some(false),
+                _ => false,
+            },
+            [cmd, sub, flag] => cmd == "recover" && sub == "authorize" && flag == "--help",
+            _ => false,
+        }
+}
+
+fn safe_actions(source: &Value) -> Value {
+    let Some(actions) = source.as_array() else {
+        return Value::Null;
+    };
+    Value::Array(actions.iter().take(8).filter_map(|row| {
+        let kind = enum_member(&row["kind"], &["command", "instruction", "wait"])?;
+        let authorized = row["authorization_required"].as_bool();
+        let mut action = json!({
+            "kind":kind,
+            "disposition":enum_member(&row["disposition"], &["inspect","wait","change_intent","repair"]),
+            "authorization_required":authorized,
+        });
+        match kind {
+            "command" if allowed_action_argv(&row["argv"], authorized) => action["argv"] = row["argv"].clone(),
+            "command" => action["unavailable_reason"] = json!("child_argv_not_allowlisted"),
+            "wait" => {
+                action["until"] = json!(nonnegative(&row["until"]));
+                action["clock"] = json!(enum_member(&row["clock"], &["unix_seconds"]));
+                action["evidence"] = json!(enum_member(&row["evidence"], &["reported_local_deadline_not_a_success_guarantee"]));
+            }
+            _ => action["unavailable_reason"] = json!("child_instruction_not_forwarded"),
+        }
+        Some(action)
+    }).collect())
+}
+
+fn repair_counts(repairs: &Value) -> Option<[Option<u64>; doctor::REPAIR_ARRAYS.len()]> {
+    let mut exact = [None; doctor::REPAIR_ARRAYS.len()];
+    for (slot, key) in exact.iter_mut().zip(doctor::REPAIR_ARRAYS) {
+        let count = repairs["counts"].get(key)?;
+        if !count.is_null() {
+            *slot = Some(count.as_u64()?);
+        }
+    }
+    Some(exact)
+}
+
+fn repair_detail(row: &Value) -> Option<Value> {
+    let reason = row["reason"].as_str().and_then(doctor::known_repair_reason);
+    if row["kind"] == "identity"
+        && row["classification"] == "legacy_identity_evidence_normalization"
+    {
+        return Some(
+            json!({"kind":"identity","classification":"legacy_identity_evidence_normalization",
+            "reason":reason.unwrap_or("unavailable")}),
+        );
+    }
+    let id = row["operation_id"].as_i64().filter(|id| *id > 0)?;
+    Some(json!({
+        "operation_id":id,
+        "kind":safe_enum(&row["kind"], &["answer", "judge", "mine"], "unknown"),
+        "classification":safe_enum(&row["classification"],
+            &["legacy_429_policy_refusal", "submit_429_pre_enqueue", "submit_503_halt_middleware"], "unavailable"),
+        "reason":reason.unwrap_or("unavailable"),
+    }))
+}
+
+fn repair_receipt(data: &Value) -> Value {
+    const DETAIL_LIMIT: usize = 256;
+    let repairs = &data["repairs"];
+    let counts = repair_counts(repairs).unwrap_or_default();
+    let [eligible, _, applied, skipped] = counts;
+    let failure = repairs["failure"]
+        .as_str()
+        .and_then(doctor::known_repair_reason);
+    let observed = if data["repair_requested"] == true {
+        match (data["repair_outcome"].as_str(), repairs.get("failure")) {
+            (Some("failed"), _) if failure.is_some() => Some("failed"),
+            (Some("applied"), Some(Value::Null))
+                if eligible
+                    .zip(applied)
+                    .is_some_and(|(eligible, applied)| applied > 0 && applied <= eligible) =>
+            {
+                Some("applied")
+            }
+            (Some("no_eligible_repairs"), Some(Value::Null))
+                if eligible == Some(0) && applied == Some(0) && skipped == Some(0) =>
+            {
+                Some("no_eligible_repairs")
+            }
+            (Some("skipped"), Some(Value::Null))
+                if applied == Some(0)
+                    && eligible
+                        .zip(skipped)
+                        .is_some_and(|(eligible, skipped)| skipped > 0 && skipped <= eligible) =>
+            {
+                Some("skipped")
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let verified = repairs["restoration"]["verified"].as_bool();
+    let mut receipt = json!({
+        "status":observed.unwrap_or("failed"),
+        "outcome":observed.unwrap_or("unknown"),
+        "receipt_status":if observed.is_some() {"complete"} else {"unavailable"},
+        "preview":safe_enum(&repairs["preview"], &["complete","unavailable"], "unknown"),
+        "execution":safe_enum(&repairs["execution"],
+            &["not_requested","not_needed","not_started","complete","partial"], "unknown"),
+        "restoration_verified":verified,
+        "restoration":{
+            "verified":verified,
+            "runtime":safe_enum(&repairs["restoration"]["runtime"],
+                &["unknown", "unchanged", "restored", "caller_managed", "stopped"], "unknown"),
+            "manager_action":safe_enum(&repairs["restoration"]["manager_action"],
+                &["none", "runtime_stop", "runtime_stop_attempted"], "unrecognized"),
+        },
+        "evidence_limit":"Retained local evidence only; no new network verification was performed. Identity normalization retains legacy uncertainty and recorded rejection; it does not verify identity or repair credentials. Refusal response bodies were not retained. Legacy 429 repairs apply the developer's all-429 pre-enqueue refusal contract; hidden body contradictions cannot be ruled out.",
+    });
+    if receipt["status"] == "failed" {
+        receipt["reason"] = json!(failure.unwrap_or("doctor_repair_failed"));
+    }
+    let mut truncated = repairs["details_truncated"] == true;
+    for (key, count) in doctor::REPAIR_ARRAYS.into_iter().zip(counts) {
+        receipt[format!("{key}_count")] = json!(count);
+        let mut visible = 0;
+        if let Some(rows) = repairs[key].as_array() {
+            let projected: Vec<_> = rows
+                .iter()
+                .take(DETAIL_LIMIT)
+                .filter_map(repair_detail)
+                .collect();
+            visible = projected.len();
+            truncated |= visible < rows.len();
+            receipt[key] = Value::Array(projected);
+        }
+        truncated |= count.is_some_and(|count| count > visible as u64);
+    }
+    receipt["details_truncated"] = json!(if truncated {
+        Some(true)
+    } else if counts.iter().all(Option::is_some) {
+        Some(false)
+    } else {
+        repairs["details_truncated"].as_bool()
+    });
+    receipt
 }
 
 // Only bounded structured readiness crosses the process boundary. In particular,
@@ -728,7 +1118,30 @@ fn doctor_outcome(report: &mut Value, data: &Value, repair: bool, exited: bool) 
     };
     if data["intervention"].is_object() {
         readiness["intervention"] = intervention(&data["intervention"]);
-        readiness["intervention"]["controller"] = intervention(&data["intervention"]["controller"]);
+        if let Some(owner) = enum_member(
+            &data["intervention"]["owner"],
+            &["controller", "answer", "judge", "mine"],
+        ) {
+            readiness["intervention"]["owner"] = json!(owner);
+        }
+        let controller = &data["intervention"]["controller"];
+        let mut projected = intervention(controller);
+        projected["owner"] = safe_enum(
+            &controller["owner"],
+            &["managed", "foreground", "unknown"],
+            "unknown",
+        );
+        projected["run_mode"] = safe_enum(
+            &controller["run_mode"],
+            &["continuous", "once", "unknown"],
+            "unknown",
+        );
+        projected["state"] = safe_enum(
+            &controller["state"],
+            &["running", "stopped", "stale", "unknown"],
+            "unknown",
+        );
+        readiness["intervention"]["controller"] = projected;
         for lane in ["answer", "judge", "mine"] {
             readiness["intervention"]["lanes"][lane] = safe_enum(
                 &data["intervention"]["lanes"][lane],
@@ -741,11 +1154,35 @@ fn doctor_outcome(report: &mut Value, data: &Value, repair: bool, exited: bool) 
                 "undetermined",
             );
             let work = &data["work"][lane];
+            let intent = &work["intent"];
+            let admission = &work["admission"];
+            let step = &work["automatic_step"];
+            let modes = &["active", "read_only", "off"];
             readiness["work"][lane] = json!({
                 "phase":safe_enum(&work["phase"], &["stopped", "blocked", "preparing", "prepared", "generating", "dispatching",
                     "queued", "observing", "answered", "completed", "included", "waiting"], "unknown"),
-                "progress":safe_enum(&work["progress"], &["waiting", "blocked", "working", "idle", "complete"], "waiting"),
+                "progress":safe_enum(&work["progress"], &["waiting", "blocked", "working", "idle", "complete"], "undetermined"),
                 "intervention":intervention(&work["intervention"]),
+                "intent":{
+                    "requested_mode":enum_member(&intent["requested_mode"], modes),
+                    "effective_mode":enum_member(&intent["effective_mode"], modes),
+                    "paused":intent["paused"].as_bool(),
+                    "configuration":safe_enum(&intent["configuration"], &["loaded","pending","rejected","unknown"], "unknown"),
+                },
+                "admission":{
+                    "state":safe_enum(&admission["state"], &["not_fenced","fenced","not_applicable","unknown"], "unknown"),
+                    "allowed":admission["allowed"].as_bool(),
+                    "reason":diagnostic_reason(&admission["reason"]),
+                    "not_before":nonnegative(&admission["not_before"]),
+                },
+                "assessment":safe_assessment(&work["assessment"]),
+                "continuation":safe_continuation(&work["continuation"]),
+                "automatic_step":if matches!(step["state"].as_str(), Some("ready" | "waiting_automatically")) {
+                    safe_continuation(step)
+                } else { Value::Null },
+                "findings":safe_findings(&work["findings"]),
+                "background_recovery":safe_background(&work["background_recovery"]),
+                "next_actions":safe_actions(&work["next_actions"]),
             });
             if legacy_identity
                 && (work["intervention"]["reason"] == "hosted_identity_unverified"
@@ -757,119 +1194,24 @@ fn doctor_outcome(report: &mut Value, data: &Value, repair: bool, exited: bool) 
             // Removing an unproven legacy rejection must not hide an independently
             // reported operator requirement from another lane.
             if legacy_root
+                && readiness["intervention"]["status"] != "operator_required"
                 && readiness["work"][lane]["intervention"]["status"] == "operator_required"
             {
                 for key in ["status", "reason", "next_action", "next_at"] {
                     readiness["intervention"][key] =
                         readiness["work"][lane]["intervention"][key].clone();
                 }
+                readiness["intervention"]["owner"] = json!(lane);
                 readiness["intervention"]["unattended"] = json!(false);
             }
         }
     }
+    readiness["next_actions"] = safe_actions(&data["next_actions"]);
     report["readiness"] = readiness;
     if repair {
-        let complete = data["repair_requested"] == true
-            && data["repairs"].get("failure").is_some()
-            && ["eligible", "ineligible", "applied", "skipped"]
-                .iter()
-                .all(|key| data["repairs"][*key].is_array());
-        let status = match data["repair_outcome"].as_str() {
-            Some("applied")
-                if complete
-                    && data["repairs"]["applied"]
-                        .as_array()
-                        .is_some_and(|rows| !rows.is_empty()) =>
-            {
-                "applied"
-            }
-            Some("no_eligible_repairs")
-                if complete
-                    && data["repairs"]["eligible"]
-                        .as_array()
-                        .is_some_and(Vec::is_empty)
-                    && data["repairs"]["applied"]
-                        .as_array()
-                        .is_some_and(Vec::is_empty) =>
-            {
-                "no_eligible_repairs"
-            }
-            Some("skipped")
-                if complete
-                    && data["repairs"]["skipped"]
-                        .as_array()
-                        .is_some_and(|rows| !rows.is_empty())
-                    && data["repairs"]["applied"]
-                        .as_array()
-                        .is_some_and(Vec::is_empty) =>
-            {
-                "skipped"
-            }
-            _ => "failed",
-        };
-        report["repair"]["status"] = json!(status);
-        for key in ["eligible", "ineligible", "applied", "skipped"] {
-            if let Some(rows) = data["repairs"][key].as_array() {
-                report["repair"][format!("{key}_count")] = json!(rows.len());
-                report["repair"][key] = Value::Array(rows.iter().take(256).filter_map(|row| {
-                    if row["kind"] == "identity"
-                        && row["classification"] == "legacy_identity_evidence_normalization"
-                    {
-                        return Some(json!({"kind":"identity",
-                            "classification":"legacy_identity_evidence_normalization",
-                            "reason":safe_enum(&row["reason"], &["eligible", "already_resolved",
-                                "identity_evidence_changed", "legacy_identity_evidence_normalized",
-                                "not_legacy_identity_failure"], "unavailable")}));
-                    }
-                    let id = row["operation_id"].as_i64().filter(|id| *id > 0)?;
-                    Some(json!({
-                        "operation_id":id,
-                        "kind":safe_enum(&row["kind"], &["answer", "judge", "mine"], "unknown"),
-                        "classification":safe_enum(&row["classification"],
-                            &["legacy_429_policy_refusal", "submit_429_pre_enqueue", "submit_503_halt_middleware"], "unavailable"),
-                    }))
-                }).collect());
-                if rows.len() > 256 {
-                    report["repair"]["details_truncated"] = json!(true);
-                }
-            }
-        }
-        report["repair"]["restoration_verified"] = data["repairs"]["restoration"]["verified"]
-            .as_bool()
-            .map_or(Value::Null, Value::Bool);
-        report["repair"]["restoration"] = json!({
-            "verified":report["repair"]["restoration_verified"],
-            "runtime":safe_enum(&data["repairs"]["restoration"]["runtime"],
-                &["unknown", "unchanged", "restored", "caller_managed", "stopped"], "unknown"),
-            "manager_action":safe_enum(&data["repairs"]["restoration"]["manager_action"],
-                &["none", "runtime_stop_attempted"], "unrecognized"),
-        });
-        report["repair"]["evidence_limit"] = json!(
-            "Retained local evidence only; no new network verification was performed. Identity normalization retains legacy uncertainty and recorded rejection; it does not verify identity or repair credentials. Refusal response bodies were not retained. Legacy 429 repairs apply the developer's all-429 pre-enqueue refusal contract; hidden body contradictions cannot be ruled out."
-        );
-        if status == "failed" || !data["repairs"]["failure"].is_null() {
+        report["repair"] = repair_receipt(data);
+        if report["repair"]["status"] == "failed" {
             report["success"] = json!(false);
-            report["repair"]["status"] = json!("failed");
-            report["repair"]["reason"] = safe_enum(
-                &data["repairs"]["failure"],
-                &[
-                    "repair_report_invalid",
-                    "repair_action_failed",
-                    "repair_runtime_unavailable",
-                    "repair_runtime_stop_failed",
-                    "repair_runtime_restore_failed",
-                    "repair_interrupted",
-                    "doctor_recovery_unavailable",
-                    "doctor_account_unavailable",
-                    "refusal_recovery_schema",
-                    "refusal_recovery_conflict",
-                    "refusal_recovery_failed",
-                    "identity_evidence_changed",
-                    "identity_normalization_failed",
-                    "refusal_recovery_ineligible",
-                ],
-                "doctor_repair_failed",
-            );
         }
     }
     // Doctor exits nonzero for unhealthy readiness too. That does not negate a
@@ -893,6 +1235,7 @@ fn qualify_diagnosis(
     }
 }
 async fn diagnose(report: &mut Value, repair: bool, target: Option<&str>) {
+    let mut repair_invoked = false;
     let result = async {
         let (current, _) = installed()?;
         ensure!(
@@ -904,6 +1247,7 @@ async fn diagnose(report: &mut Value, repair: bool, target: Option<&str>) {
         } else {
             vec!["--json", "doctor"]
         };
+        repair_invoked = repair;
         let (exited, bytes) = child(&current.binary, &args, !repair).await?;
         let envelope: Value =
             serde_json::from_slice(&bytes).map_err(|_| failure("update_doctor_report_invalid"))?;
@@ -924,11 +1268,23 @@ async fn diagnose(report: &mut Value, repair: bool, target: Option<&str>) {
         Ok::<_, anyhow::Error>(())
     }
     .await;
-    if result.is_err() {
+    if let Err(error) = result {
         report["update"]["doctor_status"] = json!("unavailable");
         if repair {
             report["success"] = json!(false);
-            report["repair"] = json!({"status":"failed","reason":"activated_doctor_unavailable","outcome":"unknown"});
+            // Once the child could have run, loss of its receipt cannot establish
+            // no effect, rollback, or that it is safe to repeat the repair.
+            let may_have_run = repair_invoked
+                && error
+                    .downcast_ref::<lifecycle::LifecycleError>()
+                    .is_none_or(|error| error.code != "update_child_unavailable");
+            report["repair"] = json!({
+                "status":if may_have_run {"failed"} else {"not_run"},
+                "reason":"activated_doctor_unavailable","receipt_status":"unavailable",
+                "outcome":if may_have_run {"unknown"} else {"not_run"},
+                "eligible_count":null,"ineligible_count":null,"applied_count":null,"skipped_count":null,
+                "details_truncated":null,"restoration_verified":null,
+            });
         }
     }
 }
@@ -2109,6 +2465,15 @@ mod tests {
             result["readiness"]["work"]["answer"]["intervention"]["status"],
             "operator_required"
         );
+        assert_eq!(
+            result["readiness"]["work"]["judge"]["progress"],
+            "undetermined"
+        );
+        assert_eq!(
+            result["readiness"]["work"]["judge"]["continuation"]["state"],
+            "unknown"
+        );
+        assert!(result["readiness"]["work"]["judge"]["automatic_step"].is_null());
         assert!(!result.to_string().contains("secret-response-body"));
         assert!(!result.to_string().contains("credential"));
     }
@@ -2184,7 +2549,8 @@ mod tests {
                 "raw":"private-upstream-body"},
             "intervention":{"status":"undetermined","reason":"hosted_identity_legacy_unknown",
                 "next_action":"inspect_local_evidence"},
-            "repairs":{"eligible":[identity.clone()],"ineligible":[identity.clone()],
+            "repairs":{"counts":{"eligible":3,"ineligible":1,"applied":2,"skipped":1},
+                "eligible":[identity.clone()],"ineligible":[identity.clone()],
                 "applied":[identity.clone(),{"operation_id":7,"kind":"answer",
                     "classification":"submit_429_pre_enqueue"}],
                 "skipped":[identity],"failure":null,"restoration":{"verified":true}}});
@@ -2230,6 +2596,7 @@ mod tests {
         // the update fail or manufacturing successful identity verification.
         data["repair_outcome"] = json!("skipped");
         data["repairs"]["applied"] = json!([]);
+        data["repairs"]["counts"] = json!({"eligible":1,"ineligible":1,"applied":0,"skipped":1});
         data["repairs"]["skipped"][0]["reason"] = json!("identity_evidence_changed");
         doctor_outcome(&mut report, &data, true, false);
         assert_eq!(report["success"], true);
@@ -2239,6 +2606,81 @@ mod tests {
             "identity_evidence_changed"
         );
         assert_eq!(report["readiness"]["hosted_identity_verified"], Value::Null);
+    }
+
+    #[test]
+    fn legacy_repair_counts_are_exact_even_with_truncated_or_omitted_rows() {
+        let mut data = json!({"repair_requested":true,"repair_outcome":"applied","repairs":{
+            "failure":null,"counts":{"eligible":513,"ineligible":700,"applied":510,"skipped":3},
+            "eligible":[{"operation_id":1},{"operation_id":2},{"operation_id":3},{"operation_id":4}],
+            "applied":[{"operation_id":1}],
+        }});
+        let repair = repair_receipt(&data);
+        assert_eq!(repair["status"], "applied");
+        assert_eq!(repair["eligible_count"], 513);
+        assert_eq!(repair["ineligible_count"], 700);
+        assert_eq!(repair["applied_count"], 510);
+        assert_eq!(repair["skipped_count"], 3);
+        assert_eq!(repair["details_truncated"], true);
+
+        // Arrays cannot supply even one total when the scalar object is not
+        // complete and well-typed.
+        for counts in [
+            Value::Null,
+            json!({"eligible":513,"ineligible":700,"applied":510}),
+            json!({"eligible":513,"ineligible":700,"applied":"510","skipped":3}),
+            json!({"eligible":513,"ineligible":700,"applied":510,"skipped":-1}),
+            json!({"eligible":513,"ineligible":700,"applied":510.0,"skipped":3}),
+        ] {
+            data["repairs"]["counts"] = counts;
+            let repair = repair_receipt(&data);
+            assert_eq!(repair["receipt_status"], "unavailable");
+            assert_eq!(repair["outcome"], "unknown");
+            for key in doctor::REPAIR_ARRAYS {
+                assert_eq!(repair[format!("{key}_count")], Value::Null);
+            }
+        }
+    }
+
+    #[test]
+    fn typed_readiness_keeps_independent_step_and_rejects_untyped_argv() {
+        let data = json!({"healthy":false,"intervention":{"owner":"judge",
+            "controller":{"owner":"managed","run_mode":"continuous","state":"running"}},
+            "work":{"judge":{"progress":"private-legacy-progress",
+                "intent":{"requested_mode":"active","effective_mode":"read_only","configuration":"pending","paused":false},
+                "assessment":{"observed_at":20,"valid_until":80,"completeness":"complete",
+                    "exclusions":{"model_budget_exhausted":3,"private-unknown":4}},
+                "continuation":{"state":"unknown","target":"submission","reason":"account_uncertainty",
+                    "condition":"admission_fenced"},
+                "automatic_step":{"state":"waiting_automatically","target":"preparation","reason":"model_retry_backoff",
+                    "operation_id":17,"not_before":40,"condition":"retry_eligibility","job_id":"private-job"},
+                "next_actions":[{"kind":"command","disposition":"inspect","authorization_required":false,
+                    "argv":["agmi","--config","/private-config","status"]},
+                    {"kind":"command","disposition":"inspect","authorization_required":false,
+                    "argv":["agmi","operations","list"]}]}}});
+        let mut report = json!({"success":true});
+        doctor_outcome(&mut report, &data, false, false);
+        let readiness = &report["readiness"];
+        assert_eq!(readiness["intervention"]["owner"], "judge");
+        assert_eq!(
+            readiness["intervention"]["controller"]["run_mode"],
+            "continuous"
+        );
+        let judge = &readiness["work"]["judge"];
+        assert_eq!(judge["progress"], "undetermined");
+        assert_eq!(judge["continuation"]["condition"], "admission_fenced");
+        assert_eq!(judge["automatic_step"]["target"], "preparation");
+        assert_eq!(judge["automatic_step"]["not_before"], 40);
+        assert_eq!(
+            judge["assessment"]["exclusions"],
+            json!({"model_budget_exhausted":3})
+        );
+        assert!(judge["next_actions"][0]["argv"].is_null());
+        assert_eq!(
+            judge["next_actions"][1]["argv"],
+            json!(["agmi", "operations", "list"])
+        );
+        assert!(!report.to_string().contains("private-"));
     }
 
     fn identity(version: &str, commit: char, dirty: bool) -> Identity {
@@ -2371,7 +2813,9 @@ mod tests {
         report["installation"] = json!({"activation":"loaded_verified"});
         doctor_outcome(
             &mut report,
-            &json!({"healthy":false,"attention_required":true,"repair_outcome":"failed","repairs":{"applied":[1],"failure":"repair_runtime_restore_failed","restoration":{"verified":false}},"secret":"must_not_escape"}),
+            &json!({"healthy":false,"attention_required":true,"repair_requested":true,"repair_outcome":"failed",
+                "repairs":{"applied":[1],"counts":{"eligible":1,"ineligible":0,"applied":1,"skipped":0},
+                    "failure":"repair_runtime_restore_failed","restoration":{"verified":false}},"secret":"must_not_escape"}),
             true,
             false,
         );
@@ -2393,7 +2837,8 @@ mod tests {
         report["success"] = json!(true);
         doctor_outcome(
             &mut report,
-            &json!({"healthy":false,"repair_requested":true,"repair_outcome":"no_eligible_repairs","repairs":{"failure":null,"eligible":[],"ineligible":[],"applied":[],"skipped":[]}}),
+            &json!({"healthy":false,"repair_requested":true,"repair_outcome":"no_eligible_repairs",
+                "repairs":{"failure":null,"counts":{"eligible":0,"ineligible":0,"applied":0,"skipped":0}}}),
             true,
             false,
         );

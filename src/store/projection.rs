@@ -2,6 +2,189 @@ use super::*;
 use crate::endpoints::Endpoint;
 use crate::solver::contract::{NativeAttemptCompletion, NativeOutcome};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JudgeInventory {
+    Unresolved,
+    Available,
+    Idle,
+    Exhausted,
+    Blocked(&'static str),
+}
+
+/// Classify coverage, not admission. A positive selected candidate does not
+/// require complete inventory; every negative conclusion does.
+pub(crate) fn judge_inventory(assessment: &Value) -> JudgeInventory {
+    use JudgeInventory::*;
+    if assessment["locally_judgeable"] == true {
+        return Available;
+    }
+    if assessment["assessment_reason"] == "required_words_absent"
+        || assessment["completeness"] != "complete"
+        || assessment["locally_judgeable"] != false
+    {
+        return Unresolved;
+    }
+    let Some(observed) = assessment["observed_opportunities"].as_u64() else {
+        return Unresolved;
+    };
+    if (assessment["eligible_candidates"] != 0
+        && !(assessment["eligible_candidates"].is_null() && observed == 0))
+        || (observed == 0
+            && (assessment["excluded_work_truncated"] == true
+                || assessment["excluded_work"]
+                    .as_array()
+                    .is_some_and(|rows| !rows.is_empty())))
+    {
+        return Unresolved;
+    }
+    let mut total = 0_u64;
+    let mut exhausted = false;
+    let mut blocker = None;
+    if let Some(counts) = assessment["exclusions"].as_object() {
+        for (reason, count) in counts {
+            let Some(count) = count.as_u64() else {
+                return Unresolved;
+            };
+            total = total.saturating_add(count);
+            if count == 0 {
+                continue;
+            }
+            let finding = match reason.as_str() {
+                "already_attempted" | "configured_exclusion" => continue,
+                "model_budget_exhausted" if assessment["capped_work_proven"] != true => {
+                    (1, "model_attempt_budget_exhausted")
+                }
+                "model_budget_exhausted" => {
+                    exhausted = true;
+                    continue;
+                }
+                "assignment_read_backoff" | "assignment_resource_restricted" => {
+                    (0, "api_dependency_unavailable")
+                }
+                "model_uncertain_retry_disabled" => (1, "model_uncertain_retry_disabled"),
+                "model_uncertain_replacement_exhausted" => {
+                    (2, "model_uncertain_replacement_exhausted")
+                }
+                "model_preparation_reserved" => (3, "model_preparation_reserved"),
+                "model_retry_cooldown" => (4, "model_retry_backoff"),
+                _ => return Unresolved,
+            };
+            blocker = Some(blocker.map_or(finding, |previous| finding.min(previous)));
+        }
+    } else if !assessment["exclusions"].is_null() {
+        return Unresolved;
+    }
+    if total != observed {
+        return Unresolved;
+    }
+    match (blocker, exhausted) {
+        (Some((_, reason)), _) => Blocked(reason),
+        (None, true) => Exhausted,
+        (None, false) => Idle,
+    }
+}
+
+impl Store {
+    pub(crate) fn settled_judgment(&self, key: &str) -> Result<bool> {
+        Ok(self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM operations
+             WHERE kind='judge' AND work_key=?1 COLLATE NOCASE
+             AND state IN ('confirmed','final') AND txid IS NOT NULL)",
+            [key],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Qualify excluded work against the same snapshot as the inventory.
+    /// Work keys never cross into the public witness.
+    fn judge_work_evidence(&self, config: &Config, assessment: &mut Value, at: i64) -> Result<()> {
+        let caps = assessment["exclusions"]["model_budget_exhausted"]
+            .as_u64()
+            .unwrap_or(0);
+        let mut capped = 0;
+        let mut step: Option<(i64, Option<i64>, &'static str, &'static str)> = None;
+        if let Some(rows) = assessment["excluded_work"].as_array() {
+            for (index, row) in rows.iter().enumerate() {
+                let Some(key) = row["work_key"].as_str() else {
+                    continue;
+                };
+                if rows[..index].iter().any(|prior| {
+                    prior["work_key"]
+                        .as_str()
+                        .is_some_and(|prior| prior.eq_ignore_ascii_case(key))
+                }) {
+                    continue;
+                }
+                let witness = match row["reason"].as_str() {
+                    Some("model_budget_exhausted") => {
+                        let rejected: bool = self.db.query_row(
+                            "SELECT COALESCE((
+                               SELECT o.state='rejected' AND o.payload IS NULL
+                                 AND o.job_id IS NULL AND o.txid IS NULL
+                                 AND COALESCE(json_extract(e.model_attempt,'$.completion.execution')='completed',0)
+                               FROM operations o LEFT JOIN operation_evidence e ON e.operation_id=o.id
+                               WHERE o.kind='judge' AND o.work_key=?1 COLLATE NOCASE
+                               ORDER BY o.id DESC LIMIT 1),0)",
+                            [key],
+                            |row| row.get(0),
+                        )?;
+                        let retry = self.model_retry_assessment(LaneId::Judge, key, config, at)?;
+                        if rejected
+                            && retry.blocker == Some("model_budget_exhausted")
+                            && retry.unresolved_attempts == 0
+                            && retry.reserved_attempts == 0
+                        {
+                            capped += 1;
+                        }
+                        None
+                    }
+                    Some("model_retry_cooldown") => {
+                        let assessment =
+                            self.model_retry_assessment(LaneId::Judge, key, config, at)?;
+                        if let Some(next) = assessment.next_at.filter(|&next| {
+                            next > at && assessment.blocker == Some("model_retry_cooldown")
+                        }) {
+                            let id: Option<i64> = self.db.query_row(
+                                "SELECT MAX(id) FROM operations WHERE kind='judge' AND work_key=?1 COLLATE NOCASE",
+                                [key],
+                                |row| row.get(0),
+                            )?;
+                            id.map(|id| (next, Some(id), "preparation", "model_retry_backoff"))
+                        } else {
+                            None
+                        }
+                    }
+                    Some("assignment_read_backoff" | "assignment_resource_restricted") => {
+                        let read = self.read_backoff(&ReadKey::Assignment {
+                            assignment_id: key.to_owned(),
+                        })?;
+                        let next = read.next_at.max(self.request_not_before(
+                            config,
+                            Endpoint::ExplorerTx,
+                            Some(key),
+                        )?);
+                        (next > at).then_some((next, None, "discovery", "read_backoff"))
+                    }
+                    _ => None,
+                };
+                if let Some(row) = witness {
+                    step = Some(step.map_or(row, |existing| existing.min(row)));
+                }
+            }
+        }
+        if caps > 0 {
+            assessment["capped_work_proven"] =
+                json!(assessment["excluded_work_truncated"] == false && capped == caps);
+        }
+        if let Some((floor, operation, target, reason)) = step {
+            assessment["candidate_wait"] = json!({"not_before":floor,"operation_id":operation,
+                "target":target,"reason":reason,
+                "dependency":if operation.is_some() {"model_attempt"} else {"public_assignment_read"}});
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     pub(super) static REMOTE_CONTEXT_CONSTRUCTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -115,16 +298,10 @@ fn judging_model_scope(context: &RemoteWorkContext, key: &str) -> &'static str {
     // Unlike the runtime's independent-work check, a diagnostic claim of
     // historical failure needs negative evidence about this exact assignment.
     match assessment["observed_opportunities"].as_u64() {
-        Some(0)
-            if crate::health::judge_inventory(assessment)
-                == crate::health::JudgeInventory::Idle =>
-        {
-            "historical_assignment"
-        }
+        Some(0) if judge_inventory(assessment) == JudgeInventory::Idle => "historical_assignment",
         Some(observed)
             if assessment["eligible_candidates"] == 0
-                && crate::health::judge_inventory(assessment)
-                    != crate::health::JudgeInventory::Unresolved
+                && judge_inventory(assessment) != JudgeInventory::Unresolved
                 && assessment["excluded_work_truncated"] == false
                 && assessment["excluded_work"].as_array().is_some_and(|rows| {
                     observed == rows.len() as u64
@@ -781,9 +958,16 @@ impl Store {
                 params![authority, origin],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )?;
+        let public_prefix = serde_json::to_value(Endpoint::ExplorerTx)?;
+        let public_prefix = public_prefix.as_str().context("unexpected endpoint name")?;
+        let at = now();
         let mut stmt=self.db.prepare("SELECT owner,purpose,resource,operation_id,binding_revision,remote_resource,retired,
             failures,in_flight,started_at,finished_at,last_http_success_at,last_success_at,last_failure_at,failure_category,status,
-            local_next_at,server_not_before,retained_conservative_floor FROM read_state r WHERE retired=0
+            local_next_at,server_not_before,retained_conservative_floor,
+            CASE WHEN purpose='assignment' THEN COALESCE((SELECT MAX(not_before)
+                FROM request_restrictions WHERE authority=?1 AND origin=?2 AND scope='resource'
+                AND target=(?3 || ':' || r.resource) AND read_class=1),0) ELSE 0 END
+            FROM read_state r WHERE retired=0
             AND (operation_id IS NULL OR EXISTS(SELECT 1 FROM operations o WHERE o.id=r.operation_id
                 AND o.binding_revision=r.binding_revision AND o.state IN ('queued','unknown','included_pending','confirmed')))
             AND (purpose!='assignment' OR in_flight=1 OR EXISTS(SELECT 1 FROM operations o
@@ -792,11 +976,19 @@ impl Store {
                     json_each(s.lane_participation,'$.judge.assessment.excluded_work') e))
             ORDER BY CASE WHEN purpose='identity' THEN 0 WHEN purpose='discovery' THEN 1 ELSE 2 END,
                 in_flight DESC,CASE WHEN operation_id IS NOT NULL THEN 0 ELSE 1 END,owner,purpose,resource LIMIT 257")?;
-        let mut rows=stmt.query_map([],|r|{
+        let mut rows=stmt.query_map(params![authority, origin, public_prefix],|r|{
+            let purpose: String = r.get(1)?;
+            let (shared, shared_server, shared_local, shared_retained) = if purpose == "assignment" {
+                // Public ExplorerTx hydration does not inherit authenticated account floors.
+                (0, 0, 0, 0)
+            } else {
+                (shared, shared_server, shared_local, shared_retained)
+            };
             let local:i64=r.get(16)?;let server:i64=r.get(17)?;let legacy:i64=r.get(18)?;
-            let next=local.max(server).max(legacy).max(shared);
+            let resource_floor: i64 = r.get(19)?;
+            let next=local.max(server).max(legacy).max(shared).max(resource_floor);
             let category:Option<String>=r.get(14)?;
-            Ok(json!({"owner":r.get::<_,String>(0)?,"purpose":r.get::<_,String>(1)?,"resource":r.get::<_,String>(2)?,
+            Ok(json!({"owner":r.get::<_,String>(0)?,"purpose":purpose,"resource":r.get::<_,String>(2)?,
                 "operation_id":r.get::<_,Option<i64>>(3)?,"binding_revision":r.get::<_,Option<i64>>(4)?,
                 "remote_resource_digest":r.get::<_,Option<String>>(5)?.map(digest),"retired":r.get::<_,bool>(6)?,
                 "failures":r.get::<_,u32>(7)?,"state":if r.get::<_,bool>(8)?{"in_flight"}else{"idle"},
@@ -807,7 +999,8 @@ impl Store {
                 "retained_conservative_floor":legacy,"shared_not_before":shared,
                 "shared_server_not_before":shared_server,"shared_local_not_before":shared_local,
                 "shared_retained_not_before":shared_retained,
-                "next_at":next,"due_in_seconds":next.saturating_sub(now()).max(0)}))
+                "resource_not_before":resource_floor,
+                "next_at":next,"due_in_seconds":next.saturating_sub(at).max(0)}))
         })?.collect::<std::result::Result<Vec<_>,_>>()?;
         let truncated = rows.len() > 256;
         rows.truncate(256);
@@ -898,8 +1091,8 @@ impl Store {
                     (kind == LaneId::Judge
                         && op.is_none()
                         && context.fresh
-                        && crate::health::judge_inventory(assessment)
-                            == crate::health::JudgeInventory::Blocked("api_dependency_unavailable"))
+                        && judge_inventory(assessment)
+                            == JudgeInventory::Blocked("api_dependency_unavailable"))
                     .then_some(&assessment["excluded_work"])
                     .and_then(Value::as_array)
                     .and_then(|rows| {
@@ -1179,10 +1372,15 @@ impl Store {
                             .as_str()
                             .map(|current| revision == current)
                     );
-                    model["scope"] = json!(if kind == LaneId::Answer
-                        || op
-                            .as_ref()
-                            .is_some_and(|op| op.key == key && op.state != "model_unknown")
+                    model["scope"] = json!(if kind == LaneId::Answer {
+                        match context.scope.epoch.filter(|_| context.fresh) {
+                            Some(epoch) if key == epoch.to_string() => "current_work",
+                            Some(_) => "historical_epoch",
+                            None => "unassessed_epoch",
+                        }
+                    } else if op
+                        .as_ref()
+                        .is_some_and(|op| op.key == key && op.state != "model_unknown")
                     {
                         "current_work"
                     } else {
@@ -1243,13 +1441,17 @@ impl Store {
             }
             if kind == LaneId::Judge {
                 lane["assessment"] = assessment.clone();
+                if context.fresh {
+                    self.judge_work_evidence(config, &mut lane["assessment"], at)?;
+                }
                 if op.is_none()
                     && context.fresh
                     && assessment["source"].is_string()
-                    && crate::health::judge_inventory(assessment)
-                        == crate::health::JudgeInventory::Idle
-                    && crate::health::model_route_fault(&lane["model"]).is_none()
-                    && !crate::health::judge_model_relevance_unknown(&lane["model"])
+                    && matches!(
+                        judge_inventory(&lane["assessment"]),
+                        JudgeInventory::Idle | JudgeInventory::Exhausted
+                    )
+                    && lane["model"]["scope"] != "unassessed_assignment"
                     && !in_flight
                     && backoff.next_at <= now()
                     && lane["phase"] == "observing"

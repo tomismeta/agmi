@@ -1030,12 +1030,13 @@ fn finite_and_unbounded_remote_history_is_risk_across_every_lane_and_surface() {
                         }
                         let output = process.output().unwrap();
                         assert!(
-                            output.status.success(),
+                            output.status.success() == (command != "doctor"),
                             "{command}: {}",
                             String::from_utf8_lossy(&output.stdout)
                         );
                         let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
                         let report = &envelope["data"];
+                        assert!(report["intervention"]["unattended"].is_null());
                         assert_eq!(report["operational"]["status"], "clear");
                         assert_eq!(report["risk"]["background_remote_work"], 1);
                         assert_eq!(
@@ -1448,7 +1449,12 @@ fn confirmed_current_judgment_is_accepted_with_nonblocking_finality_followup() {
         let output = process.output().unwrap();
         let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
         let report = &envelope["data"];
-        assert!(output.status.success(), "{command}: {envelope}");
+        assert_eq!(
+            output.status.success(),
+            command != "doctor",
+            "{command}: {envelope}"
+        );
+        assert!(report["intervention"]["unattended"].is_null());
         assert_eq!(report["healthy"], true, "{command}: {report}");
         assert_eq!(report["operational"]["status"], "clear");
         assert_eq!(report["components"]["judge"]["state"], "ok");
@@ -1760,7 +1766,15 @@ fn managed_health_does_not_hide_discovery_failure_during_an_admission_wait() {
     )
     .unwrap();
     let (_, waiting) = run_health(&config, &["--managed-exit", "--min-free-mib", "0"]);
-    assert_eq!(waiting.status.code(), Some(3), "{waiting:?}");
+    let waiting_report: Value = serde_json::from_slice(&waiting.stdout).unwrap();
+    assert_eq!(waiting.status.code(), Some(1), "{waiting_report}");
+    let data = &waiting_report["data"];
+    assert!(data["intervention"]["unattended"].is_null());
+    assert_eq!(data["work"]["answer"]["intervention"]["next_at"], at + 120);
+    assert_eq!(
+        data["components"]["answer"]["reasons"],
+        serde_json::json!(["operation_backoff"])
+    );
 
     db.execute(
         "UPDATE read_state SET last_failure_at=?1,failures=1,status=503,failure_category='transport'
@@ -2135,6 +2149,80 @@ fn judge_model_failure_is_historical_only_with_current_complete_assignment_evide
         )
         .unwrap();
     assert_eq!(retained, model_attempt);
+}
+
+#[test]
+fn rejected_judge_attempts_at_cap_leave_distinct_work_open() {
+    use agmi::config::CountLimit;
+    use serde_json::json;
+
+    let (_dir, mut config, db, at) = initialized_health_fixture();
+    config.capabilities.judge.preparation.max_attempts_per_work = CountLimit::Bounded(1);
+    diagnostic_lane(&mut config, &db, "judge", CountLimit::Bounded(4), at);
+    let mut excluded = Vec::new();
+    for (id, symbol) in [(1, "a"), (2, "b"), (3, "c")] {
+        let key = symbol.repeat(64);
+        db.execute("INSERT INTO operations(id,kind,work_key,state,request,generation,revision,created_at,updated_at)
+            SELECT ?1,'judge',?2,'rejected','{}',generation,'fixture',?3,?3 FROM control",
+            rusqlite::params![id, key, at - 1]).unwrap();
+        let completion = json!({"producer":{"requested":{"model":"fixture-model"}},
+            "launch":{"admitted_at":at-1},"completion":{"phase":"artifact_validation",
+                "execution":"completed","outcome":"invalid","reason_code":"artifact_grade_invalid",
+                "collected_at":at-1,"preflight_started_at":at-1,"inference_spawned_at":at-1,"reported":{},
+                "cancellation":{"requested_at":null,"local_process_stop":"not_requested","remote_run_stop":"not_requested"}}});
+        db.execute(
+            "INSERT INTO operation_evidence(operation_id,model_attempt) VALUES(?1,?2)",
+            rusqlite::params![id, completion.to_string()],
+        )
+        .unwrap();
+        excluded.push(json!({"work_key":key,"reason":"model_budget_exhausted"}));
+    }
+    db.execute("UPDATE runtime_state SET lane_participation=json_set(lane_participation,
+         '$.judge.assessment.locally_judgeable',json('false'),'$.judge.assessment.eligible_candidates',0,
+         '$.judge.assessment.observed_opportunities',3,
+         '$.judge.assessment.exclusions',json('{\"model_budget_exhausted\":3}'),
+         '$.judge.assessment.excluded_work',json(?1),
+         '$.judge.assessment.excluded_work_truncated',json('false'))",
+         [json!(excluded).to_string()]).unwrap();
+
+    let mut report = diagnostic_health(&config);
+    assert_eq!(report["healthy"], true, "{}", report["issues"]);
+    agmi::health::compact_diagnostics(&mut report);
+    let judge = &report["work"]["judge"];
+    assert_eq!(judge["intervention"]["status"], "none_required");
+    assert_eq!(
+        judge["intervention"]["reason"],
+        "model_attempts_exhausted_for_observed_work"
+    );
+    assert_eq!(judge["admission"]["state"], "not_fenced");
+    assert_eq!(judge["assessment"]["observed_opportunities"], 3);
+    assert_eq!(judge["assessment"]["eligible_candidates"], 0);
+    assert_eq!(
+        judge["assessment"]["exclusions"]["model_budget_exhausted"],
+        3
+    );
+    assert!(!judge.to_string().contains(&"a".repeat(64)));
+
+    // A distinct assignment's public hydration cooldown is a specific next
+    // observation, not an authenticated-account restriction or another cap.
+    let public_key = "d".repeat(64);
+    excluded.push(json!({"work_key":public_key,"reason":"assignment_read_backoff"}));
+    db.execute(
+        "UPDATE runtime_state SET lane_participation=json_set(lane_participation,
+         '$.judge.assessment.observed_opportunities',4,
+         '$.judge.assessment.exclusions.assignment_read_backoff',1,
+         '$.judge.assessment.excluded_work',json(?1))",
+        [json!(excluded).to_string()],
+    )
+    .unwrap();
+    db.execute("INSERT INTO read_state(owner,purpose,resource,local_next_at,failures,last_failure_at,status)
+        VALUES('judge','assignment',?1,?2,1,?3,503)", rusqlite::params![public_key, at+60, at]).unwrap();
+    let mixed = diagnostic_health(&config);
+    let judge = &mixed["work"]["judge"];
+    assert_eq!(judge["assessment"]["capped_work_proven"], true);
+    assert_eq!(judge["intervention"]["next_action"], "observe_assignments");
+    assert_eq!(judge["intervention"]["next_at"], at + 60);
+    assert!(!agmi::health::managed_health_wait(&mixed));
 }
 
 #[test]

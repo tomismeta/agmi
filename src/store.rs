@@ -32,6 +32,7 @@ mod epoch;
 mod inspection;
 pub mod migration;
 mod projection;
+pub(crate) use projection::{JudgeInventory, judge_inventory};
 mod reads;
 mod schema;
 pub(crate) use reads::{
@@ -76,6 +77,15 @@ impl std::fmt::Display for RefusalRecoveryError {
 }
 impl std::error::Error for RefusalRecoveryError {}
 
+#[derive(Debug)]
+struct MissingRefusalOperation;
+impl std::fmt::Display for MissingRefusalOperation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("operation not found")
+    }
+}
+impl std::error::Error for MissingRefusalOperation {}
+
 /// Local-only extension of recover resolve. A preview never opens a writer;
 /// application requires its exact snapshot token and excludes a live controller.
 pub fn recovery_refusal(config_path: &Path, operation: i64, apply: Option<&str>) -> Result<Value> {
@@ -98,8 +108,8 @@ pub fn recovery_refusal(config_path: &Path, operation: i64, apply: Option<&str>)
     }
 }
 
-/// Local doctor repairs share the stopped-writer guards. Identity normalization
-/// also requires the original preview, so new observations cannot be overwritten.
+/// Apply only the frozen preview. The stopped-writer guards and each operation's
+/// token determine whether that exact candidate can still be repaired.
 pub(crate) fn doctor_repairs(config_path: &Path, apply: Option<&Value>) -> Result<Value> {
     let _configuration = crate::admin::lock_config_directory(config_path)?;
     let config = Config::load_metadata(config_path)?;
@@ -110,28 +120,32 @@ pub(crate) fn doctor_repairs(config_path: &Path, apply: Option<&Value>) -> Resul
     }
     let mut report = json!({"config_revision":revision,"eligible":[],"ineligible":[],
         "applied":[],"skipped":[],"failure":null,
-        "restoration":{"manager_action":"none","runtime":"unchanged"}});
+        "restoration":{"manager_action":"none","runtime":"unchanged","verified":null}});
     let Some(store) = Store::read_only(&config)? else {
+        if apply.is_some() {
+            return Err(RefusalRecoveryError("refusal_recovery_conflict").into());
+        }
         return Ok(report);
     };
     store.routing_change_allowed(&config)?;
-    if apply.is_none() {
+    let Some(apply) = apply else {
         let snapshot = store.db.unchecked_transaction()?;
         let (mut eligible, ineligible) = Store::refusal_candidates(&snapshot, &revision)?;
         let (identity, _) = Store::identity_normalization_preview(&snapshot, &revision)?;
         if identity["eligible"] == true {
             eligible.push(identity);
         }
-        report["eligible"] = json!(eligible);
-        report["ineligible"] = json!(ineligible);
+        report["eligible"] = Value::Array(eligible);
+        report["ineligible"] = Value::Array(ineligible);
         snapshot.commit()?;
         return Ok(report);
-    }
+    };
+    let eligible = apply["eligible"]
+        .as_array()
+        .context(RefusalRecoveryError("repair_report_invalid"))?;
     // Writer acquisition may bind a new routing profile. That must not reset
     // observations as a side effect of local identity normalization.
-    if apply
-        .and_then(|preview| preview["eligible"].as_array())
-        .is_some_and(|rows| rows.iter().any(|row| row["kind"] == "identity"))
+    if eligible.iter().any(|row| row["kind"] == "identity")
         && store.routing_status(&config)?["matches_config"] != true
     {
         return Err(RefusalRecoveryError("identity_evidence_changed").into());
@@ -140,74 +154,63 @@ pub(crate) fn doctor_repairs(config_path: &Path, apply: Option<&Value>) -> Resul
     let (_account, mut store) = AccountLock::acquire(&config)
         .map_err(|error| error.context(RefusalRecoveryError("doctor_account_unavailable")))?;
     let _gate = AccountAdmissionGuard::acquire(&config)?;
-    let (mut eligible, ineligible) = Store::refusal_candidates(&store.db, &revision)?;
-    if let Some(identity) = apply
-        .and_then(|preview| preview["eligible"].as_array())
-        .and_then(|rows| {
-            rows.iter().find(|row| {
-                row["kind"] == "identity"
-                    && row["classification"] == "legacy_identity_evidence_normalization"
-            })
-        })
-    {
-        eligible.push(identity.clone());
-    }
-    report["ineligible"] = json!(ineligible);
     let mut applied = Vec::new();
     let mut skipped = Vec::new();
-    for preview in &eligible {
-        if preview["kind"] == "identity" {
-            let mut skipped_row = preview.clone();
-            if !report["failure"].is_null() {
-                skipped_row["reason"] = json!("earlier_repair_failed");
-                skipped.push(skipped_row);
-                continue;
-            }
-            let token = preview["preview_token"]
-                .as_str()
-                .context("missing identity token")?;
-            match store.normalize_legacy_identity(&revision, token) {
-                Ok(result) if result["applied"] == true => applied.push(result),
-                Ok(result) => skipped.push(result),
-                Err(error) => {
-                    let code = error
-                        .downcast_ref::<RefusalRecoveryError>()
-                        .map_or("identity_normalization_failed", |error| error.0);
-                    if code != "identity_evidence_changed" {
-                        report["failure"] = json!(code);
-                    }
-                    skipped_row["eligible"] = json!(false);
-                    skipped_row["reason"] = json!(code);
-                    skipped.push(skipped_row);
-                }
-            }
+    let mut failure = None;
+    for preview in eligible {
+        if failure.is_some() {
+            skipped.push(skipped_doctor_repair(preview, "earlier_repair_failed"));
             continue;
         }
-        let id = preview["operation_id"]
-            .as_i64()
-            .context("invalid refusal operation")?;
-        if !report["failure"].is_null() {
-            skipped.push(json!({"operation_id":id,"reason":"earlier_repair_failed"}));
-            continue;
-        }
-        let token = preview["preview_token"]
-            .as_str()
-            .context("missing refusal token")?;
-        match store.resolve_refusal(id, &revision, token) {
-            Ok(result) => applied.push(result),
+        let identity = preview["kind"] == "identity";
+        let result = match (
+            identity,
+            preview["operation_id"].as_i64(),
+            preview["preview_token"].as_str(),
+        ) {
+            (true, _, Some(token)) => store.normalize_legacy_identity(&revision, token),
+            (false, Some(id), Some(token)) => store.resolve_refusal(id, &revision, token),
+            _ => Err(RefusalRecoveryError("repair_report_invalid").into()),
+        };
+        match result {
+            Ok(result) if result["applied"] == true => applied.push(result),
+            Ok(result) => skipped.push(result),
             Err(error) => {
-                let code = error
-                    .downcast_ref::<RefusalRecoveryError>()
-                    .map_or("refusal_recovery_failed", |error| error.0);
-                report["failure"] = json!(code);
-                skipped.push(json!({"operation_id":id,"reason":code}));
+                let code = if let Some(error) = error.downcast_ref::<RefusalRecoveryError>() {
+                    error.0
+                } else if identity {
+                    "identity_normalization_failed"
+                } else if error.downcast_ref::<MissingRefusalOperation>().is_some() {
+                    "refusal_recovery_ineligible"
+                } else {
+                    "refusal_recovery_failed"
+                };
+                if !matches!(
+                    code,
+                    "identity_evidence_changed"
+                        | "refusal_recovery_conflict"
+                        | "refusal_recovery_ineligible"
+                ) {
+                    failure = Some(code);
+                }
+                skipped.push(skipped_doctor_repair(preview, code));
             }
         }
     }
-    report["eligible"] = json!(eligible);
-    report["applied"] = json!(applied);
-    report["skipped"] = json!(skipped);
+    report["applied"] = Value::Array(applied);
+    report["skipped"] = Value::Array(skipped);
+    report["failure"] = json!(failure);
+    report["execution"] = json!(if failure.is_some() {
+        "partial"
+    } else {
+        "complete"
+    });
     Ok(report)
+}
+
+pub(crate) fn skipped_doctor_repair(preview: &Value, reason: &str) -> Value {
+    json!({"operation_id":preview["operation_id"],"kind":preview["kind"],
+        "classification":preview["classification"],"eligible":false,"applied":false,"reason":reason})
 }
 
 // SQLite may see a new inode only after its raw creation descriptor is closed.
@@ -3327,7 +3330,17 @@ impl Store {
         Ok(answers)
     }
 
+    #[cfg(test)]
     pub(crate) fn runtime_state(&self, config: &Config, reload_blocked: bool) -> Result<()> {
+        self.runtime_state_with_mode(config, reload_blocked, false)
+    }
+
+    pub(crate) fn runtime_state_with_mode(
+        &self,
+        config: &Config,
+        reload_blocked: bool,
+        once: bool,
+    ) -> Result<()> {
         self.continuity()?;
         // Reserve the writer before reading metadata that concurrent lane controls can change.
         let tx = rusqlite::Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
@@ -3347,6 +3360,7 @@ impl Store {
         policy["process"] = json!({
             "pid":std::process::id(),
             "start_ticks":crate::installer::current_start_ticks(),
+            "run_mode": if once { "once" } else { "continuous" },
             "authority_epoch":authority_epoch,
             "runtime_instance":runtime_instance,
             "account_generation":account_generation,
@@ -3824,7 +3838,7 @@ impl Store {
                 },
             )
             .optional()?
-            .context("operation not found")?;
+            .context(MissingRefusalOperation)?;
         let (
             kind,
             state,
@@ -4513,8 +4527,7 @@ mod tests {
         })
     }
 
-    #[test]
-    fn doctor_batch_preserves_partial_progress_and_fences_configuration_and_writer() {
+    fn doctor_fixture() -> (tempfile::TempDir, Config, PathBuf) {
         let (temp, mut config) = fixture();
         config.network.chain = format!(
             "test-{}",
@@ -4528,6 +4541,12 @@ mod tests {
         config.network.credential_file = temp.path().join("unused-credential");
         let path = temp.path().join("config.toml");
         fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+        (temp, config, path)
+    }
+
+    #[test]
+    fn doctor_batch_preserves_partial_progress_and_fences_configuration_and_writer() {
+        let (_temp, config, path) = doctor_fixture();
         let (account, mut store) = AccountLock::acquire(&config).unwrap();
         store
             .set_paused(false, &AccountAdmissionGuard::acquire(&config).unwrap())
@@ -4578,6 +4597,64 @@ mod tests {
         assert_eq!(store.operation(2).unwrap().unwrap().state, "unknown");
         assert_eq!(store.operation(3).unwrap().unwrap().state, "unknown");
         assert!(store.control().unwrap().paused);
+    }
+
+    #[test]
+    fn doctor_apply_revalidates_the_frozen_candidates_without_substituting_new_work() {
+        let (_temp, config, path) = doctor_fixture();
+        let (account, mut store) = AccountLock::acquire(&config).unwrap();
+        store
+            .set_paused(false, &AccountAdmissionGuard::acquire(&config).unwrap())
+            .unwrap();
+        for epoch in 1..=4 {
+            let op = prepared_epoch(&mut store, LaneId::Judge, epoch, "historical");
+            store
+                .db
+                .execute("UPDATE operations SET state='unknown' WHERE id=?1", [op.id])
+                .unwrap();
+            if epoch != 4 {
+                store
+                    .record_evidence(op.id, &refusal_evidence(op.kind, 429, Some("rate_limited")))
+                    .unwrap();
+                age_refusal_evidence(&store, op.id);
+            }
+        }
+        let preview = doctor_repairs(&path, None).unwrap();
+        assert_eq!(preview["eligible"].as_array().unwrap().len(), 3);
+        assert_eq!(preview["ineligible"][0]["operation_id"], 4);
+        store
+            .db
+            .execute_batch(
+                "UPDATE operations SET result='{}' WHERE id=1;
+             UPDATE operations SET job_id='fixture-job' WHERE id=2;",
+            )
+            .unwrap();
+        store
+            .record_evidence(
+                4,
+                &refusal_evidence(LaneId::Judge, 429, Some("rate_limited")),
+            )
+            .unwrap();
+        age_refusal_evidence(&store, 4);
+        drop(store);
+        drop(account);
+
+        let result = doctor_repairs(&path, Some(&preview)).unwrap();
+        assert_eq!(result["failure"], Value::Null);
+        assert_eq!(result["applied"].as_array().unwrap().len(), 1);
+        assert_eq!(result["applied"][0]["operation_id"], 3);
+        assert_eq!(result["skipped"].as_array().unwrap().len(), 2);
+        assert_eq!(result["skipped"][0]["reason"], "refusal_recovery_conflict");
+        assert_eq!(
+            result["skipped"][1]["reason"],
+            "refusal_recovery_ineligible"
+        );
+        let store = Store::read_only(&config).unwrap().unwrap();
+        assert_eq!(store.operation(4).unwrap().unwrap().state, "unknown");
+        drop(store);
+        let repeat = doctor_repairs(&path, Some(&preview)).unwrap();
+        assert_eq!(repeat["applied"], json!([]));
+        assert_eq!(repeat["skipped"][2]["reason"], "already_resolved");
     }
 
     #[test]

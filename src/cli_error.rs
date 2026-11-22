@@ -27,7 +27,14 @@ pub(crate) fn action(config: Option<&Path>, command: &[&str], authorization: boo
         argv.extend(["--config".into(), path.to_owned()]);
     }
     argv.extend(command.iter().map(|part| (*part).to_owned()));
-    json!({"kind":"command","argv":argv,"authorization_required":authorization})
+    let disposition = if command.starts_with(&["doctor", "--repair"]) {
+        "repair"
+    } else if authorization {
+        "change_intent"
+    } else {
+        "inspect"
+    };
+    json!({"kind":"command","argv":argv,"authorization_required":authorization,"disposition":disposition})
 }
 /// Render one argv element with POSIX single-quote escaping when needed.
 fn shell_quote(argument: &str) -> Cow<'_, str> {
@@ -477,12 +484,14 @@ pub(crate) fn diagnostics(data: &mut Value, config: Option<&Path>) {
             "hosted_identity_unavailable" | "hosted_identity_invalid_response" |
             "hosted_identity_legacy_unknown" | "hosted_identity_authentication_failed" => (&["reads"], false),
             "hosted_identity_mismatch" => (&["config", "show"], false),
-            "not_initialized" => (&["run", "--once"], true),
+            "not_initialized" => (&["run", "--help"], false),
             _ => (&["status"], false),
         };
         let mut actions = vec![action(config, command, authorization)];
         let instruction = match *code {
             "config_location_unavailable" => Some("Select the existing configuration with --config, or choose a private configuration path before initialization."),
+            "not_initialized" => Some("A run invocation may perform real work, including with --once. Inspect controller ownership and configured modes before starting it."),
+            "assignment_access_unverified" => Some("Inspect the recorded public assignment read and its deadline. This read does not use the account credential."),
             "local_evidence_unavailable" => Some("Inspect local state access and integrity without deleting, replacing or opening a second writer on the journal."),
             "state_disk_space_low" | "state_disk_headroom_low" | "state_disk_space_unavailable" =>
                 Some("Inspect state filesystem capacity and access. Preserve the journal, WAL, retained evidence and credentials; do not delete state to free space."),
@@ -512,6 +521,11 @@ pub(crate) fn diagnostics(data: &mut Value, config: Option<&Path>) {
             .map(|duration| i64::try_from(duration.as_secs()).unwrap_or(i64::MAX))
             .unwrap_or(0)
     });
+    let managed = data["intervention"]["controller"]["owner"] == "managed";
+    let controller = &data["intervention"]["controller"];
+    let continuous = controller["state"] == "running"
+        && controller["run_mode"] == "continuous"
+        && controller["ready"] == true;
     for lane in agmi::capability::LaneId::NAMES {
         let detail = &data["work"][lane];
         if !detail.is_object() {
@@ -523,8 +537,14 @@ pub(crate) fn diagnostics(data: &mut Value, config: Option<&Path>) {
             && detail["model"]["failure_category"] == "native_api_unsupported"
             && data["effective_capabilities"][lane]["model"]["harness"] == "openclaw";
         let detail = &mut data["work"][lane];
-        detail["next_actions"] =
-            intervention_actions(&detail["intervention"], &diagnostics, config, checked_at);
+        detail["next_actions"] = intervention_actions(
+            &detail["intervention"],
+            &diagnostics,
+            config,
+            checked_at,
+            managed,
+            continuous,
+        );
         if show_hint {
             detail["next_actions"]
                 .as_array_mut()
@@ -580,14 +600,23 @@ pub(crate) fn diagnostics(data: &mut Value, config: Option<&Path>) {
             }
         }
     }
-    let mut actions = intervention_actions(&data["intervention"], &diagnostics, config, checked_at)
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    if data["intervention"]["next_action"] == "resume" && data["paused"] != true {
-        actions = if let Some(lane) = agmi::capability::LaneId::NAMES.into_iter().find(|lane| {
-            data["lane_controls"][*lane]["desired"]["paused"] == true
-                && data["work"][*lane]["intervention"]["next_action"] == "resume"
+    let mut actions = intervention_actions(
+        &data["intervention"],
+        &diagnostics,
+        config,
+        checked_at,
+        managed,
+        continuous,
+    )
+    .as_array()
+    .cloned()
+    .unwrap_or_default();
+    if data["intervention"]["reason"] == "lane_paused"
+        && data["intervention"]["next_action"] == "resume"
+    {
+        actions = if let Some(lane) = data["intervention"]["owner"].as_str().filter(|lane| {
+            agmi::capability::LaneId::NAMES.contains(lane)
+                && data["lane_controls"][*lane]["desired"]["paused"] == true
         }) {
             data["work"][lane]["next_actions"]
                 .as_array()
@@ -629,8 +658,30 @@ pub(crate) fn diagnostics(data: &mut Value, config: Option<&Path>) {
     if gated {
         actions.retain(|step| !contradicts_inspection_gate(step));
     }
+    for step in actions.iter_mut().chain(
+        diagnostics
+            .iter_mut()
+            .flat_map(|row| row["next_actions"].as_array_mut().into_iter().flatten()),
+    ) {
+        set_action_disposition(step);
+    }
+    for lane in agmi::capability::LaneId::NAMES {
+        if let Some(actions) = data["work"][lane]["next_actions"].as_array_mut() {
+            actions.iter_mut().for_each(set_action_disposition);
+        }
+    }
     data["next_actions"] = json!(actions);
     data["diagnostics"] = Value::Array(diagnostics);
+}
+
+fn set_action_disposition(action: &mut Value) {
+    if action.get("disposition").is_none() {
+        action["disposition"] = json!(match action["kind"].as_str() {
+            Some("wait") => "wait",
+            _ if action["authorization_required"] == true => "change_intent",
+            _ => "inspect",
+        });
+    }
 }
 
 fn openclaw_setup_instruction() -> Value {
@@ -687,17 +738,33 @@ fn intervention_actions(
     diagnostics: &[Value],
     config: Option<&Path>,
     checked_at: i64,
+    managed: bool,
+    continuous: bool,
 ) -> Value {
     let mut actions = Vec::new();
     match detail["status"].as_str() {
         Some("none_required") => return json!([]),
+        Some("automatic_recovery") if !continuous => {
+            actions.push(action(config, &["status"], false));
+            actions.push(json!({"kind":"instruction","authorization_required":false,
+                "message":"A local path is recorded, but a continuing controller was not verified. Inspect current ownership before relying on automatic recovery."}));
+        }
         Some("automatic_recovery") => {
             if let Some(deadline) = detail["next_at"].as_i64().filter(|at| *at > checked_at) {
-                actions.push(json!({"kind":"wait","until":deadline,"clock":"unix_seconds",
-                    "authorization_required":false,"evidence":"reported_local_deadline_not_a_success_guarantee"}));
+                actions.push(
+                    json!({"kind":"wait","until":deadline,"clock":"unix_seconds",
+                    "disposition":"wait","authorization_required":false,
+                    "evidence":"reported_local_deadline_not_a_success_guarantee"}),
+                );
             }
-            actions.push(json!({"kind":"instruction","authorization_required":false,
-                "message":"The configured controller has an automatic path; wait for fresh local evidence. Retry eligibility and upstream success are not guaranteed. Do not replay writes or change policy merely to bypass the wait."}));
+            let message = if detail["resolution"] == "polling_not_guaranteed" {
+                "Only re-observation is scheduled. The original outcome remains unknown; do not replay it."
+            } else {
+                "The configured controller has an automatic path; wait for fresh local evidence. Retry eligibility and upstream success are not guaranteed. Do not replay writes or change policy merely to bypass the wait."
+            };
+            actions.push(
+                json!({"kind":"instruction","authorization_required":false,"message":message}),
+            );
             actions.push(action(config, &["health"], false));
         }
         _ => {
@@ -719,13 +786,29 @@ fn intervention_actions(
                 actions.push(json!({"kind":"instruction","authorization_required":false,
                     "message":"Inspect the controller's model temporary directory, its parent filesystem capacity, quota and permissions. A local workspace failure is not a model-provider or account-credential rejection. Preserve the journal, WAL, credentials and unknown outcomes. Doctor --repair does not repair model workspaces. A service restart can recreate a deleted private temporary namespace, but stops active model calls; assess in-flight work before explicitly restarting. Do not delete active service directories or reset model attempts."}));
                 actions.push(action(config, &["operations", "list"], false));
-                actions.push(action(config, &["service", "status"], false));
+                if managed {
+                    actions.push(action(None, &["service", "status"], false));
+                } else {
+                    actions.push(action(config, &["status"], false));
+                }
+                return json!(actions);
+            }
+            if detail["next_action"] == "start_controller"
+                || detail["next_action"] == "inspect_managed_service"
+            {
+                if managed {
+                    actions.push(action(None, &["service", "status"], false));
+                } else {
+                    actions.push(action(config, &["status"], false));
+                }
+                actions.push(json!({"kind":"instruction","disposition":"inspect","authorization_required":false,
+                    "message":"Verify controller ownership before starting a service or foreground writer. A stale or unavailable observation is not proof of a stopped controller."}));
                 return json!(actions);
             }
             let command: &[&str] = match detail["next_action"].as_str() {
+                Some("resume") if detail["reason"] == "lane_paused" => &["lane", "--help"],
                 Some("resume") => &["resume"],
-                Some("initialize_controller") => &["run", "--once"],
-                Some("start_controller") => &["run"],
+                Some("initialize_controller") => &["run", "--help"],
                 Some(
                     "repair_config" | "review_participation_policy" | "review_model_configuration",
                 ) => &["config", "show"],
@@ -737,21 +820,15 @@ fn intervention_actions(
                 }
                 _ => &["status"],
             };
-            if command == ["run"] {
-                actions.push(json!({"kind":"instruction","authorization_required":false,
-                    "message":"Inspect the selected managed service or foreground controller before starting it; do not run two controllers."}));
-            }
             if command == ["recover-model"] {
                 actions.push(json!({"kind":"instruction","authorization_required":false,
                     "message":"Inspect retained model evidence and stop its controller before explicitly authorizing model-only abandonment. Abandonment does not refund execution exposure or grant another attempt; eligible regeneration may incur another model charge. Sent network requests are never reset."}));
             }
+
             actions.push(action(
                 config,
                 command,
-                matches!(
-                    command,
-                    ["resume"] | ["run"] | ["run", "--once"] | ["recover-model"]
-                ),
+                matches!(command, ["resume"] | ["recover-model"]),
             ));
         }
     }
@@ -947,13 +1024,43 @@ pub(crate) fn human(kind: &str, data: &Value) {
             if data["dry_run"] == true {
                 println!("Dry run: no installer changes.");
             }
-            if kind == "service"
+            if data["manager"].is_object() {
+                for (label, field) in [
+                    ("Controller", "controller"),
+                    ("Last health probe", "health_probe"),
+                    ("Health timer", "health_timer"),
+                ] {
+                    let unit = &data["manager"][field];
+                    print!(
+                        "{label}: {}/{}",
+                        unit["active"].as_str().unwrap_or("unavailable"),
+                        unit["substate"].as_str().unwrap_or("unavailable")
+                    );
+                    if let Some(pid) = unit["pid"].as_u64() {
+                        print!("; PID {pid}");
+                    }
+                    if let Some(result) = unit["result"].as_str() {
+                        print!("; result {result}");
+                    }
+                    if let Some(code) = unit["exit_code"].as_i64() {
+                        print!("; exit {code}");
+                    }
+                    if let Some(error) = unit["error"].as_str() {
+                        print!("; {error}");
+                    }
+                    println!();
+                }
+            } else if kind == "service"
                 && data["plan"]["arguments"][1] == "status"
                 && let Some(output) = data["output"].as_str()
             {
                 print!("{output}");
             }
         }
+        "run" => println!(
+            "Run ended ({}). This does not attest participation; inspect status.",
+            data["run_mode"].as_str().unwrap_or("unknown")
+        ),
         "lane_show" | "lane_pause" | "lane_resume" => print_lane_control(data),
         "pause" => println!(
             "Participation paused; dispatched requests and server auto-mining are not retracted."
@@ -1117,11 +1224,18 @@ fn print_core_row(data: &Value) {
     } else {
         print!("Core: ready={}", fmt_json(&root["controller"]["ready"]));
     }
-    println!(
-        "; {} ({})",
-        intervention_label(&root["status"]),
-        intervention_reason(root)
-    );
+    let controller = &root["controller"];
+    if let Some(reason) = controller["reason"].as_str() {
+        println!(
+            "; {} ({reason}); {}/{}/{}",
+            intervention_label(&controller["status"]),
+            controller["owner"].as_str().unwrap_or("unknown"),
+            controller["run_mode"].as_str().unwrap_or("unknown"),
+            controller["state"].as_str().unwrap_or("unknown")
+        );
+    } else {
+        println!();
+    }
     if let Some(gate) = inspection_gate(data) {
         println!("Shared prerequisite: {gate}; lane recovery paths remain conditional.");
     }
@@ -1150,21 +1264,29 @@ fn print_lane_row(data: &Value, lane: &str) {
             }
         }
     }
-    let control = &data["lane_controls"][lane];
-    if control["authoritative_closure"]["state"] == "closed" {
-        print!("; fenced");
-    } else {
-        let observed = &control["observed_admission"];
-        if observed["state"] != "open" || observed["freshness"] != "current_observation" {
-            print!(
-                "; admission={}",
-                observed["state"].as_str().unwrap_or("unknown")
-            );
-            if let Some(freshness) = observed["freshness"].as_str()
-                && freshness != "current_observation"
-            {
-                print!("/{freshness}");
-            }
+    let admission = work["admission"]["state"].as_str().unwrap_or("unknown");
+    print!("; local admission={admission}");
+    let continuation = &work["continuation"];
+    if let Some(state) = continuation["state"].as_str() {
+        print!("; continuation={state}");
+        if let Some(target) = continuation["target"]
+            .as_str()
+            .filter(|target| *target != "none")
+        {
+            print!(" ({target})");
+        }
+    }
+    let assessment = &work["assessment"];
+    if assessment["completeness"] == "complete"
+        && intervention["observation_fresh"] == true
+        && let (Some(total), Some(eligible)) = (
+            assessment["observed_opportunities"].as_u64(),
+            assessment["eligible_candidates"].as_u64(),
+        )
+    {
+        print!("; {eligible}/{total} candidates");
+        if let Some(caps) = assessment["exclusions"]["model_budget_exhausted"].as_u64() {
+            print!(", {caps} attempt caps");
         }
     }
     let primary = &intervention["next_observation"];
@@ -1779,7 +1901,7 @@ mod tests {
         for token in [json!("lane-token"), Value::Null] {
             let mut report = json!({
                 "paused":false,"issues":[],
-                "intervention":{"status":"operator_required","reason":"lane_paused","next_action":"resume"},
+                "intervention":{"status":"operator_required","owner":"judge","reason":"lane_paused","next_action":"resume"},
                 "work":{"judge":{"intervention":{"status":"operator_required","reason":"lane_paused","next_action":"resume"}}},
                 "lane_controls":{"judge":{"desired":{"paused":true,"control_token":token}}}
             });
@@ -1911,6 +2033,7 @@ mod tests {
     fn diagnostic_actions_use_only_supplied_future_deadlines_and_keep_risk() {
         let mut value = json!({"checked_at":100,"issues":["pending_outcome_uncertain"],
             "risk":{"unresolved_effects":4},"operational":{"status":"clear"},
+            "intervention":{"controller":{"owner":"managed","run_mode":"continuous","state":"running","ready":true}},
             "work":{"answer":{"intervention":{"status":"automatic_recovery","next_action":"await_reconciliation","next_at":120}},
                 "judge":{"intervention":{"status":"automatic_recovery","next_action":"await_assignments","next_at":null}},
                 "mine":{"intervention":{"status":"automatic_recovery","next_action":"observe_challenge","next_at":99}}}});
@@ -1960,16 +2083,20 @@ mod tests {
             value["diagnostics"][1]["next_actions"][0]["argv"],
             json!(["agmi", "operations", "list"])
         );
-        for kind in ["answer", "judge"] {
-            assert!(
-                value["work"][kind]["next_actions"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|action| action["kind"] == "command"
-                        && action["authorization_required"] == true)
-            );
-        }
+        assert!(
+            value["work"]["answer"]["next_actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|step| step["disposition"] == "change_intent")
+        );
+        assert!(
+            value["work"]["judge"]["next_actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|step| step["disposition"] == "inspect")
+        );
     }
 
     #[test]
@@ -1980,6 +2107,8 @@ mod tests {
             &[],
             None,
             100,
+            true,
+            true,
         );
         let actions = actions.as_array().unwrap();
         assert!(
@@ -2097,13 +2226,15 @@ mod tests {
 
     #[test]
     fn stale_or_manual_work_never_gets_a_misleading_wait_action() {
-        for status in ["undetermined", "operator_required"] {
+        for status in ["undetermined", "operator_required", "automatic_recovery"] {
             let actions = intervention_actions(
                 &json!({"status":status,
                 "next_action":"inspect_local_evidence","next_at":200}),
                 &[],
                 None,
                 100,
+                false,
+                false,
             );
             assert!(
                 actions

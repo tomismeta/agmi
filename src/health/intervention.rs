@@ -16,7 +16,7 @@ struct Finding<'a> {
 impl<'a> Finding<'a> {
     fn unknown(reason: &'a str) -> Self {
         Self {
-            progress: "waiting",
+            progress: "undetermined",
             status: "undetermined",
             reason,
             action: "inspect_local_evidence",
@@ -86,6 +86,12 @@ pub(super) fn unknown_work(reason: &str) -> Value {
     for name in LANES {
         work[name] = json!({"progress":finding.progress,"intervention":finding.value(None, None),
             "operational":{"state":"unknown","reasons":[reason]},
+            "intent":{"requested_mode":null,"effective_mode":null,"paused":null,"configuration":"unknown"},
+            "admission":{"allowed":null,"reason":null,"state":"unknown"},
+            "assessment":{"completeness":"unavailable","observed_at":null,"valid_until":null,
+                "observed_opportunities":null,"eligible_candidates":null},
+            "continuation":super::assessment::unknown_step(reason),
+            "automatic_step":null,"findings":{"items":[],"truncated":false},
             "refresh":{"state":"unknown","reason":reason,"observed_at":null,"valid_until":null,
                 "evidence":"same_lane_original_completion_not_retry_authority"},
             "background_recovery":{"count":null,"bound_count":null,"unbound_count":null,
@@ -99,8 +105,9 @@ pub(super) fn unknown(reason: &str) -> Value {
     let finding = Finding::unknown(reason);
     let mut result = finding.value(None, None);
     result["unattended"] = Value::Null;
-    result["controller"] = json!({"ready":null,"reason":reason,"observed_at":null,
-        "evidence_fresh":null,"process_identity":"not_assessed"});
+    result["owner"] = json!("controller");
+    result["controller"] = json!({"ready":null,"reason":reason,"status":"undetermined","observed_at":null,
+        "evidence_fresh":null,"process_identity":"not_assessed","owner":"unknown","run_mode":"unknown","state":"unknown"});
     result["lanes"] = json!({"answer":"undetermined","judge":"undetermined","mine":"undetermined"});
     result
 }
@@ -468,16 +475,15 @@ fn release_path<'a>(
             .with_all(blocker_evidence(detail))
             .with("next_observation", no_observation("authentication_failed"))
     } else {
-        Finding::blocked(
-            if detail["scope"] == "account" {
-                "unbound_uncertainty"
-            } else {
-                "no_automatic_capacity_release"
-            },
-            "inspect_operations",
-        )
-        .with_all(blocker_evidence(detail))
-        .with("next_observation", no_observation("no_safe_binding"))
+        let mut finding = Finding::unknown(if detail["scope"] == "account" {
+            "unbound_uncertainty"
+        } else {
+            "no_automatic_capacity_release"
+        });
+        finding.action = "inspect_operations";
+        finding
+            .with_all(blocker_evidence(detail))
+            .with("next_observation", no_observation("no_safe_binding"))
     }
 }
 
@@ -503,6 +509,7 @@ fn blocker<'a>(
                 Finding::blocked(reason, "authorize").with_all(blocker_evidence(detail))
             }
         }
+        "lane_paused" => Finding::blocked(reason, "resume"),
         reason if let Some(kind) = floor_kind(reason, &detail["restriction_basis"]) => {
             // The primary reason can be an earlier operation-level check.
             // A later request restriction still prevents reaching eligibility.
@@ -566,6 +573,9 @@ fn lane<'a>(
     if !read_only && status["paused"] == true {
         return Finding::blocked("admission_paused", "resume");
     }
+    if !read_only && status["lane_controls"][name]["desired"]["paused"] == true {
+        return Finding::blocked("lane_paused", "resume");
+    }
     let identity = super::hosted_identity(status);
     if !read_only && identity.rejected() {
         return Finding::blocked(
@@ -603,6 +613,9 @@ fn lane<'a>(
             && read_failed(row)
             && matches!(row["status"].as_u64(), Some(401 | 403))
         {
+            if dependency == "assignment" {
+                return Finding::unknown("assignment_access_unverified");
+            }
             return if read_auth_failed(row, at, stale) {
                 Finding::blocked("read_authentication_failed", "review_credentials")
             } else {
@@ -747,9 +760,34 @@ fn lane<'a>(
         if let Some(reason) = super::model_route_fault(model) {
             return Finding::blocked(reason, "review_model_configuration");
         }
+        if name == "judge"
+            && work["admission"]["allowed"] == true
+            && super::judge_inventory_fresh(status, at, stale)
+            && let Some(next) = future(&work["assessment"]["candidate_wait"]["not_before"], at)
+        {
+            let wait = &work["assessment"]["candidate_wait"];
+            let preparation = wait["target"] == "preparation";
+            return Finding::automatic(
+                if preparation {
+                    "model_retry_backoff"
+                } else {
+                    "read_backoff"
+                },
+                if preparation {
+                    "retry_model"
+                } else {
+                    "observe_assignments"
+                },
+                Some(next),
+            )
+            .with("candidate_wait", wait.clone());
+        }
         // Assignment-specific failures do not fence other eligible judgments.
         // Only current-route setup/auth evidence applies across assignments.
-        if (name != "judge" || model["scope"] == "current_work")
+        if ((name == "answer"
+            && model["scope"] == "current_work"
+            && lane_observation_fresh(status, name, at, stale) == Some(true))
+            || (name == "judge" && model["scope"] == "current_work" && !complete))
             && matches!(
                 model["state"].as_str(),
                 Some(
@@ -782,28 +820,33 @@ fn lane<'a>(
             }
             match model["retry_eligible"].as_bool() {
                 Some(true) => {
-                    if super::lane_policy(status, name)["preparation"]["while_blocked"] != true {
-                        if let Some(finding) =
-                            blocker(status, name, work, &work["admission"], at, stale, timing)
-                        {
-                            return finding;
-                        }
-                        if work["admission"]["allowed"] != true {
-                            return Finding::unknown("admission_recovery_unproven");
-                        }
+                    let preparation =
+                        Finding::automatic("model_retry_eligible", "retry_model", None);
+                    if work["admission"]["allowed"] == true {
+                        return preparation;
                     }
-                    return Finding::automatic(
-                        "model_retry_eligible",
-                        "retry_model",
-                        timestamp(&model["next_at"]),
-                    );
+                    let mut gate =
+                        blocker(status, name, work, &work["admission"], at, stale, timing)
+                            .unwrap_or_else(|| Finding::unknown("admission_recovery_unproven"));
+                    if super::lane_policy(status, name)["preparation"]["while_blocked"] == true {
+                        gate = gate.with(
+                            "independent_preparation",
+                            json!(model["operation_id"].as_i64()),
+                        );
+                    }
+                    return gate;
                 }
                 Some(false) if timestamp(&model["next_at"]).is_some() => {
-                    return Finding::automatic(
-                        model["blocker"].as_str().unwrap_or("model_retry_backoff"),
-                        "await_retry_eligibility",
-                        timestamp(&model["next_at"]),
-                    );
+                    if work["admission"]["allowed"] != true {
+                        return blocker(status, name, work, &work["admission"], at, stale, timing)
+                            .unwrap_or_else(|| Finding::unknown("admission_recovery_unproven"));
+                    }
+                    let next = future(&model["next_at"], at);
+                    return if let Some(next) = next {
+                        Finding::automatic("model_retry_backoff", "retry_model", Some(next))
+                    } else {
+                        Finding::unknown("model_retry_evidence_unavailable")
+                    };
                 }
                 Some(false) if model["state"] == "model_unknown" => {
                     return Finding::blocked("model_uncertain", "recover_model");
@@ -824,7 +867,11 @@ fn lane<'a>(
         return Finding {
             progress: "idle",
             status: "none_required",
-            reason: "no_eligible_assignments_observed",
+            reason: if work["assessment"]["capped_work_proven"] == true {
+                "model_attempts_exhausted_for_observed_work"
+            } else {
+                "no_eligible_assignments_observed"
+            },
             action,
             next_at: next,
             detail: json!({}),
@@ -1203,6 +1250,9 @@ pub(super) fn qualify_operational(report: &mut Value, status: &Value) {
             let intervention = report["work"][name]["intervention"]
                 .as_object_mut()
                 .expect("projected intervention");
+            for key in ["candidate_wait", "independent_preparation"] {
+                intervention.remove(key);
+            }
             if override_observation {
                 intervention.remove("next_observation");
             }
@@ -1272,22 +1322,29 @@ fn select(root: &mut Value, finding: &Value) {
     for field in ["status", "reason", "next_action", "next_at", "retry_floor"] {
         root[field] = finding[field].clone();
     }
-    if let Some(observation) = finding.get("next_observation") {
-        root["next_observation"] = observation.clone();
-    } else if let Some(root) = root.as_object_mut() {
-        root.remove("next_observation");
+    for field in ["next_observation", "resolution"] {
+        if let Some(value) = finding.get(field) {
+            root[field] = value.clone();
+        } else if let Some(root) = root.as_object_mut() {
+            root.remove(field);
+        }
     }
 }
 
 /// Core first, then stable lane order. Qualifications always precede CLI actions.
 fn reduce(root: &mut Value, work: &Value, core: &Value, modes: &Value, paused: &Value) {
     select(root, core);
+    root["owner"] = json!("controller");
+    for field in ["status", "next_action", "next_at"] {
+        root["controller"][field] = core[field].clone();
+    }
     for name in LANES {
         let lane = &work[name]["intervention"];
         if rank(lane["status"].as_str().unwrap_or("undetermined"))
             > rank(root["status"].as_str().unwrap_or("undetermined"))
         {
             select(root, lane);
+            root["owner"] = json!(name);
         }
         root["lanes"][name] = lane["status"].clone();
     }
@@ -1304,7 +1361,13 @@ fn reduce(root: &mut Value, work: &Value, core: &Value, modes: &Value, paused: &
         || (known && !active)
     {
         json!(false)
-    } else if root["status"] == "undetermined" || !known || root["controller"]["ready"].is_null() {
+    } else if root["status"] == "undetermined"
+        || LANES
+            .iter()
+            .any(|lane| work[*lane]["intervention"]["resolution"] == "polling_not_guaranteed")
+        || !known
+        || root["controller"]["ready"].is_null()
+    {
         Value::Null
     } else {
         json!(root["controller"]["ready"] == true && active && *paused == false)
@@ -1453,6 +1516,7 @@ pub(super) fn qualify_repair_failure(report: &mut Value) {
         &mut report["intervention"],
         &Finding::blocked("doctor_repair_unavailable", action).value(None, None),
     );
+    report["intervention"]["owner"] = json!("controller");
     report["intervention"]["unattended"] = json!(false);
     report["attention_required"] = json!(true);
 }
@@ -1899,16 +1963,14 @@ mod tests {
         );
         status["pending_work"] =
             json!([{"operation_id":1,"kind":"judge","state":"unknown","read_key":null}]);
-        status["work"]["answer"]["model"] = json!({"state":"model_unknown","budget_used":1,
+        status["work"]["answer"]["model"] = json!({"state":"model_unknown","operation_id":7,"budget_used":1,
             "budget_limit":2,"retry_eligible":true,"scope":"current_work"});
-        assert_eq!(
-            projection(&status).0["answer"]["intervention"]["next_action"],
-            "retry_model"
-        );
-        assert_eq!(
-            projection(&status).0["answer"]["admission"]["allowed"],
-            false
-        );
+        let (work, root) = projection(&status);
+        let answer = &work["answer"];
+        assert_eq!(answer["intervention"]["next_action"], "inspect_operations");
+        assert_eq!(answer["intervention"]["independent_preparation"], 7);
+        assert_eq!(answer["admission"]["allowed"], false);
+        assert_ne!(root["unattended"], true);
         status["effective_runtime"]["policy"]["capabilities"]["answer"]["preparation"]["while_blocked"] =
             json!(false);
         assert_eq!(

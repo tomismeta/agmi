@@ -411,7 +411,7 @@ pub async fn run(config_path: &Path, once: bool) -> Result<()> {
     {
         let _gate = AccountAdmissionGuard::acquire(&config)?;
         store.recover()?;
-        store.runtime_state(&config, false)?;
+        store.runtime_state_with_mode(&config, false, once)?;
     }
     let (stop_tx, stop) = watch::channel(false);
     let mut runtime = HostAccess::new(config_path.to_owned(), config, protocol, store, stop, true)?;

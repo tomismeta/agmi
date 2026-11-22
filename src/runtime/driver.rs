@@ -412,7 +412,7 @@ impl HostAccess {
             self.collect().await?;
             self.reload()?;
             self.store
-                .runtime_state(&self.config, self.reload_blocked)?;
+                .runtime_state_with_mode(&self.config, self.reload_blocked, once)?;
             if self.stopping() {
                 break;
             }

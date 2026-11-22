@@ -158,6 +158,7 @@ Answer/judge `preparation` defaults to `retry_uncertain = false`, `max_attempts_
 New configs explicitly enable `retry_uncertain` and `while_blocked` on Answer and Judge, with two attempts and at most one replacement for possibly-running inference per work item. An uncertain attempt may still incur a charge even when no usable result was captured.
 
 `run --once` takes a finite entry-time plan: at most two entry-due recovery reads per lane, one model attempt per model lane and one effect per lane, with bounded discovery/freshness. It drains owned handles but does not wait for future grace/cadence deadlines, discover later grants or replenish completed work indefinitely. Ordinary `run` continues scheduling.
+Both modes can call models and submit eligible work; neither is a diagnostic. The returned `run_mode` and `stopped` fields describe the finished invocation, not what it accomplished. `pause` and `resume` record local intent; neither starts a controller or recalls work already sent.
 
 The runtime reloads model guidance and ordinary participation policy at safe boundaries. Invalid edits are reported without partially applying them. Account, chain, credential reference and state directory remain identity boundaries for existing state. Network profile changes additionally require a stopped, drained runtime; see below. A different account needs separate configuration/state. Model changes apply to new model calls; in-flight work retains its captured configuration. Pause and capability policy are rechecked before dispatch.
 
@@ -609,12 +610,16 @@ judge/mine progress, intervention requirements and eligible guarded repairs.
 It does not contact MinePOA, invoke a model or read credentials. Add `--json`
 for the same machine-readable assessment.
 
-Human diagnostics share a compact Core/answer/judge/mine view, separate retained
-risk and actionable next steps. `status` is a snapshot using default diagnostic
-thresholds, not a full health check. `health` names the selected readiness scope;
-`doctor` additionally reports repair eligibility/outcome. Default output retains
-operational essentials rather than duplicating full evidence trees; use
-`agmi --json status --verbose` (or `health --verbose` / `doctor --verbose`) for detailed evidence.
+| Command | Question it answers |
+| --- | --- |
+| `status` | What does the local snapshot show for each lane? This does not check disk headroom. |
+| `health` | Do the selected operational checks pass, including the configured disk check? |
+| `doctor` | Which lanes have a verified unattended path, and what should I inspect? Also previews guarded repairs. |
+| `service status` | What did user systemd observe for the controller, last health probe, and timer? This does not establish lane health or admission. |
+
+Human diagnostics separate the controller, each lane, and retained risk. Use
+`--json` for `agmi.cli.v1`, and `--verbose` on `status`, `health`, or `doctor`
+for retained evidence omitted from the default report.
 Readiness and intervention use the same evidence expiry. A stale completion can
 leave health degraded while the controller refreshes it automatically.
 Nonblocking historical uncertainty is still reported as risk, not as a current
@@ -655,23 +660,38 @@ and inspection actions, not retry authority or a requirement to clear history.
 `lane show`, `lane pause` and `lane resume` report control/admission evidence;
 they do not certify operational health.
 
-`status`, `health` and `doctor` share `work.{answer,judge,mine}.progress`
-(`working`, `idle`, `complete`, `waiting`, `blocked`) and an `intervention`
-object with reason, next action/time and evidence freshness:
+Each `work.<lane>` separates `intent` (requested and effective mode, pause,
+and reload), `admission.state` (whether the local write path is fenced), and
+`continuation` (what can continue unattended). `continuation` identifies the
+next stage, reason, and a not-before floor when one was established. An
+`automatic_step` can be narrower: preparation may be eligible while submission
+is fenced; a job may be polled while its outcome remains unknown.
+
+For Judge, `assessment` reports coverage, expiry, candidate counts, and
+exclusions. A complete `0/3` with three conclusively exhausted assignments
+means no retry remains for those assignments, not that a human must intervene
+before the controller can grade new work. A separate assignment on backoff
+still has its own wait. Expired or missing inventory is not evidence of zero.
+
+The legacy `progress` and `intervention` fields remain; root
+`intervention.owner` identifies the controller or lane responsible for the
+primary recommendation. `next_actions[].disposition` separates inspecting,
+waiting, changing intent, and explicit repair. A suggested mutation is not
+authorization.
 
 | Intervention | Operator meaning |
 | --- | --- |
 | `none_required` | No intervention indicated for this lane; inspect progress and effective mode. |
-| `automatic_recovery` | A configured automatic path exists. Wait for its next observation; success is not guaranteed. |
+| `automatic_recovery` | A local recovery step is evidenced. Check the live controller and whether the step is only a read; a next observation is not a resolution. |
 | `operator_required` | A known fence requires operator action; use the reported action, not a blind replay. |
 | `undetermined` | Evidence is missing, stale or inconclusive. Inspect before assuming recovery or failure. |
 
-Root `intervention.unattended` is `true` only when the observed controller is
-ready, participation is resumed, at least one capability is active, and no lane
-requires intervention or has undetermined progress. `false` also covers deliberate
-pause/inactivity; `null` preserves insufficient evidence. A live process alone,
-an old successful epoch or retained audit warnings do not establish this result.
-Completion is scoped to fresh local epoch/inventory evidence, not rewards.
+Root `intervention.unattended` is `true` only with an attributable continuous
+controller, resumed participation, an active capability, and no required
+human intervention or unknown required path. `false` also covers deliberate
+inactivity; `null` preserves insufficient evidence. A heartbeat, `run --once`,
+or a matched process without current journal evidence does not establish
+continuation. Completion is scoped to fresh local evidence, not rewards.
 
 The default `health` exit contract is unchanged: admission waits can still
 fail health even when recovery is automatic. The installed `agmi-health.service`
@@ -725,6 +745,12 @@ nonce change, capacity increase or policy relaxation occurs. Failed restoration
 requires attention; a hard kill, process abort or host failure can prevent it.
 A newly restored process without a fresh controller observation remains
 `undetermined`, not a claim that participation has resumed.
+
+`repairs.counts` are exact when available, independently of compact detail.
+`--repair` freezes the preview and rechecks each candidate before applying it.
+If a complete receipt cannot fit the legacy updater's 2 MiB limit, Doctor
+refuses before stopping the service or applying repairs. A missing receipt
+after launch does not prove that no effects occurred; inspect before retrying.
 
 ## Storage ownership
 
@@ -979,6 +1005,11 @@ inspection; it cannot recover already-pruned history.
 systemctl --user status agmi.service agmi-health.timer
 journalctl --user --user-unit=agmi-health.service
 ```
+
+`agmi --json service status` also reports `data.manager.controller`,
+`health_probe`, and `health_timer` independently. A failed previous probe
+and a running controller can coexist. The previous probe's exit code is not
+the result of a new health check; `data.output` retains legacy manager text.
 
 Health is a local, read-only check: no network requests, model calls, credential/guidance reads or state initialization. Unhealthy checks return nonzero with structured issues for stale/stopped execution, blocked or unobserved admission, overdue work, missed-answer evidence, identity failures, inactive participation and low disk space. Evidence reflects local observations, not a fresh network verification or proof of rewards. Warnings are reported separately from health failures: a healthy runtime may have warnings, and warnings alone preserve a successful exit status. Healthy with warnings still reports attention required. Historical unknowns alone never fail a lane with a genuinely open fresh path, under finite as well as explicitly unbounded policy; this never turns age, missing jobs, or unrelated acceptance into terminal evidence. Neither warnings nor a healthy result permit replaying uncertain work.
 

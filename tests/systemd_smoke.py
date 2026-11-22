@@ -1196,10 +1196,24 @@ def managed_health_exit(binary, home):
         code, managed = health('--managed-exit')
         assert code == 3 and managed['ok'] is False and managed['data']['healthy'] is False, managed
         managed_status(3, 'success')
+        service = json.loads(run([str(binary), '--json', 'service', 'status']).stdout)['data']
+        assert service['manager']['controller']['active'] == 'active', service
+        assert service['manager']['health_probe']['result'] == 'success', service
+        assert service['manager']['health_probe']['exit_code'] == 3, service
+        assert service['manager']['health_timer']['unit'] == 'agmi-health.timer', service
         run([str(binary), 'pause'])
         code, paused = health('--managed-exit')
         assert code == 1 and 'participation_paused' in paused['data']['issues'], paused
         managed_status(1, 'exit-code')
+        service = json.loads(run([str(binary), '--json', 'service', 'status']).stdout)['data']
+        assert service['manager']['controller']['active'] == 'active', service
+        assert service['manager']['health_probe']['result'] == 'exit-code', service
+        assert service['manager']['health_probe']['exit_code'] == 1, service
+        status = json.loads(run([str(binary), '--json', 'status']).stdout)['data']
+        controller = status['intervention']['controller']
+        assert (controller['owner'], controller['run_mode'], controller['state']) == (
+            'managed', 'continuous', 'running'), status
+        assert status['work']['answer']['continuation']['state'] == 'intentionally_inactive', status
         assert len(fixture.writes) == 1
         print('PASS installed health unit: healthy 0, known wait 3, independent pause 1', flush=True)
     finally:

@@ -177,7 +177,7 @@ enum Command {
     },
     /// Run the supervised participation loop using the configured modes.
     Run {
-        /// Perform one bounded cycle and exit.
+        /// Perform one bounded cycle (may call models and submit eligible work) and exit.
         #[arg(long)]
         once: bool,
     },
@@ -879,8 +879,7 @@ fn doctor_prerequisite(code: &'static str, repair: bool) -> Value {
     let mut report = health_prerequisite(code);
     report["repair_requested"] = json!(repair);
     report["repair_outcome"] = json!(if repair { "failed" } else { "not_requested" });
-    report["repairs"] = json!({"eligible":[],"ineligible":[],"applied":[],"skipped":[],
-        "failure":if repair {Some(code)} else {None},"restoration":{"manager_action":"none","runtime":"unchanged"}});
+    report["repairs"] = doctor::failed_repairs(code, repair);
     report
 }
 
@@ -1330,7 +1329,10 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
         }
         Command::Run { once } => {
             runtime::run(&path, *once).await?;
-            return Ok(("run", json!({"stopped":true})));
+            return Ok((
+                "run",
+                json!({"stopped":true,"run_mode":if *once {"once"} else {"continuous"}}),
+            ));
         }
         Command::Config {
             command: ConfigCommand::Show,
@@ -1588,14 +1590,14 @@ async fn execute(cli: &Cli) -> Result<(&'static str, Value)> {
             runtime::pause(&config)?;
             Ok((
                 "pause",
-                json!({"paused":true,"server_auto_mining":"not_controlled"}),
+                json!({"paused":true,"intent":"pause","controller_started":false,"server_auto_mining":"not_controlled"}),
             ))
         }
         Command::Resume => {
             runtime::resume(&config)?;
             Ok((
                 "resume",
-                json!({"paused":false,"capabilities":config.capabilities}),
+                json!({"paused":false,"intent":"resume","controller_started":false,"capabilities":config.capabilities}),
             ))
         }
         Command::RecoverModel => Ok((
@@ -1843,8 +1845,12 @@ async fn main() {
                     | Command::Health { verbose: true, .. }
                     | Command::Doctor { verbose: true, .. }
             );
-            if matches!(kind, "status" | "health" | "doctor") && !verbose {
-                health::compact_diagnostics(&mut data);
+            if !verbose {
+                match kind {
+                    "doctor" => doctor::compact_report(&mut data),
+                    "status" | "health" => health::compact_diagnostics(&mut data),
+                    _ => {}
+                }
             }
             let value = json!({"schema":SCHEMA,"ok":ok,"type":kind,"data":data});
             if cli.json {

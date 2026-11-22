@@ -201,7 +201,10 @@ pub(super) fn project(row: Option<&Value>, at: i64, stale: u64) -> Value {
                 .as_str()
                 .unwrap_or("unusable_response"),
         ));
-        component["next_actions"] = if status == Some(401) || status == Some(403) {
+        component["next_actions"] = if row["purpose"] == "assignment" {
+            json!([{"kind":"instruction","disposition":"inspect","authorization_required":false,
+                "message":"Inspect the recorded public assignment read and its resource deadline; this read does not use the account credential."}])
+        } else if status == Some(401) || status == Some(403) {
             json!([{"kind":"instruction","authorization_required":false,
                     "message":"Review configured credentials and endpoint permissions locally; do not replay writes."}])
         } else {

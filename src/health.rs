@@ -1,12 +1,14 @@
 //! Read-only, local health evidence with a bounded component contract.
 //! Component readiness is separate from retained effect risk and never authorizes
 //! replay. Effective modes and fresh local evidence are not live remote probes.
+use crate::store::{JudgeInventory, judge_inventory};
 use crate::{capability::LaneId, config::Config, runtime, store::now};
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 use std::path::Path;
 
 mod api;
+mod assessment;
 mod intervention;
 
 /// A bounded view of canonical evidence, not an upstream-response classifier.
@@ -113,6 +115,7 @@ impl Default for Options {
 /// Status does not probe filesystem capacity; health qualifies that separately.
 pub fn enrich_status(status: &mut Value, options: Options, at: i64) {
     let mut report = evaluate_evidence(options, status, at);
+    assessment::attach(&mut report, status);
     for field in [
         "work",
         "intervention",
@@ -195,6 +198,29 @@ pub(crate) fn qualify_doctor(report: &mut Value, repairs: &Value) {
             sync_work_components(report);
         }
         intervention::qualify_restoration(report);
+        let controller = &mut report["intervention"]["controller"];
+        if controller["reason"] == reason {
+            controller["state"] = json!("unknown");
+            controller["run_mode"] = json!("unknown");
+            if report["intervention"]["unattended"] == true {
+                report["intervention"]["unattended"] = Value::Null;
+            }
+        }
+        for lane in LANES {
+            let work = &mut report["work"][lane];
+            if work["continuation"]["reason"] == "controller_stopped" {
+                work["continuation"] = assessment::unknown_step(reason);
+                work["automatic_step"] = Value::Null;
+            }
+            if let Some(findings) = work["findings"]["items"].as_array_mut() {
+                for finding in findings {
+                    if finding["reason"] == "controller_stopped" {
+                        finding["reason"] = json!(reason);
+                        finding["state"] = json!("unknown");
+                    }
+                }
+            }
+        }
     }
     if !repairs["failure"].is_null() {
         intervention::qualify_repair_failure(report);
@@ -260,14 +286,18 @@ pub fn check(config_path: &Path, config: &Config, options: Options) -> Result<Va
     );
     operational_summary(&mut result);
     qualify_refresh(&mut result, &status, options, at);
+    assessment::attach(&mut result, &status);
     Ok(result)
 }
 
 /// Journal facts plus bounded local observations and a read-only release cache.
 /// This path must not initialize installer state, read credentials or probe HTTP.
 pub fn local_status(config_path: &Path, config: &Config, at: i64) -> Result<Value> {
-    let mut status = runtime::status_evidence(config)?;
-    let process = serde_json::to_value(crate::installer::observe_process(config_path, &status))?;
+    let (mut status, process) =
+        crate::installer::observe_status_process(config_path, config, || {
+            runtime::status_evidence(config)
+        })?;
+    let process = serde_json::to_value(process)?;
     let selected = serde_json::to_value(crate::installer::observe_selected(config_path))?;
     status["process_identity"] = process["state"].clone();
     status["release_advisory"] =
@@ -867,18 +897,6 @@ fn operational_summary(report: &mut Value) {
         report["intervention"]["status"].as_str(),
         Some("operator_required" | "undetermined")
     ));
-    if report["healthy"] != true || report["operator_action_required"] == true {
-        for lane in LANES {
-            if matches!(
-                report["work"][lane]["refresh"]["state"].as_str(),
-                Some("transient" | "refreshing")
-            ) {
-                report["work"][lane]["refresh"]["state"] = json!("blocked");
-                report["work"][lane]["refresh"]["reason"] =
-                    json!("required_evidence_or_action_outstanding");
-            }
-        }
-    }
     report["severity"] = json!(match report["operational"]["status"].as_str() {
         Some("clear")
             if report["attention_required"] == true
@@ -941,8 +959,8 @@ fn qualify_refresh(report: &mut Value, status: &Value, options: Options, at: i64
         let failed = row.is_some_and(intervention::read_failed);
         let in_flight =
             row.is_some_and(|row| row["in_flight"] == true || row["state"] == "in_flight");
-        let safe = report["healthy"] == true
-            && lane_mode(status, lane) == Some("active")
+        let safe = lane_mode(status, lane) == Some("active")
+            && report["components"]["controller"]["state"] == "ok"
             && report["components"][lane]["state"] == "ok"
             && report["work"][lane]["intervention"]["status"] == "none_required"
             && stale.is_some_and(|stale| work_complete(status, lane, at, stale));
@@ -1065,6 +1083,59 @@ pub fn compact_diagnostics(data: &mut Value) {
             );
         }
     }
+    fn scoped_work(out: &mut Value, source: &Value, truncated: &mut bool) {
+        for key in ["intent", "continuation", "automatic_step"] {
+            if let Some(value) = source.get(key) {
+                out[key] = value.clone();
+            }
+        }
+        if let Some(items) = source["findings"]["items"].as_array() {
+            let cut = items.len() > 4;
+            *truncated |= cut;
+            out["findings"] =
+                json!({"items":items.iter().take(4).collect::<Vec<_>>(),"truncated":cut});
+        }
+        let mut assessment = fields(
+            &source["assessment"],
+            &[
+                "observed_at",
+                "valid_until",
+                "completeness",
+                "observed_opportunities",
+                "eligible_candidates",
+                "locally_judgeable",
+                "assessment_reason",
+                "capped_work_proven",
+            ],
+            truncated,
+        );
+        if source["assessment"]["exclusions"].is_object() {
+            assessment["exclusions"] = fields(
+                &source["assessment"]["exclusions"],
+                &[
+                    "already_attempted",
+                    "configured_exclusion",
+                    "model_budget_exhausted",
+                    "model_retry_cooldown",
+                    "assignment_read_backoff",
+                    "assignment_resource_restricted",
+                    "model_uncertain_retry_disabled",
+                    "model_uncertain_replacement_exhausted",
+                    "model_preparation_reserved",
+                    "observation_stale",
+                ],
+                truncated,
+            );
+        }
+        out["assessment"] = assessment;
+        if out.get("admission").is_none() {
+            out["admission"] = fields(
+                &source["admission"],
+                &["state", "allowed", "reason", "scope", "not_before"],
+                truncated,
+            );
+        }
+    }
     fn admission(value: &Value, truncated: &mut bool) -> Value {
         let mut out = fields(value, ADMISSION, truncated);
         if let Some(blocker) = value.get("pre_intent_blocker") {
@@ -1096,6 +1167,7 @@ pub fn compact_diagnostics(data: &mut Value) {
                         row,
                         &[
                             "kind",
+                            "disposition",
                             "authorization_required",
                             "message",
                             "until",
@@ -1186,6 +1258,8 @@ pub fn compact_diagnostics(data: &mut Value) {
         "observation_fresh",
         "requires_fresh_eligibility",
         "ready",
+        "owner",
+        "run_mode",
         "mode",
         "process_identity",
         "last_http_status",
@@ -1220,6 +1294,7 @@ pub fn compact_diagnostics(data: &mut Value) {
         "assessment_reason",
     ];
     const ADMISSION: &[&str] = &[
+        "state",
         "allowed",
         "reason",
         "scope",
@@ -1400,6 +1475,12 @@ pub fn compact_diagnostics(data: &mut Value) {
             &[
                 "ready",
                 "reason",
+                "status",
+                "state",
+                "owner",
+                "run_mode",
+                "next_action",
+                "next_at",
                 "observed_at",
                 "evidence_fresh",
                 "process_identity",
@@ -1457,7 +1538,6 @@ pub fn compact_diagnostics(data: &mut Value) {
             "operational",
             "refresh",
             "background_recovery",
-            "assessment",
         ] {
             out["work"][lane][name] = fields(&source["work"][lane][name], FINDING, &mut truncated);
             observation(
@@ -1505,6 +1585,11 @@ pub fn compact_diagnostics(data: &mut Value) {
         );
         out["work"][lane]["admission"] =
             admission(&source["work"][lane]["admission"], &mut truncated);
+        scoped_work(
+            &mut out["work"][lane],
+            &source["work"][lane],
+            &mut truncated,
+        );
         out["participation"]["lanes"][lane] =
             admission(&source["participation"]["lanes"][lane], &mut truncated);
         out["thresholds"]["lanes"][lane] = fields(
@@ -1617,7 +1702,11 @@ pub fn compact_diagnostics(data: &mut Value) {
     }
     out["components"]["api"]["background_resources"] = background;
     if source["repairs"].is_object() {
-        out["repairs"] = fields(&source["repairs"], &["failure"], &mut truncated);
+        out["repairs"] = fields(
+            &source["repairs"],
+            &["failure", "preview", "execution", "details_truncated"],
+            &mut truncated,
+        );
         out["repairs"]["counts"] = fields(
             &source["repairs"]["counts"],
             &["eligible", "ineligible", "applied", "skipped"],
@@ -1625,7 +1714,10 @@ pub fn compact_diagnostics(data: &mut Value) {
         );
         for name in ["eligible", "ineligible", "applied", "skipped"] {
             if let Some(rows) = source["repairs"][name].as_array() {
-                truncated |= rows.len() > 4;
+                if rows.len() > 4 {
+                    truncated = true;
+                    out["repairs"]["details_truncated"] = json!(true);
+                }
                 out["repairs"][name] = Value::Array(
                     rows.iter()
                         .take(4)
@@ -1677,12 +1769,9 @@ pub fn compact_diagnostics(data: &mut Value) {
     let mut omitted = Vec::new();
     let mut fits = within_budget(&out);
     for name in [
-        "effective_runtime",
-        "effective_capabilities",
-        "lane_controls",
         "lane_participation",
-        "observations",
-        "thresholds",
+        "effective_capabilities",
+        "effective_runtime",
         "selected_image",
         "last_reported_build",
         "hosted_identity",
@@ -1692,7 +1781,13 @@ pub fn compact_diagnostics(data: &mut Value) {
             break;
         }
         if out[name].is_object() {
-            out[name] = json!({});
+            if name == "effective_capabilities" {
+                for lane in LANES {
+                    out[name][lane] = fields(&out[name][lane], &["mode"], &mut truncated);
+                }
+            } else {
+                out[name] = json!({});
+            }
             omitted.push(name);
             truncated = true;
             fits = within_budget(&out);
@@ -1700,12 +1795,29 @@ pub fn compact_diagnostics(data: &mut Value) {
     }
     if !fits {
         for lane in LANES {
-            for name in ["assessment", "retry", "admission", "background_recovery"] {
-                out["work"][lane][name] = json!({});
-            }
+            let background = &source["work"][lane]["background_recovery"];
+            out["work"][lane]["retry"] = json!({});
+            out["work"][lane]["background_recovery"] = fields(
+                background,
+                &[
+                    "count",
+                    "bound_count",
+                    "unbound_count",
+                    "required_for_participation",
+                    "next_at",
+                ],
+                &mut truncated,
+            );
             observation(
                 &mut out["work"][lane]["background_recovery"],
                 &source["work"][lane]["background_recovery"],
+                &mut truncated,
+            );
+            out["work"][lane]["background_recovery"]["next_actions"] =
+                actions(&background["next_actions"], &mut truncated);
+            scoped_work(
+                &mut out["work"][lane],
+                &source["work"][lane],
                 &mut truncated,
             );
             out["components"][lane] = fields(
@@ -1714,9 +1826,11 @@ pub fn compact_diagnostics(data: &mut Value) {
                 &mut truncated,
             );
         }
+        let background = out["components"]["api"]["background_resources"].take();
         out["components"]["api"] = json!({
             "resources":[],"resources_count":resources.map(Vec::len),
             "resources_truncated":source["components"]["api"]["resources_truncated"],
+            "background_resources":background,
             "details_omitted":true,
         });
         omitted.push("work_detail_and_api");
@@ -1726,16 +1840,23 @@ pub fn compact_diagnostics(data: &mut Value) {
     if !fits {
         // Worst-case strings/lists still cannot turn routine output into an
         // unbounded log. Keep the canonical top-level decisions and their types.
+        let background = out["components"]["api"]["background_resources"].take();
         for (name, value) in out.as_object_mut().expect("compact object") {
             if value.is_object()
                 && !matches!(
                     name.as_str(),
-                    "operational" | "risk" | "historical_uncertainty" | "intervention" | "work"
+                    "operational"
+                        | "risk"
+                        | "historical_uncertainty"
+                        | "intervention"
+                        | "work"
+                        | "repairs"
                 )
             {
                 *value = json!({});
             }
         }
+        out["components"]["api"]["background_resources"] = background;
         for lane in LANES {
             let work = &source["work"][lane];
             let mut intervention = fields(
@@ -1754,7 +1875,12 @@ pub fn compact_diagnostics(data: &mut Value) {
             observation(&mut intervention, &work["intervention"], &mut truncated);
             let mut background = fields(
                 &work["background_recovery"],
-                &["count", "bound_count", "required_for_participation"],
+                &[
+                    "count",
+                    "bound_count",
+                    "unbound_count",
+                    "required_for_participation",
+                ],
                 &mut truncated,
             );
             observation(
@@ -1762,8 +1888,12 @@ pub fn compact_diagnostics(data: &mut Value) {
                 &work["background_recovery"],
                 &mut truncated,
             );
-            out["work"][lane] =
-                json!({"intervention":intervention,"background_recovery":background});
+            background["next_actions"] =
+                actions(&work["background_recovery"]["next_actions"], &mut truncated);
+            out["work"][lane] = json!({"intervention":intervention,"background_recovery":background,
+                "phase":work["phase"],"progress":work["progress"],"reason":work["reason"],
+                "next_actions":actions(&work["next_actions"], &mut truncated)});
+            scoped_work(&mut out["work"][lane], work, &mut truncated);
         }
         omitted.push("extended_details");
         truncated = true;
@@ -1797,6 +1927,13 @@ pub fn compact_diagnostics(data: &mut Value) {
             }
         }
         bound(&mut out);
+        for lane in LANES {
+            scoped_work(
+                &mut out["work"][lane],
+                &source["work"][lane],
+                &mut truncated,
+            );
+        }
         omitted.push("long_strings_and_lists");
         truncated = true;
     }
@@ -1822,7 +1959,10 @@ fn work_complete(status: &Value, lane: &str, at: i64, stale: u64) -> bool {
     let work = &status["work"][lane];
     if lane == "judge" {
         judge_inventory_fresh(status, at, stale)
-            && judge_inventory(&work["assessment"]) == JudgeInventory::Idle
+            && matches!(
+                judge_inventory(&work["assessment"]),
+                JudgeInventory::Idle | JudgeInventory::Exhausted
+            )
             && model_route_fault(&work["model"]).is_none()
             && !judge_model_relevance_unknown(&work["model"])
             && !current_remote_work(status, lane)
@@ -1857,88 +1997,6 @@ fn push_issue(result: &mut Value, code: &str) {
         .expect("health issues array");
     if !issues.iter().any(|issue| issue == code) {
         issues.push(json!(code));
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum JudgeInventory {
-    Unresolved,
-    Available,
-    Idle,
-    Blocked(&'static str),
-}
-
-/// The selection flag describes a selected row, not the entire inventory.
-/// Negative evidence needs a complete inventory with every candidate accounted for.
-pub(crate) fn judge_inventory(assessment: &Value) -> JudgeInventory {
-    if assessment["locally_judgeable"] == true {
-        return JudgeInventory::Available;
-    }
-    if assessment["assessment_reason"] == "required_words_absent" {
-        return JudgeInventory::Unresolved;
-    }
-    if assessment["completeness"] != "complete" || assessment["locally_judgeable"] != false {
-        return JudgeInventory::Unresolved;
-    }
-    let observed = assessment["observed_opportunities"].as_u64();
-    if observed == Some(0)
-        && (assessment["excluded_work_truncated"] == true
-            || assessment["excluded_work"]
-                .as_array()
-                .is_some_and(|rows| !rows.is_empty()))
-    {
-        return JudgeInventory::Unresolved;
-    }
-    let eligible = assessment["eligible_candidates"].as_u64();
-    if eligible != Some(0) && !(eligible.is_none() && observed == Some(0)) {
-        return JudgeInventory::Unresolved;
-    }
-    let blocker = [
-        ("assignment_read_backoff", "api_dependency_unavailable"),
-        (
-            "assignment_resource_restricted",
-            "api_dependency_unavailable",
-        ),
-        ("model_budget_exhausted", "model_attempt_budget_exhausted"),
-        (
-            "model_uncertain_retry_disabled",
-            "model_uncertain_retry_disabled",
-        ),
-        (
-            "model_uncertain_replacement_exhausted",
-            "model_uncertain_replacement_exhausted",
-        ),
-        ("model_preparation_reserved", "model_preparation_reserved"),
-        ("model_retry_cooldown", "model_retry_backoff"),
-    ]
-    .into_iter()
-    .find_map(|(key, reason)| {
-        (assessment["exclusions"][key].as_u64().unwrap_or(0) > 0).then_some(reason)
-    });
-    if let Some(reason) = blocker {
-        return JudgeInventory::Blocked(reason);
-    }
-    let excluded = match assessment.get("exclusions") {
-        None => Some(0),
-        Some(value) => value.as_object().and_then(|counts| {
-            counts.iter().try_fold(0_u64, |total, (reason, value)| {
-                let count = value.as_u64()?;
-                if count > 0
-                    && !matches!(
-                        reason.as_str(),
-                        "already_attempted" | "configured_exclusion"
-                    )
-                {
-                    return None;
-                }
-                total.checked_add(count)
-            })
-        }),
-    };
-    if observed.is_some() && excluded == observed {
-        JudgeInventory::Idle
-    } else {
-        JudgeInventory::Unresolved
     }
 }
 
@@ -2493,6 +2551,9 @@ fn components(status: &Value, health: &Value, at: i64, stale: u64, options: Opti
                         "ok",
                         match name {
                             "answer" => "current_epoch_answered",
+                            "judge" if work["assessment"]["capped_work_proven"] == true => {
+                                "model_attempts_exhausted_for_observed_work"
+                            }
                             "judge" => "no_eligible_assignments_observed",
                             _ => "current_epoch_completed",
                         },
@@ -3988,7 +4049,7 @@ mod tests {
         let mut health = evaluate(&config, options, &status, 10000);
         assert_eq!(
             health["work"]["judge"]["intervention"]["reason"],
-            "controller_stopped"
+            "lane_paused"
         );
         let risk = health["risk"].clone();
         qualify_doctor(

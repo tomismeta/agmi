@@ -44,6 +44,8 @@ pub(crate) struct ProcessObservation {
     invocation_id: Option<String>,
     image_relation: &'static str,
     evidence_scope: &'static str,
+    owner: &'static str,
+    run_mode: &'static str,
 }
 
 pub(crate) fn observe_selected(config_path: &Path) -> SelectedObservation {
@@ -79,6 +81,8 @@ pub(crate) fn observe_process(config_path: &Path, status: &Value) -> ProcessObse
         invocation_id: None,
         image_relation: "unknown",
         evidence_scope: "managed_invocation_and_stable_file_object_not_checksum_attestation",
+        owner: "unknown",
+        run_mode: "unknown",
     };
     #[cfg(target_os = "linux")]
     let observation = {
@@ -89,6 +93,57 @@ pub(crate) fn observe_process(config_path: &Path, status: &Value) -> ProcessObse
     #[cfg(not(target_os = "linux"))]
     let _ = (config_path, status);
     observation
+}
+
+/// Attributed owner/run-mode reported alongside a journal snapshot. Reads the
+/// persisted run mode recorded by the writer, never the process table alone.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn snapshot_run_mode(status: &Value) -> &'static str {
+    for location in [
+        &status["effective_runtime"]["policy"]["process"]["run_mode"],
+        &status["effective_runtime"]["policy"]["run_mode"],
+    ] {
+        match location.as_str() {
+            Some("once") => return "once",
+            Some("continuous") => return "continuous",
+            _ => {}
+        }
+    }
+    "unknown"
+}
+
+/// Read-only bracketed journal capture for diagnostics. Samples attributable
+/// owner/process/runtime identity before and after `load_status`, matches the
+/// bracket to the snapshot (not merely a heartbeat), and reports
+/// mismatch/unavailable instead of granting autonomy. No network, no journal
+/// mutation, no health authority; outputs stay untrusted and bounded.
+pub(crate) fn observe_status_process(
+    config_path: &Path,
+    config: &crate::config::Config,
+    load_status: impl FnOnce() -> anyhow::Result<Value>,
+) -> anyhow::Result<(Value, ProcessObservation)> {
+    #[cfg(target_os = "linux")]
+    let before = native::journal_bracket(config, config_path);
+    let status = load_status()?;
+    let observation = observe_process(config_path, &status);
+    #[cfg(target_os = "linux")]
+    let observation = {
+        let mut observation = observation;
+        if before != native::journal_bracket(config, config_path)
+            || (observation.state == "observed_match"
+                && !native::matching_bracket(&before, &status))
+        {
+            observation.state = "unavailable";
+            observation.reason = "snapshot_rollover";
+            observation.image_relation = "unknown";
+            observation.owner = "unknown";
+            observation.run_mode = "unknown";
+        }
+        observation
+    };
+    #[cfg(not(target_os = "linux"))]
+    let _ = config;
+    Ok((status, observation))
 }
 
 pub(crate) fn current_start_ticks() -> Option<u64> {
@@ -718,6 +773,147 @@ mod native {
             && policy["authority_epoch"] == tuple["authority_epoch"]
             && policy["account_generation"] == tuple["generation"]
     }
+    #[cfg(target_os = "linux")]
+    pub(super) fn journal_bracket(config: &crate::config::Config, config_path: &Path) -> Value {
+        let selected = super::observe_selected(config_path);
+        let tuple = runtime_tuple(config).ok();
+        let live_process = tuple
+            .as_ref()
+            .and_then(|tuple| live_process(&tuple["process"]));
+        json!({"release": selected.release, "image": selected.image,
+            "tuple":tuple,"live_process":live_process})
+    }
+
+    #[cfg(target_os = "linux")]
+    fn live_process(policy: &Value) -> Option<(u32, u64, ImageObservation)> {
+        let pid = u32::try_from(policy["pid"].as_u64()?)
+            .ok()
+            .filter(|pid| *pid > 0)?;
+        let path = PathBuf::from(format!("/proc/{pid}"));
+        if fs::metadata(&path).ok()?.uid() != unsafe { libc::geteuid() } {
+            return None;
+        }
+        let start = process_start(&bounded_bytes(&path.join("stat")).ok()?).ok()?;
+        if policy["start_ticks"].as_u64() != Some(start) {
+            return None;
+        }
+        let image = fs::metadata(path.join("exe")).ok()?;
+        Some((pid, start, image_metadata(&image)))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn matching_bracket(bracket: &Value, status: &Value) -> bool {
+        !bracket["live_process"].is_null()
+            && related_runtime_snapshot(&bracket["tuple"], status)
+            && bracket["tuple"]["paused"] == status["paused"]
+            && bracket["tuple"]["stopped"] == status["controller_stopped"]
+            && crate::capability::LaneId::NAMES.into_iter().all(|lane| {
+                let desired = &status["lane_controls"][lane]["desired"];
+                bracket["tuple"]["lane_controls"][lane]["revision"] == desired["control_revision"]
+                    && bracket["tuple"]["lane_controls"][lane]["paused"].as_i64()
+                        == desired["paused"].as_bool().map(i64::from)
+                    && desired["control_revision"].as_i64().is_some()
+            })
+    }
+
+    /// Manager property values are untrusted; only bounded allowlisted shapes
+    /// survive, everything else is explicit unavailable.
+    fn sanitize_load_state(value: Option<&str>) -> &str {
+        match value {
+            Some(
+                "loaded" | "not-found" | "masked" | "masked-runtime" | "error" | "bad-setting",
+            ) => value.expect("matched load state"),
+            _ => "unavailable",
+        }
+    }
+
+    fn sanitize_active_state(value: Option<&str>) -> &str {
+        match value {
+            Some(
+                "active" | "reloading" | "inactive" | "failed" | "activating" | "deactivating",
+            ) => value.expect("matched active state"),
+            _ => "unavailable",
+        }
+    }
+
+    fn sanitize_substate(value: Option<&str>) -> String {
+        match value {
+            Some(state)
+                if !state.is_empty()
+                    && state.len() <= 64
+                    && state
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-') =>
+            {
+                state.to_owned()
+            }
+            _ => "unavailable".to_owned(),
+        }
+    }
+
+    fn sanitize_result(value: Option<&str>) -> Value {
+        match value {
+            Some(
+                "success" | "protocol" | "timeout" | "exit-code" | "signal" | "core-dump"
+                | "watchdog" | "start-limit-hit" | "resources" | "canceled" | "assert" | "failure"
+                | "skip" | "oom-kill",
+            ) => Value::String(value.expect("matched result").to_owned()),
+            Some(_) => Value::String("unknown".to_owned()),
+            None => Value::Null,
+        }
+    }
+
+    fn sanitize_pid(value: Option<&str>) -> Option<u32> {
+        value?.trim().parse::<u32>().ok().filter(|pid| *pid > 0)
+    }
+
+    fn sanitize_exit(value: Option<&str>) -> Value {
+        value
+            .and_then(|text| text.trim().parse::<i32>().ok())
+            .map_or(Value::Null, |code| json!(code))
+    }
+
+    /// One typed unit entry from already-fetched property strings. Pure and
+    /// bounded for tests; the caller reports fetch failures via `error`.
+    /// `probe` carries the health-probe result/exit properties; other units
+    /// omit them.
+    fn manager_unit_entry(
+        unit: &'static str,
+        load: Option<&str>,
+        active: Option<&str>,
+        substate: Option<&str>,
+        pid: Option<&str>,
+        probe: Option<(Option<&str>, Option<&str>)>,
+        error: Option<&'static str>,
+    ) -> Value {
+        let mut entry = serde_json::Map::new();
+        entry.insert("unit".into(), Value::String(unit.to_owned()));
+        entry.insert(
+            "load".into(),
+            Value::String(sanitize_load_state(load).to_owned()),
+        );
+        entry.insert(
+            "active".into(),
+            Value::String(sanitize_active_state(active).to_owned()),
+        );
+        entry.insert(
+            "substate".into(),
+            Value::String(sanitize_substate(substate)),
+        );
+        entry.insert(
+            "pid".into(),
+            sanitize_pid(pid).map_or(Value::Null, |pid| json!(pid)),
+        );
+        if let Some((result, exit_code)) = probe {
+            entry.insert("result".into(), sanitize_result(result));
+            entry.insert("exit_code".into(), sanitize_exit(exit_code));
+        }
+        entry.insert(
+            "error".into(),
+            error.map_or(Value::Null, |error| Value::String(error.to_owned())),
+        );
+        Value::Object(entry)
+    }
 
     #[cfg(target_os = "linux")]
     fn observation_properties(
@@ -825,7 +1021,9 @@ mod native {
         db.busy_timeout(Duration::ZERO)?;
         let tuple = db.query_row(
             "SELECT s.runtime_instance,s.effective_revision,s.controller_stopped,
-             a.authority_epoch,c.generation,json_extract(p.policy,'$.process')
+             a.authority_epoch,c.generation,json_extract(p.policy,'$.process'),
+             (SELECT json_group_object(lane,json_object('revision',control_revision,'paused',paused)) FROM lane_control),
+             c.paused
              FROM runtime_state s,runtime_authority a,control c,runtime_policy p
              WHERE s.singleton=1 AND a.singleton=1 AND c.singleton=1 AND p.singleton=1
              AND length(p.policy)<=1048576",
@@ -838,6 +1036,8 @@ mod native {
                     r.get::<_, u64>(3)?,
                     r.get::<_, i64>(4)?,
                     r.get::<_, String>(5)?,
+                    r.get::<_, String>(6)?,
+                    r.get::<_, bool>(7)?,
                 ))
             },
         )?;
@@ -850,7 +1050,9 @@ mod native {
         Ok(
             json!({"runtime_instance":tuple.0,"revision":tuple.1,"stopped":tuple.2,
             "authority_epoch":tuple.3,"generation":tuple.4,
-            "process":serde_json::from_str::<Value>(&tuple.5)?}),
+            "process":serde_json::from_str::<Value>(&tuple.5)?,
+            "lane_controls":serde_json::from_str::<Value>(&tuple.6)?,
+            "journal_device":before.device,"journal_inode":before.inode,"paused":tuple.7}),
         )
     }
 
@@ -864,6 +1066,24 @@ mod native {
         let selected = super::observe_selected(path);
         if selected.ownership == "unmanaged" {
             result.reason = "unmanaged_installation";
+            // An unmanaged layout is not evidence of foreground ownership.
+            let mode = super::snapshot_run_mode(status);
+            if mode != "unknown"
+                && let Ok(config) = crate::config::Config::load_metadata(path)
+                && let Ok(tuple) = runtime_tuple(&config)
+                && related_runtime_snapshot(&tuple, status)
+                && tuple["stopped"] == false
+                && tuple["process"]["invocation_id"].is_null()
+                && let Some((pid, start, _)) = live_process(&tuple["process"])
+            {
+                result.state = "observed_match";
+                result.reason = "matched_unmanaged_writer";
+                result.evidence_scope = "recorded_local_writer_and_stable_process_identity";
+                result.owner = "foreground";
+                result.run_mode = mode;
+                result.pid = Some(pid);
+                result.start_ticks = Some(start);
+            }
             return;
         }
         result.state = "unavailable";
@@ -904,6 +1124,8 @@ mod native {
                 if matches!(before["ActiveState"].as_str(), "inactive" | "failed") {
                     result.state = "stopped";
                     result.reason = "managed_service_inactive";
+                    result.owner = "managed";
+                    result.run_mode = "unknown";
                 }
                 return Ok(());
             }
@@ -986,6 +1208,15 @@ mod native {
             } else {
                 "stable_managed_invocation"
             };
+            // A verified canonical managed run is continuous; anything less
+            // than the full stable invocation leaves owner and mode unknown.
+            if result.state == "observed_match" {
+                result.owner = "managed";
+                result.run_mode = "continuous";
+            } else {
+                result.owner = "unknown";
+                result.run_mode = "unknown";
+            }
             Ok(())
         })();
         if inspected.is_err() {
@@ -996,6 +1227,8 @@ mod native {
                 "identity_or_snapshot_unavailable"
             };
             result.image_relation = "unknown";
+            result.owner = "unknown";
+            result.run_mode = "unknown";
         }
     }
     fn digest(file: File) -> Result<String> {
@@ -1496,6 +1729,7 @@ mod native {
         preview: Option<Value>,
         lock: Option<InstallLock>,
         output: String,
+        manager: Value,
         bootstrap_recovery: Option<BootstrapRecovery>,
         #[cfg(test)]
         proc_root: PathBuf,
@@ -1531,6 +1765,7 @@ mod native {
                 migration: Value::Null,
                 preview: None,
                 lock: None,
+                manager: Value::Null,
                 output: String::new(),
                 bootstrap_recovery: None,
                 #[cfg(test)]
@@ -1720,6 +1955,67 @@ mod native {
             Ok(String::from_utf8(output.stdout)?
                 .trim_end_matches('\n')
                 .to_owned())
+        }
+        fn manager_entry(&self, unit: &'static str, probe: bool) -> Value {
+            // One manager reply per unit; do not join properties sampled
+            // across different invocations of the same service.
+            let properties = if probe {
+                "--property=LoadState,ActiveState,SubState,MainPID,Result,ExecMainStatus"
+            } else {
+                "--property=LoadState,ActiveState,SubState,MainPID"
+            };
+            let output = self.systemctl(&["show", unit, properties], true);
+            let text = output.as_ref().ok().and_then(|output| {
+                (output.stdout.len() <= 4096)
+                    .then(|| std::str::from_utf8(&output.stdout).ok())
+                    .flatten()
+            });
+            let field = |name| {
+                let mut values = text?.lines().filter_map(|line| {
+                    let (key, value) = line.split_once('=')?;
+                    (key == name).then_some(value)
+                });
+                let value = values.next()?;
+                (value.len() <= 256 && values.next().is_none()).then_some(value)
+            };
+            let load = field("LoadState");
+            let active = field("ActiveState");
+            let substate = field("SubState");
+            let result = probe.then(|| (field("Result"), field("ExecMainStatus")));
+            let error = if load == Some("not-found") {
+                Some("unavailable")
+            } else if !output.as_ref().is_ok_and(|output| output.status.success()) {
+                Some("client_error")
+            } else if load.is_none()
+                || active.is_none()
+                || substate.is_none()
+                || result == Some((None, None))
+            {
+                Some("unavailable")
+            } else {
+                None
+            };
+            manager_unit_entry(
+                unit,
+                load,
+                active,
+                substate,
+                field("MainPID"),
+                result,
+                error,
+            )
+        }
+        /// Typed, sanitized manager identity for `service status`: the
+        /// independently observed controller, health probe (with result/exit),
+        /// and health timer units. Never fails; gaps are explicit unavailable
+        /// or client-error entries. The free-text `.data.output` is retained
+        /// separately and stays untrusted.
+        fn manager_snapshot(&self) -> Value {
+            json!({
+                "controller": self.manager_entry("agmi.service", false),
+                "health_probe": self.manager_entry("agmi-health.service", true),
+                "health_timer": self.manager_entry("agmi-health.timer", false),
+            })
         }
         fn account_context(&self) -> Result<()> {
             ensure!(
@@ -2510,6 +2806,7 @@ mod native {
             self.output.push_str(
                 "identity_evidence=checksums_and_build_labels_not_signed_source_provenance\n",
             );
+            self.manager = self.manager_snapshot();
             checkpoint()
         }
     }
@@ -4515,6 +4812,9 @@ mod native {
                 let evidence = installation.evidence(!decision);
                 let mut result =
                     json!({"plan":plan,"installation":evidence,"output":installation.output});
+                if installation.phase == "status" {
+                    result["manager"] = std::mem::take(&mut installation.manager);
+                }
                 if decision {
                     result["status"] = json!("decision_required");
                 }
@@ -4593,6 +4893,89 @@ mod native {
         use super::*;
 
         static TEST_SERIAL: Mutex<()> = Mutex::new(());
+        #[test]
+        fn manager_unit_entry_sanitizes_untrusted_properties() {
+            let entry = manager_unit_entry(
+                "agmi.service",
+                Some("loaded"),
+                Some("active"),
+                Some("running"),
+                Some("123"),
+                None,
+                None,
+            );
+            assert_eq!(entry["unit"], "agmi.service");
+            assert_eq!(entry["load"], "loaded");
+            assert_eq!(entry["active"], "active");
+            assert_eq!(entry["substate"], "running");
+            assert_eq!(entry["pid"], 123);
+            assert!(entry.get("result").is_none());
+            assert!(entry["error"].is_null());
+
+            let probe = manager_unit_entry(
+                "agmi-health.service",
+                Some("loaded"),
+                Some("active"),
+                Some("running"),
+                Some("7"),
+                Some((Some("success"), Some("0"))),
+                None,
+            );
+            assert_eq!(probe["result"], "success");
+            assert_eq!(probe["exit_code"], 0);
+
+            // Untrusted manager output collapses to bounded explicit values.
+            let hostile = manager_unit_entry(
+                "agmi-health.service",
+                Some("loaded\ninjected"),
+                Some("ACTIVE"),
+                Some(&"x".repeat(200)),
+                Some("0"),
+                Some((Some("weird;`rm -rf /`"), Some("99999999999"))),
+                None,
+            );
+            assert_eq!(hostile["load"], "unavailable");
+            assert_eq!(hostile["active"], "unavailable");
+            assert_eq!(hostile["substate"], "unavailable");
+            assert!(hostile["pid"].is_null());
+            assert_eq!(hostile["result"], "unknown");
+            assert!(hostile["exit_code"].is_null());
+
+            let missing = manager_unit_entry(
+                "agmi.service",
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("client_error"),
+            );
+            assert_eq!(missing["error"], "client_error");
+            assert_eq!(missing["load"], "unavailable");
+
+            let absent = manager_unit_entry(
+                "agmi-health.timer",
+                Some("not-found"),
+                None,
+                None,
+                None,
+                None,
+                Some("unavailable"),
+            );
+            assert_eq!(absent["load"], "not-found");
+            assert_eq!(absent["error"], "unavailable");
+        }
+
+        #[test]
+        fn snapshot_run_mode_reads_only_the_persisted_mode() {
+            let once = json!({"effective_runtime":{"policy":{"process":{"run_mode":"once"}}}});
+            assert_eq!(crate::installer::snapshot_run_mode(&once), "once");
+            let policy = json!({"effective_runtime":{"policy":{"run_mode":"continuous"}}});
+            assert_eq!(crate::installer::snapshot_run_mode(&policy), "continuous");
+            let garbage = json!({"effective_runtime":{"run_mode":"turbo"}});
+            assert_eq!(crate::installer::snapshot_run_mode(&garbage), "unknown");
+            assert_eq!(crate::installer::snapshot_run_mode(&json!({})), "unknown");
+        }
 
         fn observed_unit_fixture() -> Result<(tempfile::TempDir, PathBuf, String, PathBuf)> {
             let home = tempfile::tempdir()?;
