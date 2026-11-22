@@ -141,6 +141,7 @@ def init(f):
         assert result['account'] == f.address
         assert result['next_actions'] == [{
             'kind': 'command', 'authorization_required': False,
+            'disposition': 'inspect',
             'argv': ['agmi', '--config', str(config), 'config', 'check'],
         }]
         assert not (target / 'state/state.sqlite3').exists()
