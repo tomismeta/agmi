@@ -46,6 +46,34 @@ jobs:
           python3 tests/omp_native_smoke.py --omp "$omp_dir/omp-19.0.1"
       - name: Behavior tests
         run: RUST_BACKTRACE=1 cargo +1.96.0 test --locked
+      - name: Isolated rootless OMP sandbox regression
+        run: |
+          docker build -f tests/systemd_fixture.Dockerfile -t agmi-systemd-fixture tests
+          sandbox_test=$(
+            cargo +1.96.0 test --locked --lib --no-run --message-format=json \
+              | jq -er 'select(.reason=="compiler-artifact" and .target.name=="agmi" and (.target.kind|index("lib")) and .profile.test and .executable!=null)|.executable'
+          )
+          security=()
+          if [[ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || true)" == 1 ]]; then
+            # Allow nested user namespaces only in the isolated test container.
+            # Keep the Ubuntu runner's AppArmor sysctl and host policy unchanged.
+            profile="$RUNNER_TEMP/agmi-ci-omp-userns"
+            cat >"$profile" <<'APPARMOR'
+          abi <abi/4.0>,
+          profile agmi-ci-omp-userns flags=(unconfined) {
+              userns,
+          }
+          APPARMOR
+            sudo apparmor_parser -r "$profile"
+            security=(--security-opt apparmor=agmi-ci-omp-userns)
+            echo 'AGMI_CI_OMP_APPARMOR=apparmor=agmi-ci-omp-userns' >> "$GITHUB_ENV"
+          fi
+          docker run --rm --privileged --cgroupns=private --network=none "${security[@]}" \
+            --tmpfs /tmp:exec,mode=1777 -v "$sandbox_test:/input/agmi-sandbox-test:ro" \
+            --entrypoint runuser agmi-systemd-fixture -u agmi-systemd-fixture -- setpriv --no-new-privs \
+            /input/agmi-sandbox-test --exact \
+            solver::omp::qualification::tests::isolated_probe_closes_host_descriptors_and_stops_with_parent \
+            --ignored --test-threads=1
       - name: Lints
         run: cargo +1.96.0 clippy --locked --all-targets -- -D warnings
       - name: Build authentic format-4 rollback fixture
@@ -152,6 +180,23 @@ jobs:
             cargo +1.96.0 test --locked --lib \
             update::tests::staged_release_passes_protocol_one_updater_verification -- --exact --ignored
           printf 'AGMI_PACKAGED_MUSL=%s\n' "$root/extracted/agmi" >> "$GITHUB_ENV"
+      - name: Isolated stock OMP qualification of exact package
+        run: |
+          security=()
+          if [[ -n "${AGMI_CI_OMP_APPARMOR:-}" ]]; then
+            security=(--security-opt "$AGMI_CI_OMP_APPARMOR")
+          fi
+          docker run --rm --privileged --cgroupns=private --network=none "${security[@]}" \
+            --tmpfs /tmp:exec,mode=1777 -v "$PWD/tests:/tests:ro" \
+            -v "$AGMI_PACKAGED_MUSL:/input/agmi:ro" \
+            -v "$RUNNER_TEMP/agmi-omp/omp-19.1.0:/input/omp:ro" \
+            --entrypoint /bin/sh agmi-systemd-fixture -ec '
+              for model in glm-5.3 kimi-k3; do
+                runuser -u agmi-systemd-fixture -- setpriv --no-new-privs \
+                  python3 -u /tests/omp_go_qualification_smoke.py /input/agmi \
+                    --omp /input/omp --stock-gate --model "$model"
+              done
+            '
       - name: CLI discovery
         run: ./target/debug/agmi commands --json
       - name: Lost-grade cold-restart safety
@@ -218,7 +263,6 @@ jobs:
             --target-dir "$RUNNER_TEMP/agmi-omp-go-fixture"
       - name: Test exact packaged adapters and separately built OpenCode Go fixture
         run: |
-          docker build -f tests/systemd_fixture.Dockerfile -t agmi-systemd-fixture tests
           docker run --rm --init --network=none --tmpfs /tmp:exec,mode=1777 \
             -v "$PWD/tests:/tests:ro" \
             -v "$RUNNER_TEMP/agmi-package/install/bin/agmi:/input/agmi-source:ro" \
@@ -253,18 +297,12 @@ jobs:
             '
       - name: Isolated systemd release lifecycle
         run: |
-          sandbox_test=$(
-            cargo +1.96.0 test --locked --lib --no-run --message-format=json \
-              | jq -er 'select(.reason=="compiler-artifact" and .target.name=="agmi" and (.target.kind|index("lib")) and .profile.test and .executable!=null)|.executable'
-          )
           # Consume the extracted, verified archive bytes, never a rebuild.
           name="agmi-systemd-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           trap 'docker rm -f "$name" >/dev/null 2>&1 || true' EXIT
           docker run -d --name "$name" --privileged --cgroupns=private \
             --network=none --tmpfs /run --tmpfs /run/lock --tmpfs /tmp:exec,mode=1777 \
             -v "$PWD:/src:ro" -v "$AGMI_PACKAGED_MUSL:/input/agmi:ro" \
-            -v "$RUNNER_TEMP/agmi-omp/omp-19.1.0:/input/omp:ro" \
-            -v "$sandbox_test:/input/agmi-sandbox-test:ro" \
             agmi-systemd-fixture
           timeout 60 docker exec "$name" sh -c \
             'until systemctl start user@17321.service; do sleep 1; done'
@@ -276,15 +314,6 @@ jobs:
             HOME=/home/agmi-systemd-fixture XDG_RUNTIME_DIR=/run/user/17321 \
             DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/17321/bus \
             python3 -u /src/tests/systemd_smoke.py /input/agmi
-          docker exec "$name" runuser -u agmi-systemd-fixture -- setpriv --no-new-privs \
-            /input/agmi-sandbox-test --exact \
-            solver::omp::qualification::tests::isolated_probe_closes_host_descriptors_and_stops_with_parent \
-            --ignored --test-threads=1
-          for model in glm-5.3 kimi-k3; do
-            docker exec "$name" runuser -u agmi-systemd-fixture -- setpriv --no-new-privs \
-              python3 -u /src/tests/omp_go_qualification_smoke.py /input/agmi \
-                --omp /input/omp --stock-gate --model "$model"
-          done
       - name: Isolated systemd retained writer and managed health outcomes
         timeout-minutes: 8
         run: |

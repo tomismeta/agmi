@@ -720,7 +720,24 @@ mod tests {
         let input = child.child.stdin.take().context("missing test stdin")?;
         let mut output = child.child.stdout.take().context("missing test stdout")?;
         let mut ready = [0];
-        tokio::time::timeout(Duration::from_secs(5), output.read_exact(&mut ready)).await??;
+        if let Err(error) =
+            tokio::time::timeout(Duration::from_secs(5), output.read_exact(&mut ready)).await?
+        {
+            let mut diagnostics = Vec::new();
+            if let Some(stderr) = child.child.stderr.take() {
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    stderr.take(4096).read_to_end(&mut diagnostics),
+                )
+                .await;
+            }
+            return Err(error).with_context(|| {
+                format!(
+                    "isolated fixture did not start: {}",
+                    String::from_utf8_lossy(&diagnostics)
+                )
+            });
+        }
         assert_eq!(ready, *b"R");
         assert!(
             tokio::time::timeout(Duration::from_millis(50), child.wait())
