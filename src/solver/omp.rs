@@ -19,7 +19,9 @@ const STDERR_LIMIT: usize = 256 * 1024;
 #[serde(rename_all = "snake_case")]
 enum GoMode {
     Stock,
+    #[cfg(feature = "omp-go-fixture")]
     Probe,
+    StockProbe,
     #[cfg(feature = "omp-go-fixture")]
     Fixture,
 }

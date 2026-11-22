@@ -6,6 +6,7 @@ For real synthetic inference use a controller built with --features omp-go-fixtu
 Use --judge-only --model MODEL to exercise grade validation on a catalog route.
 Use --expect-production-refusal for exact artifacts without the fixture feature.
 Use --expect-refusal only for a separately known incompatible omp executable.
+Use --stock-gate for the packaged binary with a clean native auth store.
 Run with no external network (CI uses --network=none); both servers are loopback.
 Uses a fresh HOME and no user credentials, extension, or replacement RPC client.
 """
@@ -162,7 +163,7 @@ def wire(call, record, kind):
     assert envelope['request']['words'] == ['clock', 'bridge'], envelope
 
 
-def exercise(fixture, server, native, expect_refusal, production, judge_only):
+def exercise(fixture, server, native, expect_refusal, production, judge_only, stock_gate):
     root = fixture.root
     home, scratch, candidate = root / 'home', root / 'tmp', root / 'omp'
     scratch.mkdir(mode=0o700)
@@ -173,7 +174,8 @@ def exercise(fixture, server, native, expect_refusal, production, judge_only):
     (models.parent / 'config.yml').write_text(
         'update:\n  auto: true\nretry:\n  enabled: false\n  modelFallback: false\n')
     origin = f'http://127.0.0.1:{server.server_port}'
-    profile(models, origin)
+    if not stock_gate:
+        profile(models, origin)
     # agmigo's default OMP profile coexists with ambient Pi extensions.
     # Trusted stock Go must not load them while resolving the catalog route.
     ambient = home / '.pi/agent/extensions'
@@ -185,6 +187,8 @@ def exercise(fixture, server, native, expect_refusal, production, judge_only):
                        XDG_CONFIG_HOME=str(home / '.config'), XDG_DATA_HOME=str(home / '.local/share'),
                        XDG_CACHE_HOME=str(home / '.cache'), AGMI_UPDATE_CHECKS='0',
                        AGMI_OMP_TEST_LOOPBACK='1')
+    if stock_gate:
+        del fixture.env['AGMI_OMP_TEST_LOOPBACK']
     for kind in ('answer', 'judge'):
         lane = fixture.lanes[kind]
         lane['mode'] = 'off' if kind == 'answer' and judge_only else 'active'
@@ -204,6 +208,21 @@ def exercise(fixture, server, native, expect_refusal, production, judge_only):
         judge_participation(fixture, server)
         return
     fixture.start(resume=True)
+    if stock_gate:
+        state, attempt = terminal(fixture, 1, 'answer')
+        result = attempt['completion']
+        # Reaching the native stream with an empty auth store proves traversal
+        # of the Rust stock descriptor gate, not just a ready RPC entry.
+        assert (state, result['phase'], result['execution']) == (
+            'model_unknown', 'inference', 'unknown'), result
+        assert result['reason_code'] in ('native_failure', 'native_stream_failed'), result
+        assert result['inference_spawned_at'] is not None
+        assert result['reported']['run_id']['source'] == 'adapter_contract', result
+        fixture.stop()
+        counts(fixture, server, 1, 0, 0)
+        print(f'PASS real stock {server.model} route crossed qualification; empty auth, no hosted write',
+              flush=True)
+        return
     if expect_refusal or production:
         reason = refused(fixture, 1)
         if production:
@@ -377,6 +396,8 @@ def main():
     mode.add_argument('--judge-only', action='store_true', help='exercise invalid and fresh Judge seats')
     mode.add_argument('--expect-production-refusal', action='store_true',
                       help='require the exact production binary to refuse the enabled fixture override')
+    mode.add_argument('--stock-gate', action='store_true',
+                      help='prove packaged stock pre-prompt gate with no native credentials')
     mode.add_argument('--expect-refusal', action='store_true',
                         help='require prelaunch refusal on the supplied incompatible executable')
     args = parser.parse_args()
@@ -392,7 +413,7 @@ def main():
                 fixture = fixture_type(agmi, Path(temp).resolve())
                 try:
                     exercise(fixture, server, omp, args.expect_refusal,
-                             args.expect_production_refusal, args.judge_only)
+                             args.expect_production_refusal, args.judge_only, args.stock_gate)
                 finally:
                     fixture.close()
             finally:

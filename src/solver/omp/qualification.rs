@@ -13,6 +13,7 @@ const UNAVAILABLE: SolverNotStarted = SolverNotStarted("native_qualification_una
 const FAILED: SolverNotStarted = SolverNotStarted("native_qualification_failed");
 const MAX_IMAGE: u64 = 512 * 1024 * 1024;
 const STOCK_ENDPOINT: &str = "https://opencode.ai/inference/go/v1";
+#[cfg(feature = "omp-go-fixture")]
 const FIXTURE_KEY: &str = "agmi-loopback-fixture";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -305,7 +306,7 @@ pub(in crate::solver) async fn qualify(
             )
         }
     };
-    validate_settings(&image.executable, &scope.home).await?;
+    validate_settings(&image.executable, &scope, deadline).await?;
     let mut qualified = None;
     for case in [
         #[cfg(feature = "omp-go-fixture")]
@@ -356,28 +357,134 @@ pub(in crate::solver) async fn qualify(
     Ok(Some(result))
 }
 
-async fn validate_settings(executable: &Path, home: &Path) -> Result<()> {
-    // Let the native settings parser interpret YAML. This does not load the
-    // provider resolver or pass any configured keys through diagnostics.
-    let mut child = spawn(
-        executable,
-        &[
-            "config".into(),
-            "list".into(),
-            "--scope=global".into(),
-            "--json".into(),
-        ],
-        home,
-        &OmpConfig::default(),
-    )?;
-    let bytes = collect_native_evidence(
-        &mut child,
-        Vec::new(),
-        NativeProtocol::Discovery,
-        None,
-        &mut Default::default(),
+fn spawn_isolated(
+    executable: &Path,
+    args: &[String],
+    work: &Path,
+    home: &Path,
+) -> Result<OwnedChild> {
+    #[cfg(target_os = "linux")]
+    {
+        // No host home, sockets or network routes are available to the probe.
+        let mut command = Command::new("/usr/bin/bwrap");
+        command.env_clear().args([
+            "--unshare-user",
+            "--unshare-all",
+            "--unshare-net",
+            "--disable-userns",
+            "--die-with-parent",
+            "--clearenv",
+            "--tmpfs",
+            "/",
+            "--dev",
+            "/dev",
+            "--proc",
+            "/proc",
+            "--tmpfs",
+            "/tmp",
+        ]);
+        for path in ["/lib", "/lib64", "/usr/lib", "/usr/lib64"] {
+            command.args(["--ro-bind-try", path, path]);
+        }
+        command
+            .arg("--bind")
+            .arg(work)
+            .arg(work)
+            .arg("--ro-bind")
+            .arg(executable)
+            .arg("/agmi-omp")
+            .arg("--chdir")
+            .arg(work)
+            .arg("--setenv")
+            .arg("HOME")
+            .arg(home)
+            .arg("--setenv")
+            .arg("TMPDIR")
+            .arg(work.join("tmp"))
+            .args([
+                "--setenv",
+                "LANG",
+                "C.UTF-8",
+                "--setenv",
+                "OMP_PROFILE",
+                "default",
+            ])
+            .args(["--", "/agmi-omp"])
+            .args(args);
+        spawn_owned(command).map_err(|_| UNAVAILABLE.into())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (executable, args, work, home);
+        Err(UNAVAILABLE.into())
+    }
+}
+
+async fn validate_settings(
+    executable: &Path,
+    scope: &Scope,
+    deadline: ExecutionDeadline,
+) -> Result<()> {
+    // Let OMP interpret the one supported settings file in isolation. Never
+    // expose the native credential store or run proof commands in the real home.
+    use std::io::Read;
+    let scratch = Scratch::new()?;
+    let home = scratch.0.join("home");
+    let agent = home.join(".omp/agent");
+    std::fs::create_dir_all(&agent).context(UNAVAILABLE)?;
+    std::fs::create_dir(scratch.0.join("tmp")).context(UNAVAILABLE)?;
+    let settings = scope.home.join(".omp/agent/config.yml");
+    if let Some((_, Some(expected))) = scope.files.iter().find(|(path, _)| *path == settings) {
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&settings)
+            .context(UNAVAILABLE)?;
+        ensure!(
+            FileStamp::from(file.metadata().context(UNAVAILABLE)?) == *expected
+                && expected.size <= 64 * 1024,
+            UNAVAILABLE
+        );
+        let mut bytes = Vec::with_capacity(expected.size as usize);
+        (&mut file)
+            .take(expected.size + 1)
+            .read_to_end(&mut bytes)
+            .context(UNAVAILABLE)?;
+        ensure!(
+            bytes.len() as u64 == expected.size
+                && FileStamp::from(file.metadata().context(UNAVAILABLE)?) == *expected,
+            UNAVAILABLE
+        );
+        private_file(&agent.join("config.yml"), &bytes)?;
+    }
+    let args = ["config", "list", "--scope=global", "--json"].map(str::to_owned);
+    #[cfg(feature = "omp-go-fixture")]
+    let mut child = if GoMode::inference() == GoMode::Fixture {
+        spawn_environment(
+            executable,
+            &args,
+            &scratch.0,
+            &OmpConfig::default(),
+            &home,
+            None,
+        )?
+    } else {
+        spawn_isolated(executable, &args, &scratch.0, &home)?
+    };
+    #[cfg(not(feature = "omp-go-fixture"))]
+    let mut child = spawn_isolated(executable, &args, &scratch.0, &home)?;
+    let bytes = tokio::time::timeout_at(
+        deadline.at,
+        collect_native_evidence(
+            &mut child,
+            Vec::new(),
+            NativeProtocol::Discovery,
+            None,
+            &mut Default::default(),
+        ),
     )
     .await
+    .context(UNAVAILABLE)?
     .context(UNAVAILABLE)?;
     let global: Value = serde_json::from_slice(&bytes).context(UNAVAILABLE)?;
     ensure!(
@@ -411,24 +518,48 @@ async fn run_probe(
     case: probe::Case,
     deadline: ExecutionDeadline,
 ) -> Result<Option<String>> {
-    let endpoint = probe::Probe::start(case, name, effort).await?;
+    #[cfg(feature = "omp-go-fixture")]
+    if matches!(case, probe::Case::RejectAuth) && GoMode::inference() != GoMode::Fixture {
+        return Ok(None);
+    }
+    #[cfg(feature = "omp-go-fixture")]
+    let endpoint = if GoMode::inference() == GoMode::Fixture {
+        Some(probe::Probe::start(case, name, effort).await?)
+    } else {
+        None
+    };
     let scratch = Scratch::new()?;
     let home = scratch.0.join("home");
     let agent = home.join(".omp/agent");
     std::fs::create_dir_all(&agent)?;
-    let key = FIXTURE_KEY;
     #[cfg(feature = "omp-go-fixture")]
-    let key = if matches!(case, probe::Case::RejectAuth) {
-        "agmi-loopback-wrong-fixture-key"
+    if let Some(endpoint) = &endpoint {
+        let key = if matches!(case, probe::Case::RejectAuth) {
+            "agmi-loopback-wrong-fixture-key"
+        } else {
+            FIXTURE_KEY
+        };
+        private_file(
+            &agent.join("models.yml"),
+            &serde_json::to_vec(&json!({"providers":{(provider):{
+                "baseUrl":format!("{}/v1",endpoint.origin()), "apiKey":key
+            }}}))?,
+        )?;
+    }
+    #[cfg(feature = "omp-go-fixture")]
+    let mode = if endpoint.is_some() {
+        GoMode::Probe
     } else {
-        key
+        GoMode::StockProbe
     };
-    private_file(
-        &agent.join("models.yml"),
-        &serde_json::to_vec(&json!({"providers":{(provider):{
-            "baseUrl":format!("{}/v1",endpoint.origin()), "apiKey":key
-        }}}))?,
-    )?;
+    #[cfg(not(feature = "omp-go-fixture"))]
+    let mode = GoMode::StockProbe;
+    if mode == GoMode::StockProbe {
+        private_file(
+            &scratch.0.join("omp-probe-response.json"),
+            &serde_json::to_vec(&probe::response(case, name, effort)?)?,
+        )?;
+    }
     let model = ModelConfig {
         harness: Harness::Omp,
         executable: executable.to_owned(),
@@ -448,28 +579,55 @@ async fn run_probe(
         &invocation,
         &scratch.0,
         deadline,
-        GoMode::Probe,
+        mode,
     )?;
-    let mut owner = spawn_environment(
-        executable,
-        &prepared.args,
-        &scratch.0,
-        &OmpConfig::default(),
-        &home,
-        Some(endpoint.proxy()),
-    )?;
-    let origin = format!("{}/v1", endpoint.origin());
+    #[cfg(feature = "omp-go-fixture")]
+    let (mut owner, origin) = if let Some(endpoint) = &endpoint {
+        (
+            spawn_environment(
+                executable,
+                &prepared.args,
+                &scratch.0,
+                &OmpConfig::default(),
+                &home,
+                Some(endpoint.proxy()),
+            )?,
+            Cow::Owned(format!("{}/v1", endpoint.origin())),
+        )
+    } else {
+        (
+            spawn_isolated(executable, &prepared.args, &scratch.0, &home)?,
+            Cow::Borrowed(STOCK_ENDPOINT),
+        )
+    };
+    #[cfg(not(feature = "omp-go-fixture"))]
+    let (mut owner, origin) = (
+        spawn_isolated(executable, &prepared.args, &scratch.0, &home)?,
+        Cow::Borrowed(STOCK_ENDPOINT),
+    );
     let (terminal, descriptor) = exchange_inference(
         &mut owner,
         prepared.input,
         deadline,
-        Descriptor::Probe(&origin),
+        Descriptor::Probe(origin.as_ref()),
         None,
     )
     .await?;
+    if mode == GoMode::StockProbe {
+        // Only the guarded synthetic fetch callback emits this dispatch witness.
+        ensure!(
+            terminal.entries["entries"]
+                .as_array()
+                .is_some_and(|entries| entries.len() == 2 && entries[0]["customType"] == DISPATCH),
+            FAILED
+        );
+    }
     let mut report = NativeReportedEvidence::default();
     let returned = terminal.verify(model.model, &mut report);
-    endpoint.finish().await?;
+    #[cfg(feature = "omp-go-fixture")]
+    if let Some(endpoint) = endpoint {
+        endpoint.finish().await?;
+    }
     match case {
         #[cfg(feature = "omp-go-fixture")]
         probe::Case::RejectAuth => {

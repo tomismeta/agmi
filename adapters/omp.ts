@@ -31,7 +31,7 @@ const bindingShape = {
 const bootstrapSchema = z.object({
   ...bindingShape, provider_discovery_cwd: z.string().regex(/^\//),
   deadline_unix_ms: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
-  go_mode: z.enum(["stock", "probe", "fixture"]).optional(),
+  go_mode: z.enum(["stock", "probe", "stock_probe", "fixture"]).optional(),
 }).strict();
 const bodySchema = z.object({
   ...bindingShape, request_json: z.string(), policy: z.string(),
@@ -252,7 +252,14 @@ export default async function (pi: ExtensionAPI) {
     reasoning_effort: boot.reasoning_effort };
   const stockGo = boot.provider === "opencode-go";
   requireThat(stockGo === (boot.go_mode !== undefined), "native_bootstrap");
-  const syntheticGo = boot.go_mode === "probe" || boot.go_mode === "fixture";
+  const stockProbe = boot.go_mode === "stock_probe";
+  const loopbackGo = boot.go_mode === "probe" || boot.go_mode === "fixture";
+  const syntheticGo = stockProbe || loopbackGo;
+  const probeResponse = stockProbe ? z.object({
+    status: z.union([z.literal(200), z.literal(400)]),
+    mime: z.enum(["text/event-stream", "application/json"]),
+    body: z.string().max(16 * 1024),
+  }).strict().parse(JSON.parse(await readFile(new URL("./omp-probe-response.json", import.meta.url), "utf8"))) : undefined;
   const settings = await Settings.loadReadOnly({ cwd: boot.provider_discovery_cwd, agentDir: getAgentDir() });
   if (!stockGo) {
     const paths = await discoverSessionExtensionPaths({ includeAmbientHooks: true }, boot.provider_discovery_cwd, settings);
@@ -336,8 +343,11 @@ export default async function (pi: ExtensionAPI) {
       if (stockGo) {
         requireThat(model.api === "openai-completions", "native_model");
         const baseUrl = model.baseUrl.replace(/\/$/, "");
-        requireThat(syntheticGo ? /^http:\/\/127\.0\.0\.1:[0-9]{1,5}\/v1$/.test(baseUrl) : baseUrl === GO_STOCK_URL, "native_model");
-        if (syntheticGo) {
+        requireThat(loopbackGo ? /^http:\/\/127\.0\.0\.1:[0-9]{1,5}\/v1$/.test(baseUrl) : baseUrl === GO_STOCK_URL, "native_model");
+        if (stockProbe) {
+          // The sandbox has no real auth store. This proves encoding, not login.
+          syntheticKey = GO_SYNTHETIC_KEY;
+        } else if (loopbackGo) {
           // Check the effective initial bearer, not the model overlay's apiKey.
           // Pass that checked value to the SDK without account rotation/re-resolution.
           const resolved = await ctx.modelRegistry.resolver(model, boot.invocation_id)({ lastChance: false, error: undefined });
@@ -390,7 +400,7 @@ export default async function (pi: ExtensionAPI) {
           && createHash("sha256").update(body.request_json, "utf8").digest("hex") === boot.request_digest && typeof body.policy === "string"
           && bytes(body.policy) <= 16 * 1024 && Number.isSafeInteger(body.timeout_ms) && body.timeout_ms > 0, "native_binding");
         const request = z.object({ kind: z.string() }).passthrough().parse(JSON.parse(body.request_json));
-        requireThat(boot.go_mode !== "probe" || (body.policy === GO_PROBE_POLICY
+        requireThat((boot.go_mode !== "probe" && !stockProbe) || (body.policy === GO_PROBE_POLICY
           && request.kind === "answer" && request.probe === GO_PROBE_MARKER && Object.keys(request).length === 2),
           "native_binding");
         const model = resolve(ctx);
@@ -451,6 +461,11 @@ export default async function (pi: ExtensionAPI) {
             }
             forwardedGoPost = true;
             pi.appendEntry("agmi_omp_dispatch_v1", binding);
+            if (probeResponse) {
+              return Promise.resolve(new Response(probeResponse.body, {
+                status: probeResponse.status, headers: { "Content-Type": probeResponse.mime },
+              }));
+            }
             return fetch(goPostUrl, outgoing);
           } : undefined,
           sessionId: boot.invocation_id, signal,

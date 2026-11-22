@@ -259,6 +259,7 @@ jobs:
           docker run -d --name "$name" --privileged --cgroupns=private \
             --network=none --tmpfs /run --tmpfs /run/lock --tmpfs /tmp:exec,mode=1777 \
             -v "$PWD:/src:ro" -v "$AGMI_PACKAGED_MUSL:/input/agmi:ro" \
+            -v "$RUNNER_TEMP/agmi-omp/omp-19.1.0:/input/omp:ro" \
             agmi-systemd-fixture
           timeout 60 docker exec "$name" sh -c \
             'until systemctl start user@17321.service; do sleep 1; done'
@@ -270,6 +271,11 @@ jobs:
             HOME=/home/agmi-systemd-fixture XDG_RUNTIME_DIR=/run/user/17321 \
             DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/17321/bus \
             python3 -u /src/tests/systemd_smoke.py /input/agmi
+          for model in glm-5.3 kimi-k3; do
+            docker exec "$name" runuser -u agmi-systemd-fixture -- setpriv --no-new-privs \
+              python3 -u /src/tests/omp_go_qualification_smoke.py /input/agmi \
+                --omp /input/omp --stock-gate --model "$model"
+          done
       - name: Isolated systemd retained writer and managed health outcomes
         timeout-minutes: 8
         run: |

@@ -495,11 +495,14 @@ Native paths are config-relative; native profile/auth/cache ownership stays with
 The omp adapter waits for final admission, then owns one fresh native process and temporary extension per attempt. A fixed local command calls the SDK directly with agmi's privileged policy and both captured guidance layers; native conversation, project instructions and tool hooks are not inherited into inference. Factory-time native providers are projected without attaching their tools/handlers. Providers registered only during live session lifecycle are not projected.
 
 For `opencode-go`, agmi qualifies a private byte snapshot of the configured
-standalone executable and requested effort using synthetic data and credentials
-against a private loopback endpoint. Actual tasks go only to the stock HTTPS
-endpoint using the default native profile and catalog. Custom endpoint and
-project settings are refused. The bound route is checked again before sending
-task data; changed executables or relevant settings invalidate cached proof.
+standalone executable and requested effort against the unchanged stock catalog
+route. An isolated child uses a synthetic bearer and gets a synthetic response
+only after its exact request passes the same fetch-boundary checks as live work.
+The proof makes no provider call and cannot establish native login. Actual tasks
+go only to the stock HTTPS endpoint using the default native profile and
+catalog. Custom endpoint and project settings are refused. The bound route is
+checked again before sending task data; changed executables or relevant
+settings invalidate cached proof.
 The final serialized request must still match the qualified model, effort,
 captured prompt, and tool policy, carry a native Bearer, and go to the bound
 endpoint without redirects.
@@ -912,7 +915,11 @@ Staging checks artifact/retention space plus a 256 MiB journal/WAL reserve witho
 
 The example uses control-group cleanup, restrictive umask, private temporary files and restart-on-failure. The service manager owns private model scratch at `%t/agmi` (normally `/run/user/<uid>/agmi`); each native child uses its own private invocation workspace as `TMPDIR`. Foreground execution retains the OS-selected temporary root. Runtime storage can be memory-backed and capacity-limited; do not put update archives or durable state there. Explicit start-rate limits also count manual service starts. `TimeoutStopSec=infinity` prevents systemd truncating captured deadlines; agmi bounds shutdown, but a shutdown bug still needs operator intervention.
 
-Stock OpenCode Go requires scratch space for a private copy of the standalone executable and a scratch mount that permits execution. Do not point agmi at a launcher script or relax mount protections globally. If qualification refuses, check the service's configured executable and scratch filesystem before changing the route.
+Stock OpenCode Go requires Linux with `/usr/bin/bwrap` (Bubblewrap) and working
+unprivileged user and network namespaces under the service account. Qualification
+fails closed without that isolation; this does not affect other model routes.
+Provide scratch space for a private executable copy on a mount that permits
+execution. Do not use a launcher script or relax mount protections globally.
 
 `PrivateTmp` namespace enforcement depends on systemd/kernel support. Private managed model workspaces do not depend on it: their service-owned runtime root and per-invocation permissions remain the storage boundary.
 
@@ -1118,9 +1125,10 @@ emits a link map and digest-bound provenance. CI verifies the shipped archive
 with the production updater verifier, then runs `tests/packaged_omp_smoke.py`
 with the extracted source-package binary and the exact binary extracted from
 the updater archive. The digest-verified standalone omp fixtures run without external networking.
-The exact distributed builds must refuse an enabled OpenCode Go loopback
-override. Positive OpenCode Go tests use the separate `omp-go-fixture` build
-and only synthetic credentials and tasks; that build is never a release asset.
+The exact distributed build must refuse an enabled OpenCode Go loopback override
+and cross the genuine stock-route gate in a credential-free environment. Positive
+loopback tests use the separate `omp-go-fixture` build and only synthetic
+credentials and tasks; that build is never a release asset.
 Keep the checked archive, `BUILD-INFO.txt`, `SHA256SUMS` and allocator evidence
 together; a fresh rebuild is a different candidate.
 

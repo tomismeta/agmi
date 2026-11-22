@@ -1,9 +1,14 @@
-//! Keep the loopback proof origin separate from the deny-only proxy listener.
+//! Synthetic stock responses and the test-build-only independent wire fixture.
 
+#[cfg(feature = "omp-go-fixture")]
 use super::FIXTURE_KEY;
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::Result;
+#[cfg(feature = "omp-go-fixture")]
+use anyhow::{Context, bail, ensure};
 use serde_json::{Value, json};
+#[cfg(feature = "omp-go-fixture")]
 use std::{net::Ipv4Addr, time::Duration};
+#[cfg(feature = "omp-go-fixture")]
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
@@ -25,6 +30,7 @@ pub(super) enum Case {
     RejectServedModel,
 }
 
+#[cfg(feature = "omp-go-fixture")]
 pub(super) struct Probe {
     origin: String,
     proxy: String,
@@ -32,6 +38,7 @@ pub(super) struct Probe {
     task: JoinHandle<Result<()>>,
 }
 
+#[cfg(feature = "omp-go-fixture")]
 impl Probe {
     pub(super) async fn start(mode: Case, model: &str, effort: &str) -> Result<Self> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
@@ -114,6 +121,7 @@ impl Probe {
     }
 }
 
+#[cfg(feature = "omp-go-fixture")]
 impl Drop for Probe {
     fn drop(&mut self) {
         self.task.abort();
@@ -122,6 +130,7 @@ impl Drop for Probe {
 
 type Reply = (&'static str, &'static str, String);
 
+#[cfg(feature = "omp-go-fixture")]
 async fn receive(
     socket: &mut TcpStream,
     authority: &str,
@@ -205,6 +214,15 @@ async fn receive(
     reader.read_exact(&mut body).await?;
     ensure!(reader.buffer().is_empty(), "pipelined OMP probe request");
     validate(&serde_json::from_slice(&body)?, model, effort)?;
+    reply(mode, model, effort)
+}
+
+pub(super) fn response(mode: Case, model: &str, effort: &str) -> Result<Value> {
+    let (status, mime, body) = reply(mode, model, effort)?;
+    Ok(json!({"status":if status == "200 OK" {200} else {400}, "mime":mime, "body":body}))
+}
+
+fn reply(mode: Case, model: &str, effort: &str) -> Result<Reply> {
     match mode {
         #[cfg(feature = "omp-go-fixture")]
         Case::RejectAuth => bail!("OMP sent a POST after synthetic auth refusal"),
@@ -234,6 +252,7 @@ async fn receive(
     }
 }
 
+#[cfg(feature = "omp-go-fixture")]
 fn text(message: &Value) -> Option<&str> {
     if message
         .as_object()?
@@ -261,6 +280,7 @@ fn text(message: &Value) -> Option<&str> {
     }
 }
 
+#[cfg(feature = "omp-go-fixture")]
 fn validate(body: &Value, model: &str, effort: &str) -> Result<()> {
     ensure!(
         body["model"] == model && body["stream"] == true,
@@ -338,6 +358,7 @@ fn completion(first_model: &str, model: &str) -> String {
     format!("data: {text}\n\ndata: {stop}\n\ndata: {usage}\n\ndata: [DONE]\n\n")
 }
 
+#[cfg(feature = "omp-go-fixture")]
 async fn send(socket: &mut TcpStream, status: &str, mime: &str, data: &str) -> Result<()> {
     let head = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
