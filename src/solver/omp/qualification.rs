@@ -367,12 +367,31 @@ fn spawn_isolated(
     {
         // No host home, sockets or network routes are available to the probe.
         let mut command = Command::new("/usr/bin/bwrap");
+        // SAFETY: this child-only hook makes one syscall. Mark descriptors
+        // close-on-exec rather than closing Rust's exec-error pipe early.
+        // A kernel without this facility must refuse the isolated launch.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::syscall(
+                    libc::SYS_close_range,
+                    3 as libc::c_uint,
+                    libc::c_uint::MAX,
+                    libc::CLOSE_RANGE_CLOEXEC,
+                ) == 0
+                {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
         command.env_clear().args([
             "--unshare-user",
             "--unshare-all",
             "--unshare-net",
             "--disable-userns",
             "--die-with-parent",
+            "--new-session",
             "--clearenv",
             "--tmpfs",
             "/",
@@ -670,4 +689,52 @@ pub(super) fn verify_descriptor(entry: &Value, endpoint: &str) -> Result<String>
         FAILED
     );
     Ok(digest.to_owned())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::time::Duration;
+
+    #[tokio::test]
+    #[ignore = "requires Bubblewrap and unprivileged Linux namespaces"]
+    async fn isolated_probe_closes_host_descriptors_and_stops_with_parent() -> Result<()> {
+        let scratch = Scratch::new()?;
+        std::fs::create_dir(scratch.0.join("tmp"))?;
+        // A real inherited descriptor to a file outside the mounted scratch.
+        let canary = tempfile::tempfile()?;
+        // SAFETY: F_DUPFD returns a fresh non-CLOEXEC descriptor owned by us.
+        let raw = unsafe { libc::fcntl(canary.as_raw_fd(), libc::F_DUPFD, 64) };
+        ensure!(raw >= 64, "failed to create inheritable test descriptor");
+        // SAFETY: raw was just allocated and has no other owner.
+        let inherited = unsafe { OwnedFd::from_raw_fd(raw) };
+        let args = [
+            "-ec".into(),
+            "test ! -e /proc/self/fd/$1; printf R; read -r input".into(),
+            "agmi-probe".into(),
+            inherited.as_raw_fd().to_string(),
+        ];
+        let shell = std::fs::canonicalize("/bin/sh")?;
+        let mut child = spawn_isolated(&shell, &args, &scratch.0, &scratch.0)?;
+        let input = child.child.stdin.take().context("missing test stdin")?;
+        let mut output = child.child.stdout.take().context("missing test stdout")?;
+        let mut ready = [0];
+        tokio::time::timeout(Duration::from_secs(5), output.read_exact(&mut ready)).await??;
+        assert_eq!(ready, *b"R");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), child.wait())
+                .await
+                .is_err(),
+            "probe should be blocked while stdin remains open"
+        );
+        drop(child);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), output.read(&mut ready)).await??,
+            0,
+            "sandbox payload must exit with its parent, even with stdin open"
+        );
+        drop(input);
+        Ok(())
+    }
 }

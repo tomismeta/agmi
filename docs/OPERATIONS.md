@@ -915,9 +915,10 @@ Staging checks artifact/retention space plus a 256 MiB journal/WAL reserve witho
 
 The example uses control-group cleanup, restrictive umask, private temporary files and restart-on-failure. The service manager owns private model scratch at `%t/agmi` (normally `/run/user/<uid>/agmi`); each native child uses its own private invocation workspace as `TMPDIR`. Foreground execution retains the OS-selected temporary root. Runtime storage can be memory-backed and capacity-limited; do not put update archives or durable state there. Explicit start-rate limits also count manual service starts. `TimeoutStopSec=infinity` prevents systemd truncating captured deadlines; agmi bounds shutdown, but a shutdown bug still needs operator intervention.
 
-Stock OpenCode Go requires Linux with `/usr/bin/bwrap` (Bubblewrap) and working
-unprivileged user and network namespaces under the service account. Qualification
-fails closed without that isolation; this does not affect other model routes.
+Stock OpenCode Go requires Linux with `/usr/bin/bwrap` (Bubblewrap), working
+unprivileged user and network namespaces, and `close_range` with
+`CLOSE_RANGE_CLOEXEC` support (Linux 5.11 or later). Qualification refuses if
+the service account cannot use these isolation controls; other routes are unchanged.
 Provide scratch space for a private executable copy on a mount that permits
 execution. Do not use a launcher script or relax mount protections globally.
 
