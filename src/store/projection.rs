@@ -51,7 +51,10 @@ pub(crate) fn judge_inventory(assessment: &Value) -> JudgeInventory {
             }
             let finding = match reason.as_str() {
                 "already_attempted" | "already_settled" | "configured_exclusion" => continue,
-                "model_budget_exhausted" if assessment["excluded_work_truncated"] == true => {
+                "model_budget_exhausted"
+                    if assessment["excluded_work_truncated"] == true
+                        || assessment.get("capped_work_proven") == Some(&Value::Null) =>
+                {
                     return Unresolved;
                 }
                 "model_budget_exhausted" if assessment["capped_work_proven"] != true => {
@@ -99,8 +102,10 @@ impl Store {
                AND e.dispatch_sequence IS NOT NULL AND e.safety_observed_at IS NOT NULL
                AND r.owner='judge' AND r.purpose='receipt' AND r.remote_resource=o.txid
                AND r.last_success_at IS NOT NULL
-               AND EXISTS(SELECT 1 FROM events WHERE operation_id=o.id AND kind='judge'
-                           AND code IN ('receipt_included','checkpoint_coverage_reported')))",
+               AND ((e.evidence ->> '$.stage'='receipt'
+                     AND e.evidence ->> '$.reason' IN ('included','checkpoint_reported'))
+                    OR EXISTS(SELECT 1 FROM events WHERE operation_id=o.id AND kind='judge'
+                              AND code IN ('receipt_included','checkpoint_coverage_reported'))))",
             [key],
             |row| row.get(0),
         )?)
@@ -111,6 +116,7 @@ impl Store {
     fn judge_work_evidence(&self, config: &Config, assessment: &mut Value, at: i64) -> Result<()> {
         let mut settled = Vec::new();
         let mut capped = 0;
+        let mut cap_settlement_unavailable = false;
         let mut step: Option<(i64, Option<i64>, &'static str, &'static str)> = None;
         if let Some(rows) = assessment["excluded_work"].as_array() {
             for (index, row) in rows.iter().enumerate() {
@@ -133,17 +139,19 @@ impl Store {
                 }
                 let witness = match row["reason"].as_str() {
                     Some("model_budget_exhausted") => {
-                        let rejected: bool = self.db.query_row(
-                            "SELECT COALESCE((
-                               SELECT o.state='rejected' AND o.payload IS NULL
+                        let prior: Option<(bool, bool)> = self.db.query_row(
+                            "SELECT o.state IN ('confirmed','final'),
+                                    o.state='rejected' AND o.payload IS NULL
                                  AND o.job_id IS NULL AND o.txid IS NULL
                                  AND COALESCE(json_extract(e.model_attempt,'$.completion.execution')='completed',0)
                                FROM operations o LEFT JOIN operation_evidence e ON e.operation_id=o.id
                                WHERE o.kind='judge' AND o.work_key=?1 COLLATE NOCASE
-                               ORDER BY o.id DESC LIMIT 1),0)",
+                               ORDER BY o.id DESC LIMIT 1",
                             [key],
-                            |row| row.get(0),
-                        )?;
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        ).optional()?;
+                        let (settled_unverified, rejected) = prior.unwrap_or_default();
+                        cap_settlement_unavailable |= settled_unverified;
                         let retry = self.model_retry_assessment(LaneId::Judge, key, config, at)?;
                         if rejected
                             && retry.blocker == Some("model_budget_exhausted")
@@ -212,8 +220,11 @@ impl Store {
             .as_u64()
             .unwrap_or(0);
         if caps > 0 {
-            assessment["capped_work_proven"] =
-                json!(assessment["excluded_work_truncated"] == false && capped == caps);
+            assessment["capped_work_proven"] = if cap_settlement_unavailable {
+                Value::Null
+            } else {
+                json!(assessment["excluded_work_truncated"] == false && capped == caps)
+            };
         }
         if let Some((floor, operation, target, reason)) = step {
             assessment["candidate_wait"] = json!({"not_before":floor,"operation_id":operation,
@@ -416,6 +427,22 @@ impl RemoteWorkContext {
             key,
             self.at,
         )
+    }
+
+    fn requires_binding(&self, state: &str, epoch: Option<u64>, key: &str) -> bool {
+        self.fresh
+            && (self.kind == LaneId::Judge || epoch.zip(self.scope.epoch).is_some())
+            && RemoteWorkScope {
+                admission_open: true,
+                ..self.scope
+            }
+            .background(
+                state,
+                epoch,
+                (self.kind == LaneId::Judge).then_some(&self.assessment),
+                key,
+                self.at,
+            ) == Some(false)
     }
 
     pub(super) fn historical(&self, epoch: Option<u64>, key: &str) -> bool {
@@ -1734,12 +1761,19 @@ impl Store {
         }
         let mut pending_work = Vec::new();
         let mut captured_work = Vec::new();
+        let mut extra_missing = [false; LaneId::COUNT];
         let mut statement=self.db.prepare("SELECT o.id,o.kind,o.state,o.created_at,o.updated_at,o.next_at,o.revision,o.generation,o.binding_revision,
             e.model_deadline,e.http_deadline,e.blocked_since,e.evidence,e.policy,COALESCE(t.retry_not_before,0),
-            e.model_attempt,o.job_id IS NOT NULL,o.txid IS NOT NULL,o.request -> '$.solver.epoch',o.work_key
+            e.model_attempt,o.job_id IS NOT NULL,o.txid IS NOT NULL,o.request -> '$.solver.epoch',o.work_key,
+            missing.status IS NOT NULL
             FROM operations o LEFT JOIN operation_evidence e ON e.operation_id=o.id LEFT JOIN operation_timing t ON t.operation_id=o.id
+            LEFT JOIN read_state missing ON missing.owner=o.kind
+                AND missing.purpose=CASE WHEN o.txid IS NOT NULL THEN 'receipt' WHEN o.job_id IS NOT NULL THEN 'job' END
+                AND missing.resource=o.id || ':' || o.binding_revision
+                AND missing.operation_id=o.id AND missing.binding_revision=o.binding_revision
+                AND missing.retired=0 AND missing.status=404 AND ?1
             WHERE o.state IN ('generating','generated','prepared','retry','dispatching','queued','unknown','included_pending','confirmed') ORDER BY o.id")?;
-        let mut rows = statement.query([])?;
+        let mut rows = statement.query([reads_truncated])?;
         while let Some(row) = rows.next()? {
             let id: i64 = row.get(0)?;
             let kind = match row.get_ref(1)?.as_str()? {
@@ -1799,16 +1833,34 @@ impl Store {
                     "queued" | "included_pending" | "confirmed" => "pending_remote",
                     _ => "active_local",
                 });
-                let context = &work_scopes[LaneId::ALL
+                let lane_index = LaneId::ALL
                     .iter()
                     .position(|lane| *lane == kind)
-                    .expect("known lane")];
+                    .expect("known lane");
+                let context = &work_scopes[lane_index];
+                let key = row.get_ref(19)?.as_str()?;
                 entry["nonblocking_for_fresh_work"] =
-                    json!(context.nonblocking(&state, epoch, row.get_ref(19)?.as_str()?));
-                if phase.is_some() && poll_ids.contains(&id) {
+                    json!(context.nonblocking(&state, epoch, key));
+                let required = || {
+                    policy.mode(kind) == Mode::Active
+                        && context.requires_binding(&state, epoch, key)
+                };
+                // The public read page may omit a required 404. Independently
+                // keep one such exact witness per lane without hydrating all rows.
+                let on_page = poll_ids.contains(&id);
+                let extra = reads_truncated
+                    && !on_page
+                    && !extra_missing[lane_index]
+                    && row.get::<_, bool>(20)?
+                    && required();
+                if phase.is_some() && (on_page || extra) {
                     let observation =
                         self.bound_next_observation(policy, id, context, accounting.cutoff.at)?;
                     if !observation.is_null() {
+                        extra_missing[lane_index] |= extra;
+                        if observation["http_status"] == 404 && (extra || required()) {
+                            entry["required_for_current_work"] = json!(true);
+                        }
                         if work[kind.as_str()]["operation_id"] == id {
                             let lane = &mut work[kind.as_str()];
                             if matches!(

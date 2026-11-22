@@ -299,7 +299,9 @@ pub(super) fn attach(report: &mut Value, status: &Value) {
     let observed = &report["intervention"]["controller"];
     let run_mode = process["run_mode"].as_str().unwrap_or("unknown");
     let owner = process["owner"].as_str().unwrap_or("unknown");
+    let rolled_over = process["state"] == "unavailable" && process["reason"] == "snapshot_rollover";
     let process_state = match (process["state"].as_str(), observed["reason"].as_str()) {
+        _ if rolled_over => "unknown",
         (Some("stopped"), _) => "stopped",
         (_, Some("controller_stopped")) => "stopped",
         (_, Some("controller_stale")) => "stale",
@@ -352,6 +354,9 @@ pub(super) fn attach(report: &mut Value, status: &Value) {
                 condition: Condition::PollOutcomeUnknown,
                 ..Step::unknown("bound_reconciliation_pending")
             };
+        }
+        if rolled_over && base.reason == "controller_stopped" {
+            base = Step::unknown("continuing_owner_unverified");
         }
         let continuation = if inactive {
             let reason = if intent.paused == Some(true) {
@@ -546,5 +551,19 @@ mod tests {
                 "a restoration receipt is not live controller attribution"
             );
         }
+        let mut stopped_snapshot = status;
+        stopped_snapshot["controller_stopped"] = json!(true);
+        stopped_snapshot["process_observation"] =
+            json!({"state":"unavailable","reason":"snapshot_rollover"});
+        super::super::enrich_status(&mut stopped_snapshot, options, 10000);
+        assert_eq!(
+            stopped_snapshot["intervention"]["controller"]["state"],
+            "unknown"
+        );
+        assert_eq!(
+            stopped_snapshot["work"]["judge"]["continuation"]["state"],
+            "unknown"
+        );
+        assert_ne!(stopped_snapshot["intervention"]["unattended"], true);
     }
 }

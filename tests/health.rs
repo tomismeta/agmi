@@ -956,6 +956,77 @@ fn retained_remote(db: &rusqlite::Connection, lane: &str, state: &str, epoch: u6
         rusqlite::params![lane,if receipt {"receipt"} else {"job"},at,at+60]).unwrap();
 }
 
+#[test]
+fn required_missing_binding_is_not_limited_to_the_read_page() {
+    use agmi::config::CountLimit;
+    use rusqlite::params;
+
+    let (_dir, mut config, db, at) = initialized_health_fixture();
+    diagnostic_lane(&mut config, &db, "answer", CountLimit::Unbounded, at);
+    retained_remote(&db, "answer", "queued", 2, at);
+    db.execute("INSERT INTO operations
+        (id,kind,work_key,state,request,payload,generation,revision,created_at,updated_at,job_id,binding_revision)
+        SELECT 2,kind,'2:other',state,request,payload,generation,revision,created_at,updated_at,'second-job',1
+        FROM operations WHERE id=1", []).unwrap();
+    let initial = diagnostic_health(&config);
+    let selected = initial["work"]["answer"]["operation_id"].as_i64().unwrap();
+    let missing = 3 - selected;
+    db.execute("DELETE FROM read_state WHERE purpose='job'", [])
+        .unwrap();
+    db.execute("INSERT INTO read_state
+        (owner,purpose,resource,operation_id,binding_revision,failures,last_failure_at,failure_category,status,local_next_at)
+        VALUES('answer','job',?1,?2,1,1,?3,'http',404,?4)",
+        params![format!("{missing}:1"), missing, at, at+60]).unwrap();
+    db.execute(
+        "WITH RECURSIVE filler(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM filler WHERE n<257)
+        INSERT INTO read_state(owner,purpose,resource,status)
+        SELECT 'judge','discovery','fixture-'||n,200 FROM filler",
+        [],
+    )
+    .unwrap();
+
+    let reads =
+        agmi::health::local_status(&config.state_dir.join("config.toml"), &config, at).unwrap();
+    assert_eq!(reads["reads_truncated"], true);
+    assert!(
+        reads["reads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["operation_id"] != missing)
+    );
+    let report = diagnostic_health(&config);
+    assert_eq!(report["work"]["answer"]["operation_id"], selected);
+    assert_eq!(
+        report["work"]["answer"]["required_missing_observation"]["operation_id"],
+        missing
+    );
+    assert!(
+        report["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| issue == "api_dependency_unavailable")
+    );
+    assert!(!agmi::health::managed_health_wait(&report));
+
+    db.execute(
+        "UPDATE operations SET state='confirmed',job_id=NULL,txid=?1 WHERE id=?2",
+        params!["a".repeat(64), missing],
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE read_state SET purpose='receipt' WHERE operation_id=?1",
+        [missing],
+    )
+    .unwrap();
+    let background = diagnostic_health(&config);
+    assert_eq!(
+        background["work"]["answer"]["required_missing_observation"],
+        Value::Null
+    );
+}
+
 fn diagnostic_health(config: &Config) -> Value {
     agmi::health::check(
         &config.state_dir.join("config.toml"),
@@ -2288,6 +2359,56 @@ fn rejected_judge_attempts_at_cap_leave_distinct_work_open() {
     assert_eq!(
         truncated["work"]["judge"]["assessment"]["capped_work_proven"],
         false
+    );
+
+    // The durable receipt still proves settlement after the bounded event
+    // history has rotated. Missing receipt evidence must not assign a remedy.
+    db.execute(
+        "UPDATE runtime_state SET lane_participation=json_set(lane_participation,
+         '$.judge.assessment.observed_opportunities',1,
+         '$.judge.assessment.exclusions',json('{\"model_budget_exhausted\":1}'),
+         '$.judge.assessment.excluded_work',json(?1),
+         '$.judge.assessment.excluded_work_truncated',json('false'))",
+        [json!([excluded[0]]).to_string()],
+    )
+    .unwrap();
+    let txid = "e".repeat(64);
+    db.execute(
+        "UPDATE operations SET state='final',txid=?1,binding_revision=1 WHERE id=1",
+        [&txid],
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE operation_evidence SET dispatch_sequence=1,safety_observed_at=?1,
+        evidence='{\"stage\":\"receipt\",\"reason\":\"checkpoint_reported\"}' WHERE operation_id=1",
+        [at],
+    )
+    .unwrap();
+    db.execute("INSERT INTO read_state(owner,purpose,resource,operation_id,binding_revision,remote_resource,retired,last_success_at,status)
+        VALUES('judge','receipt','1:1',1,1,?1,1,?2,200)", rusqlite::params![txid, at]).unwrap();
+    let settled = diagnostic_health(&config);
+    assert_eq!(
+        settled["work"]["judge"]["assessment"]["exclusions"]["already_settled"],
+        1
+    );
+    assert_eq!(
+        settled["work"]["judge"]["intervention"]["reason"],
+        "observed_judgments_already_settled"
+    );
+
+    db.execute(
+        "UPDATE read_state SET remote_resource='other' WHERE operation_id=1",
+        [],
+    )
+    .unwrap();
+    let unavailable = diagnostic_health(&config);
+    assert_eq!(
+        unavailable["work"]["judge"]["intervention"]["status"],
+        "undetermined"
+    );
+    assert_eq!(
+        unavailable["work"]["judge"]["intervention"]["reason"],
+        "judge_cap_coverage_unproven"
     );
 }
 

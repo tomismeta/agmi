@@ -134,7 +134,7 @@ fn finish_repairs(
     if oversized {
         preview["failure"] = json!("repair_receipt_too_large");
         for key in REPAIR_ARRAYS {
-            preview[key] = json!([]);
+            preview[key] = Value::Null;
         }
     } else if repair && eligible != 0 {
         let actual = match execute(&preview) {
@@ -185,7 +185,7 @@ fn finish_repairs(
         .expect("store repair preview object")
         .remove("config_revision");
     for key in REPAIR_ARRAYS {
-        for row in preview[key].as_array_mut().expect("store repair array") {
+        for row in preview[key].as_array_mut().into_iter().flatten() {
             *row = repair_row(row);
         }
     }
@@ -354,6 +354,6 @@ mod tests {
         assert_eq!(repairs["counts"]["eligible"], count as u64);
         assert_eq!(repairs["counts"]["applied"], 0);
         assert_eq!(repairs["details_truncated"], true);
-        assert!(REPAIR_ARRAYS.iter().all(|key| repairs[*key] == json!([])));
+        assert!(REPAIR_ARRAYS.iter().all(|key| repairs[*key].is_null()));
     }
 }

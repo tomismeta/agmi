@@ -4579,6 +4579,28 @@ mod native {
             );
             account_owned_ancestors(&installation.root, &installation.home)?;
             installation.lock = Some(InstallLock::acquire(&installation.root)?);
+            // A selected Doctor child must repair as the release that the
+            // installer lock still selects, not whichever release replaced it.
+            // A standalone operator binary retains the existing local workflow.
+            let executable = Path::new("/proc/self/exe");
+            let running = fs::read_link(executable)?;
+            if let Some(release_dir) = running.parent()
+                && release_dir.parent() == Some(installation.root.canonicalize()?.as_path())
+                && let Some(running_release) =
+                    release_dir.file_name().and_then(|name| name.to_str())
+                && valid_id(running_release)
+            {
+                let selected = fs::read_link(installation.root.join("current"))?;
+                ensure!(
+                    selected == Path::new(running_release),
+                    "repair release changed"
+                );
+                let target = File::open(release_dir.join("agmi"))?;
+                ensure!(
+                    same_executable(&target.metadata()?, &fs::metadata(executable)?),
+                    "repair executable changed"
+                );
+            }
             if let Some(mut record) = update_state::read(&installation.root)? {
                 record.cancelled = true;
                 update_state::save(&installation.root, &record)?;

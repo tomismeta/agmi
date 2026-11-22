@@ -1708,12 +1708,17 @@ pub fn compact_diagnostics(data: &mut Value) {
             &mut truncated,
         );
     }
-    let resources = source["components"]["api"]["resources"].as_array();
+    let resources = source["components"]["api"]["resources"]
+        .as_array()
+        .filter(|rows| {
+            !rows.is_empty() || source["components"]["api"]["resources_truncated"].is_boolean()
+        });
     out["components"]["api"]["resources"] = json!([]);
     out["components"]["api"]["resources_count"] = json!(resources.map(Vec::len));
     out["components"]["api"]["resources_truncated"] =
         source["components"]["api"]["resources_truncated"].clone();
-    let mut background = json!({"count":0,"degraded":0,"unknown":0});
+    let total = resources.map(|_| 0);
+    let mut background = json!({"count":total,"degraded":total,"unknown":total});
     for row in resources.into_iter().flatten() {
         if row["dependency"] == "background_remote_work" {
             background["count"] = json!(background["count"].as_u64().unwrap_or(0) + 1);

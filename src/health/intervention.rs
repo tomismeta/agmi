@@ -239,7 +239,7 @@ fn required_missing<'a>(status: &'a Value, name: &str, at: i64) -> Option<&'a Va
         .as_array()
         .into_iter()
         .flatten()
-        .filter(|row| row["kind"] == name && row["nonblocking_for_fresh_work"] == false)
+        .filter(|row| row["kind"] == name && row["required_for_current_work"] == true)
     {
         if let Some(observation) = bound_observation(row)
             && observation["http_status"] == 404
@@ -822,7 +822,8 @@ fn lane<'a>(
         && name == "judge"
         && !runnable_judgment
         && work["admission"]["allowed"] == true
-        && work["assessment"]["excluded_work_truncated"] == true
+        && (work["assessment"]["excluded_work_truncated"] == true
+            || work["assessment"].get("capped_work_proven") == Some(&Value::Null))
         && work["assessment"]["exclusions"]["model_budget_exhausted"]
             .as_u64()
             .is_some_and(|count| count > 0)
@@ -1209,7 +1210,6 @@ pub(super) fn project(status: &Value, options: Options, at: i64) -> (Value, Valu
         work[name]["intervention"] = finding.value(observed, current);
         if let Some(missing) = required_missing(status, name, at) {
             work[name]["required_missing_observation"] = missing.clone();
-            work[name]["intervention"]["required_missing_outcome"] = json!(true);
         }
         work[name]["intervention"]["requires_fresh_eligibility"] = json!(
             status["work"][name]["retry"]["requires_fresh_eligibility"] == true
@@ -1275,7 +1275,12 @@ pub(super) fn qualify_operational(report: &mut Value, status: &Value) {
             {
                 Some(Finding::blocked(reason, "inspect_operations"))
             }
-            "work_evidence_unavailable" if existing["reason"] == "completion_evidence_stale" => {
+            "work_evidence_unavailable"
+                if matches!(
+                    existing["reason"].as_str(),
+                    Some("completion_evidence_stale" | "judge_cap_coverage_unproven")
+                ) =>
+            {
                 None
             }
             _ if state == "unknown"

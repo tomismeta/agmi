@@ -1021,7 +1021,14 @@ fn repair_receipt(data: &Value) -> Value {
     let accounted = match counts {
         [Some(eligible), Some(_), Some(applied), Some(skipped)]
             if applied.checked_add(skipped) == Some(eligible)
-                && repairs["execution"] != "partial" =>
+                && repairs.get("execution").is_none_or(|execution| {
+                    execution
+                        == if eligible == 0 {
+                            "not_needed"
+                        } else {
+                            "complete"
+                        }
+                }) =>
         {
             Some(if applied > 0 {
                 "applied"
@@ -1044,7 +1051,7 @@ fn repair_receipt(data: &Value) -> Value {
     };
     let verified = repairs["restoration"]["verified"].as_bool();
     let mut receipt = json!({
-        "status":observed.unwrap_or("failed"),
+        "status":observed.unwrap_or("unknown"),
         "outcome":observed.unwrap_or("unknown"),
         "receipt_status":if observed.is_some() {"complete"} else {"unavailable"},
         "preview":safe_enum(&repairs["preview"], &["complete","unavailable"], "unknown"),
@@ -1061,7 +1068,9 @@ fn repair_receipt(data: &Value) -> Value {
         "evidence_limit":"Retained local evidence only; no new network verification was performed. Identity normalization retains legacy uncertainty and recorded rejection; it does not verify identity or repair credentials. Refusal response bodies were not retained. Legacy 429 repairs apply the developer's all-429 pre-enqueue refusal contract; hidden body contradictions cannot be ruled out.",
     });
     if receipt["status"] == "failed" {
-        receipt["reason"] = json!(failure.unwrap_or("doctor_repair_failed"));
+        receipt["reason"] = json!(failure.expect("observed failure has a known code"));
+    } else if observed.is_none() {
+        receipt["reason"] = json!("update_doctor_report_invalid");
     }
     let mut truncated = repairs["details_truncated"] == true;
     for (key, count) in doctor::REPAIR_ARRAYS.into_iter().zip(counts) {
@@ -1096,7 +1105,7 @@ fn doctor_outcome(report: &mut Value, data: &Value, repair: bool, exited: bool) 
     if repair {
         report["repair"] = repair_receipt(data);
         inspection_only = report["repair"]["receipt_status"] == "unavailable";
-        if report["repair"]["status"] == "failed" {
+        if inspection_only || report["repair"]["status"] == "failed" {
             report["success"] = json!(false);
         }
     }
@@ -1158,6 +1167,14 @@ fn doctor_outcome(report: &mut Value, data: &Value, repair: bool, exited: bool) 
             &["running", "stopped", "stale", "unknown"],
             "unknown",
         );
+        if readiness["intervention"]["unattended"] == true
+            && !(matches!(projected["owner"].as_str(), Some("managed" | "foreground"))
+                && projected["run_mode"] == "continuous"
+                && projected["state"] == "running"
+                && projected["ready"] == true)
+        {
+            readiness["intervention"]["unattended"] = Value::Null;
+        }
         readiness["intervention"]["controller"] = projected;
         for lane in ["answer", "judge", "mine"] {
             readiness["intervention"]["lanes"][lane] = safe_enum(
@@ -1290,7 +1307,7 @@ async fn diagnose(report: &mut Value, repair: bool, target: Option<&str>) {
                     .downcast_ref::<lifecycle::LifecycleError>()
                     .is_none_or(|error| error.code != "update_child_unavailable");
             report["repair"] = json!({
-                "status":if may_have_run {"failed"} else {"not_run"},
+                "status":if may_have_run {"unknown"} else {"not_run"},
                 "reason":"activated_doctor_unavailable","receipt_status":"unavailable",
                 "outcome":if may_have_run {"unknown"} else {"not_run"},
                 "eligible_count":null,"ineligible_count":null,"applied_count":null,"skipped_count":null,
@@ -2668,6 +2685,21 @@ mod tests {
             ("applied", [Some(5), Some(2), Some(1), None], "complete"),
             ("applied", [Some(5), None, Some(1), Some(4)], "complete"),
             ("applied", [Some(5), Some(2), Some(1), Some(4)], "partial"),
+            (
+                "applied",
+                [Some(5), Some(2), Some(1), Some(4)],
+                "not_started",
+            ),
+            (
+                "applied",
+                [Some(5), Some(2), Some(1), Some(4)],
+                "not_needed",
+            ),
+            (
+                "no_eligible_repairs",
+                [Some(0), Some(2), Some(0), Some(0)],
+                "not_started",
+            ),
             ("skipped", [Some(5), Some(2), Some(1), Some(4)], "complete"),
         ] {
             let [eligible, ineligible, applied, skipped] = counts;
@@ -2939,7 +2971,8 @@ mod tests {
             true,
             false,
         );
-        assert_eq!(report["repair"]["reason"], "doctor_repair_failed");
+        assert_eq!(report["repair"]["status"], "unknown");
+        assert_eq!(report["repair"]["reason"], "update_doctor_report_invalid");
         assert!(!report.to_string().contains("private-unrecognized-error"));
         assert!(!report.to_string().contains("must_not_escape"));
         // A health failure alone must not alter a successful operation.
