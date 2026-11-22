@@ -10,6 +10,7 @@ Environment="PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
 TimeoutStartSec=30
 UMask=0077
 NoNewPrivileges=true
-PrivateTmp=true
+# A private user namespace prevents this read-only probe from inspecting the
+# controller executable in /proc. Keep the controller's private workspace.
 StandardOutput=journal
 StandardError=journal

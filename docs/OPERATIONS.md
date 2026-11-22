@@ -702,6 +702,10 @@ remains a health failure. The unit accepts 0 and 3. This does not change `ok`,
 `attention_required` or the exit code alone, to decide whether to ask a human.
 A concurrent current discovery failure still fails the managed check even
 when an independent retry has a known deadline.
+The read-only probe runs without a private `/tmp` mount so its Linux user
+namespace can verify the controller executable in `/proc`. The controller
+and its native model workspace remain isolated; if process attribution is
+unavailable, the probe does not claim a proven wait.
 `doctor` exits successfully only when `unattended` is true and its repair scan/
 application has no failure. A repair can therefore be `applied` while the command
 still exits nonzero because participation is paused or other blockers remain.

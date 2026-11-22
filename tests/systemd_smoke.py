@@ -1296,6 +1296,7 @@ def main():
     hashes = {candidate: digest(candidate) for candidate in (first, second)}
     ids = {candidate: 'r-' + value for candidate, value in hashes.items()}
     assert ids[first] != ids[second]
+    ever_started = False
 
     def cli(*words, success=True):
         result = run([str(binary), '--json', *words], success=success)
@@ -1351,8 +1352,18 @@ def main():
         else:
             assert property_value('agmi.service', 'MainPID') == '0'
             status = cli('status', '--verbose')
-            assert status['process_observation']['state'] == 'stopped', status
-            assert status['process_observation']['pid'] == 0
+            observation = status['process_observation']
+            assert observation['pid'] == 0
+            if ever_started:
+                assert observation['state'] == 'stopped', observation
+                assert observation['owner'] == 'managed', observation
+            else:
+                # Inactive service alone cannot attest that a controller
+                # stopped. This journal has never recorded a running writer.
+                assert status['effective_runtime'] is None
+                assert observation['state'] == 'unavailable', observation
+                assert observation['owner'] == 'unknown', observation
+                assert status['intervention']['controller']['state'] == 'unknown'
             assert not scratch.exists() and not scratch.is_symlink()
         assert status['paused'] is True
         assert all(path.read_bytes() == value for path, value in private_inputs.items())
@@ -1436,6 +1447,7 @@ def main():
         # do not alter the installed unit's restart/start-limit policy.
         systemctl('reset-failed', 'agmi.service')
         cli('service', 'start')
+        ever_started = True
         selected(first, runtime=True, timer=True)
         scratch_marker = scratch / 'fixture-before-native-update'
         scratch_marker.write_text('must disappear with the old invocation')
