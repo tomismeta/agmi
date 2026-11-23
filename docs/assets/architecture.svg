@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="452" viewBox="0 0 1000 452" role="img" aria-labelledby="title desc" font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="452" viewBox="0 0 1080 452" role="img" aria-labelledby="title desc" font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
   <title id="title">agmi compact architecture</title>
   <desc id="desc">Agent harnesses answer and judge for agmi; agmi keeps durable SQLite evidence and submits to the MinePOA agent network.</desc>
   <style>
@@ -21,36 +21,36 @@
   </style>
 
   <text x="24" y="40" font-size="21" font-weight="700" fill="var(--fg,currentColor)">Agents Gonna Mine <tspan fill="var(--muted,currentColor)">(Make)</tspan> It</text>
-  <line x1="24" y1="56" x2="976" y2="56" stroke="var(--border,currentColor)" stroke-width="1"/>
+  <line x1="24" y1="56" x2="1056" y2="56" stroke="var(--border,currentColor)" stroke-width="1"/>
 
   <g stroke="var(--fg,currentColor)" stroke-width="1.4">
-    <line x1="374" y1="182" x2="240" y2="182"/>
-    <line x1="230" y1="226" x2="364" y2="226"/>
-    <line x1="626" y1="182" x2="760" y2="182"/>
-    <line x1="770" y1="226" x2="636" y2="226"/>
+    <line x1="399" y1="182" x2="265" y2="182"/>
+    <line x1="255" y1="226" x2="389" y2="226"/>
+    <line x1="681" y1="182" x2="815" y2="182"/>
+    <line x1="825" y1="226" x2="691" y2="226"/>
   </g>
   <g fill="var(--fg,currentColor)">
-    <path d="M230 182 240 177.5 240 186.5Z"/>
-    <path d="M374 226 364 221.5 364 230.5Z"/>
-    <path d="M770 182 760 177.5 760 186.5Z"/>
-    <path d="M626 226 636 221.5 636 230.5Z"/>
+    <path d="M255 182 265 177.5 265 186.5Z"/>
+    <path d="M399 226 389 221.5 389 230.5Z"/>
+    <path d="M825 182 815 177.5 815 186.5Z"/>
+    <path d="M681 226 691 221.5 691 230.5Z"/>
   </g>
   <g font-size="14" fill="var(--fg,currentColor)" text-anchor="middle">
-    <text x="302" y="170">Answer / judge tasks</text>
-    <text x="302" y="214">Artifacts + evidence</text>
-    <text x="698" y="170">Submissions</text>
-    <text x="698" y="214">Network observations</text>
+    <text x="327" y="170">Answer / judge tasks</text>
+    <text x="327" y="214">Artifacts + evidence</text>
+    <text x="753" y="170">Submissions</text>
+    <text x="753" y="214">Network observations</text>
   </g>
 
   <g id="actor-harnesses">
-    <rect x="24" y="140" width="200" height="116" rx="10" fill="none" stroke="var(--border,currentColor)" stroke-width="1.25"/>
+    <rect x="24" y="140" width="225" height="116" rx="10" fill="none" stroke="var(--border,currentColor)" stroke-width="1.25"/>
     <text x="38" y="176" font-size="15" font-weight="600" fill="var(--fg,currentColor)">Agent harnesses</text>
     <text x="38" y="202" font-size="14" fill="var(--fg,currentColor)">omp · Hermes · OpenClaw</text>
     <text x="38" y="226" font-size="14" fill="var(--muted,currentColor)">Native model execution</text>
   </g>
 
-  <g id="actor-agmi">
-    <rect x="380" y="110" width="240" height="240" rx="10" fill="none" stroke="var(--border,currentColor)" stroke-width="1.25"/>
+  <g id="actor-agmi" transform="translate(25 0)">
+    <rect x="380" y="110" width="270" height="240" rx="10" fill="none" stroke="var(--border,currentColor)" stroke-width="1.25"/>
     <g transform="translate(388.75,104.25)">
       <g id="mark-b-balanced">
         <path stroke="currentColor" stroke-width="5.5" fill="none" d="M10 43H30V31H37.75"/>
@@ -61,19 +61,19 @@
     <text x="396" y="196" font-size="15" font-weight="600" fill="var(--fg,currentColor)">Agent network harness</text>
     <text x="396" y="221" font-size="14" fill="var(--fg,currentColor)">Schedule · submit · recover</text>
     <text x="396" y="243" font-size="14" fill="var(--muted,currentColor)">Deterministic coordination</text>
-    <rect x="396" y="262" width="208" height="64" rx="8" fill="none" stroke="var(--border,currentColor)" stroke-width="1.25"/>
+    <rect x="396" y="262" width="238" height="64" rx="8" fill="none" stroke="var(--border,currentColor)" stroke-width="1.25"/>
     <rect x="408" y="279" width="8" height="8" fill="var(--accent,currentColor)"/>
     <text x="422" y="288" font-size="14" font-weight="600" fill="var(--fg,currentColor)">SQLite</text>
     <text x="422" y="310" font-size="14" fill="var(--muted,currentColor)">Durable local evidence</text>
   </g>
 
-  <g id="actor-network">
-    <rect x="776" y="140" width="200" height="116" rx="10" fill="none" stroke="var(--border,currentColor)" stroke-width="1.25"/>
+  <g id="actor-network" transform="translate(55 0)">
+    <rect x="776" y="140" width="225" height="116" rx="10" fill="none" stroke="var(--border,currentColor)" stroke-width="1.25"/>
     <text x="790" y="176" font-size="15" font-weight="600" fill="var(--fg,currentColor)">MinePOA</text>
     <text x="790" y="202" font-size="14" fill="var(--fg,currentColor)">Agent network</text>
     <text x="790" y="226" font-size="14" fill="var(--muted,currentColor)">Hosted HTTP API</text>
   </g>
 
-  <line x1="24" y1="404" x2="976" y2="404" stroke="var(--border,currentColor)" stroke-width="1"/>
+  <line x1="24" y1="404" x2="1056" y2="404" stroke="var(--border,currentColor)" stroke-width="1"/>
   <text x="24" y="428" font-size="14" fill="var(--muted,currentColor)">Answer and judge use models. Mining is model-free.</text>
 </svg>
