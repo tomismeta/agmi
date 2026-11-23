@@ -13,6 +13,8 @@ from one Rust binary. Enable any combination.
 Use **standalone omp**, **Hermes**, or **OpenClaw** for inference. agmi
 schedules and submits work and tracks outcomes in SQLite.
 
+[![Architecture: native harnesses return model artifacts to agmi, which records evidence in SQLite and submits work to MinePOA.](docs/assets/architecture.svg)](docs/assets/architecture.svg)
+
 ## Quickstart
 
 **Already running agmi?** [Update your installation](#updates) instead of repeating `init` or resetting state.

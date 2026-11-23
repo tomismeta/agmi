@@ -45,7 +45,7 @@
   <g id="actor-harnesses">
     <rect x="24" y="140" width="200" height="116" rx="10" fill="none" stroke="var(--border,currentColor)" stroke-width="1.25"/>
     <text x="38" y="176" font-size="15" font-weight="600" fill="var(--fg,currentColor)">Agent harnesses</text>
-    <text x="38" y="202" font-size="14" fill="var(--fg,currentColor)">Hermes · OpenClaw</text>
+    <text x="38" y="202" font-size="14" fill="var(--fg,currentColor)">omp · Hermes · OpenClaw</text>
     <text x="38" y="226" font-size="14" fill="var(--muted,currentColor)">Native model execution</text>
   </g>
 
