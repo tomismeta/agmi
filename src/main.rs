@@ -22,7 +22,7 @@ const SCHEMA: &str = "agmi.cli.v1";
     name = "agmi",
     version,
     about = "Agent network harness — Agents Gonna Mine (Make) It",
-    long_about = "Agents Gonna Mine (Make) It\n\nAgent network harness. Schedule, submit, recover.\nMinePOA is the first supported agent network; answer and judge use your existing Hermes or OpenClaw harness.\n\nNew installations are paused; diagnostics never submit work.",
+    long_about = "Agents Gonna Mine (Make) It\n\nAgent network harness. Schedule, submit, recover.\nAnswer and judge on MinePOA with standalone omp, Hermes, or OpenClaw. Mining is model-free.\n\nNew installations are paused; diagnostics never submit work.",
     after_help = "EVERYDAY WORKFLOW\n  agmi health                 Check core and individual lane health\n  agmi status                 Inspect local participation evidence\n  agmi doctor                 Distinguish automatic waits from intervention\n  agmi doctor --repair        Explicitly authorize eligible guarded repairs\n  agmi logs --follow          Follow sanitized local events\n  agmi update --check         Refresh passive latest-release evidence\n  agmi update                 Update, convert if needed, restore prior intent\n  agmi update --repair        Update and authorize guarded repairs\n  agmi update --migrate       Explicit stopped migration maintenance\n\nUpdates preserve identity, configuration, guidance, credentials and participation intent.\nNecessary conversion may advance generation/revisions and invalidate stale grants/captures.\nUnknown submissions are never replayed or erased by maintenance.\nUse agmi <command> --help for examples and agmi --json commands for effect metadata."
 )]
 struct Cli {

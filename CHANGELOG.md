@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased (0.3.0)
+## 0.3.0
 
 - **Fleet-aligned onboarding:** new configurations save unbounded `participation_first`, bounded uncertain-model and answer retries, per-epoch mining, and fleet discovery, queued-job and timeout settings. Lanes still start read-only. Existing configurations and omitted-field defaults are unchanged.
 - **Private credential diagnostics:** distinguish locally rejected hosted-key formatting from network/client preparation failures before verification. A contradictory identity response never verifies a key or account. No diagnostic echoes the credential or creates onboarding files.
@@ -19,7 +19,7 @@
 - **Independent omp adapter:** use the separately installed standalone omp executable through an invocation-only SDK bridge, without a runtime version pin. On Linux, OpenCode Go qualification tests the unchanged stock route in a credential-free Bubblewrap sandbox. Live requests still use native auth and the exact stock endpoint, with the serialized request checked before forwarding. No omp fork, bundled executable, permanent plugin, or automatic authentication or install.
 - **omp route and output integrity:** validate route syntax and effort without replacing native catalog/auth ownership. Reject request overrides, contradictory served identities and nonfinal artifacts. Direct and Factory Anthropic stops must come from the artifact’s response; delegated Chat Completions cannot renegotiate effort. Distinguish proven startup refusal, invalid artifacts and uncertain execution.
 - **OpenCode Go qualification:** accept OMP’s dotted spelling for known safe global settings alongside the grouped spelling. Unknown settings and enabled retry or fallback still fail before inference.
-- **Branding and operator documentation:** introduce the compact agmi architecture hero and agent network harness branding; align README, CLI and package/service descriptions without changing participation or upgrade behavior.
+- **Operator quickstart:** document verified Linux installation, building from the release tag, private SSH onboarding, and safe activation. The architecture diagram shows omp alongside Hermes and OpenClaw. Clarify how agents should handle Doctor reports, local pause, and standalone upgrades.
 
 ## 0.2.0
 
