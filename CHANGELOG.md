@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.1
+
+- **Security:** update the locked `url` dependency to 2.5.9 to fix the denial of service in [RUSTSEC-2026-0592](https://rustsec.org/advisories/RUSTSEC-2026-0592).
+- **Release checks:** require a fresh RustSec audit of the exact candidate's lockfile before building or uploading release artifacts.
+
 ## 0.3.0
 
 - **Fleet-aligned onboarding:** new configurations save unbounded `participation_first`, bounded uncertain-model and answer retries, per-epoch mining, and fleet discovery, queued-job and timeout settings. Lanes still start read-only. Existing configurations and omitted-field defaults are unchanged.

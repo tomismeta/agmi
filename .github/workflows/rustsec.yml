@@ -1,17 +1,7 @@
 name: RustSec
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - '**/Cargo.lock'
-      - '**/Cargo.toml'
-      - '.github/workflows/rustsec.yml'
-  pull_request:
-    paths:
-      - '**/Cargo.lock'
-      - '**/Cargo.toml'
-      - '.github/workflows/rustsec.yml'
+  workflow_call:
   schedule:
     - cron: '41 5 * * *'
 

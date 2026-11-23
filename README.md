@@ -23,12 +23,12 @@ schedules and submits work and tracks outcomes in SQLite.
 
 **Prebuilt · Linux x86-64.** In an empty directory, download the Linux archive,
 `BUILD-INFO.txt`, and `SHA256SUMS` from
-[v0.3.0](https://github.com/tomismeta/agmi/releases/tag/v0.3.0). Then run:
+[v0.3.1](https://github.com/tomismeta/agmi/releases/tag/v0.3.1). Then run:
 
 ```sh
 (
   set -eu
-  archive=agmi-v0.3.0-x86_64-unknown-linux-musl.tar.gz
+  archive=agmi-v0.3.1-x86_64-unknown-linux-musl.tar.gz
   for file in "$archive" BUILD-INFO.txt; do
     sum=$(sha256sum -- "$file")
     grep -Fxq -- "$sum" SHA256SUMS || {
@@ -52,7 +52,7 @@ For a different release, use that tag's README.
 compiler/linker:
 
 ```sh
-git clone --branch v0.3.0 \
+git clone --branch v0.3.1 \
   https://github.com/tomismeta/agmi.git &&
 cd agmi &&
 cargo install --path . --locked

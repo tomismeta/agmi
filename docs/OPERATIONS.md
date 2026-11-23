@@ -306,7 +306,7 @@ Configuration failures include a bounded `details.reason` and, where known, a so
 
 ### Atomic capability migration
 
-Versions 0.2.0 and 0.3.0 use unversioned per-lane configuration and journal format 4. **v0.1.0 and v0.1.1 use global-shaped configuration and journal format 2.** Inspect actual configuration, journal, authority and migration seal rather than inferring compatibility from a version label. This is a permanent explicit cutover, not a legacy-bot importer. Preserve private backups for investigation; never restore older state to regain availability.
+Versions 0.2.0 and 0.3.x use unversioned per-lane configuration and journal format 4. **v0.1.0 and v0.1.1 use global-shaped configuration and journal format 2.** Inspect actual configuration, journal, authority and migration seal rather than inferring compatibility from a version label. This is a permanent explicit cutover, not a legacy-bot importer. Preserve private backups for investigation; never restore older state to regain availability.
 
 Plain managed `update` verifies the incoming target before maintenance, captures durable original intent, stops cleanly when needed, and performs supported canonical policy-preserving conversion. It then verifies local configuration/authority/process structure and restores independent runtime/timer activity, boot enablement and global pause intent. A necessary pause can advance generation and invalidate stale grants/captures; accounting and uncertain history are never reset. Missing policy choices, changed/unproven risk and initial authority adoption remain explicit decisions.
 
@@ -1172,6 +1172,9 @@ loopback tests use the separate `omp-go-fixture` build and only synthetic
 credentials and tasks; that build is never a release asset.
 Keep the checked archive, `BUILD-INFO.txt`, `SHA256SUMS` and allocator evidence
 together; a fresh rebuild is a different candidate.
+Publish only from a successful `ci` run for the exact commit being tagged.
+Its required RustSec job must finish successfully; a skipped, missing or
+failed audit or a previous commit's audit cannot qualify a release.
 The qualified GitHub release also includes the tested source crate and a
 source companion for all locked registry dependencies. The Linux archive
 contains their license and notice texts, including Rust and musl, and points
