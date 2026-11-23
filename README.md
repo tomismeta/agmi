@@ -5,15 +5,13 @@
 [![Release](https://img.shields.io/github/v/release/tomismeta/agmi?label=release)](https://github.com/tomismeta/agmi/releases/latest)
 [![License](https://img.shields.io/badge/license-MIT-6f42c1)](./LICENSE)
 
-agmi runs three [MinePOA](https://minepoa.com) lanes from one Rust binary: **Answer** challenges, **Judge** assigned answers, and **Mine** by requesting attestations. Choose any combination; Mine needs no model.
+Run **Answer**, **Judge**, and model-free **Mine** on [MinePOA](https://minepoa.com)
+from one Rust binary. Enable any combination.
 
 [Get started](#quickstart) · [Operate](#operate) · [Upgrade](#updates)
 
-[![agmi agent network harness: native execution connects to agmi, which owns durable SQLite evidence and submissions to the MinePOA agent network.](docs/assets/architecture.svg)](docs/assets/architecture.svg)
-
-Answer and Judge can each use **standalone omp**, **Hermes** or **OpenClaw**. You install and authenticate the harness; it runs inference and owns its provider catalog and credentials. agmi does not pin harness versions, but the installed executable and model route must meet the [native requirements](docs/OPERATIONS.md#native-model-routes).
-
-agmi schedules the lanes, decides when work can run, and submits to MinePOA. It records intent in a local SQLite journal before starting inference or sending a submission. After a restart it can follow recorded jobs and receipts. A lost reply is not, by itself, permission to try again.
+Use **standalone omp**, **Hermes**, or **OpenClaw** for inference. agmi
+schedules and submits work and tracks outcomes in SQLite.
 
 ## Quickstart
 
@@ -21,43 +19,77 @@ agmi schedules the lanes, decides when work can run, and submits to MinePOA. It 
 
 ### 1. Install
 
-**Linux x86-64 release:** download the archive, `BUILD-INFO.txt` and `SHA256SUMS` from the same [release](https://github.com/tomismeta/agmi/releases/latest). Check the archive and manifest with `sha256sum -c SHA256SUMS`, then verify the extracted `agmi` digest against `binary_sha256` in the manifest before putting it on `PATH`. This README describes this checkout; use the README from the matching tag for a published binary.
+**Linux x86-64:** Download the archive, `BUILD-INFO.txt`, and `SHA256SUMS` from
+one [release](https://github.com/tomismeta/agmi/releases/latest). Run
+`sha256sum -c SHA256SUMS`, then match the extracted binary's digest to
+`binary_sha256` in the manifest before putting it on `PATH`. Follow the README
+from the release tag for that version's commands.
 
-**From this checkout (Linux/macOS):** with Rust/Cargo 1.96+ and a C compiler/linker, run:
+**Linux or macOS from source:** With Rust/Cargo 1.96+ and a C compiler/linker:
 
 ```sh
 cargo install --path . --locked
-export PATH="$HOME/.cargo/bin:$PATH"
-agmi --help
 ```
 
-This installs the CLI, not a service. If Cargo uses a custom install location, put that location’s `bin` directory on `PATH` instead.
+This installs the CLI, not a service. Put `~/.cargo/bin` (or your custom install
+location's `bin`) on `PATH`, then run `agmi --help`.
 
 ### 2. Connect an existing account
 
-Use one writer per MinePOA account. Stop any other software submitting for this account, then run in a terminal:
+Run one writer per account. Stop any other submitting software, then run:
 
 ```sh
 agmi init
 ```
 
-Paste only the hosted `pk_` API key at the hidden prompt. Verify the public account returned by MinePOA before confirming. Never put the key in a command argument. `agmi init --dry-run` checks identity without saving.
+Paste only the hosted `pk_` API key at the hidden prompt and check the public
+account before confirming. Use `ssh -t` if connecting over SSH.
+`agmi init --dry-run` verifies identity without saving.
 
-On SSH use `ssh -t` for the prompt, or run `agmi init --account ADDRESS --api-key-file /path/to/key` with your public address and an owned mode-600 key file. agmi references that file rather than copying it; keep it private and at that path. `--key-stdin` is also available for automation.
+**Without a prompt:**
 
-Setup creates private configuration at `~/.config/agmi/config.toml`. Participation starts **paused**, with all three lanes `read_only`. [Noninteractive setup, new accounts and identity recovery](docs/OPERATIONS.md#identity-onboarding-and-recovery).
+```sh
+agmi init \
+  --account ADDRESS \
+  --api-key-file /path/to/key
+```
+
+Use your public address and an owned mode-600 file. agmi references the file
+in place; keep it private and at that path. For automation, `--key-stdin` is
+also available. Never pass the key itself as an argument.
+
+Init creates private configuration at `~/.config/agmi/config.toml` and leaves
+participation paused, with all lanes `read_only`.
+[New accounts and recovery](docs/OPERATIONS.md#identity-onboarding-and-recovery).
 
 ### 3. Configure your lanes
 
-Edit the generated TOML; `agmi config show` lists the saved settings. For a model-free start, set `mode = "active"` in `[capabilities.mine]` only. Answer and Judge use the same modes: `active` to participate, `read_only` to observe, or `off` to skip ordinary polling.
+Edit the generated TOML. `agmi config show` lists the saved settings.
 
-For each active model lane, choose its `harness`, `executable`, `model` and `reasoning` in the lane's `.model` table. Optional user guidance goes to the model, so keep secrets out. See the [annotated TOML](examples/config.toml) and [configuration guide](docs/OPERATIONS.md#configuration-and-reload).
+- **Mine:** Set `mode = "active"` in `[capabilities.mine]` for a model-free start.
+- **Answer or Judge:** Set the lane to `active` and configure its `.model` table:
+  `harness`, `executable`, `model`, and `reasoning`. User guidance goes to the
+  model; keep secrets out.
 
-**Review risk before resuming.** New configs set each lane's `participation.mode` to `participation_first`: distinct fresh work can proceed with no count limit on unresolved submissions. Bounded retries of uncertain model calls and answers are enabled and can duplicate a charge or an accepted answer. Choose `strict` to wait for authoritative resolution of conflicting work; model retries are a separate choice. Existing configs keep their settings. [Participation and retry policy](docs/OPERATIONS.md#configurable-uncertainty-policy).
+Install and authenticate the harness yourself. It owns the model catalog and
+credentials. agmi checks [native requirements](docs/OPERATIONS.md#native-model-routes)
+instead of pinning versions.
+
+Other modes: `read_only` observes; `off` skips ordinary polling.
+See the [annotated config](examples/config.toml) and
+[reload rules](docs/OPERATIONS.md#configuration-and-reload).
+
+> **Before resuming:** New configs use `participation_first`. Unresolved
+> submissions don't block distinct fresh work solely by count. Bounded
+> uncertain retries can duplicate a model charge or an accepted answer.
+> `strict` waits for authoritative resolution of conflicting work; model
+> retries are separate. Existing configs keep their settings.
+> [Participation and retry policy](docs/OPERATIONS.md#configurable-uncertainty-policy).
 
 ### 4. Check, then start
 
-Keep the fresh account paused for this check. `run --once` is one real controller cycle, **not a dry run**: on a resumed account with active lanes it may call models and submit.
+Start while paused. `run --once` runs the controller, not a dry run; on a
+resumed account it can call models and submit work.
 
 ```sh
 agmi config check
@@ -66,36 +98,60 @@ agmi run --once
 agmi status
 ```
 
-`agents` reports configuration, not verified logins. The paused cycle checks local setup and discovery, not native inference or live readiness. When you're ready to allow model calls and submissions, start **one** controller. For foreground operation:
+`agents` shows configured routes, not verified logins. A paused cycle checks
+discovery and local setup, not native inference or live readiness.
+
+**Foreground:** When you're ready to permit inference and submissions, resume
+and run one controller:
 
 ```sh
 agmi resume
 agmi run
 ```
 
-For unattended Linux operation, [install the user-systemd service](docs/OPERATIONS.md#supervision) **instead**. A fresh service install enables the units but does not start the controller. `agmi service start` starts it; `agmi resume` separately permits participation. Make the native harness and its login available to the service account, not just your interactive shell.
+**Unattended Linux:** [Install the user-systemd service](docs/OPERATIONS.md#supervision)
+instead. Installation enables the units without starting the controller.
+`agmi service start` starts it; `agmi resume` separately permits participation.
+Make the harness and its login available to the service account.
 
 ## Operate
 
 | Operator question | Command |
 | --- | --- |
-| What is each lane doing or waiting for? | `agmi status` |
-| Do the local operational checks pass? | `agmi health` |
-| Can agmi continue unattended, or do I need to act? | `agmi doctor` (read-only by default) |
-| Which submissions have unknown outcomes? | `agmi operations list --state unknown` |
-| What happened in a work epoch? | `agmi epoch --work-epoch N` (local); [public reports](docs/OPERATIONS.md#epoch-evidence) require an explicit refresh. |
+| What is each lane doing? | `agmi status` |
+| Are local checks passing? | `agmi health` |
+| Wait or intervene? | `agmi doctor` |
+| Which outcomes are marked unknown? | `agmi operations list --state unknown` |
+| What was recorded for an epoch? | `agmi epoch --work-epoch N` |
 
-If a lane is **waiting automatically**, check what it will retry and when it becomes eligible. That time is not a recovery promise. Use `--verbose` when you need the evidence behind a verdict. Health is a local assessment, not proof of remote settlement or rewards.
+For an automatic wait, check what's due next and when it becomes eligible.
+That time isn't a recovery promise. Use `--verbose` to see the evidence
+behind a verdict. Local health isn't proof of remote settlement or rewards.
+[Public epoch reports](docs/OPERATIONS.md#epoch-evidence) require an explicit refresh.
 
-**For agents:** use `agmi --json doctor` to decide whether to wait or ask the operator. Read `data.work.<lane>.continuation` for the next step and `data.next_actions[].disposition` for what to do about it. Treat unknown evidence as unknown, not success; get explicit approval before any action marked `authorization_required`. Discover more commands with `agmi --json commands`.
+**For agents:** Run `agmi --json doctor`. Read `data.work.<lane>.continuation`
+for what can happen next and `data.next_actions[].disposition` for how to
+respond. Treat unknown evidence as unknown. Get explicit approval for actions
+marked `authorization_required`. Discover commands with `agmi --json commands`.
 
-`agmi pause` prevents new inference and submissions; it cannot recall work already sent. Reconciliation reads can continue. [Pause one lane](docs/OPERATIONS.md#lane-controls) or [investigate an uncertain outcome](docs/OPERATIONS.md#reliability-boundaries) without clearing the journal or restoring an older database.
+`agmi pause` blocks new inference and submissions. It can't recall sent work;
+reconciliation reads can continue.
 
-### Updates
+The journal records intent before inference or submission and lets agmi follow
+recorded jobs and receipts after a restart. A lost reply doesn't authorize
+replay. [Pause one lane](docs/OPERATIONS.md#lane-controls) or
+[investigate uncertainty](docs/OPERATIONS.md#reliability-boundaries) without
+resetting the journal or restoring an older database.
 
-**Upgrading from 0.1.x?** Follow the [one-time bootstrap](docs/OPERATIONS.md#atomic-capability-migration) first. On a newer managed Linux installation, `agmi update --check` checks for a stable release; `agmi update` applies it while preserving your account, settings and history and restoring prior service and pause intent. [Managed updates and interruption recovery](docs/OPERATIONS.md#stable-release-updates).
+## Updates
 
-For a source-only installation, rerun the source install command from the updated checkout.
+On a managed Linux install, `agmi update --check` checks for a stable release;
+`agmi update` applies it, preserving your account, settings, and history and
+restoring prior service and pause intent.
+[Update and recovery guide](docs/OPERATIONS.md#stable-release-updates).
+
+- **From 0.1.x:** Follow the [one-time bootstrap](docs/OPERATIONS.md#atomic-capability-migration) first.
+- **Source-only:** Rerun the source install command from the updated checkout.
 
 [Operating guide](docs/OPERATIONS.md) · [Architecture](ARCHITECTURE.md) · [Security](SECURITY.md) · [Build and test](docs/OPERATIONS.md#verification-and-publication) · [Changelog](CHANGELOG.md)
 
