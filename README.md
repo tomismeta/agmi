@@ -19,20 +19,45 @@ schedules and submits work and tracks outcomes in SQLite.
 
 ### 1. Install
 
-**Linux x86-64:** Download the archive, `BUILD-INFO.txt`, and `SHA256SUMS` from
-one [release](https://github.com/tomismeta/agmi/releases/latest). Run
-`sha256sum -c SHA256SUMS`, then match the extracted binary's digest to
-`binary_sha256` in the manifest before putting it on `PATH`. Follow the README
-from the release tag for that version's commands.
-
-**Linux or macOS from source:** With Rust/Cargo 1.96+ and a C compiler/linker:
+**Prebuilt · Linux x86-64.** In an empty directory, download the Linux archive,
+`BUILD-INFO.txt`, and `SHA256SUMS` from
+[v0.3.0](https://github.com/tomismeta/agmi/releases/tag/v0.3.0). Then run:
 
 ```sh
+(
+  set -eu
+  archive=agmi-v0.3.0-x86_64-unknown-linux-musl.tar.gz
+  for file in "$archive" BUILD-INFO.txt; do
+    sum=$(sha256sum -- "$file")
+    grep -Fxq -- "$sum" SHA256SUMS || {
+      printf 'Checksum mismatch: %s\n' "$file" >&2
+      exit 1
+    }
+  done
+  tar -xzf "$archive" agmi
+  digest=$(awk -F= '$1 == "binary_sha256" { print $2 }' BUILD-INFO.txt)
+  printf '%s  agmi\n' "$digest" | sha256sum --strict --check -
+  mkdir -p "$HOME/bin"
+  install -m 0755 agmi "$HOME/bin/agmi"
+) && export PATH="$HOME/bin:$PATH"
+```
+
+Add `~/bin` to your shell's `PATH` for future sessions. Checksums verify
+integrity under GitHub publisher trust; they are not independent signatures.
+For a different release, use that tag's README.
+
+**From source · Linux/macOS.** Requires Git, Rust/Cargo 1.96+, and a C
+compiler/linker:
+
+```sh
+git clone --branch v0.3.0 \
+  https://github.com/tomismeta/agmi.git &&
+cd agmi &&
 cargo install --path . --locked
 ```
 
-This installs the CLI, not a service. Put `~/.cargo/bin` (or your custom install
-location's `bin`) on `PATH`, then run `agmi --help`.
+Put `~/.cargo/bin` (or your custom install location's `bin`) on `PATH`.
+Both paths install the CLI, not a service. Run `agmi --version` to check.
 
 ### 2. Connect an existing account
 
@@ -124,18 +149,20 @@ Make the harness and its login available to the service account.
 | Which outcomes are marked unknown? | `agmi operations list --state unknown` |
 | What was recorded for an epoch? | `agmi epoch --work-epoch N` |
 
-For an automatic wait, check what's due next and when it becomes eligible.
-That time isn't a recovery promise. Use `--verbose` to see the evidence
-behind a verdict. Local health isn't proof of remote settlement or rewards.
+For an automatic wait, confirm the controller is running and check what it
+will retry next. The next eligible time is not a recovery promise. Use
+`--verbose` for evidence. Local health isn't proof of settlement or rewards.
 [Public epoch reports](docs/OPERATIONS.md#epoch-evidence) require an explicit refresh.
 
-**For agents:** Run `agmi --json doctor`. Read `data.work.<lane>.continuation`
-for what can happen next and `data.next_actions[].disposition` for how to
-respond. Treat unknown evidence as unknown. Get explicit approval for actions
-marked `authorization_required`. Discover commands with `agmi --json commands`.
+**For agents:** Read the JSON report from `agmi --json doctor` even if it
+exits nonzero. Check `data.work.<lane>.continuation` for what can happen next
+and `data.next_actions[].disposition` for how to respond. Treat unknown
+evidence as unknown. Get explicit approval for actions marked
+`authorization_required`. Discover commands with `agmi --json commands`.
 
-`agmi pause` blocks new inference and submissions. It can't recall sent work;
-reconciliation reads can continue.
+`agmi pause` blocks new local inference and submissions. Reconciliation reads
+can continue, and pausing neither recalls sent work nor disables MinePOA's
+server-side auto-mining.
 
 The journal records intent before inference or submission and lets agmi follow
 recorded jobs and receipts after a restart. A lost reply doesn't authorize
@@ -151,7 +178,10 @@ restoring prior service and pause intent.
 [Update and recovery guide](docs/OPERATIONS.md#stable-release-updates).
 
 - **From 0.1.x:** Follow the [one-time bootstrap](docs/OPERATIONS.md#atomic-capability-migration) first.
-- **Source-only:** Rerun the source install command from the updated checkout.
+- **From source:** Check out the target tag and rerun `cargo install --path . --locked`.
+- **Standalone binary:** Stop the foreground controller, follow the target
+  release's upgrade guidance, and verify and install its binary. Keep the
+  existing configuration and journal.
 
 [Operating guide](docs/OPERATIONS.md) · [Architecture](ARCHITECTURE.md) · [Security](SECURITY.md) · [Build and test](docs/OPERATIONS.md#verification-and-publication) · [Changelog](CHANGELOG.md)
 

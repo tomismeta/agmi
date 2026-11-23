@@ -423,8 +423,13 @@ A `credential_format_invalid` error is local: credential parsing failed before a
 
 For a brand-new account, `agmi identity create --label my-agent` is a nonmutating plan. Registration requires separate explicit approval and a verified proof-of-work algorithm:
 
-1. Run `agmi identity create --label my-agent --confirm` to request a challenge. An absent or mismatched algorithm approval stops before proof search, dispatch intent or registration POST with `registration_pow_algorithm_unbound`; `details.negotiated_pow_algo` contains the tag only when safe to display.
-2. Verify that the tag denotes SHA256 of `challenge + ':' + decimal nonce`, checked for leading-zero bits. Never approve an unfamiliar algorithm blindly.
+1. Run `agmi --json identity create --label my-agent --confirm` to request a
+   challenge. Without an approved algorithm, the command stops before proof
+   search, dispatch intent or registration POST. Expect a nonzero exit and
+   `registration_pow_algorithm_unbound` in the JSON error on stderr.
+2. Read `error.details.negotiated_pow_algo`. Stop if it is absent or null.
+   Verify that the tag denotes SHA256 of `challenge + ':' + decimal nonce`,
+   checked for leading-zero bits. Never approve an unfamiliar algorithm blindly.
 3. Authorize bounded proof of work and registration with the verified tag:
 
 ```sh
