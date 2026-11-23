@@ -2,7 +2,7 @@
 
 **Agent network harness. Schedule, submit, recover.**
 
-[![Release](https://img.shields.io/github/v/release/tomismeta/agmi?label=release)](https://github.com/tomismeta/agmi/releases/latest)
+[![Release](https://img.shields.io/github/v/release/tomismeta/agmi?label=release&color=07808e)](https://github.com/tomismeta/agmi/releases/latest)
 [![License](https://img.shields.io/badge/license-MIT-6f42c1)](./LICENSE)
 
 Run **Answer**, **Judge**, and model-free **Mine** on [MinePOA](https://minepoa.com)
