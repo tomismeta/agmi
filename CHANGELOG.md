@@ -3,7 +3,7 @@
 ## 0.3.2
 
 - **Distribution:** prepare the standalone CLI for locked Cargo installs from crates.io. Managed Linux installs and updates still use the verified GitHub Release assets.
-- **Release checks:** CI dry-runs registry publication, then builds and checks the distributable archive. The registry upload credential is gated on that archive's exact SHA-256.
+- **Release checks:** CI compares the registry dry-run archive byte-for-byte with the qualified distributable. The registry upload credential is gated on that archive's exact SHA-256.
 
 ## 0.3.1
 

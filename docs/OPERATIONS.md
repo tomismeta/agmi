@@ -1175,10 +1175,11 @@ together; a fresh rebuild is a different candidate.
 Publish only from a successful `ci` push-to-`main` run for the exact commit
 being tagged. Both `rustsec` and `rust` must finish successfully; a skipped,
 missing or failed audit or a previous commit's audit cannot qualify a release.
-CI checks registry eligibility with a credential-free Cargo publish dry run.
+CI dry-runs `cargo publish` without credentials in a fresh target directory.
 It builds the distributable with `cargo package --locked --registry crates-io`,
-then extracts, installs and exercises that archive and builds its Rustdoc
-with warnings treated as errors.
+requires byte-for-byte equality with the dry-run archive, then records the
+checksum before extracting, installing and exercising the staged archive.
+It also builds the archive's Rustdoc with warnings treated as errors.
 The qualified GitHub release also includes the tested source crate and a
 source companion for all locked registry dependencies. The Linux archive
 contains their license and notice texts, including Rust and musl, and points
@@ -1223,13 +1224,23 @@ upload and do not publish a placeholder.
 
 1. Record the successful CI run and attempt for the full tagged commit. Download
    its `agmi-linux-x64-qualified` artifact. Verify `SHA256SUMS` and that
-   `BUILD-INFO.txt` names that commit and version. Publish the verified GitHub
-   assets first, without rebuilding; confirm the published `.crate` hash matches
-   the qualified archive.
+   `BUILD-INFO.txt` names that commit and version. Stage the five assets in a
+   GitHub release draft for the verified tag. Verify the draft assets match CI
+   before approving publication. Publish it as stable but **not Latest**,
+   without rebuilding. Re-download the public `.crate` and compare it to the
+   qualified archive. Confirm `/releases/latest` still names the previous
+   managed release.
+   Say in the GitHub notes that Cargo installation is pending.
 2. After explicit publication approval, run the following from a clean checkout
-   of that release tag in a trusted Linux environment with Cargo 1.96.0 and
-   Python 3. Set `CI_ASSETS` to the absolute path of the extracted `assets`
+   of that release tag in a trusted Linux environment with Cargo 1.96.0,
+   Python 3, and no inherited Cargo registry or source overrides. Set `CI_ASSETS`
+   to the absolute path of the extracted `assets`
    directory from the qualifying CI run, not a locally regenerated archive.
+   Rehearse a credential-free dry run on the publish host and compare its
+   archive with the qualified `.crate` before obtaining a token.
+   Record the approved crates.io login before making a token. Confirm you are
+   signed in to that account and that the name is still unclaimed. Stop if the
+   login or name status is uncertain.
    The command isolates Cargo from existing credentials. Do not pass `--token`
    to Cargo: it bypasses the provider. Use an expiring maintainer token scoped to
    create the crate; [Trusted Publishing](https://crates.io/docs/trusted-publishing)
@@ -1245,7 +1256,15 @@ upload and do not publish a placeholder.
      (cd "$CI_ASSETS" && sha256sum --strict --check SHA256SUMS)
      grep -Fx "commit=$(git rev-parse HEAD)" "$CI_ASSETS/BUILD-INFO.txt"
      grep -Fx "package_version=$AGMI_CRATE_VERSION" "$CI_ASSETS/BUILD-INFO.txt"
-     AGMI_CRATE_SHA256=$(sha256sum "$CI_ASSETS/agmi-$AGMI_CRATE_VERSION.crate" | cut -d ' ' -f 1)
+     crate="agmi-$AGMI_CRATE_VERSION.crate"
+     dry_run_root=$(mktemp -d)
+     trap 'rm -rf -- "$dry_run_root"' EXIT
+     unset AGMI_CRATES_IO_TOKEN CARGO_REGISTRY_TOKEN CARGO_REGISTRIES_CRATES_IO_TOKEN
+     CARGO_HOME="$dry_run_root/cargo-home" \
+       cargo +1.96.0 publish --locked --registry crates-io --dry-run --no-verify \
+         --target-dir "$dry_run_root/target"
+     cmp -- "$dry_run_root/target/package/tmp-crate/$crate" "$CI_ASSETS/$crate"
+     AGMI_CRATE_SHA256=$(sha256sum "$CI_ASSETS/$crate" | cut -d ' ' -f 1)
      export AGMI_CRATE_SHA256
      read -rsp 'crates.io publish token: ' AGMI_CRATES_IO_TOKEN
      printf '\n'
@@ -1265,6 +1284,14 @@ upload and do not publish a placeholder.
    and run that binary's `--version`, `build-info --manifest` and `--help`.
    Check the package README, links, docs.rs landing page and registry security
    tab; avoid claiming platform support not exercised by the release.
+   Once the registry install passes, update the GitHub release notes with the
+   versioned crates.io link and verified owner login. This confirms the
+   official Cargo install route; a matching crate name alone does not.
+4. Before managed-channel promotion, verify the five public GitHub assets
+   against the qualifying CI files again, including `SHA256SUMS` itself.
+   Stop on any drift. After the registry install passes and promotion is
+   explicitly approved, mark the verified GitHub release Latest. Confirm
+   `/releases/latest` names that tag and that its asset digests are unchanged.
 
 If only GitHub is available, say so and retry only the missing registry step.
 After an uncertain upload, check the registry before retrying; only a confirmed

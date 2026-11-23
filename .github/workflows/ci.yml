@@ -262,13 +262,20 @@ jobs:
         run: cargo +1.96.0 package --locked --list
       - name: Install and exercise extracted package
         run: |
-          cargo +1.96.0 publish --locked --registry crates-io --dry-run --no-verify
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
+          crate="agmi-$version.crate"
+          dry_run_target="$(mktemp -d "$RUNNER_TEMP/agmi-publish-dry-run.XXXXXX")"
+          cargo +1.96.0 publish --locked --registry crates-io --dry-run --no-verify \
+            --target-dir "$dry_run_target"
           cargo +1.96.0 package --locked --registry crates-io
+          qualified_crate="$RUNNER_TEMP/agmi-release/assets/$crate"
+          install -m 0644 "target/package/$crate" "$qualified_crate"
+          # Cargo 1.96 puts the actual dry-run archive under package/tmp-crate.
+          cmp -- "$dry_run_target/package/tmp-crate/$crate" "$qualified_crate"
+          (cd "$RUNNER_TEMP/agmi-release/assets" && sha256sum -- "$crate" >> SHA256SUMS)
           package_root="$RUNNER_TEMP/agmi-package"
           mkdir -p "$package_root"
-          version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
-          install -m 0644 "target/package/agmi-$version.crate" "$RUNNER_TEMP/agmi-release/assets/"
-          tar -xzf "target/package/agmi-$version.crate" -C "$package_root"
+          tar -xzf "$qualified_crate" -C "$package_root"
           cargo +1.96.0 test --manifest-path "$package_root/agmi-$version/Cargo.toml" --locked --lib --no-run
           RUSTDOCFLAGS="-D warnings" cargo +1.96.0 doc --locked --lib --no-deps \
             --manifest-path "$package_root/agmi-$version/Cargo.toml" --target-dir "$PWD/target"
@@ -369,8 +376,6 @@ jobs:
       - name: Recheck qualified release bytes
         run: |
           cd "$RUNNER_TEMP/agmi-release/assets"
-          version=$(awk -F= '$1 == "package_version" { print $2 }' BUILD-INFO.txt)
-          sha256sum -- "agmi-$version.crate" >> SHA256SUMS
           sha256sum --strict --check SHA256SUMS
           digest=$(awk -F= '$1 == "binary_sha256" { print $2 }' BUILD-INFO.txt)
           printf '%s  %s\n' "$digest" "$AGMI_PACKAGED_MUSL" | sha256sum --strict --check
