@@ -1172,6 +1172,11 @@ loopback tests use the separate `omp-go-fixture` build and only synthetic
 credentials and tasks; that build is never a release asset.
 Keep the checked archive, `BUILD-INFO.txt`, `SHA256SUMS` and allocator evidence
 together; a fresh rebuild is a different candidate.
+The qualified GitHub release also includes the tested source crate and a
+source companion for all locked registry dependencies. The Linux archive
+contains their license and notice texts, including Rust and musl, and points
+to the companion for MPL-covered source. The SHA256SUMS file covers all
+published download assets other than itself.
 
 CI also runs `tests/systemd_smoke.py` on the extracted Linux release binary in
 the disposable image defined by `tests/systemd_fixture.Dockerfile`. The

@@ -142,6 +142,17 @@ jobs:
           version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
           [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
           archive="agmi-v$version-$target.tar.gz"
+          dependency_sources="agmi-$version-third-party-sources"
+          mkdir "$root/$dependency_sources"
+          cp Cargo.lock "$root/$dependency_sources/"
+          cargo +1.96.0 vendor --locked --versioned-dirs "$root/$dependency_sources/vendor"
+          sysroot=$(rustup run 1.96.0 rustc --print sysroot)
+          python3 tools/release-notices.py "$root/$dependency_sources" \
+            "$sysroot/share/doc/rust/COPYRIGHT-library.html" "$version"
+          cp "$root/$dependency_sources/THIRD_PARTY.md" "$root/stage/"
+          cp -R "$root/$dependency_sources/third-party-licenses" "$root/stage/"
+          tar -C "$root" --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner \
+            -cf - "$dependency_sources" | gzip -n > "$root/assets/$dependency_sources.tar.gz"
           install -m 0755 "$binary" "$root/stage/agmi"
           embedded="$root/embedded-build-info.txt"
           "$root/stage/agmi" build-info --manifest > "$embedded"
@@ -162,16 +173,18 @@ jobs:
           gzip -n -c "$CARGO_TARGET_DIR/agmi-linux-musl.map" > "$root/evidence/LINK-MAP.txt.gz"
           install -m 0644 "$manifest" "$root/stage/BUILD-INFO.txt"
           install -m 0644 LICENSE "$root/stage/LICENSE"
-          tar -C "$root/stage" --format=ustar --mtime=@0 --owner=0 --group=0 --numeric-owner \
-            -cf - agmi BUILD-INFO.txt LICENSE | gzip -n > "$root/assets/$archive"
+          tar -C "$root/stage" --sort=name --format=ustar --mtime=@0 --owner=0 --group=0 --numeric-owner \
+            -cf - agmi BUILD-INFO.txt LICENSE THIRD_PARTY.md third-party-licenses \
+            | gzip -n > "$root/assets/$archive"
           (
             cd "$root/assets"
-            sha256sum BUILD-INFO.txt "$archive" > SHA256SUMS
+            sha256sum BUILD-INFO.txt "$archive" "$dependency_sources.tar.gz" > SHA256SUMS
             sha256sum --strict --check SHA256SUMS
           )
-          test "$(tar -tzf "$root/assets/$archive")" = "$(printf 'agmi\nBUILD-INFO.txt\nLICENSE')"
           tar -xzf "$root/assets/$archive" -C "$root/extracted"
           cmp "$manifest" "$root/extracted/BUILD-INFO.txt"
+          cmp "$root/stage/THIRD_PARTY.md" "$root/extracted/THIRD_PARTY.md"
+          diff -qr "$root/stage/third-party-licenses" "$root/extracted/third-party-licenses"
           printf '%s  %s\n' "$digest" "$root/extracted/agmi" | sha256sum --strict --check
           "$root/extracted/agmi" build-info --manifest | cmp "$embedded" -
           "$root/extracted/agmi" build-info --installer-capabilities \
@@ -247,6 +260,7 @@ jobs:
           package_root="$RUNNER_TEMP/agmi-package"
           mkdir -p "$package_root"
           version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
+          install -m 0644 "target/package/agmi-$version.crate" "$RUNNER_TEMP/agmi-release/assets/"
           tar -xzf "target/package/agmi-$version.crate" -C "$package_root"
           cargo +1.96.0 test --manifest-path "$package_root/agmi-$version/Cargo.toml" --locked --lib --no-run
           cargo +1.96.0 install --path "$package_root/agmi-$version" --locked --root "$package_root/install"
@@ -346,6 +360,8 @@ jobs:
       - name: Recheck qualified release bytes
         run: |
           cd "$RUNNER_TEMP/agmi-release/assets"
+          version=$(awk -F= '$1 == "package_version" { print $2 }' BUILD-INFO.txt)
+          sha256sum -- "agmi-$version.crate" >> SHA256SUMS
           sha256sum --strict --check SHA256SUMS
           digest=$(awk -F= '$1 == "binary_sha256" { print $2 }' BUILD-INFO.txt)
           printf '%s  %s\n' "$digest" "$AGMI_PACKAGED_MUSL" | sha256sum --strict --check
