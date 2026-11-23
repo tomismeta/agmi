@@ -124,7 +124,8 @@ jobs:
           sudo install -m 0644 "$llvm_key" /usr/share/keyrings/agmi-llvm.asc
           echo 'deb [signed-by=/usr/share/keyrings/agmi-llvm.asc] https://apt.llvm.org/noble/ llvm-toolchain-noble-22 main' \
             | sudo tee /etc/apt/sources.list.d/agmi-llvm.list
-          sudo apt-get update -o Dir::Etc::sourcelist=sources.list.d/agmi-llvm.list -o Dir::Etc::sourceparts=-
+          # LLVM packages depend on Ubuntu packages, so refresh both indexes.
+          sudo apt-get update
           llvm_version=$(apt-cache madison clang-22 \
             | awk '$3 ~ /^(1:)?22\.1\.8([~+.-]|$)/ && $5 ~ /^https:\/\/apt\.llvm\.org\// { print $3; exit }')
           test -n "$llvm_version"
