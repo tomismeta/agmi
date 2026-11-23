@@ -1123,7 +1123,7 @@ Use health/status and the existing service journal. agmi sends no Telegram/webho
 
 ## Verification and publication
 
-Source/package builds require Unix, Rust/Cargo 1.96+ and a C compiler/linker. Tests additionally require Node.js and Python 3 for native/process fixtures, but no OpenClaw installation or live credentials. A source install is `cargo install --path . --locked`; it installs only the CLI, not systemd services or native harnesses.
+Source/package builds require Unix, Rust/Cargo 1.96+ and a C compiler/linker for bundled SQLite. Tests additionally require Node.js and Python 3 for native/process fixtures, but no OpenClaw installation or live credentials. Use `cargo install agmi --locked --version VERSION` for a registry release or `cargo install --path . --locked` from its checkout. Both install the CLI only, not systemd services or native harnesses.
 
 ```sh
 cargo test --locked
@@ -1153,7 +1153,7 @@ cargo install --path "$package_root/agmi-$version" --locked --root "$package_roo
 
 `cargo package` verifies the packaged build; the separate temporary install checks the extracted source workflow without replacing the normal CLI. Keep `.cargo_vcs_info.json` with the extracted sources. `--allow-dirty` records dirty source rather than certifying a clean release; omit it for a clean release candidate. `build.rs` only derives labels and hashes embedded assets: it never installs, authenticates or provisions. It uses the package's own Git checkout, or Cargo's JSON VCS metadata when outside that checkout, and never an enclosing repository's identity. Neither source labels nor packaged files are signed provenance.
 
-The explicit package allowlist includes Rust sources, all three native adapters, defaults, guidance, unit templates and public documentation. Shell installers, tests, private inputs and generated artifacts are not shipped. Inspect the actual list and archive as part of the secret audit.
+The explicit package allowlist includes Rust sources and integration tests, the three embedded native adapters (Python, JavaScript and TypeScript), defaults, guidance, unit templates and public documentation. The adapters run only when their harness route is invoked; Cargo does not install or authenticate those harnesses. The archive excludes release tools, external process fixtures, private inputs and generated release binaries. Inspect the actual archive, not just the allowlist.
 
 The process fixture also supports `--harness hermes` for its Python-only fake native transport; this does not require Node.js or a real Hermes account. Native authentication still needs separate real-harness acceptance.
 
@@ -1172,9 +1172,13 @@ loopback tests use the separate `omp-go-fixture` build and only synthetic
 credentials and tasks; that build is never a release asset.
 Keep the checked archive, `BUILD-INFO.txt`, `SHA256SUMS` and allocator evidence
 together; a fresh rebuild is a different candidate.
-Publish only from a successful `ci` run for the exact commit being tagged.
-Its required RustSec job must finish successfully; a skipped, missing or
-failed audit or a previous commit's audit cannot qualify a release.
+Publish only from a successful `ci` push-to-`main` run for the exact commit
+being tagged. Both `rustsec` and `rust` must finish successfully; a skipped,
+missing or failed audit or a previous commit's audit cannot qualify a release.
+CI checks registry eligibility with a credential-free Cargo publish dry run.
+It builds the distributable with `cargo package --locked --registry crates-io`,
+then extracts, installs and exercises that archive and builds its Rustdoc
+with warnings treated as errors.
 The qualified GitHub release also includes the tested source crate and a
 source companion for all locked registry dependencies. The Linux archive
 contains their license and notice texts, including Rust and musl, and points
@@ -1208,6 +1212,71 @@ Atomic-capability acceptance includes local macOS proof for independent lane pau
 
 Subsequent bounded acceptance exercised authenticated Hermes and existing-Gateway OpenClaw answer/grade execution using the native adapters from `c3640a3`, with synthetic loopback protocol identities and no MinePOA requests. Both harnesses returned valid bound artifacts with matching native-envelope provider/model/reasoning evidence: Hermes `gpt-6.1-sol` at max/high, OpenClaw `gpt-6.1-sol` at ultra/high. A 60-second Hermes answer probe timed out; a separately authorized attempt within the deployed 600-second limit succeeded. Timeout and explicit OpenClaw interruption retained unknown execution/stop evidence, not proof of remote cancellation or stopped billing. Manual uncertainty policy did not prevent first synthetic submissions; loopback isolation—not that policy—contained protocol effects. Protected copies of three real format-2 journals also converted offline with original operation fields, database identity and dispatch witness preserved, leaving copies paused. These checks do not establish live fleet participation, sustained stability, earnings or a rollout approval.
 
-agmi is [MIT-licensed](../LICENSE). Package publication is deliberately disabled in `Cargo.toml`. Before publishing: clear registry name availability if publishing to crates.io, review third-party license obligations, audit source/history and packaged files for secrets, and require explicit release approval. `.gitignore` and Cargo's package allowlist do not replace a secret audit.
+### crates.io publication
+
+The registry distributes the standalone CLI, not a supported Rust SDK or a
+second managed-update feed. Use the same version and tag on both channels.
+Before release approval, inspect the qualified `.crate` and audit the
+source/history for secrets; review third-party license and source obligations.
+A registry 404 is not a reservation. Check the name again before the first
+upload and do not publish a placeholder.
+
+1. Record the successful CI run and attempt for the full tagged commit. Download
+   its `agmi-linux-x64-qualified` artifact. Verify `SHA256SUMS` and that
+   `BUILD-INFO.txt` names that commit and version. Publish the verified GitHub
+   assets first, without rebuilding; confirm the published `.crate` hash matches
+   the qualified archive.
+2. After explicit publication approval, run the following from a clean checkout
+   of that release tag in a trusted Linux environment with Cargo 1.96.0 and
+   Python 3. Set `CI_ASSETS` to the absolute path of the extracted `assets`
+   directory from the qualifying CI run, not a locally regenerated archive.
+   The command isolates Cargo from existing credentials. Do not pass `--token`
+   to Cargo: it bypasses the provider. Use an expiring maintainer token scoped to
+   create the crate; [Trusted Publishing](https://crates.io/docs/trusted-publishing)
+   cannot create a new name. Revoke the bootstrap token after the attempt.
+
+   ```bash
+   (
+     set +x
+     set -euo pipefail
+     test -z "$(git status --porcelain)"
+     tag=$(git describe --tags --exact-match --match 'v[0-9]*')
+     export AGMI_CRATE_VERSION="${tag#v}"
+     (cd "$CI_ASSETS" && sha256sum --strict --check SHA256SUMS)
+     grep -Fx "commit=$(git rev-parse HEAD)" "$CI_ASSETS/BUILD-INFO.txt"
+     grep -Fx "package_version=$AGMI_CRATE_VERSION" "$CI_ASSETS/BUILD-INFO.txt"
+     AGMI_CRATE_SHA256=$(sha256sum "$CI_ASSETS/agmi-$AGMI_CRATE_VERSION.crate" | cut -d ' ' -f 1)
+     export AGMI_CRATE_SHA256
+     read -rsp 'crates.io publish token: ' AGMI_CRATES_IO_TOKEN
+     printf '\n'
+     export AGMI_CRATES_IO_TOKEN
+     RUSTUP_TOOLCHAIN=1.96.0 ./tools/publish-crate.py --publish
+   )
+   ```
+
+   `--no-verify` avoids rebuilding with publication credentials; the exact
+   archive already passed the credential-free CI build and extracted-package
+   checks. Cargo repackages for upload. crates.io uses `registry.credential-provider`
+   (not `registries.crates-io.credential-provider`); the sole provider compares
+   Cargo's publish name, version and checksum to the qualified archive. Stop
+   on mismatch instead of bypassing it.
+3. Verify the public version, owner, non-yanked status and downloaded `.crate`
+   hash. Install the exact version in a fresh Cargo root, outside the checkout,
+   and run that binary's `--version`, `build-info --manifest` and `--help`.
+   Check the package README, links, docs.rs landing page and registry security
+   tab; avoid claiming platform support not exercised by the release.
+
+If only GitHub is available, say so and retry only the missing registry step.
+After an uncertain upload, check the registry before retrying; only a confirmed
+404 means absent. The same version with the expected owner and identical bytes
+needs no second upload. A public version with incorrect bytes needs a new
+patch, not a retag or replacement. Yanking stops normal new resolution, not
+existing installs or locked builds.
+
+After the bootstrap, configure a protected `release` environment and register
+its exact repository, workflow and environment with crates.io before enabling
+OIDC publication. Keep the exact-commit and archive gates, exchange for a
+short-lived token in the publish job only, and check its provenance afterward.
+Do not add a permanent token to CI.
 
 See [architecture](../ARCHITECTURE.md) and [security boundaries](../SECURITY.md). Protocol reference: [MinePOA agent instructions](https://minepoa.com/go.md). Experimental network; no earnings or monetary-value guarantees.

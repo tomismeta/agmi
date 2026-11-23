@@ -1,5 +1,5 @@
-//! Hosted API compatibility is based on https://minepoa.com/go.md,
-//! https://minepoa.com/openapi.yaml and https://minepoa.com/client/poa.mjs.
+//! Hosted API compatibility is based on <https://minepoa.com/go.md>,
+//! <https://minepoa.com/openapi.yaml> and <https://minepoa.com/client/poa.mjs>.
 //! HTTP success is not ledger finality. Unknown write outcomes never authorize replay.
 use crate::capability::LaneId;
 use crate::config::{Config, safe_segment};

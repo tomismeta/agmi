@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.2
+
+- **Distribution:** prepare the standalone CLI for locked Cargo installs from crates.io. Managed Linux installs and updates still use the verified GitHub Release assets.
+- **Release checks:** CI dry-runs registry publication, then builds and checks the distributable archive. The registry upload credential is gated on that archive's exact SHA-256.
+
 ## 0.3.1
 
 - **Security:** update the locked `url` dependency to 2.5.9 to fix the denial of service in [RUSTSEC-2026-0592](https://rustsec.org/advisories/RUSTSEC-2026-0592).
@@ -201,4 +206,4 @@ Source change history; this heading does not assert publication, signed release 
 - Validate submissions before journaling possible dispatch, share protocol grade/word constraints with model validation, retain backoff on malformed responses, and retry only authoritatively expired bound jobs. Report partial assignment inventories without inventing an undocumented continuation API.
 - Exercise actual binary behavior using local HTTP/native-process fixtures: queued answer recovery, grading, mining, durable pause, read-only enforcement, no resend after a lost response, hot model reload, capability disablement, Hermes embedding, preflight pause races, alternate-state rejection, model-only recovery, authoritative job expiry, malformed-response backoff, failed-initialization correction and conservative assignment absence.
 
-Earlier bounded Linux acceptance exercised authenticated Hermes and existing-Gateway OpenClaw participation, explicit mining and node-reported checkpoint coverage. Historical pilot observations are not live-registration acceptance, proof of the current checkout's deployed release identity, long-running stability or earnings. Upstream timeouts and uncertain model attempts remain unresolved without blind replay. Cargo publication remains disabled pending registry name clearance, third-party license review and release approval. Server auto-mining and cryptographic finality are not controlled or independently verified by the local runtime.
+Earlier bounded Linux acceptance exercised authenticated Hermes and existing-Gateway OpenClaw participation, explicit mining and node-reported checkpoint coverage. Historical pilot observations are not live-registration acceptance, proof of the current checkout's deployed release identity, long-running stability or earnings. Upstream timeouts and uncertain model attempts remain unresolved without blind replay. Cargo publication was disabled for this release. Server auto-mining and cryptographic finality are not controlled or independently verified by the local runtime.

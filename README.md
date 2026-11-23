@@ -21,14 +21,29 @@ schedules and submits work and tracks outcomes in SQLite.
 
 ### 1. Install
 
+**Cargo · Linux/macOS.** Install a released CLI with Rust/Cargo 1.96+ and a C
+compiler/linker for the bundled SQLite:
+
+```sh
+cargo install agmi --locked --version 0.3.2
+agmi --version
+```
+
+Put `~/.cargo/bin` (or your custom install location's `bin`) on `PATH`.
+The [crate](https://crates.io/crates/agmi) ships the Rust CLI and the source
+for its embedded Python, JavaScript and TypeScript adapters. Installation
+does not run those adapters or install their harnesses. The Rust library
+modules are CLI internals, not a supported SDK. If the crate isn't available
+yet, use a GitHub install below.
+
 **Prebuilt · Linux x86-64.** In an empty directory, download the Linux archive,
 `BUILD-INFO.txt`, and `SHA256SUMS` from
-[v0.3.1](https://github.com/tomismeta/agmi/releases/tag/v0.3.1). Then run:
+[v0.3.2](https://github.com/tomismeta/agmi/releases/tag/v0.3.2). Then run:
 
 ```sh
 (
   set -eu
-  archive=agmi-v0.3.1-x86_64-unknown-linux-musl.tar.gz
+  archive=agmi-v0.3.2-x86_64-unknown-linux-musl.tar.gz
   for file in "$archive" BUILD-INFO.txt; do
     sum=$(sha256sum -- "$file")
     grep -Fxq -- "$sum" SHA256SUMS || {
@@ -48,18 +63,18 @@ Add `~/bin` to your shell's `PATH` for future sessions. Checksums verify
 integrity under GitHub publisher trust; they are not independent signatures.
 For a different release, use that tag's README.
 
-**From source · Linux/macOS.** Requires Git, Rust/Cargo 1.96+, and a C
-compiler/linker:
+**From a Git checkout · Linux/macOS.** Use Git and the same build tools as
+the Cargo registry install:
 
 ```sh
-git clone --branch v0.3.1 \
+git clone --branch v0.3.2 \
   https://github.com/tomismeta/agmi.git &&
 cd agmi &&
 cargo install --path . --locked
 ```
 
-Put `~/.cargo/bin` (or your custom install location's `bin`) on `PATH`.
-Both paths install the CLI, not a service. Run `agmi --version` to check.
+All three options install only the CLI, not a service. Run `agmi --help`
+to explore the CLI without configuring access to a network.
 
 ### 2. Connect an existing account
 
@@ -180,7 +195,8 @@ restoring prior service and pause intent.
 [Update and recovery guide](docs/OPERATIONS.md#stable-release-updates).
 
 - **From 0.1.x:** Follow the [one-time bootstrap](docs/OPERATIONS.md#atomic-capability-migration) first.
-- **From source:** Check out the target tag and rerun `cargo install --path . --locked`.
+- **Cargo:** Stop the foreground controller and rerun `cargo install agmi --locked --version VERSION` for the intended release. Keep your configuration and journal. This does not replace a managed Linux release.
+- **From a Git checkout:** Check out the target tag and rerun `cargo install --path . --locked`.
 - **Standalone binary:** Stop the foreground controller, follow the target
   release's upgrade guidance, and verify and install its binary. Keep the
   existing configuration and journal.

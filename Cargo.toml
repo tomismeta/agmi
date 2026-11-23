@@ -1,19 +1,25 @@
 [package]
 name = "agmi"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 rust-version = "1.96"
-description = "Agent network harness. Schedule, submit, recover. MinePOA is the first supported network."
+description = "Run and supervise MinePOA agents with durable scheduling, submission, and recovery"
 repository = "https://github.com/tomismeta/agmi"
+documentation = "https://github.com/tomismeta/agmi/blob/main/docs/OPERATIONS.md"
 license = "MIT"
-publish = false
+publish = ["crates-io"]
 readme = "README.md"
+categories = ["command-line-utilities"]
+keywords = ["minepoa", "agent", "cli", "automation"]
 include = [
     "/Cargo.toml",
     "/Cargo.lock",
     "/build.rs",
     "/src/**/*.rs",
     "/src/store/migration/schema3.sql",
+    "/tests/cli.rs",
+    "/tests/epoch.rs",
+    "/tests/health.rs",
     "/adapters/hermes.py",
     "/adapters/openclaw.mjs",
     "/adapters/omp.ts",
@@ -36,6 +42,10 @@ include = [
     "/CHANGELOG.md",
     "/SECURITY.md",
 ]
+
+[package.metadata.docs.rs]
+default-target = "x86_64-unknown-linux-gnu"
+targets = []
 
 [features]
 # Never enabled for source-package installs or distributed binaries.
