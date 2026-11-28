@@ -119,6 +119,13 @@ pub(crate) const DIAGNOSTIC_REASONS: &[&str] = &[
     "reconciliation_evidence_truncated",
     "pending_work_overdue",
     "migration_pending",
+    "process_identity_mismatch",
+    "release_evidence_unavailable",
+    "config_missing",
+    "config_invalid",
+    "config_location_unavailable",
+    "current_epoch_unanswered",
+    "evidence_unavailable",
 ];
 
 pub(crate) const NEXT_ACTIONS: &[&str] = &[

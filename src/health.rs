@@ -875,11 +875,18 @@ pub fn managed_health_wait(report: &Value) -> bool {
             && intervention["next_action"] == "await_retry_eligibility"
             && intervention["observation_fresh"] == true
             && timed_reason(&reasons[0]);
+        let last_success_at = if lane == "judge" {
+            report["work"]["judge"]["assessment"]["observed_at"].as_i64()
+        } else {
+            report["observations"][lane]["observed_at"].as_i64()
+        }
+        .or_else(|| report["components"]["api"]["lanes"][lane]["last_success_at"].as_i64());
         let bounded_outage_age = intervention["observation_fresh"] == true
-            || (component["observed_at"].as_i64().is_some()
-                && component["age_seconds"]
-                    .as_u64()
-                    .is_some_and(|age| age <= (stale_limit.max(60) as u64).saturating_mul(2)));
+            || last_success_at.is_some_and(|ts| {
+                ts <= at
+                    && at.saturating_sub(ts) as u64
+                        <= (stale_limit.max(60) as u64).saturating_mul(2)
+            });
         let is_transient_upstream_wait = !is_strict_blocked_wait
             && bounded_outage_age
             && next_at.saturating_sub(at) <= stale_limit.max(60)
@@ -911,6 +918,12 @@ pub fn managed_health_wait(report: &Value) -> bool {
             if let Some(code) = reason.as_str() {
                 explained.push(code);
             }
+        }
+        if is_transient_upstream_wait && lane == "answer" {
+            // `components.answer.reasons` carries only the highest-priority finding
+            // (e.g. `api_dependency_unavailable`), while top-level `issues` also
+            // records `challenge_observation_stale` for the same bounded wait.
+            explained.push("challenge_observation_stale");
         }
         if lane_blocked {
             let reason = &admission["reason"];

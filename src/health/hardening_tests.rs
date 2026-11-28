@@ -157,61 +157,84 @@ fn compact_evidence_is_bounded_private_and_never_recalculates_risk() {
 #[test]
 fn managed_health_wait_bounds_transient_upstream_outages_and_rejects_sustained_outages() {
     let at = 10_000_i64;
-    let make_report = |observed_at: Option<i64>, age_seconds: Option<u64>, next_at: i64| {
-        json!({
-            "checked_at": at,
-            "healthy": false,
-            "hosted_identity_verified": true,
-            "issues": ["api_dependency_unavailable", "challenge_observation_stale"],
-            "thresholds": { "stale_seconds": 180 },
-            "intervention": {
-                "unattended": true,
-                "controller": { "ready": true },
-            },
-            "participation": {
-                "lanes": {
-                    "answer": { "allowed": true },
-                    "judge": { "allowed": true },
-                    "mine": { "allowed": true },
-                },
-            },
-            "components": {
-                "controller": { "state": "ok", "reasons": [] },
-                "storage": { "state": "ok", "reasons": [] },
-                "disk": { "state": "ok", "reasons": [] },
-                "api": { "state": "degraded", "reasons": ["api_dependency_unavailable"] },
-                "answer": {
-                    "mode": "active",
-                    "state": "degraded",
-                    "reasons": ["api_dependency_unavailable", "challenge_observation_stale"],
-                    "observed_at": observed_at,
-                    "age_seconds": age_seconds,
-                },
-                "judge": { "mode": "off", "state": "disabled", "reasons": [] },
-                "mine": { "mode": "off", "state": "disabled", "reasons": [] },
-            },
-            "work": {
-                "answer": {
-                    "intervention": {
-                        "status": "automatic_recovery",
-                        "reason": "read_backoff",
-                        "next_action": "observe_challenge",
-                        "next_at": next_at,
-                        "observation_fresh": false,
-                    },
-                },
-                "judge": { "intervention": {} },
-                "mine": { "intervention": {} },
-            },
-        })
+    let make_report = |last_success_at: Option<i64>, next_at: i64| {
+        let mut status = super::tests::fixture().2;
+        status["observations"]["answer"]["observed_at"] = json!(last_success_at);
+        status["reads"][0]["last_success_at"] = json!(last_success_at);
+        status["reads"][0]["last_failure_at"] = json!(at - 5);
+        status["reads"][0]["failures"] = json!(2);
+        status["reads"][0]["failure_category"] = json!("transport");
+        status["reads"][0]["status"] = json!(503);
+        status["reads"][0]["next_at"] = json!(next_at);
+        let (config, options, _) = super::tests::fixture();
+        evaluate(&config, options, &status, at)
     };
-    // Transient blip (age 240s <= 2 * 180s, next retry in 60s <= 180s): accepted as managed wait (exit 3).
-    let transient = make_report(Some(at - 240), Some(240), at + 60);
-    assert!(managed_health_wait(&transient));
-    // Sustained outage (age 900s > 2 * 180s): must NOT be masked as exit 3.
-    let sustained = make_report(Some(at - 900), Some(900), at + 60);
-    assert!(!managed_health_wait(&sustained));
-    // Never-observed outage (observed_at = null): must NOT be masked as exit 3.
-    let never_observed = make_report(None, None, at + 60);
-    assert!(!managed_health_wait(&never_observed));
+    // Transient blip (last success 240s ago <= 2 * 180s, next retry in 60s <= 180s): accepted as managed wait (exit 3).
+    let transient = make_report(Some(at - 240), at + 60);
+    assert!(managed_health_wait(&transient), "{transient}");
+    // Sustained outage (last success 900s ago > 2 * 180s, despite recent failure 5s ago): must NOT be masked as exit 3.
+    let sustained = make_report(Some(at - 900), at + 60);
+    assert!(!managed_health_wait(&sustained), "{sustained}");
+    // Never-observed outage (last_success_at = null, despite recent failure 5s ago): must NOT be masked as exit 3.
+    let never_observed = make_report(None, at + 60);
+    assert!(!managed_health_wait(&never_observed), "{never_observed}");
+
+    // Verify judge/mine also reject sustained and never-observed outages even when
+    // api::project sets component.observed_at to the recent last_failure_at.
+    for (index, lane) in [(1usize, "judge"), (2usize, "mine")] {
+        for last_success_at in [Some(at - 900), None] {
+            let (config, options, mut status) = super::tests::fixture();
+            if lane == "judge" {
+                status["work"]["judge"]["assessment"]["observed_at"] = json!(last_success_at);
+            } else {
+                status["observations"][lane]["observed_at"] = json!(last_success_at);
+            }
+            status["reads"][index]["last_success_at"] = json!(last_success_at);
+            status["reads"][index]["last_failure_at"] = json!(at - 5);
+            status["reads"][index]["failures"] = json!(3);
+            status["reads"][index]["failure_category"] = json!("transport");
+            status["reads"][index]["status"] = json!(503);
+            status["reads"][index]["next_at"] = json!(at + 60);
+            let report = evaluate(&config, options, &status, at);
+            assert!(
+                !managed_health_wait(&report),
+                "{lane} {last_success_at:?} must not exit 3: {report}"
+            );
+        }
+    }
+}
+
+#[test]
+fn health_intervention_vocabulary_matches_shared_updater_allowlist() {
+    let (config, options, mut status) = super::tests::fixture();
+    let cases: Vec<(&str, Value)> = vec![
+        ("healthy", evaluate(&config, options, &status, 10_000)),
+        ("mismatch", {
+            status["process_identity"] = json!("mismatch");
+            evaluate(&config, options, &status, 10_000)
+        }),
+        ("degraded_api", {
+            let mut s = super::tests::fixture().2;
+            s["reads"][0]["last_failure_at"] = json!(10_005);
+            s["reads"][0]["failures"] = json!(2);
+            s["reads"][0]["failure_category"] = json!("transport");
+            s["reads"][0]["status"] = json!(503);
+            s["reads"][0]["next_at"] = json!(10_060);
+            evaluate(&config, options, &s, 10_010)
+        }),
+    ];
+    for (label, report) in cases {
+        if let Some(reason) = report["intervention"]["reason"].as_str() {
+            assert!(
+                vocabulary::DIAGNOSTIC_REASONS.contains(&reason),
+                "{label}: intervention.reason {reason:?} missing from vocabulary::DIAGNOSTIC_REASONS"
+            );
+        }
+        if let Some(action) = report["intervention"]["next_action"].as_str() {
+            assert!(
+                vocabulary::NEXT_ACTIONS.contains(&action),
+                "{label}: intervention.next_action {action:?} missing from vocabulary::NEXT_ACTIONS"
+            );
+        }
+    }
 }

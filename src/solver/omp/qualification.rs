@@ -178,11 +178,64 @@ fn loopback_overlay(path: &Path) -> Result<String> {
 
 type Inventory = Vec<(PathBuf, Option<FileStamp>)>;
 struct Image {
+    // Drop `_workspace` BEFORE `_lock` so the directory is removed while the
+    // exclusive per-snapshot flock is still held.
     _workspace: Scratch,
+    _lock: Option<std::fs::File>,
     executable: PathBuf,
 }
 
-fn snapshot_workspace() -> Result<Scratch> {
+fn flock_file(file: &std::fs::File, operation: libc::c_int) -> bool {
+    use std::os::unix::io::AsRawFd;
+    loop {
+        let rc = unsafe { libc::flock(file.as_raw_fd(), operation) };
+        if rc == 0 {
+            return true;
+        }
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return false;
+        }
+    }
+}
+
+fn sweep_orphaned_snapshots(root: &Path) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("agmi-model-") {
+            continue;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.is_dir() || meta.file_type().is_symlink() {
+            continue;
+        }
+        let lock_path = path.join(".lock");
+        let Ok(lock) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .custom_flags(libc::O_NOFOLLOW)
+            .mode(0o600)
+            .open(&lock_path)
+        else {
+            continue;
+        };
+        if flock_file(&lock, libc::LOCK_EX | libc::LOCK_NB) {
+            let _ = std::fs::remove_dir_all(&path);
+            drop(lock);
+        }
+    }
+}
+
+fn snapshot_workspace() -> Result<(Scratch, Option<std::fs::File>)> {
     // Prefer persistent disk storage under the user's local agmi data dir so
     // large standalone omp binaries do not exhaust RAM-backed tmpfs (TMPDIR).
     if let Some(base) = dirs::data_local_dir() {
@@ -225,18 +278,48 @@ fn snapshot_workspace() -> Result<Scratch> {
                 ))
             }
         })();
-        if ready.is_ok()
-            && let Ok(scratch) = Scratch::in_dir(&root)
-        {
-            return Ok(scratch);
+        if ready.is_ok() {
+            // Coordinate orphan sweeping and new workspace creation + lock
+            // acquisition via a short root-level flock so a concurrent process
+            // cannot sweep a newly created workspace before its `.lock` is held.
+            let sweep_lock = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .custom_flags(libc::O_NOFOLLOW)
+                .mode(0o600)
+                .open(root.join(".sweep.lock"))
+                .ok();
+            let sweep_locked = sweep_lock
+                .as_ref()
+                .is_some_and(|file| flock_file(file, libc::LOCK_EX));
+            if sweep_locked {
+                sweep_orphaned_snapshots(&root);
+            }
+            if let Ok(scratch) = Scratch::in_dir(&root) {
+                let lock = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .mode(0o600)
+                    .open(scratch.0.join(".lock"))
+                    .ok()
+                    .filter(|file| flock_file(file, libc::LOCK_EX | libc::LOCK_NB));
+                drop(sweep_lock);
+                return Ok((scratch, lock));
+            }
+            drop(sweep_lock);
         }
     }
-    Scratch::new()
+    Ok((Scratch::new()?, None))
 }
 
 fn snapshot(path: &Path, expected: FileStamp) -> Result<Image> {
     use std::io::{Read, Seek, SeekFrom};
-    let workspace = snapshot_workspace()?;
+    let (workspace, lock) = snapshot_workspace()?;
     let executable = workspace.0.join("omp");
     let mut source = std::fs::OpenOptions::new()
         .read(true)
@@ -284,6 +367,7 @@ fn snapshot(path: &Path, expected: FileStamp) -> Result<Image> {
     drop(target);
     Ok(Image {
         _workspace: workspace,
+        _lock: lock,
         executable,
     })
 }
@@ -834,5 +918,36 @@ mod tests {
         );
         drop(input);
         Ok(())
+    }
+
+    #[test]
+    fn sweep_orphaned_snapshots_preserves_locked_and_removes_unlocked() {
+        let root = tempfile::tempdir().unwrap();
+        let orphan = root.path().join("agmi-model-orphan-1");
+        let active = root.path().join("agmi-model-active-2");
+        let unrelated = root.path().join("other-dir");
+        for dir in [&orphan, &active, &unrelated] {
+            std::fs::create_dir(dir).unwrap();
+            std::fs::write(dir.join("omp"), b"dummy").unwrap();
+        }
+        let active_lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(active.join(".lock"))
+            .unwrap();
+        assert!(flock_file(&active_lock, libc::LOCK_EX | libc::LOCK_NB));
+
+        sweep_orphaned_snapshots(root.path());
+
+        assert!(!orphan.exists(), "unlocked orphan snapshot should be swept");
+        assert!(active.exists(), "locked active snapshot must be preserved");
+        assert!(unrelated.exists(), "unrelated directory must be untouched");
+        drop(active_lock);
+
+        sweep_orphaned_snapshots(root.path());
+        assert!(!active.exists(), "released snapshot should be swept");
     }
 }

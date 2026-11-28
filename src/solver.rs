@@ -577,7 +577,7 @@ fn resolve_executable(path: &Path) -> Result<PathBuf> {
 struct OwnedChild {
     child: Child,
     #[cfg(unix)]
-    group: std::sync::atomic::AtomicI32,
+    group: std::sync::Arc<std::sync::atomic::AtomicI32>,
 }
 
 impl OwnedChild {
@@ -665,7 +665,7 @@ impl Drop for OwnedChild {
     }
 }
 
-fn kill_process_group(group: Option<&std::sync::atomic::AtomicI32>) {
+fn kill_process_group(group: Option<&std::sync::Arc<std::sync::atomic::AtomicI32>>) {
     #[cfg(unix)]
     if let Some(group) = group {
         let pgid = group.swap(0, std::sync::atomic::Ordering::AcqRel);
@@ -683,7 +683,7 @@ fn kill_process_group(group: Option<&std::sync::atomic::AtomicI32>) {
 
 async fn read_bounded(
     reader: impl AsyncRead + Unpin,
-    group: Option<&std::sync::atomic::AtomicI32>,
+    group: Option<std::sync::Arc<std::sync::atomic::AtomicI32>>,
 ) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     reader
@@ -692,7 +692,7 @@ async fn read_bounded(
         .await
         .map_err(|_| NativeFailure("native_pipe_failed"))?;
     if bytes.len() > MAX_OUTPUT {
-        kill_process_group(group);
+        kill_process_group(group.as_ref());
         return Err(NativeFailure("native_output_limit").into());
     }
     Ok(bytes)
@@ -700,7 +700,7 @@ async fn read_bounded(
 
 async fn drain_bounded(
     mut reader: impl AsyncRead + Unpin,
-    group: Option<&std::sync::atomic::AtomicI32>,
+    group: Option<std::sync::Arc<std::sync::atomic::AtomicI32>>,
 ) -> Result<()> {
     let mut scratch = [0u8; 4096];
     let mut total = 0usize;
@@ -714,7 +714,7 @@ async fn drain_bounded(
         }
         total = total.saturating_add(count);
         if total > MAX_OUTPUT {
-            kill_process_group(group);
+            kill_process_group(group.as_ref());
             return Err(NativeFailure("native_output_limit").into());
         }
     }
@@ -770,9 +770,9 @@ fn spawn_owned(mut command: Command) -> Result<OwnedChild> {
         .context("native adapter launch failed")
         .map_err(|error| error.context(SolverNotStarted("executable_unavailable")))?;
     #[cfg(unix)]
-    let group = std::sync::atomic::AtomicI32::new(
+    let group = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(
         child.id().context(NativeFailure("native_process_failed"))? as i32,
-    );
+    ));
     Ok(OwnedChild {
         child,
         #[cfg(unix)]
@@ -812,9 +812,10 @@ async fn collect_native_evidence(
         .take()
         .context(NativeFailure("native_pipe_failed"))?;
     #[cfg(unix)]
-    let group = Some(&owner.group);
+    let stdout_group = Some(std::sync::Arc::clone(&owner.group));
     #[cfg(not(unix))]
-    let group: Option<&std::sync::atomic::AtomicI32> = None;
+    let stdout_group: Option<std::sync::Arc<std::sync::atomic::AtomicI32>> = None;
+    let stderr_group = stdout_group.clone();
     let write = async {
         stdin
             .write_all(&input)
@@ -827,15 +828,16 @@ async fn collect_native_evidence(
         drop(stdin);
         Ok::<_, anyhow::Error>(())
     };
-    // Drain stdin/stdout/stderr BEFORE reaping the leader via owner.wait(), while
-    // also sharing the atomic PGID so overflow kills the group immediately and
-    // can never signal a reused PID.
-    let (written, output, diagnostics) = tokio::join!(
+    // Run owner.wait() concurrently with stdin/stdout/stderr so a leader that
+    // exits while a grandchild holds a pipe open immediately SIGKILLs the group
+    // via waitid(WNOWAIT) + swap(0) before reaping, while sharing the same
+    // atomic PGID so pipe-overflow kills also cannot race PID reuse.
+    let (written, output, diagnostics, status) = tokio::join!(
         write,
-        read_bounded(stdout, group),
-        drain_bounded(stderr, group),
+        read_bounded(stdout, stdout_group),
+        drain_bounded(stderr, stderr_group),
+        owner.wait(),
     );
-    let status = owner.wait().await;
     let output = output?;
     if let Ok(value) = serde_json::from_slice::<Value>(&output) {
         let prompt_channel = evidence.prompt_channel.take();
