@@ -1294,7 +1294,9 @@ mod native {
             result.image_relation = "unknown";
             result.owner = "unknown";
             result.run_mode = "unknown";
-            result.pid = None;
+            if result.pid != Some(0) {
+                result.pid = None;
+            }
             result.start_ticks = None;
             result.invocation_id = None;
         }
