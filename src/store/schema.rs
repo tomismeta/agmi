@@ -21,7 +21,17 @@ pub(super) fn initialize_query_indexes(db: &Connection) -> Result<()> {
          AND payload IS NULL AND job_id IS NULL AND txid IS NULL;
          CREATE INDEX IF NOT EXISTS lane_observation_rejected
          ON lane_observation_evidence(lane,authority_epoch,generation,epoch,fingerprint)
-         WHERE applied=0;",
+         WHERE applied=0;
+         CREATE INDEX IF NOT EXISTS events_operation
+         ON events(operation_id) WHERE operation_id IS NOT NULL;
+         CREATE INDEX IF NOT EXISTS risk_admissions_operation
+         ON risk_admissions(operation_id);
+         CREATE INDEX IF NOT EXISTS manual_grants_lookup
+         ON manual_grants(epoch,kind,generation);
+         CREATE INDEX IF NOT EXISTS operations_answer_history
+         ON operations(kind,id DESC)
+         WHERE kind='answer' AND payload IS NOT NULL
+         AND state IN ('final','confirmed','queued','unknown','included_pending');",
     )?;
     Ok(())
 }

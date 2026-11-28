@@ -3,7 +3,7 @@
 //! A loopback fixture measures the native encoder, not a substitute provider.
 use super::*;
 use std::borrow::Cow;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -182,13 +182,55 @@ struct Image {
     executable: PathBuf,
 }
 
+fn snapshot_workspace() -> Result<Scratch> {
+    // Prefer persistent disk storage under the user's local agmi data dir so
+    // large standalone omp binaries do not exhaust RAM-backed tmpfs (TMPDIR).
+    if let Some(base) = dirs::data_local_dir() {
+        let agmi_dir = base.join("agmi");
+        let root = agmi_dir.join("omp-snapshots");
+        let ready = (|| -> std::io::Result<()> {
+            if !agmi_dir.exists() {
+                std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(&agmi_dir)?;
+            }
+            if !root.exists() {
+                std::fs::DirBuilder::new().mode(0o700).create(&root)?;
+            }
+            let meta = std::fs::symlink_metadata(&root)?;
+            if meta.is_dir()
+                && !meta.file_type().is_symlink()
+                && meta.uid() == unsafe { libc::geteuid() }
+                && meta.mode() & 0o077 == 0
+            {
+                Ok(())
+            } else {
+                Err(std::io::Error::other("snapshot root is not a private directory"))
+            }
+        })();
+        if ready.is_ok()
+            && let Ok(scratch) = Scratch::in_dir(&root)
+        {
+            return Ok(scratch);
+        }
+    }
+    Scratch::new()
+}
+
 fn snapshot(path: &Path, expected: FileStamp) -> Result<Image> {
     use std::io::{Read, Seek, SeekFrom};
-    let workspace = Scratch::new()?;
+    let workspace = snapshot_workspace()?;
     let executable = workspace.0.join("omp");
-    let mut source = std::fs::File::open(path).context(FAILED)?;
+    let mut source = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .context(FAILED)?;
+    let source_meta = source.metadata().context(FAILED)?;
     ensure!(
-        FileStamp::from(source.metadata().context(FAILED)?) == expected
+        source_meta.is_file()
+            && FileStamp::from(source_meta) == expected
             && expected.size <= MAX_IMAGE,
         FAILED
     );
@@ -263,10 +305,9 @@ impl Qualified {
 // route. A bounded positive cache owns only private, qualified snapshots.
 static CACHE: Mutex<Vec<Arc<Qualified>>> = Mutex::const_new(Vec::new());
 
-pub(in crate::solver) fn release_cache() {
-    if let Ok(mut cache) = CACHE.try_lock() {
-        cache.clear();
-    }
+pub(in crate::solver) async fn release_cache() {
+    let mut cache = CACHE.lock().await;
+    cache.clear();
 }
 
 pub(in crate::solver) async fn qualify(
@@ -282,21 +323,24 @@ pub(in crate::solver) async fn qualify(
     let (_, _, selection) = selection(model)?;
     let scope = Scope::current(model)?;
     let current = executable_stamp(source)?;
-    let mut cache = CACHE.lock().await;
-    if let Some(found) = cache.iter().find(|entry| {
-        entry.source == source
-            && entry.configured == model.executable
-            && entry.stamp == current
-            && entry.selection == selection
-            && entry.scope == scope
-    }) {
-        return Ok(Some(found.clone()));
-    }
-    let image = match cache
-        .iter()
-        .find(|entry| entry.source == source && entry.stamp == current)
-    {
-        Some(found) => found.image.clone(),
+    let cached_image = {
+        let cache = CACHE.lock().await;
+        if let Some(found) = cache.iter().find(|entry| {
+            entry.source == source
+                && entry.configured == model.executable
+                && entry.stamp == current
+                && entry.selection == selection
+                && entry.scope == scope
+        }) {
+            return Ok(Some(found.clone()));
+        }
+        cache
+            .iter()
+            .find(|entry| entry.source == source && entry.stamp == current)
+            .map(|entry| entry.image.clone())
+    };
+    let image = match cached_image {
+        Some(found) => found,
         None => {
             let path = source.to_owned();
             Arc::new(
@@ -324,7 +368,18 @@ pub(in crate::solver) async fn qualify(
             deadline,
         )
         .await
-        .map_err(|_| FAILED)?
+        .map_err(|error| {
+            if error
+                .downcast_ref::<crate::solver::cleanup::WorkspaceAllocationError>()
+                .is_some()
+                || error.downcast_ref::<SolverNotStarted>().is_some()
+                || error.downcast_ref::<NativeFailure>().is_some()
+            {
+                error
+            } else {
+                error.context(FAILED)
+            }
+        })?
         else {
             continue;
         };
@@ -349,6 +404,7 @@ pub(in crate::solver) async fn qualify(
         scope,
         model_digest: qualified.context(FAILED)?,
     });
+    let mut cache = CACHE.lock().await;
     cache.retain(|entry| entry.source != result.source || entry.stamp == result.stamp);
     if cache.len() >= 4 {
         cache.remove(0);

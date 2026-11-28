@@ -316,6 +316,23 @@ fn queued_poll_interval(initial: u64, cap: u64, mut elapsed: u64) -> u64 {
     interval
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct RuntimeStateKey {
+    pub(super) revision: String,
+    pub(super) reload_blocked: bool,
+    pub(super) once: bool,
+    pub(super) account_generation: i64,
+    pub(super) authority_epoch: u64,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct AdmissionObservationKey {
+    pub(super) stamp: crate::store::AdmissionStampSnapshot,
+    pub(super) state: &'static str,
+    pub(super) reasons: Vec<&'static str>,
+    pub(super) valid_until: Option<i64>,
+}
+
 pub(super) struct HostAccess {
     config_path: PathBuf,
     config: Config,
@@ -337,6 +354,8 @@ pub(super) struct HostAccess {
     effect: Option<EffectInFlight>,
     once: Option<OncePlan>,
     identity_nonblocking: bool,
+    last_runtime_state: Option<(RuntimeStateKey, Instant)>,
+    last_admission_observations: [Option<(AdmissionObservationKey, Instant)>; LaneId::COUNT],
 }
 
 fn authority_fingerprint(config: &Config, protocol: &Protocol) -> Result<String> {

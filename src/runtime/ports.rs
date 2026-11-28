@@ -530,8 +530,13 @@ impl HostAccess {
             .is_some();
         Ok(begun)
     }
-    pub(in crate::runtime) fn record_admission_observations(&self) -> Result<()> {
-        for id in LaneId::ALL {
+    pub(in crate::runtime) fn record_admission_observations(&mut self) -> Result<()> {
+        const OBSERVATION_REFRESH: Duration = Duration::from_secs(15);
+        let current_instant = Instant::now();
+        let observed_at = now();
+        let mut updates = Vec::new();
+        let mut next_cache = Vec::new();
+        for (index, id) in LaneId::ALL.into_iter().enumerate() {
             let stamp = self.admission_stamp(id)?;
             let mut reasons = Vec::new();
             if !self.active(id)? {
@@ -557,7 +562,7 @@ impl HostAccess {
                 if self
                     .store
                     .request_not_before(&self.config, ready.intent.endpoint(), None)?
-                    > now()
+                    > observed_at
                 {
                     reasons.push("endpoint_restricted");
                 }
@@ -573,17 +578,46 @@ impl HostAccess {
             } else {
                 reasons.push("no_current_ready_work");
             }
-            self.store.record_admission_observation(
-                id,
-                &stamp,
-                AdmissionObservation {
-                    runtime_instance: &self.authority_instance,
-                    state: if reasons.is_empty() { "open" } else { "closed" },
-                    reasons: &reasons,
-                    observed_at: now(),
-                    valid_until,
-                },
-            )?;
+            let state = if reasons.is_empty() { "open" } else { "closed" };
+            let key = AdmissionObservationKey {
+                stamp,
+                state,
+                reasons,
+                valid_until,
+            };
+            let unchanged = self.last_admission_observations[index]
+                .as_ref()
+                .is_some_and(|(last, at)| {
+                    *last == key && current_instant.duration_since(*at) < OBSERVATION_REFRESH
+                });
+            if !unchanged {
+                updates.push((index, id, key.clone()));
+                next_cache.push((index, key));
+            }
+        }
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let batch: Vec<_> = updates
+            .iter()
+            .map(|(_, id, key)| {
+                (
+                    *id,
+                    &key.stamp,
+                    AdmissionObservation {
+                        runtime_instance: &self.authority_instance,
+                        state: key.state,
+                        reasons: &key.reasons,
+                        observed_at,
+                        valid_until: key.valid_until,
+                    },
+                )
+            })
+            .collect();
+        self.store
+            .record_admission_observations_batch(&batch, &self.authority_instance)?;
+        for (index, key) in next_cache {
+            self.last_admission_observations[index] = Some((key, current_instant));
         }
         Ok(())
     }

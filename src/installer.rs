@@ -138,6 +138,9 @@ pub(crate) fn observe_status_process(
             observation.image_relation = "unknown";
             observation.owner = "unknown";
             observation.run_mode = "unknown";
+            observation.pid = None;
+            observation.start_ticks = None;
+            observation.invocation_id = None;
         }
         observation
     };
@@ -1034,7 +1037,7 @@ mod native {
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX
                 | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )?;
-        db.busy_timeout(Duration::ZERO)?;
+        db.busy_timeout(Duration::from_millis(50))?;
         let tuple = db.query_row(
             "SELECT s.runtime_instance,s.effective_revision,s.controller_stopped,
              a.authority_epoch,c.generation,json_extract(p.policy,'$.process'),
@@ -1125,7 +1128,7 @@ mod native {
                 observed_unit(&home, root, release, Path::new(&before["FragmentPath"]))?;
             let unit_image = image_metadata(&unit_file.metadata()?);
             let pid: u32 = before["MainPID"].parse()?;
-            result.pid = Some(pid);
+            result.pid = (pid > 0).then_some(pid);
             if pid == 0 {
                 let after = observation_properties(deadline, &mut remaining)?;
                 let final_selected = super::observe_selected(path);
@@ -1286,6 +1289,9 @@ mod native {
             result.image_relation = "unknown";
             result.owner = "unknown";
             result.run_mode = "unknown";
+            result.pid = None;
+            result.start_ticks = None;
+            result.invocation_id = None;
         }
     }
     fn digest(file: File) -> Result<String> {

@@ -44,6 +44,8 @@ impl HostAccess {
             effect: None,
             once: None,
             identity_nonblocking: false,
+            last_runtime_state: None,
+            last_admission_observations: std::array::from_fn(|_| None),
         })
     }
 
@@ -397,7 +399,38 @@ impl HostAccess {
         self.arbitrate()
     }
 
+    fn refresh_runtime_state(&mut self, once: bool) -> Result<()> {
+        const HEARTBEAT_REFRESH: Duration = Duration::from_secs(15);
+        let key = RuntimeStateKey {
+            revision: self.config.revision()?,
+            reload_blocked: self.reload_blocked,
+            once,
+            account_generation: self.store.control()?.generation,
+            authority_epoch: self.authority_epoch,
+        };
+        let now_instant = Instant::now();
+        match &mut self.last_runtime_state {
+            Some((last_key, last_written)) if *last_key == key => {
+                if now_instant.duration_since(*last_written) >= HEARTBEAT_REFRESH {
+                    self.store.heartbeat()?;
+                    *last_written = now_instant;
+                }
+            }
+            _ => {
+                self.store.runtime_state_for_instance(
+                    &self.config,
+                    self.reload_blocked,
+                    once,
+                    Some(&self.authority_instance),
+                )?;
+                self.last_runtime_state = Some((key, now_instant));
+            }
+        }
+        Ok(())
+    }
+
     pub(in crate::runtime) async fn run_loop(&mut self, once: bool) -> Result<()> {
+        const IDLE_WAKE_FALLBACK_SECONDS: u64 = 5;
         self.identity_nonblocking = self.controller && !once;
         self.store.reschedule_all_reads(&self.config)?;
         if once {
@@ -411,8 +444,7 @@ impl HostAccess {
             // Every completion turn ingests assembled safety evidence before any launch.
             self.collect().await?;
             self.reload()?;
-            self.store
-                .runtime_state_with_mode(&self.config, self.reload_blocked, once)?;
+            self.refresh_runtime_state(once)?;
             if self.stopping() {
                 break;
             }
@@ -427,7 +459,9 @@ impl HostAccess {
             let seconds = if once {
                 1
             } else {
-                self.store.wake_delay(&self.config, 1)?.max(1)
+                self.store
+                    .wake_delay(&self.config, IDLE_WAKE_FALLBACK_SECONDS)?
+                    .max(1)
             };
             tokio::select! {
                 biased;

@@ -367,9 +367,16 @@ impl Protocol {
         Self::with_key(config, Some(parse_credential(bytes)?))
     }
 
-    /// Reloading an unchanged credential retains its opaque authority instance.
+    /// Reloading an unchanged credential retains its opaque authority instance
+    /// and reuses the existing HTTP client / TLS root store.
     pub fn reload(config: &Config, previous: &Self) -> Result<Self> {
-        let mut protocol = Self::new(config)?;
+        config.validate()?;
+        let key = if config.network.credential_file.as_os_str().is_empty() {
+            None
+        } else {
+            Some(read_credential(&config.network.credential_file)?)
+        };
+        let mut protocol = Self::with_key_and_client(config, key, Some(previous.client.clone()))?;
         if protocol.key == previous.key {
             protocol.credential_instance = previous.credential_instance;
         }
@@ -381,15 +388,26 @@ impl Protocol {
     }
 
     fn with_key(config: &Config, key: Option<HeaderValue>) -> Result<Self> {
+        Self::with_key_and_client(config, key, None)
+    }
+
+    fn with_key_and_client(
+        config: &Config,
+        key: Option<HeaderValue>,
+        existing_client: Option<Client>,
+    ) -> Result<Self> {
         static NEXT_CREDENTIAL_INSTANCE: AtomicU64 = AtomicU64::new(1);
         // No client total/connect caps: the owning request bounds all phases.
-        let client = Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .no_proxy()
-            .user_agent(concat!("agmi/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .map_err(|_| anyhow::anyhow!("HTTP client initialization failed"))?;
+        let client = match existing_client {
+            Some(client) => client,
+            None => Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .retry(reqwest::retry::never())
+                .no_proxy()
+                .user_agent(concat!("agmi/", env!("CARGO_PKG_VERSION")))
+                .build()
+                .map_err(|_| anyhow::anyhow!("HTTP client initialization failed"))?,
+        };
         Ok(Self {
             client,
             credential_reference: config

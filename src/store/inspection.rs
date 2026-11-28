@@ -275,6 +275,25 @@ impl Store {
         read: &Value,
         decay: Option<(i64, i64)>,
     ) -> Result<PollFloors> {
+        let schedule = (
+            self.reconciliation_schedule(&format!("reconciliation:{}", op.kind.as_str()))?
+                .0,
+            self.reconciliation_schedule(&format!("reconciliation:fair:{}", op.kind.as_str()))?
+                .0,
+            self.reconciliation_schedule(&format!("reconciliation:missing:{}", op.kind.as_str()))?
+                .0,
+        );
+        self.poll_floors_with_schedule(config, op, read, decay, schedule)
+    }
+
+    fn poll_floors_with_schedule(
+        &self,
+        config: &Config,
+        op: &InspectionOperation,
+        read: &Value,
+        decay: Option<(i64, i64)>,
+        (recent, fair, missing_schedule): (i64, i64, i64),
+    ) -> Result<PollFloors> {
         let local = read["local"].as_i64().unwrap_or(0);
         let server = read["server"].as_i64().unwrap_or(0);
         let retained = read["retained"].as_i64().unwrap_or(0);
@@ -287,23 +306,11 @@ impl Store {
                 };
                 let (source, basis, _) =
                     Self::request_floor_in(&self.db, config, endpoint, Some(remote))?;
-                let recent = self
-                    .reconciliation_schedule(&format!("reconciliation:{}", op.kind.as_str()))?
-                    .0;
-                let fair = self
-                    .reconciliation_schedule(&format!("reconciliation:fair:{}", op.kind.as_str()))?
-                    .0;
                 let missing = op.txid.is_none()
                     && read["status"] == 404
                     && read["failures"].as_u64().is_some_and(|count| count >= 2);
                 let service = if missing {
-                    fair.max(
-                        self.reconciliation_schedule(&format!(
-                            "reconciliation:missing:{}",
-                            op.kind.as_str()
-                        ))?
-                        .0,
-                    )
+                    fair.max(missing_schedule)
                 } else {
                     recent.min(fair)
                 };
@@ -425,9 +432,94 @@ impl Store {
         let mut finite_totals: Option<[UncertaintyAccounting; LaneId::COUNT]> = None;
         let mut contexts: [Option<RemoteWorkContext>; LaneId::COUNT] =
             std::array::from_fn(|_| None);
+        // Preload lane schedules, operations/evidence, and live poll reads for the whole page.
+        let mut schedules = [(0_i64, 0_i64, 0_i64); LaneId::COUNT];
+        for (index, lane) in LaneId::ALL.into_iter().enumerate() {
+            schedules[index] = (
+                self.reconciliation_schedule(&format!("reconciliation:{}", lane.as_str()))?
+                    .0,
+                self.reconciliation_schedule(&format!("reconciliation:fair:{}", lane.as_str()))?
+                    .0,
+                self.reconciliation_schedule(&format!("reconciliation:missing:{}", lane.as_str()))?
+                    .0,
+            );
+        }
+        let ids_json = serde_json::to_string(ids)?;
+        let mut ops_by_id: std::collections::HashMap<
+            i64,
+            (InspectionOperation, Option<String>, Option<String>),
+        > = std::collections::HashMap::with_capacity(ids.len());
+        {
+            let mut stmt = self.db.prepare(
+                "SELECT o.id,o.kind,o.work_key,o.state,o.job_id,o.txid,o.next_at,o.binding_revision,
+                 CASE WHEN json_type(o.request,'$.solver.epoch')='integer'
+                  AND json_extract(o.request,'$.solver.epoch')>=0
+                  AND json_extract(o.request,'$.solver.kind')=o.kind
+                  THEN json_extract(o.request,'$.solver.epoch') END,
+                 o.created_at,
+                 json_extract(e.policy,'$.reconciliation'),
+                 e.evidence
+                 FROM json_each(?1) j
+                 JOIN operations o ON o.id=j.value
+                 LEFT JOIN operation_evidence e ON e.operation_id=o.id",
+            )?;
+            let mut rows = stmt.query([&ids_json])?;
+            while let Some(r) = rows.next()? {
+                let id: i64 = r.get(0)?;
+                let kind = r.get_ref(1)?.as_str()?;
+                let kind = LaneId::ALL
+                    .into_iter()
+                    .find(|lane| lane.as_str() == kind)
+                    .ok_or(rusqlite::Error::InvalidQuery)?;
+                let op = InspectionOperation {
+                    kind,
+                    key: r.get(2)?,
+                    state: r.get(3)?,
+                    job_id: r.get(4)?,
+                    txid: r.get(5)?,
+                    next_at: r.get(6)?,
+                    binding_revision: r.get(7)?,
+                    epoch: r.get(8)?,
+                    created_at: r.get(9)?,
+                };
+                ops_by_id.insert(id, (op, r.get(10)?, r.get(11)?));
+            }
+        }
+        let mut reads_by_key: std::collections::HashMap<(i64, i64, String), Value> =
+            std::collections::HashMap::new();
+        {
+            let mut stmt = self.db.prepare(
+                "SELECT r.operation_id,r.binding_revision,r.purpose,
+                 r.started_at,r.finished_at,r.status,r.last_success_at,r.in_flight,
+                 r.local_next_at,r.server_not_before,r.retained_conservative_floor,r.failures
+                 FROM json_each(?1) j
+                 JOIN read_state r ON r.operation_id=j.value AND r.retired=0
+                 WHERE r.purpose IN ('job','receipt')",
+            )?;
+            let mut rows = stmt.query([&ids_json])?;
+            while let Some(r) = rows.next()? {
+                let op_id: i64 = r.get(0)?;
+                let rev: i64 = r.get(1)?;
+                let purpose: String = r.get(2)?;
+                reads_by_key.insert(
+                    (op_id, rev, purpose),
+                    json!({
+                        "started_at":r.get::<_,Option<i64>>(3)?,
+                        "checked_at":r.get::<_,Option<i64>>(4)?,
+                        "status":r.get::<_,Option<u16>>(5)?,
+                        "usable_at":r.get::<_,Option<i64>>(6)?,
+                        "in_flight":r.get::<_,bool>(7)?,
+                        "local":r.get::<_,i64>(8)?,
+                        "server":r.get::<_,i64>(9)?,
+                        "retained":r.get::<_,i64>(10)?,
+                        "failures":r.get::<_,u32>(11)?,
+                    }),
+                );
+            }
+        }
         let mut result = Vec::with_capacity(ids.len());
         for id in ids {
-            let Some(op) = self.inspection_operation(*id)? else {
+            let Some((op, raw_provenance, diagnostic)) = ops_by_id.get(id) else {
                 continue;
             };
             let index = LaneId::ALL
@@ -478,10 +570,13 @@ impl Store {
             } else {
                 "not_assessed"
             };
-            let provenance = self
-                .reconciliation_provenance(*id, op.binding_revision)?
+            let provenance = raw_provenance
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<ReconciliationProvenance>(raw).ok())
                 .filter(|p| {
-                    p.first_observed_at >= 0
+                    p.binding_revision == op.binding_revision
+                        && p.consecutive_404 <= 2
+                        && p.first_observed_at >= 0
                         && p.first_observed_at <= at
                         && p.bound_since
                             .is_none_or(|since| since >= 0 && since <= p.first_observed_at)
@@ -500,17 +595,52 @@ impl Store {
             let created = op.created_at;
             let key = op.read_key(*id);
             let read = match &key {
-                Some(key) => self.exact_poll_read(key)?,
-                None => Value::Null,
+                Some(ReadKey::Operation {
+                    operation_id,
+                    binding_revision,
+                    phase,
+                }) => {
+                    let purpose = if *phase == reads::ReadPhase::Receipt {
+                        "receipt"
+                    } else {
+                        "job"
+                    };
+                    reads_by_key
+                        .get(&(*operation_id, *binding_revision, purpose.to_owned()))
+                        .cloned()
+                        .unwrap_or(Value::Null)
+                }
+                _ => Value::Null,
             };
-            let decay = context
-                .map(|context| self.reconciliation_decay_at(*id, context, at))
-                .transpose()?
-                .flatten();
-            let poll = self.poll_floors(config, &op, &read, decay)?;
+            let decay = if matches!(op.state.as_str(), "queued" | "unknown")
+                && op.job_id.is_some()
+                && op.txid.is_none()
+            {
+                context
+                    .map(|context| self.reconciliation_decay_at(*id, context, at))
+                    .transpose()?
+                    .flatten()
+            } else {
+                None
+            };
+            let poll = self.poll_floors_with_schedule(config, op, &read, decay, schedules[index])?;
             let floors = poll.projection();
             let next = (key.is_some() && op.pollable()).then_some(poll.gate);
-            let reason = if matches!(op.state.as_str(), "completed" | "final" | "failed") {
+            let reason = if matches!(
+                op.state.as_str(),
+                "completed"
+                    | "final"
+                    | "rejected"
+                    | "refused"
+                    | "expired"
+                    | "stale"
+                    | "discarded"
+                    | "abstained"
+                    | "locally_rejected"
+                    | "prelaunch_failed"
+                    | "abandoned_model"
+                    | "superseded_model_unknown"
+            ) {
                 "terminal_evidence"
             } else if op.state == "model_unknown" {
                 "model_uncertain"
@@ -525,17 +655,9 @@ impl Store {
             } else {
                 "not_assessed"
             };
-            let diagnostic: Option<String> = self
-                .db
-                .query_row(
-                    "SELECT evidence FROM operation_evidence WHERE operation_id=?1",
-                    [id],
-                    |r| r.get(0),
-                )
-                .optional()?
-                .flatten();
             let mining = diagnostic
-                .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
                 .and_then(|d| {
                     (op.kind == LaneId::Mine
                         && matches!(d["stage"].as_str(), Some("submit" | "bound_job"))

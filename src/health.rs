@@ -625,10 +625,8 @@ fn evaluate_evidence(options: Options, status: &Value, at: i64) -> Value {
             .as_str()
             .and_then(|lane| work_timing(status, lane, options));
         if work["state"] == "generating"
-            && timing
-                .as_ref()
-                .and_then(|timing| model_overdue(work, at, timing.poll, timing.model))
-                .is_none()
+            && let Some(timing) = timing.as_ref()
+            && model_overdue(work, at, timing.poll, timing.model).is_none()
         {
             if !warnings.contains(&"model_deadline_unavailable") {
                 warnings.push("model_deadline_unavailable");
@@ -837,9 +835,13 @@ pub fn managed_health_wait(report: &Value) -> bool {
             .and_then(|reason| intervention::floor_kind(reason, &Value::Null))
             .is_some()
     };
-    let mut explained = [[None; 2]; LaneId::COUNT];
+    let stale_limit = report["thresholds"]["stale_seconds"]
+        .as_i64()
+        .filter(|&s| s > 0)
+        .unwrap_or(Options::default().stale_seconds as i64);
+    let mut explained: Vec<&str> = Vec::new();
     let mut aggregate_covered = false;
-    for (index, lane) in LANES.into_iter().enumerate() {
+    for lane in LANES {
         let component = &report["components"][lane];
         let intervention = &report["work"][lane]["intervention"];
         let admission = &report["participation"]["lanes"][lane];
@@ -852,22 +854,57 @@ pub fn managed_health_wait(report: &Value) -> bool {
         if matches!(component["state"].as_str(), Some("ok" | "disabled")) && !lane_blocked {
             continue;
         }
-        let Some([reason]) = component["reasons"].as_array().map(Vec::as_slice) else {
+        let Some(reasons) = component["reasons"].as_array() else {
             return false;
         };
+        if reasons.is_empty() {
+            return false;
+        }
         let next = intervention["next_at"].as_i64().filter(|&next| next > at);
         if component["mode"] != "active"
-            || component["state"] != "blocked"
             || intervention["status"] != "automatic_recovery"
-            || intervention["reason"] != *reason
-            || intervention["next_action"] != "await_retry_eligibility"
-            || intervention["observation_fresh"] != true
             || next.is_none()
-            || !timed_reason(reason)
         {
             return false;
         }
-        explained[index][0] = reason.as_str();
+        let next_at = next.expect("checked future next_at");
+        let is_strict_blocked_wait = reasons.len() == 1
+            && component["state"] == "blocked"
+            && intervention["reason"] == reasons[0]
+            && intervention["next_action"] == "await_retry_eligibility"
+            && intervention["observation_fresh"] == true
+            && timed_reason(&reasons[0]);
+        let is_transient_upstream_wait = !is_strict_blocked_wait
+            && next_at.saturating_sub(at) <= stale_limit.max(60)
+            && matches!(
+                intervention["reason"].as_str(),
+                Some("read_backoff" | "shared_server_restriction")
+            )
+            && matches!(
+                intervention["next_action"].as_str(),
+                Some("observe_challenge" | "observe_assignments" | "await_retry_eligibility")
+            )
+            && matches!(component["state"].as_str(), Some("degraded" | "blocked"))
+            && reasons.iter().all(|reason| {
+                matches!(
+                    reason.as_str(),
+                    Some(
+                        "api_dependency_unavailable"
+                            | "challenge_observation_stale"
+                            | "shared_server_restriction"
+                            | "work_evidence_unavailable"
+                            | "admission_blocked"
+                    )
+                )
+            });
+        if !is_strict_blocked_wait && !is_transient_upstream_wait {
+            return false;
+        }
+        for reason in reasons {
+            if let Some(code) = reason.as_str() {
+                explained.push(code);
+            }
+        }
         if lane_blocked {
             let reason = &admission["reason"];
             let deadline = admission["not_before"]
@@ -879,7 +916,9 @@ pub fn managed_health_wait(report: &Value) -> bool {
                 return false;
             }
             aggregate_covered = true;
-            explained[index][1] = reason.as_str();
+            if let Some(code) = reason.as_str() {
+                explained.push(code);
+            }
         }
     }
     issues.iter().all(|issue| {
@@ -887,10 +926,7 @@ pub fn managed_health_wait(report: &Value) -> bool {
             (code == "admission_blocked"
                 && aggregate_covered
                 && report["admission_blocked"] == true)
-                || explained
-                    .iter()
-                    .flatten()
-                    .any(|&candidate| candidate == Some(code))
+                || explained.contains(&code)
         })
     })
 }
@@ -1791,10 +1827,36 @@ pub fn compact_diagnostics(data: &mut Value) {
                 .collect::<Vec<_>>()
         );
     }
-    // Reserve room for the cli.v1 envelope. If optional presentation grows, keep
-    // classification, counts and issue lists rather than copying larger witnesses.
+    // Reserve room for the cli.v1 envelope. First compact repetitive per-lane
+    // instructions and verbose command arrays before omitting primary diagnostic
+    // sections so routine healthy/warning reports retain core evidence.
     let mut omitted = Vec::new();
     let mut fits = within_budget(&out);
+    if !fits {
+        let mut trimmed_actions = false;
+        if let Some(rows) = out["diagnostics"].as_array_mut() {
+            for row in rows {
+                if let Some(list) = row["next_actions"].as_array_mut() {
+                    let before = list.len();
+                    list.retain(|item| item["kind"] != "instruction");
+                    if list.len() != before {
+                        trimmed_actions = true;
+                    }
+                }
+            }
+        }
+        for lane in LANES {
+            if let Some(list) = out["work"][lane]["background_recovery"]["next_actions"].as_array_mut()
+                && !list.is_empty()
+            {
+                list.clear();
+                trimmed_actions = true;
+            }
+        }
+        if trimmed_actions {
+            fits = within_budget(&out);
+        }
+    }
     for name in [
         "lane_participation",
         "effective_capabilities",
@@ -1953,7 +2015,6 @@ pub fn compact_diagnostics(data: &mut Value) {
                 _ => {}
             }
         }
-        bound(&mut out);
         for lane in LANES {
             scoped_work(
                 &mut out["work"][lane],
@@ -1961,6 +2022,7 @@ pub fn compact_diagnostics(data: &mut Value) {
                 &mut truncated,
             );
         }
+        bound(&mut out);
         omitted.push("long_strings_and_lists");
         truncated = true;
     }
@@ -2521,7 +2583,7 @@ fn components(status: &Value, health: &Value, at: i64, stale: u64, options: Opti
         let mut concurrent_read_issue = None;
         if mode == Some("off") {
             finding = ("disabled", "capability_off", observed);
-        } else if name == "judge" && observation.is_some_and(|time| time > at) {
+        } else if observation.is_some_and(|time| time > at) {
             finding = ("unknown", "clock_regressed", observation);
         } else if mode == Some("active")
             && status["lane_controls"][name]["authoritative_closure"]["state"] == "closed"
@@ -2768,13 +2830,13 @@ fn components(status: &Value, health: &Value, at: i64, stale: u64, options: Opti
         for pending in std::iter::once(&status["pending"])
             .chain(status["pending_work"].as_array().into_iter().flatten())
             .chain(status["captured_work"].as_array().into_iter().flatten())
-            .filter(|pending| pending["kind"] == name)
+            .filter(|pending| {
+                pending["kind"] == name && pending["nonblocking_for_fresh_work"] != true
+            })
         {
             if pending["state"] == "generating"
-                && timing
-                    .as_ref()
-                    .and_then(|timing| model_overdue(pending, at, timing.poll, timing.model))
-                    .is_none()
+                && let Some(timing) = timing.as_ref()
+                && model_overdue(pending, at, timing.poll, timing.model).is_none()
             {
                 finding = (
                     "unknown",

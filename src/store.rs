@@ -1232,12 +1232,13 @@ const HISTORICAL_EXAMPLE_LIMIT: usize = 20;
 
 // Operations and direct retry linkage remain authoritative; this query never
 // resolves an original or treats age/same-epoch similarity as acceptance.
+// Drive from operation_links so SQLite does not scan every finalized answer.
 const HISTORICAL_ANSWERS: &str = "
     SELECT original.id AS operation_id,MIN(accepted.id) AS accepted_answer_id
-    FROM operations original
-    JOIN operation_evidence evidence ON evidence.operation_id=original.id
-    JOIN operation_links link ON link.retry_of=original.id
-    JOIN operations accepted ON accepted.id=link.operation_id
+    FROM operation_links link
+    CROSS JOIN operations original ON original.id=link.retry_of
+    CROSS JOIN operation_evidence evidence ON evidence.operation_id=original.id
+    CROSS JOIN operations accepted ON accepted.id=link.operation_id
     WHERE original.kind='answer' AND original.state='unknown'
     AND original.job_id IS NULL AND original.txid IS NULL
     AND evidence.dispatch_sequence IS NOT NULL
@@ -3392,12 +3393,22 @@ impl Store {
         reload_blocked: bool,
         once: bool,
     ) -> Result<()> {
+        self.runtime_state_for_instance(config, reload_blocked, once, None)
+    }
+
+    pub(crate) fn runtime_state_for_instance(
+        &self,
+        config: &Config,
+        reload_blocked: bool,
+        once: bool,
+        instance: Option<&str>,
+    ) -> Result<()> {
         self.continuity()?;
         // Reserve the writer before reading metadata that concurrent lane controls can change.
         let tx = rusqlite::Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
         let mut policy = json!({"capabilities":config.capabilities,
             "identity":config.identity,"runtime":config.runtime,"build":crate::runtime::build_info()});
-        let (authority_epoch, runtime_instance, account_generation): (
+        let (authority_epoch, stored_instance, account_generation): (
             Option<u64>,
             Option<String>,
             i64,
@@ -3408,6 +3419,7 @@ impl Store {
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
+        let runtime_instance = instance.map(str::to_owned).or(stored_instance);
         policy["process"] = json!({
             "pid":std::process::id(),
             "start_ticks":crate::installer::current_start_ticks(),
@@ -3430,15 +3442,18 @@ impl Store {
         tx.execute("INSERT INTO runtime_policy VALUES (1,?1) ON CONFLICT(singleton) DO UPDATE SET policy=excluded.policy",
             [serde_json::to_string(&policy)?])?;
         tx.execute(
-            "INSERT INTO runtime_state(singleton,effective_revision,reload_blocked,capabilities,observed_at,controller_stopped)
-             VALUES (1,?1,?2,?3,?4,0) ON CONFLICT(singleton) DO UPDATE SET
+            "INSERT INTO runtime_state(singleton,effective_revision,reload_blocked,capabilities,observed_at,runtime_instance,controller_stopped)
+             VALUES (1,?1,?2,?3,?4,?5,0) ON CONFLICT(singleton) DO UPDATE SET
             effective_revision=excluded.effective_revision,reload_blocked=excluded.reload_blocked,
-            capabilities=excluded.capabilities,observed_at=excluded.observed_at,controller_stopped=0",
+            capabilities=excluded.capabilities,observed_at=excluded.observed_at,
+            runtime_instance=COALESCE(excluded.runtime_instance,runtime_state.runtime_instance),
+            controller_stopped=0",
             params![
                 config.revision()?,
                 reload_blocked,
                 serde_json::to_string(&config.capabilities)?,
-                now()
+                now(),
+                instance
             ],
         )?;
         tx.execute(
@@ -4277,7 +4292,11 @@ impl Store {
             ("NULL", "")
         };
         let mut statement = self.db.prepare(&format!(
-            "SELECT o.id,o.kind,o.state,o.request,o.created_at,o.updated_at,o.next_at,o.generation,
+            "SELECT o.id,o.kind,o.state,
+                CASE WHEN json_type(o.request,'$.solver.epoch')='integer'
+                     AND json_extract(o.request,'$.solver.epoch')>=0
+                     THEN json_extract(o.request,'$.solver.epoch') END,
+                o.created_at,o.updated_at,o.next_at,o.generation,
                 o.job_id IS NOT NULL,o.txid IS NOT NULL,{link_columns},{evidence_columns},{timing_column},{model_column}
             FROM operations o {link_join} {evidence_join} {timing_join}
             WHERE (?1 IS NULL OR o.kind=?1) AND (?2 IS NULL OR o.state=?2)
@@ -4287,31 +4306,28 @@ impl Store {
             params![kind.map(|k| k.as_str()),state,before,(limit+1) as i64],
             |r| Ok((json!({
                 "operation_id":r.get::<_,i64>(0)?,"kind":r.get::<_,String>(1)?,
-                "state":r.get::<_,String>(2)?,"created_at":r.get::<_,i64>(4)?,
+                "state":r.get::<_,String>(2)?,"epoch":r.get::<_,Option<u64>>(3)?,
+                "created_at":r.get::<_,i64>(4)?,
                 "updated_at":r.get::<_,i64>(5)?,"next_at":r.get::<_,i64>(6)?,
                 "generation":r.get::<_,i64>(7)?,"has_job_id":r.get::<_,bool>(8)?,
                 "has_txid":r.get::<_,bool>(9)?,"retry_of":r.get::<_,Option<i64>>(10)?,
                 "payload_reused":r.get::<_,bool>(11)?,"blocked_since":r.get::<_,Option<i64>>(12)?,
                 "model_deadline":r.get::<_,Option<i64>>(13)?,"http_deadline":r.get::<_,Option<i64>>(14)?,
                 "retry_not_before":r.get::<_,Option<i64>>(15)?,
-            }),r.get::<_,String>(3)?,r.get::<_,Option<String>>(16)?)),
+            }),r.get::<_,Option<String>>(16)?)),
         )?;
         let mut operations = Vec::with_capacity(limit);
         let mut more = false;
         for row in rows {
-            let (mut operation, request, model_attempt) = row?;
+            let (mut operation, model_attempt) = row?;
             if operations.len() == limit {
                 more = true;
                 break;
             }
-            let request: Value = serde_json::from_str(&request)?;
             operation["model_attempt"] = model_attempt
                 .map(|value| serde_json::from_str::<Value>(&value))
                 .transpose()?
                 .unwrap_or(Value::Null);
-            operation["epoch"] = request["solver"]["epoch"]
-                .as_u64()
-                .map_or(Value::Null, Value::from);
             let empty = WaitEvidence::default();
             operation["wait"] = waits
                 .get(&operation["operation_id"].as_i64().unwrap_or(-1))

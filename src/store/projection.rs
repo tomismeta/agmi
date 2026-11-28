@@ -1954,7 +1954,7 @@ impl Store {
         } else {
             None
         };
-        let mut restrictions=self.db.prepare("SELECT scope,basis,not_before,observed_at,source,server_minimum_seconds,policy FROM request_restrictions WHERE not_before>?1 ORDER BY not_before DESC")?;
+        let mut restrictions=self.db.prepare("SELECT scope,basis,not_before,observed_at,source,server_minimum_seconds,policy FROM request_restrictions WHERE not_before>?1 ORDER BY not_before DESC LIMIT 256")?;
         let restrictions=restrictions.query_map([now()],|r|Ok(json!({"scope":r.get::<_,String>(0)?,"basis":r.get::<_,String>(1)?,"not_before":r.get::<_,i64>(2)?,
             "observed_at":r.get::<_,i64>(3)?,"source":r.get::<_,String>(4)?,"server_minimum_seconds":r.get::<_,Option<u64>>(5)?,"policy":r.get::<_,Option<String>>(6)?})))?.collect::<std::result::Result<Vec<_>,_>>()?;
         let mut lane_controls = json!({});

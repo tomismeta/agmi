@@ -763,19 +763,69 @@ impl Store {
         )
     }
 
-    pub(crate) fn record_admission_observation(
+    pub(crate) fn record_admission_observations_batch(
         &self,
-        lane: LaneId,
-        stamp: &AdmissionStampSnapshot,
-        observation: AdmissionObservation<'_>,
+        entries: &[(LaneId, &AdmissionStampSnapshot, AdmissionObservation<'_>)],
+        runtime_instance: &str,
     ) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        ensure!(
+            !runtime_instance.is_empty() && runtime_instance.len() <= 128,
+            "invalid observation identity"
+        );
+        self.continuity()?;
+        let tx = rusqlite::Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
+        let raw: Option<String> = tx.query_row(
+            "SELECT control_observations FROM runtime_state WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )?;
+        let mut values = raw
+            .map(|v| serde_json::from_str::<Value>(&v))
+            .transpose()?
+            .unwrap_or_else(|| json!({}));
+        ensure!(values.is_object(), "invalid runtime observations");
+        let mut changed = false;
+        for &(lane, stamp, ref observation) in entries {
+            let value = Self::encode_admission_observation(stamp, observation)?;
+            if !Self::observation_stamp_matches(&tx, lane, stamp)? {
+                continue;
+            }
+            if values.get(lane.as_str()) == Some(&value) {
+                continue;
+            }
+            values[lane.as_str()] = value;
+            changed = true;
+        }
+        if !changed {
+            return Ok(());
+        }
+        let encoded = serde_json::to_string(&values)?;
+        ensure!(
+            encoded.len() <= MAX_OBSERVATION_BYTES * LaneId::COUNT,
+            "runtime observations too large"
+        );
+        tx.execute(
+            "UPDATE runtime_state SET control_observations=?1, runtime_instance=?2 WHERE singleton=1",
+            params![encoded, runtime_instance],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn encode_admission_observation(
+        stamp: &AdmissionStampSnapshot,
+        observation: &AdmissionObservation<'_>,
+    ) -> Result<Value> {
         let AdmissionObservation {
             runtime_instance,
             state,
             reasons,
             observed_at,
             valid_until,
-        } = observation;
+        } = *observation;
         ensure!(
             matches!(state, "open" | "closed" | "unknown")
                 && reasons.len() <= 16
@@ -788,16 +838,25 @@ impl Store {
             !runtime_instance.is_empty() && runtime_instance.len() <= 128 && observed_at >= 0,
             "invalid observation identity"
         );
-        let value = json!({"state":state,"reasons":reasons,"freshness":"current_observation","source":"runtime_snapshot",
+        Ok(json!({"state":state,"reasons":reasons,"freshness":"current_observation","source":"runtime_snapshot",
             "observed_at":observed_at,"valid_until":valid_until,"runtime_instance":runtime_instance,
             "observed_control_revision":stamp.lane_control_revision,"accepted_config_revision":stamp.lane_config_revision,
-            "authority_epoch":stamp.authority_epoch,"account_generation":stamp.account_generation});
+            "authority_epoch":stamp.authority_epoch,"account_generation":stamp.account_generation}))
+    }
+
+    pub(crate) fn record_admission_observation(
+        &self,
+        lane: LaneId,
+        stamp: &AdmissionStampSnapshot,
+        observation: AdmissionObservation<'_>,
+    ) -> Result<()> {
+        let value = Self::encode_admission_observation(stamp, &observation)?;
         self.record_lane_snapshot(
             lane,
             stamp,
             "control_observations",
             &value,
-            Some(runtime_instance),
+            Some(observation.runtime_instance),
         )
     }
 

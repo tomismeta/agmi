@@ -24,8 +24,39 @@ fn worker() -> Result<&'static mpsc::Sender<Cleanup>> {
                     for message in receiver {
                         match message {
                             Cleanup::Remove(path) => {
-                                if let Err(error) = std::fs::remove_dir_all(path)
-                                    && error.kind() != std::io::ErrorKind::NotFound
+                                let mut last_error = None;
+                                // Dying children/descendants after async SIGKILL may briefly hold
+                                // files open or create WAL sidecars while tearing down.
+                                for attempt in 0..10_u64 {
+                                    match std::fs::remove_dir_all(&path) {
+                                        Ok(()) => {
+                                            last_error = None;
+                                            break;
+                                        }
+                                        Err(error)
+                                            if error.kind() == std::io::ErrorKind::NotFound =>
+                                        {
+                                            last_error = None;
+                                            break;
+                                        }
+                                        Err(error)
+                                            if matches!(
+                                                error.raw_os_error(),
+                                                Some(libc::ENOTEMPTY | libc::EBUSY)
+                                            ) && attempt < 9 =>
+                                        {
+                                            last_error = Some(error);
+                                            std::thread::sleep(Duration::from_millis(
+                                                5 * (attempt + 1),
+                                            ));
+                                        }
+                                        Err(error) => {
+                                            last_error = Some(error);
+                                            break;
+                                        }
+                                    }
+                                }
+                                if let Some(error) = last_error
                                     && failure.is_none()
                                 {
                                     failure = Some(error);
@@ -53,7 +84,7 @@ fn worker() -> Result<&'static mpsc::Sender<Cleanup>> {
 }
 
 pub(crate) async fn drain_native_cleanup_until(deadline: tokio::time::Instant) -> Result<bool> {
-    omp::qualification::release_cache();
+    omp::qualification::release_cache().await;
     let Some(worker) = WORKER.get() else {
         return Ok(true);
     };
@@ -61,6 +92,7 @@ pub(crate) async fn drain_native_cleanup_until(deadline: tokio::time::Instant) -
         .as_ref()
         .map_err(|error| anyhow::anyhow!("native cleanup worker unavailable: {error}"))?;
     loop {
+        omp::qualification::release_cache().await;
         if tokio::time::Instant::now() >= deadline {
             return Ok(false);
         }
@@ -117,6 +149,10 @@ pub(super) struct Scratch(pub(super) PathBuf, &'static mpsc::Sender<Cleanup>);
 impl Scratch {
     pub(super) fn new() -> Result<Self> {
         Self::in_root(&std::env::temp_dir())
+    }
+
+    pub(super) fn in_dir(root: &Path) -> Result<Self> {
+        Self::in_root(root)
     }
 
     fn in_root(root: &Path) -> Result<Self> {

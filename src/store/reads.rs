@@ -691,78 +691,106 @@ impl Store {
     }
 
     pub(crate) fn reschedule_all_reads(&self, config: &Config) -> Result<()> {
-        let mut statement=self.db.prepare("SELECT owner,purpose,resource,operation_id,binding_revision FROM read_state WHERE retired=0")?;
-        let rows = statement.query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, Option<i64>>(3)?,
-                r.get::<_, Option<i64>>(4)?,
-            ))
-        })?;
-        for row in rows {
-            let (owner, purpose, resource, id, revision) = row?;
-            if owner == "account" {
-                self.reschedule_read(
-                    &ReadKey::Identity,
+        const RETAIN_LANE_OBSERVATION_EVIDENCE_PER_LANE: i64 = 1_000;
+        const EXPIRED_RESTRICTION_GRACE_SECONDS: i64 = 86_400;
+        const IDLE_ASSIGNMENT_READ_RETENTION_SECONDS: i64 = 86_400;
+        const RETIRED_READ_RETENTION_SECONDS: i64 = 7 * 86_400;
+        self.continuity()?;
+        let at = now();
+        let tx = rusqlite::Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
+        let rows: Vec<(String, String, String, u32, i64)> = {
+            let mut statement = tx.prepare(
+                "SELECT owner,purpose,resource,failures,last_failure_at
+                 FROM read_state
+                 WHERE retired=0 AND failures>0 AND last_failure_at IS NOT NULL",
+            )?;
+            let mapped = statement.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, u32>(3)?,
+                    r.get::<_, i64>(4)?,
+                ))
+            })?;
+            mapped.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (owner, purpose, resource, failures, failed_at) in rows {
+            let (base, cap, jitter) = if owner == "account" {
+                (
                     config.identity.retry_seconds,
                     config.identity.backoff_max_seconds,
                     config.identity.jitter_seconds,
-                )?;
-                continue;
-            }
-            let lane = match owner.as_str() {
-                "answer" => LaneId::Answer,
-                "judge" => LaneId::Judge,
-                "mine" => LaneId::Mine,
-                _ => bail!("invalid read owner"),
-            };
-            let schedule = config.schedule(lane);
-            let key = if let (Some(operation_id), Some(binding_revision)) = (id, revision) {
-                ReadKey::Operation {
-                    operation_id,
-                    binding_revision,
-                    phase: if purpose == "receipt" {
-                        ReadPhase::Receipt
-                    } else {
-                        ReadPhase::Job
-                    },
-                }
-            } else if purpose == "assignment" {
-                ReadKey::Assignment {
-                    assignment_id: resource,
-                }
+                )
             } else {
-                ReadKey::Discovery {
-                    lane,
-                    source: if resource == "assignments" {
-                        DiscoverySource::Assignments
+                let lane = match owner.as_str() {
+                    "answer" => LaneId::Answer,
+                    "judge" => LaneId::Judge,
+                    "mine" => LaneId::Mine,
+                    _ => bail!("invalid read owner"),
+                };
+                let schedule = config.schedule(lane);
+                let discovery = purpose == "discovery";
+                (
+                    if discovery {
+                        schedule
+                            .discovery_retry_seconds
+                            .unwrap_or(schedule.retry_seconds)
                     } else {
-                        DiscoverySource::Challenge
+                        schedule.retry_seconds
                     },
-                }
+                    if discovery {
+                        schedule
+                            .discovery_backoff_max_seconds
+                            .unwrap_or(schedule.backoff_max_seconds)
+                    } else {
+                        schedule.backoff_max_seconds
+                    },
+                    schedule.jitter_seconds,
+                )
             };
-            let discovery = purpose == "discovery";
-            self.reschedule_read(
-                &key,
-                if discovery {
-                    schedule
-                        .discovery_retry_seconds
-                        .unwrap_or(schedule.retry_seconds)
-                } else {
-                    schedule.retry_seconds
-                },
-                if discovery {
-                    schedule
-                        .discovery_backoff_max_seconds
-                        .unwrap_or(schedule.backoff_max_seconds)
-                } else {
-                    schedule.backoff_max_seconds
-                },
-                schedule.jitter_seconds,
+            let deadline = failed_at
+                .saturating_add(read_delay(failures, base, cap, jitter).min(i64::MAX as u64) as i64)
+                .saturating_add(1);
+            tx.execute(
+                "UPDATE read_state SET local_next_at=?4
+                 WHERE owner=?1 AND purpose=?2 AND resource=?3 AND retired=0",
+                params![owner, purpose, resource, deadline],
             )?;
         }
+        // Bound live control/scheduling tables without ever pruning active floors,
+        // live reconciliation bindings, or recent audit evidence.
+        tx.execute(
+            "DELETE FROM request_restrictions WHERE not_before < ?1",
+            [at.saturating_sub(EXPIRED_RESTRICTION_GRACE_SECONDS)],
+        )?;
+        tx.execute(
+            "DELETE FROM read_state
+             WHERE retired=1 AND COALESCE(finished_at, started_at, 0) < ?1",
+            [at.saturating_sub(RETIRED_READ_RETENTION_SECONDS)],
+        )?;
+        tx.execute(
+            "DELETE FROM read_state
+             WHERE purpose='assignment' AND retired=0 AND in_flight=0
+               AND operation_id IS NULL
+               AND local_next_at <= ?1 AND server_not_before <= ?1
+               AND retained_conservative_floor <= ?1
+               AND COALESCE(finished_at, started_at, 0) < ?2",
+            params![at, at.saturating_sub(IDLE_ASSIGNMENT_READ_RETENTION_SECONDS)],
+        )?;
+        for lane in [LaneId::Answer, LaneId::Mine] {
+            tx.execute(
+                "DELETE FROM lane_observation_evidence
+                 WHERE lane=?1 AND rowid NOT IN (
+                     SELECT rowid FROM lane_observation_evidence
+                     WHERE lane=?1
+                     ORDER BY observed_at DESC, authority_epoch DESC, generation DESC, request_sequence DESC
+                     LIMIT ?2
+                 )",
+                params![lane.as_str(), RETAIN_LANE_OBSERVATION_EVIDENCE_PER_LANE],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
