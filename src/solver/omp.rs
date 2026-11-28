@@ -693,7 +693,7 @@ async fn exchange_inference(
         .try_into()
         .unwrap_or(i64::MAX);
     // Stop the owned group without delaying terminal delivery for process reaping.
-    let stopped = owner.stop_and_observe();
+    let stopped = owner.stop_and_observe().await;
     if let Some(facts) = facts {
         facts.cancellation = CancellationEvidence {
             requested_at: Some(requested_at),

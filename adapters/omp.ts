@@ -275,7 +275,7 @@ export default async function (pi: ExtensionAPI) {
   let syntheticGo = false;
   let probeResponse: { status: 200 | 400; mime: "text/event-stream" | "application/json"; body: string } | undefined;
   let settings!: Awaited<ReturnType<typeof Settings.loadReadOnly>>;
-  let startupFailed = false;
+  let startupError: string | undefined;
   try {
     requireThat(stockGo === (boot.go_mode !== undefined), "native_bootstrap");
     stockProbe = boot.go_mode === "stock_probe";
@@ -295,8 +295,7 @@ export default async function (pi: ExtensionAPI) {
       for (const { name, config } of loaded.runtime.pendingProviderRegistrations) pi.registerProvider(name, config);
     }
   } catch (e) {
-    startupFailed = true;
-    emitResult({ ok: false, stage: "startup", reason_code: e instanceof Failure ? e.code : "native_startup" });
+    startupError = e instanceof Failure ? e.code : "native_startup";
   }
 
   let consumed = false;
@@ -347,7 +346,10 @@ export default async function (pi: ExtensionAPI) {
   let readyRoute: { digest: string; url: string } | null = null;
   let syntheticKey: string | undefined;
   pi.on("session_start", async (_event, ctx) => {
-    if (startupFailed) return;
+    if (startupError !== undefined) {
+      emitResult({ ok: false, stage: "startup", reason_code: startupError });
+      return;
+    }
     try {
       const model = resolve(ctx);
       const effort = boot.reasoning_effort === "off" ? undefined : boot.reasoning_effort;

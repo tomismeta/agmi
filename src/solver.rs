@@ -577,36 +577,36 @@ fn resolve_executable(path: &Path) -> Result<PathBuf> {
 struct OwnedChild {
     child: Child,
     #[cfg(unix)]
-    group: i32,
+    group: std::sync::atomic::AtomicI32,
 }
 
 impl OwnedChild {
-    fn request_stop(&mut self) {
+    fn request_stop(&self) {
         #[cfg(unix)]
-        if self.group > 0 {
-            // SAFETY: this is the private group created for our owned child.
-            unsafe {
-                libc::kill(-self.group, libc::SIGKILL);
+        {
+            let pgid = self.group.swap(0, std::sync::atomic::Ordering::AcqRel);
+            if pgid > 0 {
+                // SAFETY: this is the private group created for our unreaped child.
+                unsafe {
+                    libc::kill(-pgid, libc::SIGKILL);
+                }
             }
-            self.group = 0;
         }
+    }
+
+    fn kill_child(&mut self) {
+        self.request_stop();
         let _ = self.child.start_kill();
     }
 
-    fn stop_and_observe(&mut self) -> bool {
-        self.request_stop();
-        // Kill the group before reaping its leader. Give the kernel a short window
-        // to reap the SIGKILLed leader synchronously; otherwise dropping Child hands
-        // it to Tokio's orphan reaper.
-        for attempt in 0..10 {
-            if self.child.try_wait().is_ok_and(|status| status.is_some()) {
-                return true;
-            }
-            if attempt < 9 {
-                std::thread::sleep(Duration::from_millis(5));
-            }
-        }
-        false
+    async fn stop_and_observe(&mut self) -> bool {
+        self.kill_child();
+        // Kill the group before reaping its leader. Give the kernel a short async
+        // window to reap the SIGKILLed leader without blocking the Tokio worker;
+        // otherwise dropping Child hands it to Tokio's orphan reaper.
+        tokio::time::timeout(Duration::from_millis(50), self.child.wait())
+            .await
+            .is_ok_and(|res| res.is_ok())
     }
 
     async fn wait(&mut self) -> Result<std::process::ExitStatus> {
@@ -650,7 +650,7 @@ impl OwnedChild {
                     .await
                     .context(NativeFailure("native_process_failed"))?;
             }
-            self.request_stop();
+            self.kill_child();
         }
         self.child
             .wait()
@@ -661,23 +661,30 @@ impl OwnedChild {
 
 impl Drop for OwnedChild {
     fn drop(&mut self) {
-        self.request_stop();
+        self.kill_child();
     }
 }
 
-fn kill_process_group(group: i32) {
+fn kill_process_group(group: Option<&std::sync::atomic::AtomicI32>) {
     #[cfg(unix)]
-    if group > 0 {
-        // SAFETY: group is the private process group created for our owned child.
-        unsafe {
-            libc::kill(-group, libc::SIGKILL);
+    if let Some(group) = group {
+        let pgid = group.swap(0, std::sync::atomic::Ordering::AcqRel);
+        if pgid > 0 {
+            // SAFETY: pgid is swapped to 0 before self.child.wait() reaps the leader,
+            // so a pipe overflow can never signal a reused process group.
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
         }
     }
     #[cfg(not(unix))]
     let _ = group;
 }
 
-async fn read_bounded(reader: impl AsyncRead + Unpin, group: i32) -> Result<Vec<u8>> {
+async fn read_bounded(
+    reader: impl AsyncRead + Unpin,
+    group: Option<&std::sync::atomic::AtomicI32>,
+) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     reader
         .take((MAX_OUTPUT + 1) as u64)
@@ -691,7 +698,10 @@ async fn read_bounded(reader: impl AsyncRead + Unpin, group: i32) -> Result<Vec<
     Ok(bytes)
 }
 
-async fn drain_bounded(mut reader: impl AsyncRead + Unpin, group: i32) -> Result<()> {
+async fn drain_bounded(
+    mut reader: impl AsyncRead + Unpin,
+    group: Option<&std::sync::atomic::AtomicI32>,
+) -> Result<()> {
     let mut scratch = [0u8; 4096];
     let mut total = 0usize;
     loop {
@@ -760,7 +770,9 @@ fn spawn_owned(mut command: Command) -> Result<OwnedChild> {
         .context("native adapter launch failed")
         .map_err(|error| error.context(SolverNotStarted("executable_unavailable")))?;
     #[cfg(unix)]
-    let group = child.id().context(NativeFailure("native_process_failed"))? as i32;
+    let group = std::sync::atomic::AtomicI32::new(
+        child.id().context(NativeFailure("native_process_failed"))? as i32,
+    );
     Ok(OwnedChild {
         child,
         #[cfg(unix)]
@@ -800,9 +812,9 @@ async fn collect_native_evidence(
         .take()
         .context(NativeFailure("native_pipe_failed"))?;
     #[cfg(unix)]
-    let group = owner.group;
+    let group = Some(&owner.group);
     #[cfg(not(unix))]
-    let group = 0;
+    let group: Option<&std::sync::atomic::AtomicI32> = None;
     let write = async {
         stdin
             .write_all(&input)
@@ -815,13 +827,15 @@ async fn collect_native_evidence(
         drop(stdin);
         Ok::<_, anyhow::Error>(())
     };
-    let wait = owner.wait();
-    let (written, output, diagnostics, status) = tokio::join!(
+    // Drain stdin/stdout/stderr BEFORE reaping the leader via owner.wait(), while
+    // also sharing the atomic PGID so overflow kills the group immediately and
+    // can never signal a reused PID.
+    let (written, output, diagnostics) = tokio::join!(
         write,
         read_bounded(stdout, group),
         drain_bounded(stderr, group),
-        wait
     );
+    let status = owner.wait().await;
     let output = output?;
     if let Ok(value) = serde_json::from_slice::<Value>(&output) {
         let prompt_channel = evidence.prompt_channel.take();
@@ -1286,7 +1300,7 @@ invocation=${invocation%%\"*}
                 std::task::Poll::Ready(Err(std::io::Error::other("secret-canary")))
             }
         }
-        let error = read_bounded(BrokenPipe, 0).await.unwrap_err();
+        let error = read_bounded(BrokenPipe, None).await.unwrap_err();
         assert_safe_failure(&error, "native_pipe_failed", true);
     }
 
@@ -1706,9 +1720,9 @@ invocation=${invocation%%\"*}
     #[tokio::test]
     async fn bounds_native_output() {
         let oversized = vec![b'x'; MAX_OUTPUT + 1];
-        let error = read_bounded(&oversized[..], 0).await.unwrap_err();
+        let error = read_bounded(&oversized[..], None).await.unwrap_err();
         assert_safe_failure(&error, "native_output_limit", true);
-        assert_eq!(read_bounded(&b"{}"[..], 0).await.unwrap(), b"{}");
+        assert_eq!(read_bounded(&b"{}"[..], None).await.unwrap(), b"{}");
     }
     #[test]
     fn answer_lengths_use_engine_utf16_units() {

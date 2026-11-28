@@ -318,5 +318,13 @@ mod tests {
         );
         assert!(api.validate().is_err());
         assert!(toml::from_str::<ApiEndpoints>("unsupported='/x'").is_err());
+        // Trailing-slash variants must be treated as overlapping routes.
+        assert!(templates_overlap("/api/answer", "/api/answer/"));
+        let mut slash_api = ApiEndpoints::default();
+        slash_api.routes.insert(
+            Endpoint::Challenge,
+            format!("{}/", slash_api.routes[&Endpoint::Mine]),
+        );
+        assert!(slash_api.validate().is_err());
     }
 }

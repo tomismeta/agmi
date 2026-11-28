@@ -396,14 +396,12 @@ impl NetworkConfig {
     /// A reusable network-only profile, or the network table from full configuration.
     pub fn read_profile(path: &Path) -> Result<Self> {
         let bytes =
-            crate::fs_util::read_bounded_regular(path, 65536, false).map_err(
-                |error| match error {
-                    crate::fs_util::RegularReadError::TooLarge => {
-                        anyhow::anyhow!("network configuration exceeds 64 KiB")
-                    }
-                    _ => anyhow::anyhow!("cannot read network configuration"),
-                },
-            )?;
+            crate::fs_util::read_bounded_shared(path, 65536).map_err(|error| match error {
+                crate::fs_util::RegularReadError::TooLarge => {
+                    anyhow::anyhow!("network configuration exceeds 64 KiB")
+                }
+                _ => anyhow::anyhow!("cannot read network configuration"),
+            })?;
         let text = std::str::from_utf8(&bytes)
             .map_err(|_| anyhow::anyhow!("cannot read network configuration"))?;
         let value: toml::Value =
@@ -2594,6 +2592,47 @@ mod tests {
             }
             .validate()
             .unwrap();
+        }
+    }
+
+    #[test]
+    fn omp_env_denylist_and_leading_dash_model_routes_fail_closed() {
+        for forbidden in [
+            "LD_PRELOAD",
+            "DYLD_INSERT_LIBRARIES",
+            "NODE_OPTIONS",
+            "BUN_INSTALL",
+            "XDG_CONFIG_HOME",
+            "AGMI_UPDATE_CHECKS",
+            "HTTPS_PROXY",
+            "http_proxy",
+            "SSL_CERT_FILE",
+            "CURL_CA_BUNDLE",
+        ] {
+            assert!(
+                OmpConfig {
+                    env: vec![forbidden.into()],
+                    ..Default::default()
+                }
+                .validate()
+                .is_err(),
+                "{forbidden}"
+            );
+        }
+        OmpConfig {
+            env: vec!["OPENAI_API_KEY".into()],
+            ..Default::default()
+        }
+        .validate()
+        .unwrap();
+        for bad_route in ["-provider/model", "provider/-model", "provider/ns/-model"] {
+            let model = ModelConfig {
+                harness: Harness::Omp,
+                model: bad_route.into(),
+                reasoning: "high".into(),
+                ..Default::default()
+            };
+            assert!(model.omp_selection().is_err(), "{bad_route}");
         }
     }
 }

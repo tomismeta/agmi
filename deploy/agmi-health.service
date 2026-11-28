@@ -13,9 +13,9 @@ NoNewPrivileges=true
 LockPersonality=true
 RestrictSUIDSGID=true
 RestrictRealtime=true
-RestrictAddressFamilies=AF_UNIX
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
 SystemCallArchitectures=native
-TasksMax=64
+TasksMax=512
 MemoryMax=256M
 # A private user namespace prevents this read-only probe from inspecting the
 # controller executable in /proc. Keep the controller's private workspace.

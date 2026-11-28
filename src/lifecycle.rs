@@ -532,13 +532,7 @@ async fn init_inner(path: &Path, options: InitOptions<'_>) -> Result<Value> {
         config.network.address.is_empty() || !admin_identity_initialized(&config)?,
         "existing account state requires its existing configuration; onboarding never replaces identity/history"
     );
-    struct Scrub(Vec<u8>);
-    impl Drop for Scrub {
-        fn drop(&mut self) {
-            crate::fs_util::wipe_bytes(&mut self.0);
-        }
-    }
-    let bytes = Scrub(credential_input(
+    let bytes = crate::fs_util::ScrubBytes(credential_input(
         options.credential_file,
         options.key_stdin,
     )?);
@@ -668,33 +662,20 @@ pub async fn rotate(path: &Path, bytes: &[u8], dry_run: bool) -> Result<Value> {
 }
 
 async fn rotate_inner(path: &Path, bytes: &[u8], dry_run: bool) -> Result<Value> {
-    struct Scrub(Vec<u8>);
-    impl Drop for Scrub {
-        fn drop(&mut self) {
-            crate::fs_util::wipe_bytes(&mut self.0);
-        }
-    }
-    let check_rotation_preconditions = |path: &Path| -> Result<(Config, PathBuf, Scrub)> {
-        let config = Config::load_metadata(path)?;
-        ensure!(
-            !config.network.address.is_empty(),
-            "configuration has no account address"
-        );
-        ensure!(
-            !config.network.credential_file.as_os_str().is_empty(),
-            "configuration has no credential reference"
-        );
-        crate::store::migration::ensure_no_pending(&config)?;
-        let store = Store::read_only(&config)?
+    let check_rotation_preconditions = |config: &Config,
+                                        path: &Path|
+     -> Result<(PathBuf, crate::fs_util::ScrubBytes)> {
+        crate::store::migration::ensure_no_pending(config)?;
+        let store = Store::read_only(config)?
             .context("initialize and pause the account before credential rotation")?;
         if !store.control()?.paused {
             return Err(LifecycleError {
-                code: "credential_rotation_requires_pause",
-                message: "Pause participation before rotating this credential; no replacement was saved.",
-            }
-            .into());
+                    code: "credential_rotation_requires_pause",
+                    message: "Pause participation before rotating this credential; no replacement was saved.",
+                }
+                .into());
         }
-        let old = Scrub(
+        let old = crate::fs_util::ScrubBytes(
             admin::read_optional(&config.network.credential_file, true)?
                 .context("existing credential is missing")?,
         );
@@ -723,7 +704,7 @@ async fn rotate_inner(path: &Path, bytes: &[u8], dry_run: bool) -> Result<Value>
                 );
             }
         }
-        Ok((config, target, old))
+        Ok((target, old))
     };
     let acquire_stopped = |config: &Config| -> Result<AccountLock> {
         AccountLock::stopped(config).map_err(|error| {
@@ -741,9 +722,7 @@ async fn rotate_inner(path: &Path, bytes: &[u8], dry_run: bool) -> Result<Value>
             }
         })
     };
-    // Phase 1: fast-fail preconditions under locks, then release ALL locks before network I/O.
-    let (config, initial_target, old) = {
-        let _directory = admin::lock_config_directory(path)?;
+    let load_rotation_config = |path: &Path| -> Result<Config> {
         let config = Config::load_metadata(path)?;
         ensure!(
             !config.network.address.is_empty(),
@@ -753,43 +732,41 @@ async fn rotate_inner(path: &Path, bytes: &[u8], dry_run: bool) -> Result<Value>
             !config.network.credential_file.as_os_str().is_empty(),
             "configuration has no credential reference"
         );
+        Ok(config)
+    };
+    // Phase 1: fast-fail preconditions under locks, then release ALL locks before network I/O.
+    let (config, initial_target, old) = {
+        let _directory = admin::lock_config_directory(path)?;
+        let config = load_rotation_config(path)?;
         let _credential_directory = _directory.additional(&config.network.credential_file)?;
         let _admission = AccountLock::rotation_admission(&config)?;
         let _writer = acquire_stopped(&config)?;
-        check_rotation_preconditions(path)?
+        let (target, old) = check_rotation_preconditions(&config, path)?;
+        (config, target, old)
     };
     // Phase 2: perform remote identity verification without holding any filesystem or account locks.
     verify(&config, bytes, false).await?;
-    // Phase 3: re-acquire exclusive locks, re-verify preconditions and unchanged credential, and persist.
+    // Phase 3: re-acquire exclusive locks, re-verify preconditions and unchanged identity/routing/credential, and persist.
     let _directory = admin::lock_config_directory(path)?;
-    let (rechecked_config, target, current_old) = {
-        let preliminary = Config::load_metadata(path)?;
-        ensure!(
-            !preliminary.network.address.is_empty(),
-            "configuration has no account address"
-        );
-        ensure!(
-            !preliminary.network.credential_file.as_os_str().is_empty(),
-            "configuration has no credential reference"
-        );
-        let _credential_directory = _directory.additional(&preliminary.network.credential_file)?;
-        let _admission = AccountLock::rotation_admission(&preliminary)?;
-        let _writer = acquire_stopped(&preliminary)?;
-        let (rechecked_config, target, current_old) = check_rotation_preconditions(path)?;
-        ensure!(
-            rechecked_config.network.address == config.network.address
-                && rechecked_config.network.chain == config.network.chain
-                && rechecked_config.network.base_url == config.network.base_url
-                && target == initial_target
-                && current_old.0.as_slice() == old.0.as_slice(),
-            "credential or identity changed during verification; retry with the current file"
-        );
-        if !dry_run {
-            admin::persist(&target, bytes)?;
-        }
-        (rechecked_config, target, current_old)
-    };
-    let _ = (rechecked_config, target, current_old);
+    let rechecked_config = load_rotation_config(path)?;
+    let _credential_directory = _directory.additional(&rechecked_config.network.credential_file)?;
+    let _admission = AccountLock::rotation_admission(&rechecked_config)?;
+    let _writer = acquire_stopped(&rechecked_config)?;
+    let (target, current_old) = check_rotation_preconditions(&rechecked_config, path)?;
+    ensure!(
+        rechecked_config.network.address == config.network.address
+            && rechecked_config.network.chain == config.network.chain
+            && rechecked_config.network.base_url == config.network.base_url
+            && rechecked_config.network.api == config.network.api
+            && rechecked_config.network.trusted_origins == config.network.trusted_origins
+            && rechecked_config.state_dir == config.state_dir
+            && target == initial_target
+            && current_old.0.as_slice() == old.0.as_slice(),
+        "credential or identity changed during verification; retry with the current file"
+    );
+    if !dry_run {
+        admin::persist(&target, bytes)?;
+    }
     Ok(
         json!({"dry_run":dry_run,"identity_verified":true,"paused":true,"state_preserved":true,
         "note":"Only the local credential is replaced. Start the service and explicitly resume; remote key issuance/revocation is outside this command."}),

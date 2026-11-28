@@ -874,7 +874,13 @@ pub fn managed_health_wait(report: &Value) -> bool {
             && intervention["next_action"] == "await_retry_eligibility"
             && intervention["observation_fresh"] == true
             && timed_reason(&reasons[0]);
+        let bounded_outage_age = intervention["observation_fresh"] == true
+            || (component["observed_at"].as_i64().is_some()
+                && component["age_seconds"]
+                    .as_u64()
+                    .is_some_and(|age| age <= (stale_limit.max(60) as u64).saturating_mul(2)));
         let is_transient_upstream_wait = !is_strict_blocked_wait
+            && bounded_outage_age
             && next_at.saturating_sub(at) <= stale_limit.max(60)
             && matches!(
                 intervention["reason"].as_str(),
@@ -1855,6 +1861,8 @@ pub fn compact_diagnostics(data: &mut Value) {
             }
         }
         if trimmed_actions {
+            truncated = true;
+            omitted.push("verbose_actions");
             fits = within_budget(&out);
         }
     }
@@ -1903,8 +1911,7 @@ pub fn compact_diagnostics(data: &mut Value) {
                 &source["work"][lane]["background_recovery"],
                 &mut truncated,
             );
-            out["work"][lane]["background_recovery"]["next_actions"] =
-                actions(&background["next_actions"], &mut truncated);
+            out["work"][lane]["background_recovery"]["next_actions"] = json!([]);
             scoped_work(
                 &mut out["work"][lane],
                 &source["work"][lane],
@@ -1978,8 +1985,7 @@ pub fn compact_diagnostics(data: &mut Value) {
                 &work["background_recovery"],
                 &mut truncated,
             );
-            background["next_actions"] =
-                actions(&work["background_recovery"]["next_actions"], &mut truncated);
+            background["next_actions"] = json!([]);
             out["work"][lane] = json!({"intervention":intervention,"background_recovery":background,
                 "phase":work["phase"],"progress":work["progress"],"reason":work["reason"],
                 "next_actions":actions(&work["next_actions"], &mut truncated)});
@@ -4365,5 +4371,67 @@ mod hardening_tests {
             256
         );
         assert_eq!(full["pending_work"].as_array().unwrap().len(), 256);
+    }
+
+    #[test]
+    fn managed_health_wait_bounds_transient_upstream_outages_and_rejects_sustained_outages() {
+        let at = 10_000_i64;
+        let make_report = |observed_at: Option<i64>, age_seconds: Option<u64>, next_at: i64| {
+            json!({
+                "checked_at": at,
+                "healthy": false,
+                "hosted_identity_verified": true,
+                "issues": ["api_dependency_unavailable", "challenge_observation_stale"],
+                "thresholds": { "stale_seconds": 180 },
+                "intervention": {
+                    "unattended": true,
+                    "controller": { "ready": true },
+                },
+                "participation": {
+                    "lanes": {
+                        "answer": { "allowed": true },
+                        "judge": { "allowed": true },
+                        "mine": { "allowed": true },
+                    },
+                },
+                "components": {
+                    "controller": { "state": "ok", "reasons": [] },
+                    "storage": { "state": "ok", "reasons": [] },
+                    "disk": { "state": "ok", "reasons": [] },
+                    "api": { "state": "degraded", "reasons": ["api_dependency_unavailable"] },
+                    "answer": {
+                        "mode": "active",
+                        "state": "degraded",
+                        "reasons": ["api_dependency_unavailable", "challenge_observation_stale"],
+                        "observed_at": observed_at,
+                        "age_seconds": age_seconds,
+                    },
+                    "judge": { "mode": "off", "state": "disabled", "reasons": [] },
+                    "mine": { "mode": "off", "state": "disabled", "reasons": [] },
+                },
+                "work": {
+                    "answer": {
+                        "intervention": {
+                            "status": "automatic_recovery",
+                            "reason": "read_backoff",
+                            "next_action": "observe_challenge",
+                            "next_at": next_at,
+                            "observation_fresh": false,
+                        },
+                    },
+                    "judge": { "intervention": {} },
+                    "mine": { "intervention": {} },
+                },
+            })
+        };
+        // Transient blip (age 240s <= 2 * 180s, next retry in 60s <= 180s): accepted as managed wait (exit 3).
+        let transient = make_report(Some(at - 240), Some(240), at + 60);
+        assert!(managed_health_wait(&transient));
+        // Sustained outage (age 900s > 2 * 180s): must NOT be masked as exit 3.
+        let sustained = make_report(Some(at - 900), Some(900), at + 60);
+        assert!(!managed_health_wait(&sustained));
+        // Never-observed outage (observed_at = null): must NOT be masked as exit 3.
+        let never_observed = make_report(None, None, at + 60);
+        assert!(!managed_health_wait(&never_observed));
     }
 }

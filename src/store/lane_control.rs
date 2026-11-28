@@ -349,23 +349,53 @@ pub(super) fn initialize_lane_state(db: &Connection, gates: &LaneGateSet) -> Res
     Ok(())
 }
 
+fn map_sqlite_busy_or_missing(error: rusqlite::Error) -> anyhow::Error {
+    if matches!(
+        error.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+    ) {
+        anyhow::Error::new(LaneControlError::Busy)
+    } else {
+        anyhow::Error::new(error).context(LaneControlError::MissingState)
+    }
+}
+
+fn map_anyhow_sqlite_busy(error: anyhow::Error) -> anyhow::Error {
+    if error.chain().any(|cause| {
+        cause.downcast_ref::<rusqlite::Error>().is_some_and(|e| {
+            matches!(
+                e.sqlite_error_code(),
+                Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+            )
+        })
+    }) {
+        anyhow::Error::new(LaneControlError::Busy)
+    } else {
+        error
+    }
+}
+
 pub(super) fn validate_required_lane_state(db: &Connection) -> Result<()> {
     let count: usize = db
         .query_row("SELECT COUNT(*) FROM lane_control", [], |r| r.get(0))
-        .context(LaneControlError::MissingState)?;
+        .map_err(map_sqlite_busy_or_missing)?;
     ensure!(count == LaneId::COUNT, LaneControlError::MissingState);
-    let id: String = db.query_row(
-        "SELECT database_id FROM authority WHERE singleton=1",
-        [],
-        |r| r.get(0),
-    )?;
+    let id: String = db
+        .query_row(
+            "SELECT database_id FROM authority WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(map_sqlite_busy)?;
     ensure!(
         id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()),
         LaneControlError::Continuity
     );
-    let raw: String = db.query_row("SELECT identity FROM control WHERE singleton=1", [], |r| {
-        r.get(0)
-    })?;
+    let raw: String = db
+        .query_row("SELECT identity FROM control WHERE singleton=1", [], |r| {
+            r.get(0)
+        })
+        .map_err(map_sqlite_busy)?;
     let identity: Value = serde_json::from_str(&raw)?;
     let chain = identity["chain"]
         .as_str()
@@ -381,7 +411,7 @@ pub(super) fn validate_required_lane_state(db: &Connection) -> Result<()> {
                 [lane.as_str()],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
-            .context(LaneControlError::MissingState)?;
+            .map_err(map_sqlite_busy_or_missing)?;
         ensure!(
             matches!(paused, 0 | 1) && revision >= 0 && matches!(served, 0 | 1),
             LaneControlError::MissingState
@@ -449,6 +479,7 @@ impl ExistingLaneControlStore {
         };
         db.busy_timeout(busy_timeout).map_err(map_sqlite_busy)?;
         check_sqlite_has_moved(&db).context(LaneControlError::Continuity)?;
+        let deadline = Instant::now() + busy_timeout;
         let version: i64 = db
             .query_row("SELECT version FROM control WHERE singleton=1", [], |r| {
                 r.get(0)
@@ -458,11 +489,14 @@ impl ExistingLaneControlStore {
             version == CURRENT_JOURNAL_FORMAT,
             LaneControlError::UnsupportedFormat
         );
-        migration::ensure_complete(&db)?;
+        migration::ensure_complete(&db).map_err(map_anyhow_sqlite_busy)?;
         validate_required_lane_state(&db)?;
-        Self::check_binding_in(&db, &binding, config)?;
+        Self::check_binding_in(&db, &binding, config).map_err(map_anyhow_sqlite_busy)?;
         if writable {
             drop(db);
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or(LaneControlError::Busy)?;
             db = {
                 let _opening = DATABASE_OPEN
                     .lock()
@@ -475,7 +509,7 @@ impl ExistingLaneControlStore {
                 )
                 .map_err(map_sqlite_busy)?
             };
-            db.busy_timeout(busy_timeout).map_err(map_sqlite_busy)?;
+            db.busy_timeout(remaining).map_err(map_sqlite_busy)?;
             check_sqlite_has_moved(&db).context(LaneControlError::Continuity)?;
             db.execute_batch("PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;")
                 .map_err(map_sqlite_busy)?;

@@ -297,14 +297,16 @@ impl HostAccess {
         let response = match result {
             Ok(hosted) => {
                 if let Err(error) = self.store.ingest_restrictions(&hosted.restrictions()) {
+                    // Never commit Outcome::Retry without its server Retry-After floor:
+                    // fall through to conservative unknown bookkeeping, then return the error.
                     deferred_error = Some(error);
-                }
-                if hosted.context.meta.dispatch_sequence != Some(effect.dispatch_sequence as u64) {
-                    if deferred_error.is_none() {
-                        deferred_error = Some(anyhow::anyhow!(
-                            "effect response dispatch identity mismatch"
-                        ));
-                    }
+                    None
+                } else if hosted.context.meta.dispatch_sequence
+                    != Some(effect.dispatch_sequence as u64)
+                {
+                    deferred_error = Some(anyhow::anyhow!(
+                        "effect response dispatch identity mismatch"
+                    ));
                     None
                 } else {
                     Some(hosted.response)

@@ -118,7 +118,11 @@ pub async fn recovery_resolve(
                 if let Some(mut read) = runtime.identity.take() {
                     let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
                     read.flight.abort(deadline).await;
-                    let _ = runtime.store.cancel_read(&read.flight.key);
+                    if let Some(res) = read.flight.take() {
+                        let _ = runtime.finish_read(&read.flight, res);
+                    } else {
+                        let _ = runtime.store.cancel_read(&read.flight.key);
+                    }
                 }
                 bail!("recovery interrupted");
             }
@@ -165,7 +169,15 @@ pub async fn recovery_resolve(
                 _ = tokio::signal::ctrl_c() => {
                     let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
                     flight.abort(deadline).await;
-                    let _ = runtime.store.cancel_read(&flight.key);
+                    if let Some(res) = flight.take() {
+                        let _ = runtime.finish_read(&flight, res);
+                    } else {
+                        let _ = runtime.store.cancel_reconciliation_read(
+                            &flight.key,
+                            flight.authority_epoch,
+                            flight.sequence,
+                        );
+                    }
                     bail!("recovery interrupted");
                 }
             }

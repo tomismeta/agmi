@@ -485,11 +485,11 @@ impl Store {
                 ops_by_id.insert(id, (op, r.get(10)?, r.get(11)?));
             }
         }
-        let mut reads_by_key: std::collections::HashMap<(i64, i64, String), Value> =
+        let mut reads_by_key: std::collections::HashMap<(i64, i64, String, String, String), Value> =
             std::collections::HashMap::new();
         {
             let mut stmt = self.db.prepare(
-                "SELECT r.operation_id,r.binding_revision,r.purpose,
+                "SELECT r.operation_id,r.binding_revision,r.owner,r.purpose,r.resource,
                  r.started_at,r.finished_at,r.status,r.last_success_at,r.in_flight,
                  r.local_next_at,r.server_not_before,r.retained_conservative_floor,r.failures
                  FROM json_each(?1) j
@@ -500,19 +500,21 @@ impl Store {
             while let Some(r) = rows.next()? {
                 let op_id: i64 = r.get(0)?;
                 let rev: i64 = r.get(1)?;
-                let purpose: String = r.get(2)?;
+                let owner: String = r.get(2)?;
+                let purpose: String = r.get(3)?;
+                let resource: String = r.get(4)?;
                 reads_by_key.insert(
-                    (op_id, rev, purpose),
+                    (op_id, rev, owner, purpose, resource),
                     json!({
-                        "started_at":r.get::<_,Option<i64>>(3)?,
-                        "checked_at":r.get::<_,Option<i64>>(4)?,
-                        "status":r.get::<_,Option<u16>>(5)?,
-                        "usable_at":r.get::<_,Option<i64>>(6)?,
-                        "in_flight":r.get::<_,bool>(7)?,
-                        "local":r.get::<_,i64>(8)?,
-                        "server":r.get::<_,i64>(9)?,
-                        "retained":r.get::<_,i64>(10)?,
-                        "failures":r.get::<_,u32>(11)?,
+                        "started_at":r.get::<_,Option<i64>>(5)?,
+                        "checked_at":r.get::<_,Option<i64>>(6)?,
+                        "status":r.get::<_,Option<u16>>(7)?,
+                        "usable_at":r.get::<_,Option<i64>>(8)?,
+                        "in_flight":r.get::<_,bool>(9)?,
+                        "local":r.get::<_,i64>(10)?,
+                        "server":r.get::<_,i64>(11)?,
+                        "retained":r.get::<_,i64>(12)?,
+                        "failures":r.get::<_,u32>(13)?,
                     }),
                 );
             }
@@ -605,8 +607,15 @@ impl Store {
                     } else {
                         "job"
                     };
+                    let resource = format!("{operation_id}:{binding_revision}");
                     reads_by_key
-                        .get(&(*operation_id, *binding_revision, purpose.to_owned()))
+                        .get(&(
+                            *operation_id,
+                            *binding_revision,
+                            op.kind.as_str().to_owned(),
+                            purpose.to_owned(),
+                            resource,
+                        ))
                         .cloned()
                         .unwrap_or(Value::Null)
                 }

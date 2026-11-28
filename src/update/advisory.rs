@@ -70,12 +70,14 @@ pub(super) fn source_failure_with_headers(
             floor: retry_after.and_then(retry_floor),
         });
     }
-    // GitHub API reports primary/secondary rate exhaustion via HTTP 403 with
-    // X-RateLimit-Remaining: 0 and X-RateLimit-Reset (Unix epoch seconds).
-    if status == 403 && ratelimit_remaining.map(str::trim) == Some("0") {
+    // GitHub API reports primary (X-RateLimit-Remaining: 0) and secondary (Retry-After)
+    // rate limits via HTTP 403.
+    if status == 403 && (ratelimit_remaining.map(str::trim) == Some("0") || retry_after.is_some()) {
         let reset = ratelimit_reset
-            .and_then(|v| v.trim().parse::<i64>().ok())
-            .map(|ts| ts.min(now().saturating_add(MAX_RETRY_FLOOR_SECONDS)));
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|ts| {
+                (ts.min(i64::MAX as u64) as i64).min(now().saturating_add(MAX_RETRY_FLOOR_SECONDS))
+            });
         return Some(SourceFailure {
             floor: retry_after.and_then(retry_floor).or(reset),
         });
@@ -2056,6 +2058,25 @@ mod tests {
         assert!(path.with_file_name("update.lock").exists());
         assert!(acquire(&path).unwrap().is_some());
     }
+    #[test]
+    fn retry_floor_is_capped_and_github_403_rate_limits_are_classified() {
+        let ceiling = now().saturating_add(MAX_RETRY_FLOOR_SECONDS + 5);
+        let capped = retry_floor("999999999").unwrap();
+        assert!(capped <= ceiling);
+        // Primary GitHub 403 rate limit (X-RateLimit-Remaining: 0)
+        let primary =
+            source_failure_with_headers(403, None, Some("0"), Some("9999999999")).unwrap();
+        assert!(primary.floor.unwrap() <= ceiling);
+        // Negative X-RateLimit-Reset is ignored rather than creating a negative floor.
+        let negative = source_failure_with_headers(403, None, Some("0"), Some("-5")).unwrap();
+        assert_eq!(negative.floor, None);
+        // Secondary GitHub 403 rate limit (Retry-After with non-zero remaining)
+        let secondary = source_failure_with_headers(403, Some("120"), Some("50"), None).unwrap();
+        assert!(secondary.floor.is_some());
+        // Ordinary non-rate-limit 403 is not a throttle failure.
+        assert!(source_failure_with_headers(403, None, Some("50"), None).is_none());
+    }
+
     #[test]
     fn record_rejects_oversized_and_foreign_format() {
         let dir = tempfile::tempdir().unwrap();

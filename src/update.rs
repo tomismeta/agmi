@@ -2893,10 +2893,12 @@ mod tests {
             "https://release-assets.githubusercontent.com:444/github-production-release-asset/a",
             "https://github.com/tomismeta/agmi/releases/download/v0.1.0/agmi",
             "https://release-assets.githubusercontent.com/other/a",
+            "https://objects.githubusercontent.com/github-production-release-asset-nothex!/a",
         ] {
             assert!(!asset_redirect(&Url::parse(url).unwrap()));
         }
         assert!(asset_redirect(&Url::parse("https://release-assets.githubusercontent.com/github-production-release-asset/1/2?signature=opaque").unwrap()));
+        assert!(asset_redirect(&Url::parse("https://objects.githubusercontent.com/github-production-release-asset-2e65be/1234?X-Amz-Signature=abc").unwrap()));
     }
     #[test]
     fn checksum_rejects_duplicate_malformed_and_mismatching_entries() {

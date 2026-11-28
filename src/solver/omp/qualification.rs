@@ -189,14 +189,28 @@ fn snapshot_workspace() -> Result<Scratch> {
         let agmi_dir = base.join("agmi");
         let root = agmi_dir.join("omp-snapshots");
         let ready = (|| -> std::io::Result<()> {
-            if !agmi_dir.exists() {
-                std::fs::DirBuilder::new()
-                    .recursive(true)
-                    .mode(0o700)
-                    .create(&agmi_dir)?;
+            match std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&agmi_dir)
+            {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
             }
-            if !root.exists() {
-                std::fs::DirBuilder::new().mode(0o700).create(&root)?;
+            let agmi_meta = std::fs::symlink_metadata(&agmi_dir)?;
+            if !agmi_meta.is_dir()
+                || agmi_meta.file_type().is_symlink()
+                || agmi_meta.uid() != unsafe { libc::geteuid() }
+            {
+                return Err(std::io::Error::other(
+                    "agmi data dir is not a real user-owned directory",
+                ));
+            }
+            match std::fs::DirBuilder::new().mode(0o700).create(&root) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
             }
             let meta = std::fs::symlink_metadata(&root)?;
             if meta.is_dir()
@@ -407,6 +421,15 @@ pub(in crate::solver) async fn qualify(
         model_digest: qualified.context(FAILED)?,
     });
     let mut cache = CACHE.lock().await;
+    if let Some(existing) = cache.iter().find(|entry| {
+        entry.source == result.source
+            && entry.configured == result.configured
+            && entry.stamp == result.stamp
+            && entry.selection == result.selection
+            && entry.scope == result.scope
+    }) {
+        return Ok(Some(existing.clone()));
+    }
     cache.retain(|entry| entry.source != result.source || entry.stamp == result.stamp);
     if cache.len() >= 4 {
         cache.remove(0);

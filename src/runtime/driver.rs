@@ -410,7 +410,18 @@ impl HostAccess {
     }
 
     fn refresh_runtime_state(&mut self, once: bool) -> Result<()> {
-        const HEARTBEAT_REFRESH: Duration = Duration::from_secs(15);
+        let min_budget = LaneId::ALL
+            .into_iter()
+            .map(|kind| {
+                self.config
+                    .schedule(kind)
+                    .poll_seconds
+                    .min(self.config.timeouts(kind).http_seconds)
+                    .min(self.config.timeouts(kind).read_http_seconds)
+            })
+            .min()
+            .unwrap_or(30);
+        let heartbeat_refresh = Duration::from_secs((min_budget / 2).clamp(1, 15));
         let key = RuntimeStateKey {
             revision: self.config.revision()?,
             reload_blocked: self.reload_blocked,
@@ -421,7 +432,7 @@ impl HostAccess {
         let now_instant = Instant::now();
         match &mut self.last_runtime_state {
             Some((last_key, last_written)) if *last_key == key => {
-                if now_instant.duration_since(*last_written) >= HEARTBEAT_REFRESH {
+                if now_instant.duration_since(*last_written) >= heartbeat_refresh {
                     self.store.heartbeat()?;
                     *last_written = now_instant;
                 }
@@ -440,7 +451,7 @@ impl HostAccess {
     }
 
     pub(in crate::runtime) async fn run_loop(&mut self, once: bool) -> Result<()> {
-        const IDLE_WAKE_FALLBACK_SECONDS: u64 = 5;
+        self.last_runtime_state = None;
         self.identity_nonblocking = self.controller && !once;
         self.store.reschedule_all_reads(&self.config)?;
         if once {
@@ -467,12 +478,22 @@ impl HostAccess {
                     break;
                 }
                 let wake = Arc::clone(&self.wake);
+                let min_budget = LaneId::ALL
+                    .into_iter()
+                    .map(|kind| {
+                        self.config
+                            .schedule(kind)
+                            .poll_seconds
+                            .min(self.config.timeouts(kind).http_seconds)
+                            .min(self.config.timeouts(kind).read_http_seconds)
+                    })
+                    .min()
+                    .unwrap_or(30);
+                let idle_fallback = (min_budget / 2).clamp(1, 5);
                 let seconds = if once {
                     1
                 } else {
-                    self.store
-                        .wake_delay(&self.config, IDLE_WAKE_FALLBACK_SECONDS)?
-                        .max(1)
+                    self.store.wake_delay(&self.config, idle_fallback)?.max(1)
                 };
                 tokio::select! {
                     biased;
@@ -487,6 +508,7 @@ impl HostAccess {
         // Always drain/cancel child processes and record effect outcomes even when the loop errored.
         let shutdown_result = self.shutdown().await;
         let stopped_result = self.store.event("runtime_stopped", None);
+        self.last_runtime_state = None;
         loop_result?;
         shutdown_result?;
         stopped_result?;
