@@ -555,10 +555,7 @@ fn resolve_executable(path: &Path) -> Result<PathBuf> {
     if path.components().count() > 1 || path.is_absolute() {
         let resolved =
             std::fs::canonicalize(path).context("native harness executable unavailable")?;
-        ensure!(
-            is_executable_file(&resolved),
-            "native harness executable unavailable"
-        );
+        ensure!(resolved.is_file(), "native harness executable unavailable");
         return Ok(resolved);
     }
     for directory in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
