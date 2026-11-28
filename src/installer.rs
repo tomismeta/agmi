@@ -1484,7 +1484,21 @@ mod native {
         let embedded = {
             #[cfg(target_os = "linux")]
             {
-                manifest_output(&executable_fd_path(&binary))?
+                use std::io::Seek;
+                let mut probe = binary.try_clone()?;
+                probe.seek(std::io::SeekFrom::Start(0))?;
+                let mut magic = [0u8; 4];
+                let is_elf = probe.read_exact(&mut magic).is_ok() && magic == *b"\x7fELF";
+                if is_elf {
+                    manifest_output(&executable_fd_path(&binary))?
+                } else {
+                    let path = release.join("agmi");
+                    ensure!(
+                        same_executable(&binary.metadata()?, &fs::symlink_metadata(&path)?),
+                        "release executable changed"
+                    );
+                    manifest_output(&path)?
+                }
             }
             #[cfg(not(target_os = "linux"))]
             {
