@@ -32,37 +32,22 @@ def replaced_check_snapshot(binary, root, environment):
     baseline = subprocess.run(command, capture_output=True, timeout=15,
                               env=environment, check=True)
     expected = json.loads(baseline.stdout)['data']
+    assert expected['file_revision'] == revision(snapshot)
+    assert expected['effective_revision'] == expected['revision']
+    # Non-regular config paths (FIFOs) must fail closed immediately without blocking.
     config.unlink()
     os.mkfifo(config, 0o600)
+    refused = subprocess.run(command, capture_output=True, timeout=5, env=environment)
+    assert refused.returncode != 0
+    error = json.loads(refused.stderr)['error']
+    assert error['code'] in ('config_invalid', 'config_unsafe_file', 'admin_unsafe_file'), error
     replacement.write_bytes(next_bytes)
-    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          env=environment) as child:
-        deadline = time.monotonic() + 5
-        try:
-            while True:
-                try:
-                    writer = os.open(config, os.O_WRONLY | os.O_NONBLOCK)
-                    break
-                except OSError as error:
-                    if (error.errno != errno.ENXIO or child.poll() is not None
-                            or time.monotonic() >= deadline):
-                        raise
-                    time.sleep(0.01)
-            try:
-                written = os.write(writer, snapshot)
-                assert written == len(snapshot)
-                # The check cannot finish reading until this writer closes.
-                replacement.replace(config)
-            finally:
-                os.close(writer)
-            stdout, stderr = child.communicate(timeout=15)
-        finally:
-            if child.poll() is None:
-                child.kill()
-        assert child.returncode == 0, stderr
-    actual = json.loads(stdout)['data']
-    assert actual['file_revision'] == revision(snapshot)
-    assert actual['effective_revision'] == actual['revision'] == expected['effective_revision']
+    replacement.replace(config)
+    updated = subprocess.run(command, capture_output=True, timeout=15,
+                             env=environment, check=True)
+    actual = json.loads(updated.stdout)['data']
+    assert actual['file_revision'] == revision(next_bytes)
+    assert actual['effective_revision'] != expected['effective_revision']
     assert config.read_bytes() == next_bytes
 
 

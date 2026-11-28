@@ -1141,9 +1141,10 @@ async fn create_inner(
     if now()? >= intent.expires_ts {
         return Err(unknown());
     }
-    let raw = protocol::complete_raw_response(request)
-        .await
-        .map_err(|_| unknown())?;
+    let raw = tokio::select! {
+        res = protocol::complete_raw_response(request) => res.map_err(|_| unknown())?,
+        _ = tokio::signal::ctrl_c() => return Err(unknown()),
+    };
     let capture = Capture {
         schema: 1,
         intent_sha256: digest(&bytes),
