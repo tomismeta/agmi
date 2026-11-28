@@ -23,6 +23,6 @@ pub mod logs;
 pub mod protocol;
 pub mod registration;
 pub mod runtime;
-pub mod solver;
+mod solver;
 pub mod store;
 pub mod update;

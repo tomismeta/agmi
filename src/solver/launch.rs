@@ -490,12 +490,10 @@ impl PendingLaunch {
     }
 }
 impl InferenceFlight {
-    pub fn preflight_started_at(&self) -> i64 {
-        self.pending.preflight_started_at
-    }
     pub fn inference_spawned_at(&self) -> i64 {
         self.spawned_at
     }
+    #[cfg(test)]
     pub async fn collect(self) -> NativeCompletion {
         self.receive().await.finish()
     }

@@ -248,29 +248,38 @@ pub(crate) fn execution(error: &Error, config: Option<&Path>) -> Value {
     }
     let boundary = error.downcast_ref::<BoundaryError>();
     let lifecycle = error.downcast_ref::<agmi::lifecycle::LifecycleError>();
+    let admin = agmi::admin::error_details(error);
     let code = boundary
         .map(|e| e.0)
         .or_else(|| lifecycle.map(|e| e.code))
-        .or_else(|| agmi::admin::error_code(error))
+        .or_else(|| admin.map(|(code, _)| code))
         .unwrap_or("operation_failed");
     // Only typed codes and static messages cross this boundary, never outer contexts.
-    let message = boundary.map(|e| e.1).or_else(|| lifecycle.map(|e| e.message)).unwrap_or(match code {
-        "admin_validation" => "Invalid configuration, patch or guidance; check schema, types and file references.",
-        "admin_unsafe_file" => "Administration requires private owned regular files without symlinks or hardlinks.",
-        "admin_io" => "Cannot read or persist administration files; a save may have completed. Reread revisions before retrying.",
-        "admin_revision_conflict" => "Revision conflict; review the current saved state before deciding whether to retry.",
-        "admin_busy" => "Configuration acquisition deadline reached or directory busy; lane control was not changed. Retry after inspecting the current lane token.",
-        "admin_routing_runtime_active" => "Stop the controller before changing API routes; preserve its journal and pause state.",
-        _ => "Operation failed; inspect local prerequisites before retrying.",
-    });
+    let message = boundary
+        .map(|e| e.1)
+        .or_else(|| lifecycle.map(|e| e.message))
+        .or_else(|| {
+            admin.map(|(code, message)| match code {
+                "admin_busy" => "Configuration acquisition deadline reached or directory busy; lane control was not changed. Retry after inspecting the current lane token.",
+                "admin_routing_runtime_active" => "Stop the controller before changing API routes; preserve its journal and pause state.",
+                _ => message,
+            })
+        })
+        .unwrap_or("Operation failed; inspect local prerequisites before retrying.");
     let command: &[&str] = match code {
-        "config_missing" => &["init", "--help"],
-        "config_invalid" => &["config", "schema"],
         "registration_configuration_invalid" => &["identity", "create", "--help"],
         "admin_routing_runtime_active" => &["status"],
         "admin_busy" => &["lane", "--help"],
-        "admin_revision_conflict" | "admin_io" | "admin_unsafe_file" => &["config", "show"],
-        "admin_validation" => &["config", "schema"],
+        "admin_revision_conflict"
+        | "admin_io"
+        | "admin_unsafe_file"
+        | "admin_unsafe_target"
+        | "admin_identity_immutable"
+        | "admin_identity_unavailable"
+        | "admin_guidance_missing"
+        | "admin_migration_blocked" => &["config", "show"],
+        "admin_config_missing" => &["init", "--help"],
+        "admin_validation" | "admin_input_too_large" => &["config", "schema"],
         "configuration_exists"
         | "initialization_failed"
         | "credential_rotation_failed"

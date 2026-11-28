@@ -27,9 +27,9 @@ use contract::GradeFailure;
 mod launch;
 mod omp;
 pub(crate) use launch::ReceivedInference;
-pub use launch::{
-    ExecutionDeadline, InferenceFlight, InferenceStart, PendingLaunch, PreflightCompletion,
-    PreflightFlight, PreflightStart, start_preflight,
+pub(crate) use launch::{
+    ExecutionDeadline, InferenceStart, PendingLaunch, PreflightCompletion, PreflightStart,
+    start_preflight,
 };
 
 const MAX_TASK_INPUT: usize = 128 * 1024;

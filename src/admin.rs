@@ -64,10 +64,20 @@ impl std::fmt::Display for RevisionConflict {
 impl std::error::Error for RevisionConflict {}
 
 pub fn error_code(error: &anyhow::Error) -> Option<&'static str> {
+    error_details(error).map(|(code, _)| code)
+}
+
+/// Canonical typed code and static public message for all administration errors.
+pub fn error_details(error: &anyhow::Error) -> Option<(&'static str, &'static str)> {
     if error.is::<RevisionConflict>() {
-        Some("admin_revision_conflict")
+        Some((
+            "admin_revision_conflict",
+            "Revision conflict; review the current saved state before deciding whether to retry.",
+        ))
     } else {
-        error.downcast_ref::<AdminError>().map(|error| error.0)
+        error
+            .downcast_ref::<AdminError>()
+            .map(|error| (error.0, error.1))
     }
 }
 

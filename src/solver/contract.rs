@@ -118,20 +118,15 @@ impl ModelSelection {
             omp: model.omp.clone(),
         })
     }
-    pub fn harness(&self) -> Harness {
-        self.harness
-    }
     pub fn provider(&self) -> &str {
         &self.provider
     }
     pub fn model(&self) -> &str {
         &self.model
     }
+    #[cfg(test)]
     pub fn reasoning_effort(&self) -> &str {
         &self.reasoning_effort
-    }
-    pub fn native_route(&self) -> &Path {
-        &self.native_route
     }
     pub(super) fn config(&self) -> ModelConfig {
         ModelConfig {
@@ -159,9 +154,6 @@ pub struct GradeArtifact(SolverResult);
 macro_rules! artifact {
     ($name:ident) => {
         impl $name {
-            pub fn result(&self) -> &SolverResult {
-                &self.0
-            }
             pub fn into_result(self) -> SolverResult {
                 self.0
             }
@@ -176,12 +168,6 @@ pub enum NativeArtifact {
     Grade(GradeArtifact),
 }
 impl NativeArtifact {
-    pub fn result(&self) -> &SolverResult {
-        match self {
-            Self::Answer(a) => a.result(),
-            Self::Grade(a) => a.result(),
-        }
-    }
     pub fn into_result(self) -> SolverResult {
         match self {
             Self::Answer(a) => a.into_result(),
