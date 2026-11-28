@@ -1615,10 +1615,29 @@ impl Store {
             )?
         };
         db.busy_timeout(std::time::Duration::from_secs(5))?;
-        let version: i64 =
-            db.query_row("SELECT version FROM control WHERE singleton=1", [], |r| {
-                r.get(0)
-            })?;
+        let version: i64 = {
+            let mut attempt = 0_u8;
+            loop {
+                match db.query_row("SELECT version FROM control WHERE singleton=1", [], |r| {
+                    r.get(0)
+                }) {
+                    Ok(version) => break version,
+                    Err(rusqlite::Error::SqliteFailure(err, _))
+                        if attempt < 20
+                            && (err.extended_code == rusqlite::ffi::SQLITE_READONLY_RECOVERY
+                                || matches!(
+                                    err.code,
+                                    rusqlite::ErrorCode::DatabaseBusy
+                                        | rusqlite::ErrorCode::DatabaseLocked
+                                )) =>
+                    {
+                        attempt += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                    }
+                    Err(err) => return Err(err.into()),
+                }
+            }
+        };
         if version != CURRENT_JOURNAL_FORMAT {
             bail!("unsupported state schema; stop the runtime and use explicit migration");
         }
@@ -1750,7 +1769,7 @@ impl Store {
             database_file: Some((path, metadata)),
         };
         store.continuity()?;
-        if !fresh {
+        if !fresh && !schema::query_indexes_present(&store.db)? {
             let tx = store
                 .db
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;

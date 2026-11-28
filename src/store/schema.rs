@@ -6,6 +6,27 @@ pub(super) fn initialize_schema(db: &Connection) -> Result<()> {
     initialize_query_indexes(db)
 }
 
+/// Fast read-only check so `Store::open_inner` skips a startup write transaction
+/// when all rebuildable query indexes are already present.
+pub(super) fn query_indexes_present(db: &Connection) -> Result<bool> {
+    let count: i64 = db.query_row(
+        "SELECT COUNT(*) FROM sqlite_schema WHERE type='index' AND name IN (
+         'operations_reconciliation',
+         'operations_model_key',
+         'operations_model_retry_recent',
+         'operations_model_retry_fair',
+         'lane_observation_rejected',
+         'events_operation',
+         'risk_admissions_operation',
+         'manual_grants_lookup',
+         'operations_answer_history'
+        )",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(count == 9)
+}
+
 /// Rebuildable access paths, shared by fresh journals and validated writer opens.
 pub(super) fn initialize_query_indexes(db: &Connection) -> Result<()> {
     db.execute_batch(
