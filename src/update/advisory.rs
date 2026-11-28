@@ -52,10 +52,35 @@ impl std::fmt::Display for SourceFailure {
 }
 impl std::error::Error for SourceFailure {}
 
+const MAX_RETRY_FLOOR_SECONDS: i64 = 7 * 86_400;
+
+#[cfg(test)]
 pub(super) fn source_failure(status: u16, retry_after: Option<&str>) -> Option<SourceFailure> {
-    matches!(status, 429 | 503).then(|| SourceFailure {
-        floor: retry_after.and_then(retry_floor),
-    })
+    source_failure_with_headers(status, retry_after, None, None)
+}
+
+pub(super) fn source_failure_with_headers(
+    status: u16,
+    retry_after: Option<&str>,
+    ratelimit_remaining: Option<&str>,
+    ratelimit_reset: Option<&str>,
+) -> Option<SourceFailure> {
+    if matches!(status, 429 | 503) {
+        return Some(SourceFailure {
+            floor: retry_after.and_then(retry_floor),
+        });
+    }
+    // GitHub API reports primary/secondary rate exhaustion via HTTP 403 with
+    // X-RateLimit-Remaining: 0 and X-RateLimit-Reset (Unix epoch seconds).
+    if status == 403 && ratelimit_remaining.map(str::trim) == Some("0") {
+        let reset = ratelimit_reset
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .map(|ts| ts.min(now().saturating_add(MAX_RETRY_FLOOR_SECONDS)));
+        return Some(SourceFailure {
+            floor: retry_after.and_then(retry_floor).or(reset),
+        });
+    }
+    None
 }
 pub(super) fn now() -> i64 {
     SystemTime::now()
@@ -65,16 +90,21 @@ pub(super) fn now() -> i64 {
         .min(i64::MAX as u64) as i64
 }
 pub(super) fn retry_floor(value: &str) -> Option<i64> {
+    let cap = now().saturating_add(MAX_RETRY_FLOOR_SECONDS);
     value
         .parse::<u64>()
         .ok()
-        .map(|seconds| now().saturating_add(seconds.min(i64::MAX as u64) as i64))
+        .map(|seconds| {
+            now()
+                .saturating_add(seconds.min(i64::MAX as u64) as i64)
+                .min(cap)
+        })
         .or_else(|| {
             httpdate::parse_http_date(value)
                 .ok()?
                 .duration_since(UNIX_EPOCH)
                 .ok()
-                .map(|d| d.as_secs().min(i64::MAX as u64) as i64)
+                .map(|d| (d.as_secs().min(i64::MAX as u64) as i64).min(cap))
         })
 }
 pub(super) async fn request_budget<T>(
@@ -1367,7 +1397,7 @@ pub async fn standalone_check(config_path: &Path) -> Result<Value> {
 }
 
 pub(crate) async fn finish_background(mut task: tokio::task::JoinHandle<()>) {
-    if tokio::time::timeout(Duration::from_millis(500), &mut task)
+    if tokio::time::timeout(Duration::from_millis(2500), &mut task)
         .await
         .is_err()
     {
@@ -1416,7 +1446,7 @@ pub(crate) async fn run(config_path: PathBuf, mut stop: watch::Receiver<bool>) {
                     .max(c.retry_not_before.unwrap_or(0))
             })
             .unwrap_or(at.saturating_add(INTERVAL + offset(&context)));
-        delay = Duration::from_secs(due.saturating_sub(at).max(INTERVAL) as u64);
+        delay = Duration::from_secs(due.saturating_sub(at).max(60) as u64);
     }
 }
 
@@ -2009,7 +2039,7 @@ mod tests {
         .unwrap();
         drop(lease);
         let task = tokio::spawn(std::future::pending::<()>());
-        tokio::time::timeout(Duration::from_secs(1), finish_background(task))
+        tokio::time::timeout(Duration::from_secs(4), finish_background(task))
             .await
             .unwrap();
         let cache = read_record(&path).unwrap();

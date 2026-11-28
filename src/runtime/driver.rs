@@ -14,7 +14,10 @@ impl HostAccess {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_nanos(),
-        )?;
+        )
+        .ok()
+        .filter(|epoch| *epoch <= i64::MAX as u64)
+        .context("authority epoch exceeds signed 64-bit bound")?;
         let authority_instance = digest(format!(
             "{}:{authority_epoch}:{authority}",
             std::process::id()
@@ -89,6 +92,7 @@ impl HostAccess {
                     self.authority_epoch = self
                         .authority_epoch
                         .checked_add(1)
+                        .filter(|epoch| *epoch <= i64::MAX as u64)
                         .context("authority epoch exhausted")?;
                     self.store.set_authority_epoch(self.authority_epoch)?;
                     self.authority = authority;
@@ -281,13 +285,19 @@ impl HostAccess {
         Ok(None)
     }
 
-    pub(in crate::runtime) fn fresh_allowed(&mut self, kind: LaneId, id: i64) -> bool {
+    pub(in crate::runtime) fn can_fresh(&self, kind: LaneId, id: i64, target: FreshTarget) -> bool {
         if !self.effect_allowed(kind) {
             return false;
         }
         self.once
-            .as_mut()
-            .is_none_or(|plan| plan.lane_mut(kind).fresh.insert(id))
+            .as_ref()
+            .is_none_or(|plan| !plan.lane(kind).fresh.contains(&(id, target)))
+    }
+
+    pub(in crate::runtime) fn consume_fresh(&mut self, kind: LaneId, id: i64, target: FreshTarget) {
+        if let Some(plan) = self.once.as_mut() {
+            plan.lane_mut(kind).fresh.insert((id, target));
+        }
     }
 
     pub(in crate::runtime) fn draft_current(&self, op: &Operation) -> Result<bool> {
@@ -438,67 +448,80 @@ impl HostAccess {
             self.reconciliation_pass = Default::default();
             self.once = Some(plan?);
         }
-        loop {
-            self.store.continuity()?;
-            let before = self.store.work_revision()?;
-            // Every completion turn ingests assembled safety evidence before any launch.
-            self.collect().await?;
-            self.reload()?;
-            self.refresh_runtime_state(once)?;
-            if self.stopping() {
-                break;
+        let loop_result: Result<()> = async {
+            loop {
+                self.store.continuity()?;
+                let before = self.store.work_revision()?;
+                // Every completion turn ingests assembled safety evidence before any launch.
+                self.collect().await?;
+                self.reload()?;
+                self.refresh_runtime_state(once)?;
+                if self.stopping() {
+                    break;
+                }
+                self.plan()?;
+                if self.store.work_revision()? != before {
+                    continue;
+                }
+                if once && !self.any_handles() {
+                    break;
+                }
+                let wake = Arc::clone(&self.wake);
+                let seconds = if once {
+                    1
+                } else {
+                    self.store
+                        .wake_delay(&self.config, IDLE_WAKE_FALLBACK_SECONDS)?
+                        .max(1)
+                };
+                tokio::select! {
+                    biased;
+                    _ = self.stop.changed() => {},
+                    _ = wake.notified() => {},
+                    _ = tokio::time::sleep(Duration::from_secs(seconds)) => {},
+                }
             }
-            self.plan()?;
-            if self.store.work_revision()? != before {
-                continue;
-            }
-            if once && !self.any_handles() {
-                break;
-            }
-            let wake = Arc::clone(&self.wake);
-            let seconds = if once {
-                1
-            } else {
-                self.store
-                    .wake_delay(&self.config, IDLE_WAKE_FALLBACK_SECONDS)?
-                    .max(1)
-            };
-            tokio::select! {
-                biased;
-                _ = self.stop.changed() => {},
-                _ = wake.notified() => {},
-                _ = tokio::time::sleep(Duration::from_secs(seconds)) => {},
-            }
+            Ok(())
         }
-        self.shutdown().await?;
-        self.store.event("runtime_stopped", None)?;
+        .await;
+        // Always drain/cancel child processes and record effect outcomes even when the loop errored.
+        let shutdown_result = self.shutdown().await;
+        let stopped_result = self.store.event("runtime_stopped", None);
+        loop_result?;
+        shutdown_result?;
+        stopped_result?;
         Ok(())
     }
 
     pub(in crate::runtime) async fn shutdown(&mut self) -> Result<()> {
         let deadline =
             tokio::time::Instant::now() + Duration::from_secs(self.config.runtime.shutdown_seconds);
-        self.collect().await?;
+        let mut first_error: Option<anyhow::Error> = None;
+        let mut record = |res: Result<()>| {
+            if let Err(error) = res
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        };
+        record(self.collect().await);
         if let Some(read) = self.identity.as_mut() {
             read.flight.abort(deadline).await;
         }
-        self.collect_identity()?;
+        record(self.collect_identity());
         if let Some(read) = self.identity.take() {
-            self.store.cancel_read(&read.flight.key)?;
+            record(self.store.cancel_read(&read.flight.key));
         }
         self.permit = None;
         let mut lanes = std::mem::take(&mut self.lanes);
-        let mut result = Ok(());
         for mut lane in lanes.iter_mut() {
-            if let Err(error) = lane.stop(self, deadline).await {
-                result = Err(error);
-            }
+            record(lane.stop(self, deadline).await);
         }
         self.lanes = lanes;
         // Only an already-sent effect needs a drain window. Unrelated reads and
         // model work have been cancelled without releasing its admission gates.
         while self.effect.is_some() {
-            self.collect_effect()?;
+            record(self.collect_effect());
             if self.effect.is_none() {
                 break;
             }
@@ -510,21 +533,31 @@ impl HostAccess {
         }
         if let Some(effect) = self.effect.as_mut() {
             effect.task.abort();
-            let _ = tokio::time::timeout_at(deadline, &mut effect.task).await;
+            let abort_settle =
+                deadline.max(tokio::time::Instant::now() + Duration::from_millis(100));
+            let _ = tokio::time::timeout_at(abort_settle, &mut effect.task).await;
         }
-        self.collect_effect()?;
+        record(self.collect_effect());
         if let Some(effect) = self.effect.take() {
-            self.finish_effect(effect, Err(anyhow::anyhow!("shutdown outcome unknown")))?;
+            record(self.finish_effect(effect, Err(anyhow::anyhow!("shutdown outcome unknown"))));
         }
         // Cleanup cannot delay an assembled effect or its conservative unknown
         // bookkeeping, and gets only the remainder of the original drain window.
         let cleanup = crate::solver::drain_native_cleanup_until(deadline).await;
-        result?;
+        if let Some(error) = first_error {
+            return Err(error);
+        }
         if !cleanup? {
             self.store.event("native_cleanup_deadline", None)?;
         }
         Ok(())
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(in crate::runtime) enum FreshTarget {
+    Pending,
+    Prepared,
 }
 
 pub(in crate::runtime) struct OnceLane {
@@ -534,7 +567,7 @@ pub(in crate::runtime) struct OnceLane {
     pub(in crate::runtime) recovery: Vec<i64>,
     pub(in crate::runtime) reads: Vec<ReadKey>,
     pub(in crate::runtime) hydrations: usize,
-    pub(in crate::runtime) fresh: std::collections::HashSet<i64>,
+    pub(in crate::runtime) fresh: std::collections::HashSet<(i64, FreshTarget)>,
 }
 pub(in crate::runtime) struct OncePlan {
     lanes: Vec<OnceLane>,

@@ -2,7 +2,7 @@ use super::{Outcome, Protocol, Response, ResponseSource, classify_source};
 use crate::{capability::LaneId, endpoints::Endpoint};
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Copy)]
 pub struct ReadDeadline(pub(super) Duration);
@@ -56,6 +56,8 @@ pub struct RequestContext {
     pub resource: Option<String>,
     pub authenticated: bool,
     pub started_at: i64,
+    #[serde(skip)]
+    started_monotonic: Instant,
 }
 impl RequestContext {
     pub(super) fn capture(
@@ -79,7 +81,20 @@ impl RequestContext {
             authenticated: endpoint.authenticated()
                 || matches!(endpoint, Endpoint::Job | Endpoint::Receipt),
             started_at: observed_now(),
+            started_monotonic: Instant::now(),
         }
+    }
+
+    pub(super) fn monotonic_observed_at(&self) -> i64 {
+        let elapsed = i64::try_from(self.started_monotonic.elapsed().as_secs()).unwrap_or(i64::MAX);
+        let floor = self.started_at.saturating_add(elapsed);
+        retry_observed_now().max(floor)
+    }
+
+    pub(super) fn monotonic_completed_at(&self) -> i64 {
+        let elapsed = i64::try_from(self.started_monotonic.elapsed().as_secs()).unwrap_or(i64::MAX);
+        let floor = self.started_at.saturating_add(elapsed);
+        observed_now().max(floor)
     }
 }
 

@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import tomllib
 
 
 INDEX_URLS = (
@@ -48,7 +49,7 @@ def respond(request):
     token = os.environ.get('AGMI_CRATES_IO_TOKEN')
     if not token:
         return {'Err': {'kind': 'not-found'}}
-    # Cargo 1.96 does a Read authentication preflight; never let its response
+    # Cargo does a Read authentication preflight; never let its response
     # satisfy a later Publish request without Cargo's actual archive checksum.
     return {'Ok': {'kind': 'get', 'token': token, 'cache': 'never', 'operation_independent': False}}
 
@@ -65,14 +66,22 @@ def credential():
         print(json.dumps(result), flush=True)
 
 
+def expected_toolchain():
+    toolchain = Path(__file__).resolve().parent.parent / 'rust-toolchain.toml'
+    return tomllib.loads(toolchain.read_text())['toolchain']['channel']
+
+
 def publish():
-    if not subprocess.check_output(['cargo', '--version'], text=True).startswith('cargo 1.96.0 '):
-        raise SystemExit('Select Cargo 1.96.0 before publishing')
+    channel = expected_toolchain()
+    if not subprocess.check_output(['cargo', '--version'], text=True).startswith(f'cargo {channel} '):
+        raise SystemExit(f'Select Cargo {channel} before publishing')
     provider = json.dumps(str(Path(__file__).resolve()), ensure_ascii=False)
     with tempfile.TemporaryDirectory(prefix='agmi-publish-') as cargo_home:
         env = dict(os.environ, CARGO_HOME=cargo_home)
         env.pop('CARGO_REGISTRY_TOKEN', None)
         env.pop('CARGO_REGISTRIES_CRATES_IO_TOKEN', None)
+        env.pop('CARGO_REGISTRY_CREDENTIAL_PROVIDER', None)
+        env.pop('CARGO_REGISTRIES_CRATES_IO_CREDENTIAL_PROVIDER', None)
         result = subprocess.run(
             ['cargo', 'publish', '--locked', '--registry', 'crates-io', '--no-verify',
              '--config', f'registry.credential-provider={provider}'],

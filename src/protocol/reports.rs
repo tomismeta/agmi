@@ -473,9 +473,14 @@ pub async fn fetch_raw(
     if response.content_length().is_some_and(|n| n != entry.bytes) {
         return Err(Failure::new("length_mismatch"));
     }
-    let mut temp = tempfile::tempfile_in(directory).map_err(|_| Failure::new("temporary_file"))?;
+    let dir = directory.to_path_buf();
+    let mut temp = tokio::task::spawn_blocking(move || tempfile::tempfile_in(&dir))
+        .await
+        .map_err(|_| Failure::new("temporary_file"))?
+        .map_err(|_| Failure::new("temporary_file"))?;
     let mut digest = Sha256::new();
     let mut length = 0u64;
+    let mut buffer = Vec::with_capacity(256 * 1024);
     while let Some(chunk) = response
         .chunk()
         .await
@@ -489,15 +494,39 @@ pub async fn fetch_raw(
             return Err(Failure::new("length_mismatch"));
         }
         digest.update(&chunk);
-        temp.write_all(&chunk)
+        buffer.extend_from_slice(&chunk);
+        if buffer.len() >= 256 * 1024 {
+            let to_write = std::mem::take(&mut buffer);
+            temp = tokio::task::spawn_blocking(move || -> std::io::Result<std::fs::File> {
+                temp.write_all(&to_write)?;
+                Ok(temp)
+            })
+            .await
+            .map_err(|_| Failure::new("temporary_write"))?
             .map_err(|_| Failure::new("temporary_write"))?;
+        }
+    }
+    if !buffer.is_empty() {
+        let to_write = std::mem::take(&mut buffer);
+        temp = tokio::task::spawn_blocking(move || -> std::io::Result<std::fs::File> {
+            temp.write_all(&to_write)?;
+            Ok(temp)
+        })
+        .await
+        .map_err(|_| Failure::new("temporary_write"))?
+        .map_err(|_| Failure::new("temporary_write"))?;
     }
     let body_hash = format!("{:x}", digest.finalize());
     if length != entry.bytes || body_hash != entry.sha256.to_ascii_lowercase() {
         return Err(Failure::new("hash_or_length_mismatch"));
     }
-    temp.rewind().map_err(|_| Failure::new("temporary_read"))?;
-    let mut value = parse_raw(temp, epoch, interest, deadline)?;
+    let interest_clone = interest.clone();
+    let mut value = tokio::task::spawn_blocking(move || -> RawAttempt {
+        temp.rewind().map_err(|_| Failure::new("temporary_read"))?;
+        parse_raw(temp, epoch, &interest_clone, deadline)
+    })
+    .await
+    .map_err(|_| Failure::new("invalid_raw_report"))??;
     value["index_hash"] = json!(hash(&index_bytes));
     value["body_hash"] = json!(body_hash);
     value["bytes"] = json!(length);

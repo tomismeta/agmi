@@ -173,9 +173,15 @@ impl AnswerLane {
                     && let Some(pending) = self.model.pending_work()
                 {
                     let key = pending.key;
-                    if services.fresh_allowed(key.operation.operation_id)
-                        && let Some(flight) = services.begin_discovery()?
+                    if services.can_fresh(
+                        key.operation.operation_id,
+                        crate::runtime::host::FreshTarget::Pending,
+                    ) && let Some(flight) = services.begin_discovery()?
                     {
+                        services.consume_fresh(
+                            key.operation.operation_id,
+                            crate::runtime::host::FreshTarget::Pending,
+                        );
                         self.read = Some(ChallengeRead {
                             flight,
                             target: Some(Target::Pending(key)),
@@ -193,9 +199,10 @@ impl AnswerLane {
             && self.ready.is_none()
             && services.active()?
             && op.next_at <= services.deadline_now()
-            && services.fresh_allowed(op.id)
+            && services.can_fresh(op.id, crate::runtime::host::FreshTarget::Prepared)
             && let Some(flight) = services.begin_discovery()?
         {
+            services.consume_fresh(op.id, crate::runtime::host::FreshTarget::Prepared);
             self.read = Some(ChallengeRead {
                 flight,
                 target: Some(Target::Prepared(op)),
@@ -264,15 +271,27 @@ impl AnswerLane {
         services: &mut AnswerServices<'_>,
         deadline: tokio::time::Instant,
     ) -> Result<()> {
+        let mut first_error: Option<anyhow::Error> = None;
+        let mut record = |res: Result<()>| {
+            if let Err(error) = res
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        };
         if let Some(read) = self.read.as_mut() {
             read.flight.abort(deadline).await;
         }
-        self.collect(services)?;
+        record(self.collect(services));
         if let Some(read) = self.read.take() {
-            services.cancel_read(&read.flight)?;
+            record(services.cancel_read(&read.flight));
         }
-        services.cancel_reconciliation(deadline).await?;
-        services.cancel_model(&mut self.model, deadline).await
+        record(services.cancel_reconciliation(deadline).await);
+        record(services.cancel_model(&mut self.model, deadline).await);
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 }
 

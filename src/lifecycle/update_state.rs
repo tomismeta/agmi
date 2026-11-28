@@ -10,19 +10,21 @@ use std::os::{
     },
 };
 use std::{
-    cell::RefCell,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
-    rc::{Rc, Weak},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
 };
 
 const RECORD: &str = ".update-state.json";
 const CHILD_FD: &str = "AGMI_UPDATE_LEASE_FD";
 const CHILD_NONCE: &str = "AGMI_UPDATE_LEASE_NONCE";
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-thread_local! { static OWNED: RefCell<Vec<(PathBuf, Weak<File>)>> = const { RefCell::new(Vec::new()) }; }
+static OWNED: Mutex<Vec<(PathBuf, Weak<File>)>> = Mutex::new(Vec::new());
+static CHILD_FD_CONSUMED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -159,7 +161,7 @@ pub(crate) fn remove(root: &Path, nonce: &str) -> Result<()> {
 }
 
 pub(crate) struct Lease {
-    file: Rc<File>,
+    file: Arc<File>,
     pub inherited: bool,
 }
 impl Lease {
@@ -175,13 +177,14 @@ impl Lease {
         if fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir()) {
             return Err(super::installer_preflight_error("legacy_install_lock"));
         }
+        let mut owned = OWNED
+            .lock()
+            .map_err(|_| anyhow::anyhow!("update lease registry poisoned"))?;
+        owned.retain(|(_, f)| f.strong_count() > 0);
         if reuse
-            && let Some(file) = OWNED.with(|owned| {
-                owned
-                    .borrow()
-                    .iter()
-                    .find_map(|(p, f)| (p == &path).then(|| f.upgrade()).flatten())
-            })
+            && let Some(file) = owned
+                .iter()
+                .find_map(|(p, f)| (p == &path).then(|| f.upgrade()).flatten())
         {
             return Ok(Self {
                 file,
@@ -204,7 +207,9 @@ impl Lease {
             "install lease inode changed"
         );
         let mut inherited = false;
-        let file = if let Ok(fd) = std::env::var(CHILD_FD) {
+        let file = if !CHILD_FD_CONSUMED.load(Ordering::Acquire)
+            && let Ok(fd) = std::env::var(CHILD_FD)
+        {
             let fd: i32 = fd.parse()?;
             ensure!(fd >= 3, "invalid inherited lease");
             let record = read(&root)?.context("inherited lease has no transaction")?;
@@ -229,10 +234,12 @@ impl Lease {
                     == 0,
                 "inherited lease is not its owner"
             );
-            // Close the non-CLOEXEC inherited copy before this CLI can launch any children.
+            // Close the non-CLOEXEC inherited copy before this CLI can launch any children,
+            // and mark it consumed so later threads never re-dup a recycled fd number.
             unsafe {
                 libc::close(fd);
             }
+            CHILD_FD_CONSUMED.store(true, Ordering::Release);
             inherited = true;
             inherited_file
         } else {
@@ -242,18 +249,14 @@ impl Lease {
             );
             file
         };
-        let file = Rc::new(file);
+        let file = Arc::new(file);
         let held = file.metadata()?;
         let selected = fs::symlink_metadata(&path)?;
         ensure!(
             (held.dev(), held.ino()) == (selected.dev(), selected.ino()) && selected.is_file(),
             "install lease inode changed while acquiring ownership"
         );
-        OWNED.with(|owned| {
-            let mut owned = owned.borrow_mut();
-            owned.retain(|(_, f)| f.strong_count() > 0);
-            owned.push((path, Rc::downgrade(&file)));
-        });
+        owned.push((path, Arc::downgrade(&file)));
         Ok(Self { file, inherited })
     }
     pub fn inherit(&self, command: &mut std::process::Command, nonce: &str) -> Result<()> {

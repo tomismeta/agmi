@@ -29,7 +29,7 @@ def capture(agent):
     return {"provider": identifier(agent.provider), "model": identifier(agent.model),
             "run_id": identifier(agent.session_id),
             "reasoning_effort": identifier(agent.reasoning_config.get("effort")),
-            "fallback_used": False if not agent._fallback_chain else None, "tool_count": len(agent.tools)}
+            "fallback_used": bool(agent._fallback_chain), "tool_count": len(agent.tools)}
 
 
 class NativeFailure(Exception):
@@ -98,12 +98,12 @@ def main():
             raise RuntimeError("unsupported Hermes policy or turn identity API")
         PRELAUNCH_CODE = 79
         runtime = resolve_runtime_provider(requested="openai-codex", target_model=payload["model"])
+        if runtime.get("source") not in ("hermes-auth-store", "manual:device_code", "device_code"):
+            raise RuntimeError("native OAuth credentials unavailable")
         PRELAUNCH_CODE = 80
         expected = ("openai-codex", "codex_responses", payload["hermes_api_url"])
         if tuple(runtime.get(k) for k in ("provider", "api_mode", "base_url")) != expected:
             raise RuntimeError("native OAuth route mismatch")
-        if runtime.get("source") not in ("hermes-auth-store", "manual:device_code", "device_code"):
-            raise RuntimeError("native OAuth credentials unavailable")
         PRELAUNCH_CODE = 78
         db = SessionDB(Path.cwd() / "session.db")
         agent = None

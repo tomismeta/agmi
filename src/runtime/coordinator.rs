@@ -293,13 +293,22 @@ impl HostAccess {
             .err()
             .and_then(|error| error.downcast_ref::<crate::protocol::ReadFailure>())
             .map(|failure| failure.as_str());
+        let mut deferred_error: Option<anyhow::Error> = None;
         let response = match result {
             Ok(hosted) => {
-                self.store.ingest_restrictions(&hosted.restrictions())?;
-                if hosted.context.meta.dispatch_sequence != Some(effect.dispatch_sequence as u64) {
-                    bail!("effect response dispatch identity mismatch");
+                if let Err(error) = self.store.ingest_restrictions(&hosted.restrictions()) {
+                    deferred_error = Some(error);
                 }
-                Some(hosted.response)
+                if hosted.context.meta.dispatch_sequence != Some(effect.dispatch_sequence as u64) {
+                    if deferred_error.is_none() {
+                        deferred_error = Some(anyhow::anyhow!(
+                            "effect response dispatch identity mismatch"
+                        ));
+                    }
+                    None
+                } else {
+                    Some(hosted.response)
+                }
             }
             Err(_) => None,
         };
@@ -346,6 +355,9 @@ impl HostAccess {
             }
         }
         drop(effect);
+        if let Some(error) = deferred_error {
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -396,6 +408,7 @@ impl HostAccess {
                         "rejected"
                     }
                 } else {
+                    op.next_at = not_before(self.retry_delay(op.kind, None));
                     "unknown"
                 }
                 .into();

@@ -206,7 +206,9 @@ fn snapshot_workspace() -> Result<Scratch> {
             {
                 Ok(())
             } else {
-                Err(std::io::Error::other("snapshot root is not a private directory"))
+                Err(std::io::Error::other(
+                    "snapshot root is not a private directory",
+                ))
             }
         })();
         if ready.is_ok()

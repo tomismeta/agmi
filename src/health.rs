@@ -1846,7 +1846,8 @@ pub fn compact_diagnostics(data: &mut Value) {
             }
         }
         for lane in LANES {
-            if let Some(list) = out["work"][lane]["background_recovery"]["next_actions"].as_array_mut()
+            if let Some(list) =
+                out["work"][lane]["background_recovery"]["next_actions"].as_array_mut()
                 && !list.is_empty()
             {
                 list.clear();

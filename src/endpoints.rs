@@ -191,6 +191,8 @@ fn validate_template(path: &str, placeholder: Option<&str>) -> Result<()> {
 }
 
 fn templates_overlap(left: &str, right: &str) -> bool {
+    let left = left.trim_end_matches('/');
+    let right = right.trim_end_matches('/');
     left.split('/').count() == right.split('/').count()
         && left
             .split('/')

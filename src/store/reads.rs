@@ -544,7 +544,7 @@ impl Store {
 
     pub(crate) fn read_started(&self, key: &ReadKey) -> Result<bool> {
         self.continuity()?;
-        let tx = self.db.unchecked_transaction()?;
+        let tx = rusqlite::Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
         let started = self.start_read_in(key, now())?;
         if started {
             self.invalidate_untracked_flight(key)?;
@@ -610,7 +610,7 @@ impl Store {
         minimum: Option<u64>,
     ) -> Result<ReadBackoff> {
         self.continuity()?;
-        let tx = self.db.unchecked_transaction()?;
+        let tx = rusqlite::Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
         let result = self.fail_read_in(&tx, key, base, cap, jitter, minimum)?;
         tx.commit()?;
         Ok(result)
@@ -646,7 +646,7 @@ impl Store {
 
     pub(crate) fn reset_read(&self, key: &ReadKey) -> Result<()> {
         self.continuity()?;
-        let tx = self.db.unchecked_transaction()?;
+        let tx = rusqlite::Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
         self.reset_read_in(&tx, key)?;
         tx.commit()?;
         Ok(())
@@ -662,31 +662,6 @@ impl Store {
         let (owner, purpose, resource, _) = self.read_parts(key)?;
         tx.execute("UPDATE read_state SET failures=0,local_next_at=0,last_success_at=?4,failure_category=NULL
             WHERE owner=?1 AND purpose=?2 AND resource=?3 AND retired=0",params![owner,purpose,resource,now()])?;
-        Ok(())
-    }
-
-    pub(crate) fn reschedule_read(
-        &self,
-        key: &ReadKey,
-        base: u64,
-        cap: u64,
-        jitter: u64,
-    ) -> Result<()> {
-        self.continuity()?;
-        if !self.read_current(key)? {
-            return Ok(());
-        }
-        let (owner, purpose, resource, _) = self.read_parts(key)?;
-        let timing:Option<(u32,Option<i64>)>=self.db.query_row(
-            "SELECT failures,last_failure_at FROM read_state WHERE owner=?1 AND purpose=?2 AND resource=?3 AND retired=0",
-            params![owner,purpose,resource],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
-        if let Some((failures, Some(failed_at))) = timing.filter(|(n, _)| *n > 0) {
-            let deadline = failed_at
-                .saturating_add(read_delay(failures, base, cap, jitter).min(i64::MAX as u64) as i64)
-                .saturating_add(1);
-            self.db.execute("UPDATE read_state SET local_next_at=?4 WHERE owner=?1 AND purpose=?2 AND resource=?3 AND retired=0",
-                params![owner,purpose,resource,deadline])?;
-        }
         Ok(())
     }
 
@@ -776,7 +751,10 @@ impl Store {
                AND local_next_at <= ?1 AND server_not_before <= ?1
                AND retained_conservative_floor <= ?1
                AND COALESCE(finished_at, started_at, 0) < ?2",
-            params![at, at.saturating_sub(IDLE_ASSIGNMENT_READ_RETENTION_SECONDS)],
+            params![
+                at,
+                at.saturating_sub(IDLE_ASSIGNMENT_READ_RETENTION_SECONDS)
+            ],
         )?;
         for lane in [LaneId::Answer, LaneId::Mine] {
             tx.execute(
@@ -797,7 +775,7 @@ impl Store {
     /// Ingest restrictions independently of local state for non-reconciliation requests.
     pub(crate) fn ingest_restrictions(&self, evidence: &[RestrictionEvidence]) -> Result<()> {
         self.continuity()?;
-        let tx = self.db.unchecked_transaction()?;
+        let tx = rusqlite::Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
         self.ingest_restrictions_in(&tx, evidence)?;
         tx.commit()?;
         Ok(())

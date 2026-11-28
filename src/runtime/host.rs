@@ -32,6 +32,7 @@ mod model;
 mod ports;
 pub(super) use coordinator::ReadyEffect;
 use coordinator::{EffectInFlight, IdentityPermit, IdentityRead};
+pub(super) use driver::FreshTarget;
 use driver::OncePlan;
 pub(super) use io::ReadFlight;
 use io::Recovery;
@@ -106,8 +107,22 @@ pub async fn recovery_resolve(
         HostAccess::new(config_path.to_owned(), config, protocol, store, stop, false)?;
     runtime.start_identity(op.kind)?;
     while runtime.identity.is_some() {
-        runtime.wake.notified().await;
         runtime.collect_identity()?;
+        if runtime.identity.is_none() {
+            break;
+        }
+        tokio::select! {
+            _ = runtime.wake.notified() => {}
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            _ = tokio::signal::ctrl_c() => {
+                if let Some(mut read) = runtime.identity.take() {
+                    let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+                    read.flight.abort(deadline).await;
+                    let _ = runtime.store.cancel_read(&read.flight.key);
+                }
+                bail!("recovery interrupted");
+            }
+        }
     }
     if !runtime.permit_current()? {
         bail!("recovery identity unverified");
@@ -144,7 +159,16 @@ pub async fn recovery_resolve(
             if let Some(result) = flight.take() {
                 break result;
             }
-            runtime.wake.notified().await;
+            tokio::select! {
+                _ = runtime.wake.notified() => {}
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                _ = tokio::signal::ctrl_c() => {
+                    let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+                    flight.abort(deadline).await;
+                    let _ = runtime.store.cancel_read(&flight.key);
+                    bail!("recovery interrupted");
+                }
+            }
         };
         if let Some(response) = runtime.finish_read(&flight, result)? {
             runtime.recovery_response(&mut op, &key, &response)?;

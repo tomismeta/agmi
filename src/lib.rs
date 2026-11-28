@@ -13,6 +13,8 @@ pub mod config;
 pub mod doctor;
 pub mod endpoints;
 pub mod epoch;
+#[doc(hidden)]
+pub mod fs_util;
 pub mod health;
 mod installer;
 pub mod journal;

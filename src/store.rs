@@ -329,6 +329,28 @@ fn validate_private_file(metadata: &fs::Metadata) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn check_sqlite_has_moved(db: &Connection) -> Result<()> {
+    let mut moved: std::ffi::c_int = 0;
+    let rc = unsafe {
+        rusqlite::ffi::sqlite3_file_control(
+            db.handle(),
+            c"main".as_ptr(),
+            rusqlite::ffi::SQLITE_FCNTL_HAS_MOVED,
+            (&mut moved as *mut std::ffi::c_int).cast(),
+        )
+    };
+    if rc == rusqlite::ffi::SQLITE_OK {
+        if moved != 0 {
+            bail!("bound journal file moved or unlinked");
+        }
+        return Ok(());
+    }
+    if rc == rusqlite::ffi::SQLITE_NOTFOUND {
+        return Ok(());
+    }
+    bail!("cannot verify SQLite journal file continuity (rc={rc})");
+}
+
 fn prepare_database(path: &Path) -> Result<()> {
     // Closing any extra descriptor for an existing SQLite inode releases that
     // process's POSIX locks. Only create a new file; inspect existing files by stat.
@@ -1505,6 +1527,7 @@ impl Store {
         database_file: &Option<(PathBuf, fs::Metadata)>,
     ) -> Result<()> {
         migration::ensure_complete(db)?;
+        check_sqlite_has_moved(db).context("bound journal continuity lost")?;
         if let Some((path, expected)) = database_file {
             lane_control::check_file_identity(path, expected)
                 .context("bound journal continuity lost")?;
@@ -1609,6 +1632,7 @@ impl Store {
                 bail!("journal replaced during open; reread local state");
             }
         }
+        check_sqlite_has_moved(&db)?;
         let store = Self {
             db,
             binding: None,
@@ -1653,6 +1677,9 @@ impl Store {
             accepted.check_admission(&admission_path, &fs::symlink_metadata(&admission_path)?)?;
             existing.check_binding(config)?;
         }
+        let existing_metadata = existing
+            .as_ref()
+            .and_then(|s| s.database_file.as_ref().map(|(_, m)| m.clone()));
         let fresh = existing.is_none();
         drop(existing);
         private_dir(&config.state_dir)?;
@@ -1672,6 +1699,14 @@ impl Store {
             )?
         };
         db.busy_timeout(std::time::Duration::from_secs(5))?;
+        let opened_metadata = fs::symlink_metadata(&path)?;
+        validate_private_file(&opened_metadata)?;
+        if let Some(expected) = &existing_metadata
+            && !same_journal_file(expected, &opened_metadata)
+        {
+            bail!("journal replaced between inspection and writable open");
+        }
+        check_sqlite_has_moved(&db)?;
         if !fresh {
             migration::ensure_complete(&db)?;
         }
@@ -3185,7 +3220,7 @@ impl Store {
         candidates: &Value,
     ) -> Result<()> {
         // Request-bound restrictions are ingested before this local evidence CAS.
-        let tx = self.db.unchecked_transaction()?;
+        let tx = rusqlite::Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
         self.record_candidates(id, candidates)?;
         self.record_evidence(id, evidence)?;
         tx.commit()?;
@@ -3485,7 +3520,7 @@ impl Store {
         retry: (u64, u64, u64),
         minimum: Option<u64>,
     ) -> Result<()> {
-        let tx = self.db.unchecked_transaction()?;
+        let tx = rusqlite::Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
         self.read_finished(&ReadKey::Identity, status, category)?;
         Self::write_identity_outcome(&tx, outcome)?;
         if outcome == HostedIdentityOutcome::Verified {
@@ -3499,7 +3534,7 @@ impl Store {
 
     #[cfg(test)]
     pub(crate) fn record_identity_outcome(&self, outcome: HostedIdentityOutcome) -> Result<()> {
-        let tx = self.db.unchecked_transaction()?;
+        let tx = rusqlite::Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
         Self::write_identity_outcome(&tx, outcome)?;
         tx.commit()?;
         Ok(())

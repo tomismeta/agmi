@@ -250,29 +250,6 @@ export default async function (pi: ExtensionAPI) {
   const binding = { protocol: 1, invocation_id: boot.invocation_id, request_digest: boot.request_digest,
     selection_digest: boot.selection_digest, provider: boot.provider, model: boot.model,
     reasoning_effort: boot.reasoning_effort };
-  const stockGo = boot.provider === "opencode-go";
-  requireThat(stockGo === (boot.go_mode !== undefined), "native_bootstrap");
-  const stockProbe = boot.go_mode === "stock_probe";
-  const loopbackGo = boot.go_mode === "probe" || boot.go_mode === "fixture";
-  const syntheticGo = stockProbe || loopbackGo;
-  const probeResponse = stockProbe ? z.object({
-    status: z.union([z.literal(200), z.literal(400)]),
-    mime: z.enum(["text/event-stream", "application/json"]),
-    body: z.string().max(16 * 1024),
-  }).strict().parse(JSON.parse(await readFile(new URL("./omp-probe-response.json", import.meta.url), "utf8"))) : undefined;
-  const settings = await Settings.loadReadOnly({ cwd: boot.provider_discovery_cwd, agentDir: getAgentDir() });
-  if (!stockGo) {
-    const paths = await discoverSessionExtensionPaths({ includeAmbientHooks: true }, boot.provider_discovery_cwd, settings);
-    // Do not pass a live event bus/runtime, construct a runner, or attach Extension objects.
-    const loaded = await loadExtensions(paths, boot.provider_discovery_cwd);
-    requireThat(loaded.errors.length === 0, "native_provider_load");
-    for (const { name, config } of loaded.runtime.pendingProviderRegistrations) pi.registerProvider(name, config);
-  }
-
-  let consumed = false;
-  let duplicateReported = false;
-  let ready = false;
-  let controller: AbortController | undefined;
   let terminal = false;
   function emitResult(data: Record<string, unknown>) {
     if (terminal) return;
@@ -281,7 +258,8 @@ export default async function (pi: ExtensionAPI) {
       const reasons: Record<string, string> = {
         native_model: "native_api_unsupported", native_effort: "native_api_unsupported",
         native_settings: "native_api_unsupported", native_deadline: "model_deadline_exceeded",
-        native_auth: "native_auth_unavailable",
+        native_auth: "native_auth_unavailable", native_provider_load: "native_api_unsupported",
+        native_bootstrap: "native_api_unsupported", native_startup: "native_api_unsupported",
         native_binding: "native_run_binding_mismatch", native_request: "native_run_binding_mismatch",
         native_not_ready: "native_run_binding_mismatch", native_identity: "native_provenance_mismatch",
         native_tool_call: "native_api_unsupported", native_completion: "native_api_unsupported",
@@ -291,6 +269,40 @@ export default async function (pi: ExtensionAPI) {
     }
     pi.appendEntry("agmi_omp_result_v1", { ...binding, ...data });
   }
+  const stockGo = boot.provider === "opencode-go";
+  let stockProbe = false;
+  let loopbackGo = false;
+  let syntheticGo = false;
+  let probeResponse: { status: 200 | 400; mime: "text/event-stream" | "application/json"; body: string } | undefined;
+  let settings!: Awaited<ReturnType<typeof Settings.loadReadOnly>>;
+  let startupFailed = false;
+  try {
+    requireThat(stockGo === (boot.go_mode !== undefined), "native_bootstrap");
+    stockProbe = boot.go_mode === "stock_probe";
+    loopbackGo = boot.go_mode === "probe" || boot.go_mode === "fixture";
+    syntheticGo = stockProbe || loopbackGo;
+    probeResponse = stockProbe ? z.object({
+      status: z.union([z.literal(200), z.literal(400)]),
+      mime: z.enum(["text/event-stream", "application/json"]),
+      body: z.string().max(16 * 1024),
+    }).strict().parse(JSON.parse(await readFile(new URL("./omp-probe-response.json", import.meta.url), "utf8"))) : undefined;
+    settings = await Settings.loadReadOnly({ cwd: boot.provider_discovery_cwd, agentDir: getAgentDir() });
+    if (!stockGo) {
+      const paths = await discoverSessionExtensionPaths({ includeAmbientHooks: true }, boot.provider_discovery_cwd, settings);
+      // Do not pass a live event bus/runtime, construct a runner, or attach Extension objects.
+      const loaded = await loadExtensions(paths, boot.provider_discovery_cwd);
+      requireThat(loaded.errors.length === 0, "native_provider_load");
+      for (const { name, config } of loaded.runtime.pendingProviderRegistrations) pi.registerProvider(name, config);
+    }
+  } catch (e) {
+    startupFailed = true;
+    emitResult({ ok: false, stage: "startup", reason_code: e instanceof Failure ? e.code : "native_startup" });
+  }
+
+  let consumed = false;
+  let duplicateReported = false;
+  let ready = false;
+  let controller: AbortController | undefined;
   function resolve(ctx: ExtensionContext) {
     const model = ctx.modelRegistry.find(boot.provider, boot.model);
     requireThat(model && model.provider === boot.provider && model.id === boot.model, "native_model");
@@ -335,6 +347,7 @@ export default async function (pi: ExtensionAPI) {
   let readyRoute: { digest: string; url: string } | null = null;
   let syntheticKey: string | undefined;
   pi.on("session_start", async (_event, ctx) => {
+    if (startupFailed) return;
     try {
       const model = resolve(ctx);
       const effort = boot.reasoning_effort === "off" ? undefined : boot.reasoning_effort;
@@ -587,13 +600,16 @@ export default async function (pi: ExtensionAPI) {
           wire_model: wireModel, upstream_model: reportedIdentifier(final.upstreamModel),
           upstream_provider: reportedIdentifier(final.upstreamProvider) });
       } catch (e) {
+        const aborted = controller?.signal.aborted === true
+          || (e instanceof Error && e.name === "AbortError");
         controller?.abort();
         const nativeFacts = final && bindingShape.provider.safeParse(final.provider).success
           && bindingShape.model.safeParse(final.model).success
           ? { native_provider: final.provider, native_model: final.model } : {};
         emitResult({ ...nativeFacts, wire_model: wireModel, upstream_model: reportedIdentifier(final?.upstreamModel),
           upstream_provider: reportedIdentifier(final?.upstreamProvider),
-          ok: false, reason_code: (requestFailure ?? (e instanceof Failure ? e : undefined))?.code ?? "native_failure" });
+          ok: false, reason_code: (requestFailure ?? (e instanceof Failure ? e : undefined))?.code
+            ?? (aborted ? "native_deadline" : "native_failure") });
       } finally { clearTimeout(timer); controller = undefined; }
     },
   });

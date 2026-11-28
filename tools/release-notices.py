@@ -32,11 +32,17 @@ def fetch(url, digest):
     return data
 
 
+def rust_toolchain_channel():
+    toolchain = Path(__file__).resolve().parent.parent / 'rust-toolchain.toml'
+    return tomllib.loads(toolchain.read_text())['toolchain']['channel']
+
+
 def main(source, rust_notice, version):
     notices = source / 'third-party-licenses'
     notices.mkdir()
+    channel = rust_toolchain_channel()
     for name, digest in RUST_LICENSES.items():
-        url = f'https://raw.githubusercontent.com/rust-lang/rust/1.96.0/{name}'
+        url = f'https://raw.githubusercontent.com/rust-lang/rust/{channel}/{name}'
         (notices / f'rust-{name}').write_bytes(fetch(url, digest))
     (notices / 'rust-COPYRIGHT-library.html').write_bytes(rust_notice.read_bytes())
     with tarfile.open(fileobj=io.BytesIO(fetch(MUSL, MUSL_SHA)), mode='r:gz') as bundle:

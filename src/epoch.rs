@@ -483,7 +483,10 @@ async fn refresh_with_source(
         (1..=100).contains(&query.limit) && query.before.is_none_or(|n| n > 0),
         "epoch pagination requires limit 1..100 and positive before"
     );
-    let interest = interest(config)?; // Drop the read-only connection before HTTP.
+    let config_for_interest = config.clone();
+    let interest = tokio::task::spawn_blocking(move || interest(&config_for_interest))
+        .await
+        .context("epoch interest task panicked")??; // Drop the read-only connection before HTTP.
     if !config.state_dir.try_exists()? {
         let mut builder = fs::DirBuilder::new();
         #[cfg(unix)]
@@ -593,9 +596,12 @@ async fn refresh_with_source(
         break;
     }
     if bytes.len() <= CACHE_BYTES {
-        let persisted = (|| -> Result<()> {
-            private_metadata(&config.state_dir, true)?;
-            let current = private_metadata(&directory, true)?;
+        let state_dir = config.state_dir.clone();
+        let dir_clone = directory.clone();
+        let cache_path = path(config, close_epoch);
+        let persisted = tokio::task::spawn_blocking(move || -> Result<()> {
+            private_metadata(&state_dir, true)?;
+            let current = private_metadata(&dir_clone, true)?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::MetadataExt;
@@ -605,13 +611,26 @@ async fn refresh_with_source(
                     "report_directory_changed"
                 );
             }
-            crate::admin::persist(&path(config, close_epoch), &bytes)
-        })();
+            crate::admin::persist(&cache_path, &bytes)
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("cache persist task panicked"))
+        .and_then(|res| res);
         if persisted.is_err() {
             errors.push(json!({"component":"cache","reason":"cache_write_failed"}));
         }
     }
-    let mut output = render(config, query, Some(cache), "refreshed_in_memory")?;
+    let config_for_render = config.clone();
+    let mut output = tokio::task::spawn_blocking(move || {
+        render(
+            &config_for_render,
+            query,
+            Some(cache),
+            "refreshed_in_memory",
+        )
+    })
+    .await
+    .context("epoch render task panicked")??;
     output["refresh_ok"] = json!(errors.is_empty());
     output["errors"] = json!(errors);
     drop(lease);

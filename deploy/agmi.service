@@ -23,6 +23,10 @@ TimeoutStopSec=infinity
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=default.target

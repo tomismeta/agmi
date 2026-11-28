@@ -244,12 +244,21 @@ fn secure(url: &Url) -> bool {
         && url.fragment().is_none()
 }
 fn asset_redirect(url: &Url) -> bool {
+    let valid_path = url.path().starts_with("/github-production-release-asset/")
+        || url
+            .path()
+            .strip_prefix("/github-production-release-asset-")
+            .is_some_and(|rest| {
+                rest.split_once('/').is_some_and(|(id, _)| {
+                    !id.is_empty() && id.bytes().all(|b| b.is_ascii_hexdigit())
+                })
+            });
     secure(url)
         && matches!(
             url.host_str(),
             Some("release-assets.githubusercontent.com" | "objects.githubusercontent.com")
         )
-        && url.path().starts_with("/github-production-release-asset/")
+        && valid_path
 }
 fn client() -> Result<Client> {
     Client::builder()
@@ -305,11 +314,19 @@ async fn response(client: &Client, initial: &str, asset: bool) -> Result<reqwest
             url = next;
             continue;
         }
-        if let Some(failure) = advisory::source_failure(
+        if let Some(failure) = advisory::source_failure_with_headers(
             response.status().as_u16(),
             response
                 .headers()
                 .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            response
+                .headers()
+                .get("x-ratelimit-remaining")
+                .and_then(|v| v.to_str().ok()),
+            response
+                .headers()
+                .get("x-ratelimit-reset")
                 .and_then(|v| v.to_str().ok()),
         ) {
             return Err(failure.into());

@@ -32,11 +32,12 @@ fi
 fail() { printf '%s\n' "$*" >&2; exit 1; }
 digest() { shasum -a 256 "$1" | cut -d ' ' -f 1; }
 target=x86_64-unknown-linux-musl
-rust=1.96.0
-llvm=22.1.8
 here=$(cd "$(dirname "$0")" && pwd -P)
 export AGMI_MUSL_SCRIPT="$here/$(basename "$0")"
 cd "$here/.."
+rust=$(awk -F'"' '/^channel[[:space:]]*=/ { print $2; exit }' rust-toolchain.toml)
+[[ -n $rust ]] || fail 'Cannot read Rust toolchain channel from rust-toolchain.toml'
+llvm=22.1.8
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$PWD/target/linux-musl}
 mkdir -p "$CARGO_TARGET_DIR"
 CARGO_TARGET_DIR=$(cd "$CARGO_TARGET_DIR" && pwd -P)
@@ -61,7 +62,8 @@ rm -f "$CARGO_TARGET_DIR/agmi-linux-musl-provenance.txt" "$CARGO_TARGET_DIR/agmi
 proof=$(mktemp -d "$CARGO_TARGET_DIR/.musl-link.XXXXXXXX")
 trap 'rm -rf "$proof"' EXIT
 export AGMI_MUSL_MAP="$proof/link.map"
-unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS RUSTC_WORKSPACE_WRAPPER ZIG_LIB_DIR
+unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS RUSTC_WORKSPACE_WRAPPER ZIG_LIB_DIR
 export RUSTUP_TOOLCHAIN=$rust RUSTC="$sysroot/bin/rustc"
 export PATH="$sysroot/bin:$PATH"
 # A cached agmi executable could have used an earlier linker or wrapper. Keep

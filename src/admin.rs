@@ -5,14 +5,11 @@ use crate::store::{AccountAdmissionGuard, AccountLock, Store, admin_identity_ini
 use anyhow::Result;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const MAX_INPUT_BYTES: usize = 65536;
 const MAX_DEPTH: usize = 32;
-static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
 struct AdminError(&'static str, &'static str);
@@ -160,6 +157,12 @@ struct DirectoryLock {
 }
 impl DirectoryLock {
     fn acquire(path: &Path, blocking: bool) -> Result<Self> {
+        Self::acquire_mode(path, blocking, false)
+    }
+    fn acquire_shared(path: &Path, blocking: bool) -> Result<Self> {
+        Self::acquire_mode(path, blocking, true)
+    }
+    fn acquire_mode(path: &Path, blocking: bool, shared: bool) -> Result<Self> {
         let parent = path.parent().ok_or_else(unsafe_file)?;
         let file = File::open(parent).map_err(|_| io_error())?;
         let metadata = file.metadata().map_err(|_| io_error())?;
@@ -174,9 +177,18 @@ impl DirectoryLock {
             }
         }
         if blocking {
-            file.lock().map_err(|_| io_error())?;
+            if shared {
+                file.lock_shared().map_err(|_| io_error())?;
+            } else {
+                file.lock().map_err(|_| io_error())?;
+            }
         } else {
-            file.try_lock().map_err(|failure| match failure {
+            let attempt = if shared {
+                file.try_lock_shared()
+            } else {
+                file.try_lock()
+            };
+            attempt.map_err(|failure| match failure {
                 std::fs::TryLockError::WouldBlock => error(
                     "admin_busy",
                     "Another administration command owns the target directory; retry.",
@@ -196,6 +208,13 @@ impl DirectoryLock {
             // Never wait while holding a different directory: cross-referenced
             // guidance files must not introduce an administration deadlock.
             Self::acquire(target, false).map(Some)
+        }
+    }
+    fn additional_shared(&self, target: &Path) -> Result<Option<Self>> {
+        if target.parent() == Some(self.path.as_path()) {
+            Ok(None)
+        } else {
+            Self::acquire_shared(target, false).map(Some)
         }
     }
 }
@@ -240,47 +259,14 @@ pub fn lock_config_directory_until(
         }
     }
 }
-fn regular(metadata: &fs::Metadata, private: bool) -> Result<()> {
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return Err(unsafe_file());
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if metadata.uid() != unsafe { libc::geteuid() }
-            || metadata.nlink() != 1
-            || (private && metadata.mode() & 0o077 != 0)
-        {
-            return Err(unsafe_file());
-        }
-    }
-    Ok(())
-}
 pub(crate) fn read_optional(path: &Path, private: bool) -> Result<Option<Vec<u8>>> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => regular(&metadata, private)?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => return Err(io_error()),
+    match crate::fs_util::read_bounded_regular(path, MAX_INPUT_BYTES, private) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(crate::fs_util::RegularReadError::NotFound) => Ok(None),
+        Err(crate::fs_util::RegularReadError::UnsafeFile) => Err(unsafe_file()),
+        Err(crate::fs_util::RegularReadError::TooLarge) => Err(invalid()),
+        Err(crate::fs_util::RegularReadError::Io) => Err(io_error()),
     }
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
-    }
-    let file = options.open(path).map_err(|_| unsafe_file())?;
-    let metadata = file.metadata().map_err(|_| io_error())?;
-    regular(&metadata, private)?;
-    if metadata.len() > MAX_INPUT_BYTES as u64 {
-        return Err(invalid());
-    }
-    let mut bytes = Vec::new();
-    file.take((MAX_INPUT_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|_| io_error())?;
-    check_input(&bytes)?;
-    Ok(Some(bytes))
 }
 fn config_bytes(path: &Path) -> Result<Vec<u8>> {
     read_optional(path, false)?.ok_or_else(|| {
@@ -374,11 +360,21 @@ fn identity_guard(
     }
     let mut writer = None;
     if old.network.api != new.network.api && admin_identity_initialized(old)? {
-        writer = Some(AccountLock::stopped(old).map_err(|_| {
-            error(
-                "admin_routing_runtime_active",
-                "Stop the controller before changing API routing.",
-            )
+        writer = Some(AccountLock::stopped(old).map_err(|failure| {
+            if failure
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::WouldBlock)
+            {
+                error(
+                    "admin_routing_runtime_active",
+                    "Stop the controller before changing API routing.",
+                )
+            } else {
+                error(
+                    "admin_identity_unavailable",
+                    "Cannot verify controller stop state before changing API routing.",
+                )
+            }
         })?);
         if let Some(store) = Store::read_only(old)? {
             store.routing_change_allowed(new)?;
@@ -399,11 +395,11 @@ fn guidance_target(config_path: &Path, config: &Config, target: &Path) -> Result
             fs::canonicalize(credential)
                 .ok()
                 .or_else(|| absolute_target(credential).ok())
-                .unwrap_or_else(|| credential.clone()),
+                .unwrap_or_else(|| crate::fs_util::canonicalize_existing_prefix(credential)),
         )
     };
     // The whole journal directory is reserved, including SQLite companions and locks.
-    let state = fs::canonicalize(&config.state_dir).unwrap_or_else(|_| config.state_dir.clone());
+    let state = crate::fs_util::canonicalize_existing_prefix(&config.state_dir);
     if target == config_path
         || credential_target.as_ref() == Some(&target)
         || target.starts_with(state)
@@ -455,39 +451,11 @@ fn mutation_fence(config: &Config) -> Result<()> {
         "Cannot mutate configuration or guidance while migration is incomplete or its state cannot be verified.",
     ))
 }
-struct Temporary(PathBuf);
-impl Drop for Temporary {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
-    }
-}
 pub(crate) fn persist(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path.parent().ok_or_else(unsafe_file)?;
-    let (temporary, mut file) = loop {
-        let serial = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
-        let name = parent.join(format!(".agmi-admin-{}-{serial}.tmp", std::process::id()));
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-        }
-        match options.open(&name) {
-            Ok(file) => break (Temporary(name), file),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(_) => return Err(io_error()),
-        }
-    };
-    file.write_all(bytes).map_err(|_| io_error())?;
-    file.sync_all().map_err(|_| io_error())?;
-    fs::rename(&temporary.0, path).map_err(|_| io_error())?;
-    File::open(parent)
-        .and_then(|file| file.sync_all())
-        .map_err(|_| io_error())?;
-    Ok(())
+    if path.parent().is_none() {
+        return Err(unsafe_file());
+    }
+    crate::fs_util::atomic_write(path, bytes, "agmi-admin").map_err(|_| io_error())
 }
 fn defaults() -> Value {
     let mut value =
@@ -703,13 +671,13 @@ fn merge(target: &mut Value, patch: Value) {
 }
 pub fn file_revision(path: &Path) -> Result<String> {
     let path = absolute_target(path)?;
-    let _lock = DirectoryLock::acquire(&path, true)?;
+    let _lock = DirectoryLock::acquire_shared(&path, true)?;
     Ok(digest(&config_bytes(&path)?))
 }
 pub fn show(path: &Path) -> Result<Value> {
     let source_path = path;
     let path = absolute_target(path)?;
-    let _lock = DirectoryLock::acquire(&path, true)?;
+    let _lock = DirectoryLock::acquire_shared(&path, true)?;
     let bytes = config_bytes(&path)?;
     let config = parse(source_path, &bytes)?;
     let revision = config.optional_revision().map_err(|_| invalid())?;
@@ -811,11 +779,11 @@ fn selected_target(
 pub fn guidance_show(path: &Path, kind: &str, layer: &str) -> Result<Value> {
     let source_path = path;
     let path = absolute_target(path)?;
-    let lock = DirectoryLock::acquire(&path, true)?;
+    let lock = DirectoryLock::acquire_shared(&path, true)?;
     let bytes = config_bytes(&path)?;
     let config = parse(source_path, &bytes)?;
     let (target, configured) = selected_target(&path, &config, kind, layer)?;
-    let _guidance_lock = lock.additional(&target)?;
+    let _guidance_lock = lock.additional_shared(&target)?;
     let guidance = read_optional(&target, true)?;
     let content = guidance
         .as_ref()

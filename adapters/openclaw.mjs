@@ -91,7 +91,7 @@ try {
   if (meta?.aborted === true) throw 'aborted';
   const payloads = result?.payloads;
   if (response?.status !== 'ok' || !Array.isArray(payloads) || payloads.length !== 1
-      || typeof payloads[0].text !== 'string'
+      || typeof payloads[0]?.text !== 'string'
       || Buffer.byteLength(payloads[0].text) > 65536) {
     throw 'error_payload';
   }
@@ -102,7 +102,7 @@ try {
     status: 'ok',
     ...reported,
     final: payloads[0].text,
-  }) + '\n');
+  }) + '\n', () => process.exit(0));
 } catch (error) {
   // A disconnected CLI does not prove that shared-Gateway inference stopped.
   const localDeadline = error === DEADLINE_BEFORE_CALL;
@@ -110,8 +110,8 @@ try {
     : error === UNSUPPORTED_SDK ? 'sdk_unavailable_before_call'
     : ['timeout', 'aborted', 'error_payload'].includes(error) ? error : 'exception';
   const localRefusal = localDeadline || error === UNSUPPORTED_SDK;
+  const code = localDeadline ? 81 : error === UNSUPPORTED_SDK ? 78 : 1;
   emit(JSON.stringify({ok: false, status: 'error', ...reported,
-    ...(localRefusal ? {runId: requestedRunId} : {}), error: {kind}}) + '\n');
-  // These two exit codes need the associated bound no-call envelope.
-  process.exitCode = localDeadline ? 81 : error === UNSUPPORTED_SDK ? 78 : 1;
+    ...(localRefusal ? {runId: requestedRunId} : {}), error: {kind}}) + '\n',
+    () => process.exit(code));
 }

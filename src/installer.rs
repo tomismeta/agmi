@@ -945,6 +945,7 @@ mod native {
                 "--property=MainPID,InvocationID,ActiveState,SubState,LoadState,FragmentPath,DropInPaths,User"])
             .env("SYSTEMD_PAGER", "").stdin(Stdio::null())
             .stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0).spawn()?;
+        let mut reaped = false;
         let result = (|| -> Result<Vec<u8>> {
             let mut stdout = child.stdout.take().context("missing stdout")?;
             let mut stderr = child.stderr.take().context("missing stderr")?;
@@ -977,6 +978,7 @@ mod native {
                     }
                 }
                 if let Some(status) = child.try_wait()? {
+                    reaped = true;
                     ensure!(status.success(), "manager unavailable");
                     if eof == [true, true] {
                         return Ok(output);
@@ -985,14 +987,17 @@ mod native {
                 std::thread::sleep(Duration::from_millis(1));
             }
         })();
-        // Also terminate descendants retaining pipe handles. Always reap our child.
-        if result.is_err() {
+        // Also terminate descendants retaining pipe handles, but never signal a
+        // process group after its leader PID has been reaped and could be reused.
+        if result.is_err() && !reaped {
             unsafe {
                 libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
             }
             let _ = child.kill();
         }
-        let _ = child.wait();
+        if !reaped {
+            let _ = child.wait();
+        }
         let text = String::from_utf8(result?)?;
         let mut properties = std::collections::BTreeMap::new();
         for line in text.lines() {
@@ -1304,7 +1309,11 @@ mod native {
             if cancellable {
                 checkpoint()?;
             }
-            let count = file.read(&mut buffer)?;
+            let count = match file.read(&mut buffer) {
+                Ok(count) => count,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error.into()),
+            };
             if count == 0 {
                 break;
             }
@@ -1352,7 +1361,11 @@ mod native {
         let mut buffer = [0_u8; 65536];
         loop {
             checkpoint()?;
-            let count = source.read(&mut buffer)?;
+            let count = match source.read(&mut buffer) {
+                Ok(count) => count,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error.into()),
+            };
             if count == 0 {
                 break;
             }
@@ -1468,7 +1481,21 @@ mod native {
             metadata(&manifest, "stop_timeout")? == "infinity",
             "incompatible shutdown policy"
         );
-        let embedded = manifest_output(&release.join("agmi"))?;
+        let embedded = {
+            #[cfg(target_os = "linux")]
+            {
+                manifest_output(&executable_fd_path(&binary))?
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let path = release.join("agmi");
+                ensure!(
+                    same_executable(&binary.metadata()?, &fs::symlink_metadata(&path)?),
+                    "release executable changed"
+                );
+                manifest_output(&path)?
+            }
+        };
         for (name, key, _) in UNITS {
             let rendered = fs::read_to_string(release.join(name))?;
             let template = rendered.replace(id, "@AGMI_RELEASE_ID@");
@@ -4696,12 +4723,20 @@ mod native {
     fn replace_link(target: &Path, destination: &Path) -> Result<()> {
         checkpoint()?;
         let parent = destination.parent().context("missing link parent")?;
-        let temporary = parent.join(format!(
-            ".agmi-link.{}.{}",
-            std::process::id(),
-            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        ));
-        symlink(target, &temporary)?;
+        let temporary = (0..1000)
+            .find_map(|_| {
+                let candidate = parent.join(format!(
+                    ".agmi-link.{}.{}",
+                    std::process::id(),
+                    TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+                ));
+                match symlink(target, &candidate) {
+                    Ok(()) => Some(Ok(candidate)),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
+                    Err(error) => Some(Err(error)),
+                }
+            })
+            .context("cannot allocate temporary symlink")??;
         let mut owned = OwnedPath::record(temporary, false)?;
         checkpoint()?;
         fs::rename(&owned.path, destination)?;
@@ -4832,8 +4867,9 @@ mod native {
                     .map(|hash| format!("r-{hash}"))
                     .unwrap_or_else(|| request.target.to_owned());
                 ensure!(
-                    request.action == "service" || requested == pending,
-                    "pending update cannot be retargeted"
+                    request.action == "service"
+                        || (requested == pending && !request.migration_only),
+                    "pending update cannot be retargeted or changed to bootstrap mode"
                 );
             }
             if request.action != "stage" {

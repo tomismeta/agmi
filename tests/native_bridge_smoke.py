@@ -306,10 +306,14 @@ class HermesContract(unittest.TestCase):
             with self.subTest(source=source):
                 result, _ = self.invoke(runtime={'source': source})
                 self.assertEqual(result.returncode, 0, result.stderr)
-        cases = [('auth_exception', {}, 79)] + [
+        cases = [
+            ('auth_exception', {}, 79),
+            ('success', {'source': 'environment'}, 79),
+            ('success', {'source': None}, 79),
+        ] + [
             ('success', {field: value}, 80) for field, value in (
                 ('provider', 'openai'), ('api_mode', 'chat_completions'),
-                ('base_url', 'https://untrusted.invalid'), ('source', 'environment'), ('source', None))]
+                ('base_url', 'https://untrusted.invalid'))]
         for case, runtime, code in cases:
             with self.subTest(case=case, runtime=runtime):
                 result, events = self.invoke(case, runtime=runtime)

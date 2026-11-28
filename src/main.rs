@@ -605,20 +605,17 @@ fn update_proposal(path: &Path) -> Result<Value> {
             "Update proposal must be a private JSON object of at most 64 KiB; only --proposal - reads stdin.",
         )
     };
-    let mut bytes = Vec::new();
-    if path == Path::new("-") {
+    let bytes = if path == Path::new("-") {
+        let mut buf = Vec::new();
         std::io::stdin()
             .lock()
             .take(64 * 1024 + 1)
-            .read_to_end(&mut bytes)
+            .read_to_end(&mut buf)
             .map_err(|_| invalid())?;
+        buf
     } else {
-        std::fs::File::open(path)
-            .map_err(|_| invalid())?
-            .take(64 * 1024 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|_| invalid())?;
-    }
+        agmi::fs_util::read_bounded_regular(path, 64 * 1024, false).map_err(|_| invalid())?
+    };
     anyhow::ensure!(bytes.len() <= 64 * 1024, invalid());
     let value: Value = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
     anyhow::ensure!(value.is_object(), invalid());
@@ -899,7 +896,16 @@ fn doctor_prerequisite(code: &'static str, repair: bool) -> Value {
 
 fn initialize(path: &Path) -> Result<Value> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent).context("cannot create configuration directory")?;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder
+            .create(parent)
+            .context("cannot create configuration directory")?;
     }
     let _configuration_guard = admin::lock_config_directory(path)?;
     let text = toml::to_string_pretty(&Config::for_onboarding())?;
@@ -908,13 +914,18 @@ fn initialize(path: &Path) -> Result<Value> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
     let mut file = options
         .open(path)
         .context("cannot create configuration; an existing file is never overwritten")?;
     file.write_all(text.as_bytes())?;
     file.sync_all()?;
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        let _ = std::fs::File::open(parent).and_then(|dir| dir.sync_all());
+    }
     Ok(
         json!({"path":path,"created":true,"note":"Set your existing account and local credential-file reference. New runtime state starts paused."}),
     )

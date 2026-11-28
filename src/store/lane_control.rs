@@ -197,7 +197,7 @@ impl LaneAdmissionGuard {
     }
 
     pub(crate) fn try_acquire(config: &Config, lane: LaneId) -> Result<Self> {
-        let control = ExistingLaneControlStore::open(config, false)?;
+        let control = ExistingLaneControlStore::open(config, false, Duration::from_millis(250))?;
         let guard = Self::lock(config, &control.binding.database_id, lane, false, None)?;
         guard.validate(&control.db, config)?;
         control.check_files()?;
@@ -396,6 +396,17 @@ pub(super) fn validate_required_lane_state(db: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn map_sqlite_busy(error: rusqlite::Error) -> anyhow::Error {
+    if matches!(
+        error.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+    ) {
+        anyhow::Error::new(LaneControlError::Busy)
+    } else {
+        error.into()
+    }
+}
+
 struct ExistingLaneControlStore {
     db: Connection,
     binding: Binding,
@@ -405,7 +416,7 @@ struct ExistingLaneControlStore {
     writer_path: PathBuf,
 }
 impl ExistingLaneControlStore {
-    fn open(config: &Config, writable: bool) -> Result<Self> {
+    fn open(config: &Config, writable: bool, busy_timeout: Duration) -> Result<Self> {
         let database_path = config.state_dir.join("state.sqlite3");
         if !database_path.exists() && !lock_path(config, "binding")?.exists() {
             return Err(LaneControlError::NotInitialized.into());
@@ -430,12 +441,19 @@ impl ExistingLaneControlStore {
         binding.check_admission(&admission_path, &fs::symlink_metadata(&admission_path)?)?;
         let flags =
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW;
-        let mut db = Connection::open_with_flags(&database_path, flags)?;
-        db.busy_timeout(Duration::ZERO)?;
-        let version: i64 =
-            db.query_row("SELECT version FROM control WHERE singleton=1", [], |r| {
+        let mut db = {
+            let _opening = DATABASE_OPEN
+                .lock()
+                .map_err(|_| anyhow::anyhow!("database opening lock poisoned"))?;
+            Connection::open_with_flags(&database_path, flags).map_err(map_sqlite_busy)?
+        };
+        db.busy_timeout(busy_timeout).map_err(map_sqlite_busy)?;
+        check_sqlite_has_moved(&db).context(LaneControlError::Continuity)?;
+        let version: i64 = db
+            .query_row("SELECT version FROM control WHERE singleton=1", [], |r| {
                 r.get(0)
-            })?;
+            })
+            .map_err(map_sqlite_busy)?;
         ensure!(
             version == CURRENT_JOURNAL_FORMAT,
             LaneControlError::UnsupportedFormat
@@ -445,14 +463,25 @@ impl ExistingLaneControlStore {
         Self::check_binding_in(&db, &binding, config)?;
         if writable {
             drop(db);
-            db = Connection::open_with_flags(
-                &database_path,
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-                    | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW
-                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-            )?;
-            db.busy_timeout(Duration::ZERO)?;
-            let synchronous: i64 = db.query_row("PRAGMA synchronous", [], |r| r.get(0))?;
+            db = {
+                let _opening = DATABASE_OPEN
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("database opening lock poisoned"))?;
+                Connection::open_with_flags(
+                    &database_path,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                        | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW
+                        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                )
+                .map_err(map_sqlite_busy)?
+            };
+            db.busy_timeout(busy_timeout).map_err(map_sqlite_busy)?;
+            check_sqlite_has_moved(&db).context(LaneControlError::Continuity)?;
+            db.execute_batch("PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;")
+                .map_err(map_sqlite_busy)?;
+            let synchronous: i64 = db
+                .query_row("PRAGMA synchronous", [], |r| r.get(0))
+                .map_err(map_sqlite_busy)?;
             ensure!(
                 synchronous == 2,
                 "lane control requires FULL SQLite durability"
@@ -471,6 +500,7 @@ impl ExistingLaneControlStore {
     }
 
     fn check_files(&self) -> Result<()> {
+        check_sqlite_has_moved(&self.db).context(LaneControlError::Continuity)?;
         check_file_identity(&self.database_path, &self.database)?;
         Self::check_witness(&self.db, &self.binding, &self.writer_path, &self.writer).map(|_| ())
     }
@@ -539,7 +569,7 @@ fn control_token(db: &Connection, lane: LaneId, revision: i64) -> Result<String>
 }
 
 pub fn lane_control_status(config: &Config, lane: LaneId) -> Result<Value> {
-    let control = ExistingLaneControlStore::open(config, false)?;
+    let control = ExistingLaneControlStore::open(config, false, Duration::from_millis(250))?;
     let snapshot = control.db.unchecked_transaction()?;
     ExistingLaneControlStore::check_binding_in(&snapshot, &control.binding, config)?;
     let result = Store::lane_control_projection(&snapshot, lane)?;
@@ -555,8 +585,10 @@ pub fn set_lane_paused(
     expected_control_token: &str,
     wait_deadline: Instant,
 ) -> Result<Value> {
-    ensure!(Instant::now() < wait_deadline, LaneControlError::Busy);
-    let control = ExistingLaneControlStore::open(config, true)?;
+    let remaining = wait_deadline
+        .checked_duration_since(Instant::now())
+        .ok_or(LaneControlError::Busy)?;
+    let control = ExistingLaneControlStore::open(config, true, remaining)?;
     commit_lane_control(
         control,
         config,
@@ -838,12 +870,15 @@ impl Store {
             !runtime_instance.is_empty() && runtime_instance.len() <= 128 && observed_at >= 0,
             "invalid observation identity"
         );
-        Ok(json!({"state":state,"reasons":reasons,"freshness":"current_observation","source":"runtime_snapshot",
+        Ok(
+            json!({"state":state,"reasons":reasons,"freshness":"current_observation","source":"runtime_snapshot",
             "observed_at":observed_at,"valid_until":valid_until,"runtime_instance":runtime_instance,
             "observed_control_revision":stamp.lane_control_revision,"accepted_config_revision":stamp.lane_config_revision,
-            "authority_epoch":stamp.authority_epoch,"account_generation":stamp.account_generation}))
+            "authority_epoch":stamp.authority_epoch,"account_generation":stamp.account_generation}),
+        )
     }
 
+    #[cfg(test)]
     pub(crate) fn record_admission_observation(
         &self,
         lane: LaneId,
@@ -955,7 +990,8 @@ mod writer_authority_tests {
     fn replacement_after_control_open_refuses_precommit_and_rolls_back() {
         let (_directory, config) = super::super::tests::bound_fixture();
         let (owner, store) = AccountLock::acquire(&config).unwrap();
-        let mut control = ExistingLaneControlStore::open(&config, true).unwrap();
+        let mut control =
+            ExistingLaneControlStore::open(&config, true, Duration::from_millis(250)).unwrap();
         let tx = control
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)

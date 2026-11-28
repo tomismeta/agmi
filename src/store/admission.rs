@@ -495,11 +495,14 @@ impl Store {
         let candidate = &candidates[selected];
         let op = candidate.operation;
         if selection.reset_round {
-            for lane in LaneId::ALL {
+            for (index, candidate) in candidates.iter().enumerate() {
+                if !selection.eligible[index] {
+                    continue;
+                }
                 ensure!(
                     tx.execute(
                         "UPDATE schedule SET served_in_round=0 WHERE kind=?1",
-                        [lane.as_str()]
+                        [candidate.operation.kind.as_str()]
                     )? == 1,
                     LaneControlError::MissingState
                 );

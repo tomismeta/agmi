@@ -535,13 +535,35 @@ fn path_string(path: &Path) -> Result<String> {
         .context("adapter path is not UTF-8")
 }
 
+fn is_executable_file(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        std::ffi::CString::new(path.as_os_str().as_bytes())
+            .is_ok_and(|cstr| unsafe { libc::access(cstr.as_ptr(), libc::X_OK) == 0 })
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 fn resolve_executable(path: &Path) -> Result<PathBuf> {
     if path.components().count() > 1 || path.is_absolute() {
-        return std::fs::canonicalize(path).context("native harness executable unavailable");
+        let resolved =
+            std::fs::canonicalize(path).context("native harness executable unavailable")?;
+        ensure!(
+            is_executable_file(&resolved),
+            "native harness executable unavailable"
+        );
+        return Ok(resolved);
     }
     for directory in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
         let candidate = directory.join(path);
-        if candidate.is_file() {
+        if is_executable_file(&candidate) {
             return std::fs::canonicalize(candidate)
                 .context("native harness executable unavailable");
         }
@@ -573,9 +595,18 @@ impl OwnedChild {
 
     fn stop_and_observe(&mut self) -> bool {
         self.request_stop();
-        // Kill the group before reaping its leader. If the leader has not
-        // exited yet, dropping Child hands it to Tokio's orphan reaper.
-        self.child.try_wait().is_ok_and(|status| status.is_some())
+        // Kill the group before reaping its leader. Give the kernel a short window
+        // to reap the SIGKILLed leader synchronously; otherwise dropping Child hands
+        // it to Tokio's orphan reaper.
+        for attempt in 0..10 {
+            if self.child.try_wait().is_ok_and(|status| status.is_some()) {
+                return true;
+            }
+            if attempt < 9 {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        false
     }
 
     async fn wait(&mut self) -> Result<std::process::ExitStatus> {
@@ -634,18 +665,49 @@ impl Drop for OwnedChild {
     }
 }
 
-async fn read_bounded(reader: impl AsyncRead + Unpin) -> Result<Vec<u8>> {
+fn kill_process_group(group: i32) {
+    #[cfg(unix)]
+    if group > 0 {
+        // SAFETY: group is the private process group created for our owned child.
+        unsafe {
+            libc::kill(-group, libc::SIGKILL);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = group;
+}
+
+async fn read_bounded(reader: impl AsyncRead + Unpin, group: i32) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     reader
         .take((MAX_OUTPUT + 1) as u64)
         .read_to_end(&mut bytes)
         .await
         .map_err(|_| NativeFailure("native_pipe_failed"))?;
-    ensure!(
-        bytes.len() <= MAX_OUTPUT,
-        NativeFailure("native_output_limit")
-    );
+    if bytes.len() > MAX_OUTPUT {
+        kill_process_group(group);
+        return Err(NativeFailure("native_output_limit").into());
+    }
     Ok(bytes)
+}
+
+async fn drain_bounded(mut reader: impl AsyncRead + Unpin, group: i32) -> Result<()> {
+    let mut scratch = [0u8; 4096];
+    let mut total = 0usize;
+    loop {
+        let count = reader
+            .read(&mut scratch)
+            .await
+            .map_err(|_| NativeFailure("native_pipe_failed"))?;
+        if count == 0 {
+            return Ok(());
+        }
+        total = total.saturating_add(count);
+        if total > MAX_OUTPUT {
+            kill_process_group(group);
+            return Err(NativeFailure("native_output_limit").into());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -737,6 +799,10 @@ async fn collect_native_evidence(
         .stderr
         .take()
         .context(NativeFailure("native_pipe_failed"))?;
+    #[cfg(unix)]
+    let group = owner.group;
+    #[cfg(not(unix))]
+    let group = 0;
     let write = async {
         stdin
             .write_all(&input)
@@ -750,18 +816,22 @@ async fn collect_native_evidence(
         Ok::<_, anyhow::Error>(())
     };
     let wait = owner.wait();
-    let (written, output, diagnostics, status) =
-        tokio::join!(write, read_bounded(stdout), read_bounded(stderr), wait);
+    let (written, output, diagnostics, status) = tokio::join!(
+        write,
+        read_bounded(stdout, group),
+        drain_bounded(stderr, group),
+        wait
+    );
     let output = output?;
     if let Ok(value) = serde_json::from_slice::<Value>(&output) {
         let prompt_channel = evidence.prompt_channel.take();
         *evidence = contract::reported(&value);
         evidence.prompt_channel = prompt_channel;
     }
-    written?;
     diagnostics?;
     let status = status?;
-    // Raw native diagnostics can contain auth material or candidate content.
+    // Check explicit pre-call refusals BEFORE `written?` so an early refusal exit
+    // causing EPIPE on stdin never masks a typed SolverNotStarted refusal.
     if matches!(protocol, NativeProtocol::Hermes | NativeProtocol::Openclaw) {
         let refusal = match (protocol, status.code()) {
             (NativeProtocol::Hermes, Some(78)) => {
@@ -790,6 +860,7 @@ async fn collect_native_evidence(
                 .context(SolverNotStarted(reason)));
         }
     }
+    written?;
     if !status.success()
         && matches!(protocol, NativeProtocol::Hermes)
         && let Ok(value) = serde_json::from_slice::<Value>(&output)
@@ -1215,7 +1286,7 @@ invocation=${invocation%%\"*}
                 std::task::Poll::Ready(Err(std::io::Error::other("secret-canary")))
             }
         }
-        let error = read_bounded(BrokenPipe).await.unwrap_err();
+        let error = read_bounded(BrokenPipe, 0).await.unwrap_err();
         assert_safe_failure(&error, "native_pipe_failed", true);
     }
 
@@ -1635,9 +1706,9 @@ invocation=${invocation%%\"*}
     #[tokio::test]
     async fn bounds_native_output() {
         let oversized = vec![b'x'; MAX_OUTPUT + 1];
-        let error = read_bounded(&oversized[..]).await.unwrap_err();
+        let error = read_bounded(&oversized[..], 0).await.unwrap_err();
         assert_safe_failure(&error, "native_output_limit", true);
-        assert_eq!(read_bounded(&b"{}"[..]).await.unwrap(), b"{}");
+        assert_eq!(read_bounded(&b"{}"[..], 0).await.unwrap(), b"{}");
     }
     #[test]
     fn answer_lengths_use_engine_utf16_units() {

@@ -3,7 +3,6 @@ use crate::endpoints::{ApiEndpoints, network_defaults};
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -269,7 +268,20 @@ impl OmpConfig {
                                 | "PI_CONFIG_DIR"
                                 | "PI_CODING_AGENT_DIR"
                                 | "PI_CONFIG_FILES"
+                                | "SSL_CERT_FILE"
+                                | "SSL_CERT_DIR"
+                                | "CURL_CA_BUNDLE"
                         )
+                        && !{
+                            let upper = name.to_ascii_uppercase();
+                            upper.starts_with("LD_")
+                                || upper.starts_with("DYLD_")
+                                || upper.starts_with("NODE_")
+                                || upper.starts_with("BUN_")
+                                || upper.starts_with("XDG_")
+                                || upper.starts_with("AGMI_")
+                                || upper.ends_with("_PROXY")
+                        }
                 }),
             "invalid omp environment inheritance"
         );
@@ -311,9 +323,12 @@ impl ModelConfig {
         let (provider, model) = self.model.split_once('/').ok_or(OmpSelectionError::Route)?;
         if self.model.len() > 256
             || provider.is_empty()
+            || provider.starts_with('-')
             || !provider.bytes().all(id_char)
             || !model.split('/').all(|segment| {
-                !segment.is_empty() && segment.bytes().all(|byte| id_char(byte) || byte == b':')
+                !segment.is_empty()
+                    && !segment.starts_with('-')
+                    && segment.bytes().all(|byte| id_char(byte) || byte == b':')
             })
         {
             return Err(OmpSelectionError::Route);
@@ -380,15 +395,19 @@ impl NetworkConfig {
     }
     /// A reusable network-only profile, or the network table from full configuration.
     pub fn read_profile(path: &Path) -> Result<Self> {
-        let file = std::fs::File::open(path)
+        let bytes =
+            crate::fs_util::read_bounded_regular(path, 65536, false).map_err(
+                |error| match error {
+                    crate::fs_util::RegularReadError::TooLarge => {
+                        anyhow::anyhow!("network configuration exceeds 64 KiB")
+                    }
+                    _ => anyhow::anyhow!("cannot read network configuration"),
+                },
+            )?;
+        let text = std::str::from_utf8(&bytes)
             .map_err(|_| anyhow::anyhow!("cannot read network configuration"))?;
-        let mut text = String::new();
-        file.take(65537)
-            .read_to_string(&mut text)
-            .map_err(|_| anyhow::anyhow!("cannot read network configuration"))?;
-        ensure!(text.len() <= 65536, "network configuration exceeds 64 KiB");
         let value: toml::Value =
-            toml::from_str(&text).map_err(|_| anyhow::anyhow!("invalid network configuration"))?;
+            toml::from_str(text).map_err(|_| anyhow::anyhow!("invalid network configuration"))?;
         let network: Self = value
             .get("network")
             .cloned()
@@ -844,21 +863,23 @@ impl Config {
     }
 
     fn read_file_bytes(path: &Path) -> Result<Vec<u8>> {
-        let file = std::fs::File::open(path).map_err(|error| {
-            ConfigDiagnostic::new(
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    "file_missing"
-                } else {
-                    "file_unreadable"
-                },
-                "Cannot open configuration; inspect the selected file and its access permissions.",
-            )
-        })?;
-        let mut bytes = Vec::new();
-        file.take(65537)
-            .read_to_end(&mut bytes)
-            .map_err(|_| ConfigDiagnostic::new("file_unreadable", "Cannot read configuration."))?;
-        Ok(bytes)
+        crate::fs_util::read_bounded_regular(path, 65536, false).map_err(|error| {
+            match error {
+                crate::fs_util::RegularReadError::NotFound => ConfigDiagnostic::new(
+                    "file_missing",
+                    "Cannot open configuration; inspect the selected file and its access permissions.",
+                ),
+                crate::fs_util::RegularReadError::TooLarge => {
+                    ConfigDiagnostic::new("file_too_large", "Configuration exceeds 64 KiB.")
+                }
+                crate::fs_util::RegularReadError::UnsafeFile
+                | crate::fs_util::RegularReadError::Io => ConfigDiagnostic::new(
+                    "file_unreadable",
+                    "Cannot open configuration; inspect the selected file and its access permissions.",
+                ),
+            }
+            .into()
+        })
     }
 
     pub(crate) fn parse_bytes(path: &Path, bytes: &[u8], load_guidance: bool) -> Result<Self> {
@@ -923,7 +944,9 @@ impl Config {
                 .into_iter()
                 .flatten()
             {
-                *path = resolve_path(root, path);
+                if !path.as_os_str().is_empty() && !path.starts_with("~") {
+                    *path = resolve_path(root, path);
+                }
             }
         }
         config.guidance_loaded = [
@@ -1537,71 +1560,35 @@ fn validate_duration(field: &'static str, seconds: u64, allow_zero: bool) -> Res
 }
 
 pub(crate) fn read_guidance(path: &Path, kind: LaneId, layer: &'static str) -> Result<Arc<str>> {
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NONBLOCK);
-    }
-    let file = options.open(path).map_err(|error| {
-        ConfigDiagnostic::guidance(
-            if error.kind() == std::io::ErrorKind::NotFound {
-                "guidance_missing"
-            } else {
-                "guidance_unreadable"
-            },
-            kind,
-            layer,
-            "Cannot open model guidance; inspect the configured file and its access permissions.",
-        )
-    })?;
-    let metadata = file.metadata().map_err(|_| {
-        ConfigDiagnostic::guidance(
-            "guidance_unreadable",
-            kind,
-            layer,
-            "Cannot inspect model guidance file.",
-        )
-    })?;
-    ensure!(
-        metadata.is_file(),
-        ConfigDiagnostic::guidance(
-            "guidance_not_regular",
-            kind,
-            layer,
-            "Model guidance must be a regular file."
-        )
-    );
-    ensure!(
-        metadata.len() <= MAX_GUIDANCE_BYTES as u64,
-        ConfigDiagnostic::guidance(
-            "guidance_too_large",
-            kind,
-            layer,
-            "Model guidance exceeds 64 KiB."
-        )
-    );
-    let mut bytes = Vec::new();
-    file.take((MAX_GUIDANCE_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|_| {
-            ConfigDiagnostic::guidance(
-                "guidance_unreadable",
-                kind,
-                layer,
-                "Cannot read model guidance file.",
-            )
+    let bytes =
+        crate::fs_util::read_bounded_regular(path, MAX_GUIDANCE_BYTES, false).map_err(|error| {
+            match error {
+                crate::fs_util::RegularReadError::NotFound => ConfigDiagnostic::guidance(
+                    "guidance_missing",
+                    kind,
+                    layer,
+                    "Cannot open model guidance; inspect the configured file and its access permissions.",
+                ),
+                crate::fs_util::RegularReadError::UnsafeFile => ConfigDiagnostic::guidance(
+                    "guidance_not_regular",
+                    kind,
+                    layer,
+                    "Model guidance must be a regular file.",
+                ),
+                crate::fs_util::RegularReadError::TooLarge => ConfigDiagnostic::guidance(
+                    "guidance_too_large",
+                    kind,
+                    layer,
+                    "Model guidance exceeds 64 KiB.",
+                ),
+                crate::fs_util::RegularReadError::Io => ConfigDiagnostic::guidance(
+                    "guidance_unreadable",
+                    kind,
+                    layer,
+                    "Cannot read model guidance file.",
+                ),
+            }
         })?;
-    ensure!(
-        bytes.len() <= MAX_GUIDANCE_BYTES,
-        ConfigDiagnostic::guidance(
-            "guidance_too_large",
-            kind,
-            layer,
-            "Model guidance exceeds 64 KiB."
-        )
-    );
     validate_guidance_bytes(&bytes).map_err(|_| {
         ConfigDiagnostic::guidance(
             "guidance_not_utf8",

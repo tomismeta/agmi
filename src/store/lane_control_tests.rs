@@ -1144,7 +1144,8 @@ fn lane_control_gate_replacement_precommit_rolls_back_without_account_lock() {
     let fixture = fixture();
     let config = &fixture.config;
     let before = account_control_state(&fixture.store);
-    let mut control = ExistingLaneControlStore::open(config, true).unwrap();
+    let mut control =
+        ExistingLaneControlStore::open(config, true, Duration::from_millis(250)).unwrap();
     let tx = control
         .db
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1298,7 +1299,7 @@ fn lane_pause_postcommit_witness_regression_reports_uncertainty() {
     }
     let mut fixture = fixture();
     let config = &fixture.config;
-    let control = ExistingLaneControlStore::open(config, true).unwrap();
+    let control = ExistingLaneControlStore::open(config, true, Duration::from_millis(250)).unwrap();
     let old_binding = read_bound_binding(config).unwrap();
     // A genuine sibling dispatch advances the witness after control opened.
     let answer = prepared(&mut fixture.store, config, LaneId::Answer, 8);

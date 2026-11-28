@@ -143,12 +143,15 @@ impl JudgeLane {
                 let more = has_more == Some(true) && !rows.is_empty();
                 let next_offset = offset.checked_add(rows.len() as u64).unwrap_or(0);
                 // Moving pages can repeat IDs. Advance by the page's raw length,
-                // not novel candidates, and wrap only at an explicit end/empty page.
-                services.set_inventory_offset(if page_complete || rows.is_empty() {
-                    0
-                } else {
-                    next_offset
-                })?;
+                // not novel candidates, and wrap only at an explicit end, empty page,
+                // or unpaginated response (omitted has_more).
+                services.set_inventory_offset(
+                    if page_complete || has_more.is_none() || rows.is_empty() {
+                        0
+                    } else {
+                        next_offset
+                    },
+                )?;
                 if let Some(inventory) = self.inventory.as_mut() {
                     let known: std::collections::HashSet<_> =
                         inventory.ids.iter().map(String::as_str).collect();
@@ -268,7 +271,9 @@ impl JudgeLane {
     ) -> Result<bool> {
         let offset = services.inventory_offset()?;
         if let Some(flight) = services.begin_discovery(Some(offset))? {
-            services.discovered()?;
+            if target.is_none() {
+                services.discovered()?;
+            }
             self.inventory = None;
             self.selected = None;
             self.read = Some(JudgeRead {
@@ -343,10 +348,16 @@ impl JudgeLane {
                         retain_targeted_inventory
                             && matches!(target,Target::Pending(existing,_) if existing == &key)
                     })
-                && services.fresh_allowed(key.operation.operation_id)
+                && services.can_fresh(
+                    key.operation.operation_id,
+                    crate::runtime::host::FreshTarget::Pending,
+                )
             {
-                self.start_inventory(services, Some(Target::Pending(key, id)))?;
-                services.start_identity()?;
+                let op_id = key.operation.operation_id;
+                if self.start_inventory(services, Some(Target::Pending(key, id)))? {
+                    services.consume_fresh(op_id, crate::runtime::host::FreshTarget::Pending);
+                    services.start_identity()?;
+                }
             }
         }
         if let Some(op) = services.preparation()?
@@ -364,10 +375,13 @@ impl JudgeLane {
             if !targeted
                 && services.active()?
                 && op.next_at <= services.deadline_now()
-                && services.fresh_allowed(op.id)
-                && self.start_inventory(services, Some(Target::Prepared(op)))?
+                && services.can_fresh(op.id, crate::runtime::host::FreshTarget::Prepared)
             {
-                services.start_identity()?;
+                let op_id = op.id;
+                if self.start_inventory(services, Some(Target::Prepared(op)))? {
+                    services.consume_fresh(op_id, crate::runtime::host::FreshTarget::Prepared);
+                    services.start_identity()?;
+                }
             }
         }
         if let Some(selected) = self.selected.as_ref()
@@ -689,15 +703,27 @@ impl JudgeLane {
         services: &mut GradeServices<'_>,
         deadline: tokio::time::Instant,
     ) -> Result<()> {
+        let mut first_error: Option<anyhow::Error> = None;
+        let mut record = |res: Result<()>| {
+            if let Err(error) = res
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        };
         if let Some(read) = self.read.as_mut() {
             read.flight.abort(deadline).await;
         }
-        self.collect(services)?;
+        record(self.collect(services));
         if let Some(read) = self.read.take() {
-            services.cancel_read(&read.flight)?;
+            record(services.cancel_read(&read.flight));
         }
-        services.cancel_reconciliation(deadline).await?;
-        services.cancel_model(&mut self.model, deadline).await
+        record(services.cancel_reconciliation(deadline).await);
+        record(services.cancel_model(&mut self.model, deadline).await);
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 }
 fn match_pending(

@@ -551,7 +551,7 @@ impl Protocol {
             .await
             .map_err(|error| anyhow::Error::new(request_failure(&error)))?;
         let status = response.status().as_u16();
-        let observed_at = transport::retry_observed_now();
+        let observed_at = context.monotonic_observed_at();
         let header_delay = response
             .headers()
             .get_all(RETRY_AFTER)
@@ -560,11 +560,14 @@ impl Protocol {
             .max();
         // Retain status/backoff even when an upstream error page is empty, broken,
         // oversized or interrupted. A null body cannot establish a write outcome.
-        let assembled = |response| HostedResponse {
-            context: context.clone(),
-            response,
-            observed_at,
-            completed_at: transport::observed_now(),
+        let assembled = |response| {
+            let completed_at = context.monotonic_completed_at();
+            HostedResponse {
+                context: context.clone(),
+                response,
+                observed_at,
+                completed_at,
+            }
         };
         let unavailable = |failure| {
             assembled(Response {
@@ -930,7 +933,9 @@ fn read_credential(path: &Path) -> Result<HeaderValue> {
     file.take(4097)
         .read_to_end(&mut bytes)
         .map_err(|_| anyhow::anyhow!("cannot read credential file"))?;
-    Ok(parse_credential(&bytes)?)
+    let parsed = parse_credential(&bytes);
+    crate::fs_util::wipe_bytes(&mut bytes);
+    Ok(parsed?)
 }
 
 fn parse_credential(bytes: &[u8]) -> std::result::Result<HeaderValue, CredentialFormatError> {
@@ -1547,6 +1552,7 @@ pub fn parse_challenge(response: &Response) -> Result<Challenge> {
     let epoch = body
         .get("epoch")
         .and_then(Value::as_u64)
+        .filter(|epoch| *epoch <= i64::MAX as u64)
         .ok_or_else(|| anyhow::anyhow!("challenge epoch missing or invalid"))?;
     let words = parse_words(
         body.get("words")
@@ -1668,6 +1674,7 @@ fn parse_author_history(row: &Value) -> Result<AuthorHistory> {
     let target_epoch = row
         .get("answer_epoch")
         .and_then(Value::as_u64)
+        .filter(|epoch| *epoch <= i64::MAX as u64)
         .ok_or_else(|| anyhow::anyhow!("author history has no target epoch"))?;
     let mut history = AuthorHistory {
         entries: Vec::with_capacity(values.len().min(16)),
@@ -1737,6 +1744,7 @@ fn parse_assignment(row: &Value) -> Result<Assignment> {
     let epoch = row
         .get("answer_epoch")
         .and_then(Value::as_u64)
+        .filter(|epoch| *epoch <= i64::MAX as u64)
         .ok_or_else(|| {
             anyhow::anyhow!("assignment target epoch unavailable; transaction hydration required")
         })?;
@@ -1762,6 +1770,7 @@ fn parse_assignment(row: &Value) -> Result<Assignment> {
             .pointer("/pending_meta/expires_at_epoch")
             .map(|v| {
                 v.as_u64()
+                    .filter(|epoch| *epoch <= i64::MAX as u64)
                     .ok_or_else(|| anyhow::anyhow!("invalid assignment expiry"))
             })
             .transpose()?,

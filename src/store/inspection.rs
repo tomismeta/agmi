@@ -623,7 +623,8 @@ impl Store {
             } else {
                 None
             };
-            let poll = self.poll_floors_with_schedule(config, op, &read, decay, schedules[index])?;
+            let poll =
+                self.poll_floors_with_schedule(config, op, &read, decay, schedules[index])?;
             let floors = poll.projection();
             let next = (key.is_some() && op.pollable()).then_some(poll.gate);
             let reason = if matches!(

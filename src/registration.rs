@@ -125,11 +125,13 @@ impl Paths {
                 .map_err(|_| io_error())?
                 .join(config)
         };
-        let parent = config.parent().ok_or_else(unsafe_file)?.to_path_buf();
+        let parent = config.parent().ok_or_else(unsafe_file)?;
+        let parent = crate::fs_util::canonicalize_existing_prefix(parent);
         let name = config
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or_else(unsafe_file)?;
+        let config = parent.join(name);
         if name == "credential"
             || name == "state"
             || name == "network.toml"
@@ -885,8 +887,6 @@ fn summary(
                         != saved.intent.binding.base_url
                     || config.network.credential_file != paths.credential
                     || config.state_dir != bound.state_dir
-                    || config.network.api != bound.api
-                    || config.network.trusted_origins != bound.trusted_origins
                 {
                     return Err(conflict());
                 }
@@ -985,12 +985,9 @@ fn resume_inner(config_path: &Path, confirm: bool) -> Result<Value> {
 }
 
 pub async fn create(config_path: &Path, options: CreateOptions, confirmed: bool) -> Result<Value> {
-    let future = create_inner(config_path, &options, confirmed);
-    tokio::pin!(future);
-    tokio::select! {
-        result = &mut future => result.map_err(sanitize),
-        _ = tokio::signal::ctrl_c() => Err(error("registration_interrupted", "Registration interrupted. Inspect identity status locally; a retained intent forbids another POST even if transmission had not begun.", json!({}))),
-    }
+    create_inner(config_path, &options, confirmed)
+        .await
+        .map_err(sanitize)
 }
 async fn create_inner(
     config_path: &Path,
@@ -1084,16 +1081,29 @@ async fn create_inner(
     ensure_no_journal(&binding.state_dir)?;
     let timeout = Duration::from_secs(options.http_seconds);
     let client = protocol::private_http_client(timeout, timeout).map_err(|_| io_error())?;
-    let challenge = protocol::complete_raw_response(client.get(challenge_url)).await.map_err(|_| error("registration_challenge_unavailable", "Admission challenge unavailable; no registration was sent and no retry was attempted.", json!({})))?;
-    if challenge.status != 200 {
-        return Err(error(
-            "registration_challenge_unavailable",
-            "Admission challenge unavailable; no registration was sent and no retry was attempted.",
-            json!({"http_status":challenge.status,"retry_after_seconds":challenge.retry_after_seconds}),
-        ));
-    }
-    let proof = proof(&challenge.bytes, options)?;
-    let nonce = mine(&proof, options).await?;
+    let interrupted = || {
+        error(
+            "registration_interrupted",
+            "Registration interrupted before durable intent publication; no registration was sent.",
+            json!({}),
+        )
+    };
+    let (proof, nonce) = tokio::select! {
+        res = async {
+            let challenge = protocol::complete_raw_response(client.get(challenge_url)).await.map_err(|_| error("registration_challenge_unavailable", "Admission challenge unavailable; no registration was sent and no retry was attempted.", json!({})))?;
+            if challenge.status != 200 {
+                return Err(error(
+                    "registration_challenge_unavailable",
+                    "Admission challenge unavailable; no registration was sent and no retry was attempted.",
+                    json!({"http_status":challenge.status,"retry_after_seconds":challenge.retry_after_seconds}),
+                ));
+            }
+            let proof = proof(&challenge.bytes, options)?;
+            let nonce = mine(&proof, options).await?;
+            Ok((proof, nonce))
+        } => res?,
+        _ = tokio::signal::ctrl_c() => return Err(interrupted()),
+    };
     if now()? >= proof.expires_ts {
         return Err(error(
             "registration_pow_deadline",

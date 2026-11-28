@@ -91,8 +91,19 @@ macro_rules! common_services {
             pub(super) fn ready_current(&self, ready: &ReadyEffect) -> Result<bool> {
                 self.host.scoped_ready_current(LaneId::$lane, ready)
             }
-            pub(super) fn fresh_allowed(&mut self, id: i64) -> bool {
-                self.host.fresh_allowed(LaneId::$lane, id)
+            pub(super) fn can_fresh(
+                &self,
+                id: i64,
+                target: crate::runtime::host::FreshTarget,
+            ) -> bool {
+                self.host.can_fresh(LaneId::$lane, id, target)
+            }
+            pub(super) fn consume_fresh(
+                &mut self,
+                id: i64,
+                target: crate::runtime::host::FreshTarget,
+            ) {
+                self.host.consume_fresh(LaneId::$lane, id, target)
             }
             pub(super) fn deadline_now(&self) -> i64 {
                 self.host.deadline_now()

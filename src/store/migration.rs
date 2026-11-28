@@ -103,7 +103,7 @@ fn table_exists(db: &Connection, table: &str) -> Result<bool> {
 }
 fn open_existing(state: &Path, writable: bool) -> Result<Option<Connection>> {
     let path = state.join("state.sqlite3");
-    match fs::symlink_metadata(&path) {
+    let metadata = match fs::symlink_metadata(&path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
         Ok(metadata) => {
@@ -113,8 +113,9 @@ fn open_existing(state: &Path, writable: bool) -> Result<Option<Connection>> {
                 !metadata.file_type().is_symlink(),
                 "journal symlink rejected"
             );
+            metadata
         }
-    }
+    };
     // SQLite opens the live inode and handles WAL; never copy its files.
     let path = fs::canonicalize(state)?.join("state.sqlite3");
     let flags = if writable {
@@ -122,8 +123,19 @@ fn open_existing(state: &Path, writable: bool) -> Result<Option<Connection>> {
     } else {
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
     };
-    let db = Connection::open_with_flags(path, flags | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW)?;
+    let db = {
+        let _opening = DATABASE_OPEN
+            .lock()
+            .map_err(|_| anyhow::anyhow!("database opening lock poisoned"))?;
+        Connection::open_with_flags(&path, flags | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW)?
+    };
     db.busy_timeout(std::time::Duration::from_secs(5))?;
+    let reopened = fs::symlink_metadata(&path)?;
+    ensure!(
+        same_journal_file(&metadata, &reopened),
+        "journal replaced during migration open"
+    );
+    check_sqlite_has_moved(&db)?;
     if writable {
         db.execute_batch("PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;")?;
     }
