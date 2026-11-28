@@ -1133,7 +1133,7 @@ mod native {
                 observed_unit(&home, root, release, Path::new(&before["FragmentPath"]))?;
             let unit_image = image_metadata(&unit_file.metadata()?);
             let pid: u32 = before["MainPID"].parse()?;
-            result.pid = (pid > 0).then_some(pid);
+            result.pid = Some(pid);
             if pid == 0 {
                 let after = observation_properties(deadline, &mut remaining)?;
                 let final_selected = super::observe_selected(path);
